@@ -6,3 +6,6 @@ watchdog>=3.0.0
 psutil>=5.9.0
 cryptography>=3.4.8
 Pillow>=10.0.0
+# QR encoding for device pairing. Pure Python — unlike Pillow it has no C
+# extension, but it still belongs here: py_modules is not on the desktop path.
+qrcode>=7.4

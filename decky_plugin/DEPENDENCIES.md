@@ -7,6 +7,7 @@ The Decky plugin runs on SteamOS, which has a minimal Python environment. Most t
 - **requests** — HTTP library
 - **watchdog** — File system monitoring
 - **PIL (Pillow)** — Image processing
+- **qrcode** — QR encoding for the device-auth pairing flow (pure Python, no C extensions)
 - **certifi, charset_normalizer, idna, urllib3** — Transitive dependencies of requests
 
 ## How to Add a New Dependency

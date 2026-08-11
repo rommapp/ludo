@@ -96,6 +96,11 @@ const getPluginStats = callable<[], any>("get_plugin_stats");
 const saveConfig = callable<[string, string, string, string, string, string, string], any>("save_config");
 const testRommConnection = callable<[string, string, string], any>("test_connection");
 const pairDevice = callable<[string, string], any>("pair_device");
+// QR pairing (RomM's device-auth flow). start returns the code + QR matrix,
+// poll is driven from the frontend so backing out of the step stops it.
+const startQrPairing = callable<[string], any>("start_qr_pairing");
+const pollQrPairing = callable<[], any>("poll_qr_pairing");
+const cancelQrPairing = callable<[], any>("cancel_qr_pairing");
 const setDeviceNameRpc = callable<[string], any>("set_device_name");
 const getSaveHistory = callable<[number], any>("get_save_history");
 const getPendingUploads = callable<[], any>("get_pending_uploads");
@@ -5122,6 +5127,15 @@ function ConfigPage() {
     }
   };
 
+  // Same QR flow the wizard offers, armed by a button for the same reason (see
+  // SetupWizard: device/init is rate-limited and the URL is typed live).
+  const [qrArmed, setQrArmed] = useState(false);
+  useEffect(() => { setQrArmed(false); }, [url]);
+  const { qr, retry: qrRetry } = useQrPairing(url, qrArmed, () => {
+    setQrArmed(false);
+    Navigation.NavigateBack();
+  });
+
   const handleSave = async () => {
     setSaving(true);
     try {
@@ -5216,7 +5230,48 @@ function ConfigPage() {
         </PanelSectionRow>
       </PanelSection>
 
-      <PanelSection title="Pair with code (recommended)">
+      <PanelSection title="Scan a QR code (recommended)">
+        {!qrArmed ? (
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={() => setQrArmed(true)} disabled={!url.trim() || saving || pairing}
+              description="Scan with your phone and approve there — no code to type on this device.">
+              📱 Show QR Code
+            </ButtonItem>
+          </PanelSectionRow>
+        ) : qr.status === 'error' ? (
+          <PanelSectionRow>
+            <ButtonItem layout="below"
+              onClick={qr.unavailable ? () => setQrArmed(false) : qrRetry}
+              description={qr.message}>
+              {qr.unavailable ? 'Use a pairing code below' : 'Try Again'}
+            </ButtonItem>
+          </PanelSectionRow>
+        ) : qr.status === 'starting' ? (
+          <PanelSectionRow>
+            <div style={{ padding: '8px 0', fontSize: '13px', opacity: 0.7 }}>Getting a code…</div>
+          </PanelSectionRow>
+        ) : (
+          <PanelSectionRow>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', padding: '8px 0' }}>
+              {qr.matrix
+                ? <QrCode matrix={qr.matrix} size={190} />
+                : <div style={{ fontSize: '12px', opacity: 0.8, wordBreak: 'break-all' }}>{qr.verifyUrl}</div>}
+              {/* Shown next to the QR, not in place of it — a second device that
+                  is already signed in can type this at /pair/device. */}
+              {qr.userCode && (
+                <div style={{ fontFamily: 'monospace', fontSize: '18px', fontWeight: 700, letterSpacing: '0.2em' }}>
+                  {qr.userCode}
+                </div>
+              )}
+              <div style={{ fontSize: '12px', opacity: 0.7, textAlign: 'center' }}>
+                {qr.status === 'approved' ? 'Approved!' : 'Waiting for approval…'}
+              </div>
+            </div>
+          </PanelSectionRow>
+        )}
+      </PanelSection>
+
+      <PanelSection title="Pair with code">
         <PanelSectionRow>
           <TextField
             label="Pairing code"
@@ -5661,6 +5716,119 @@ function V2TextField({ label, value, onChange, password, placeholder, icon, mono
       </div>
     </Focusable>
   );
+}
+
+// QrCode — draws the backend's boolean matrix as an SVG.
+//
+// Deliberately not an image: the matrix is a few hundred bytes, SVG stays crisp
+// at whatever size the surface gives it, and nothing has to encode a PNG. The
+// quiet zone is drawn here rather than baked into the matrix so the light plate
+// extends past the modules — phone scanners need that margin, and the Deck's
+// dark UI would otherwise run right up to the finder patterns.
+function QrCode({ matrix, size = 200 }: { matrix: boolean[][]; size?: number }) {
+  const n = matrix.length;
+  if (!n) return null;
+  const quiet = 2;
+  const span = n + quiet * 2;
+  return (
+    <div style={{ background: '#ffffff', borderRadius: V2.radiusMd, padding: '10px', lineHeight: 0 }}>
+      <svg width={size} height={size} viewBox={`0 0 ${span} ${span}`} shapeRendering="crispEdges"
+        role="img" aria-label="Pairing QR code">
+        <rect width={span} height={span} fill="#ffffff" />
+        {matrix.map((row, y) => row.map((on, x) => on
+          ? <rect key={`${x}-${y}`} x={x + quiet} y={y + quiet} width={1} height={1} fill="#000000" />
+          : null))}
+      </svg>
+    </div>
+  );
+}
+
+type QrState = {
+  matrix: boolean[][] | null; userCode: string; verifyUrl: string;
+  status: 'idle' | 'starting' | 'waiting' | 'approved' | 'error';
+  message: string; unavailable: boolean;
+};
+
+// useQrPairing — owns one device-auth request: start it, poll until the user
+// approves on their phone, and stop cleanly when the caller goes away.
+//
+// The poll interval comes from the server (RFC 8628's `interval`, widened if it
+// answers slow_down), so this never hammers an endpoint that is rate-limited
+// per-IP. `active` is what makes it safe to mount on a step the user can leave:
+// flipping it false cancels the pending request instead of leaving a poll loop
+// running behind a screen nobody is looking at.
+function useQrPairing(url: string, active: boolean, onPaired: (r: any) => void) {
+  const [qr, setQr] = useState<QrState>({
+    matrix: null, userCode: '', verifyUrl: '', status: 'idle', message: '', unavailable: false,
+  });
+  // onPaired is typically an inline closure; keep it in a ref so re-renders
+  // don't restart the flow through the effect's dependency list.
+  const paidRef = useRef(onPaired);
+  paidRef.current = onPaired;
+  const [nonce, setNonce] = useState(0);
+  const retry = () => setNonce((n) => n + 1);
+
+  useEffect(() => {
+    if (!active || !url.trim()) return;
+    let alive = true;
+    let timer: any = null;
+    setQr({ matrix: null, userCode: '', verifyUrl: '', status: 'starting', message: '', unavailable: false });
+
+    (async () => {
+      let started: any;
+      try { started = await startQrPairing(url.trim()); }
+      catch { started = { success: false, message: 'Could not reach the server.' }; }
+      if (!alive) return;
+      if (!started?.success) {
+        setQr({
+          matrix: null, userCode: '', verifyUrl: '', status: 'error',
+          message: started?.message || 'Could not start QR pairing.',
+          unavailable: !!started?.unavailable,
+        });
+        return;
+      }
+      setQr({
+        matrix: started.matrix || null,
+        userCode: started.user_code || '',
+        verifyUrl: started.verification_url || '',
+        status: 'waiting', message: '', unavailable: false,
+      });
+
+      const tick = async () => {
+        if (!alive) return;
+        let r: any;
+        try { r = await pollQrPairing(); }
+        catch { r = { status: 'pending' }; }  // a dropped poll is not a failure
+        if (!alive) return;
+        if (r?.status === 'approved') {
+          setQr((s) => ({ ...s, status: 'approved', message: r?.message || 'Paired' }));
+          paidRef.current(r);
+          return;
+        }
+        if (r?.status === 'pending') {
+          timer = setTimeout(tick, Math.max(1, Number(r?.interval) || 5) * 1000);
+          return;
+        }
+        setQr((s) => ({
+          ...s, status: 'error',
+          message: r?.status === 'expired'
+            ? 'This code expired. Get a new one to try again.'
+            : (r?.message || 'Pairing failed.'),
+        }));
+      };
+      timer = setTimeout(tick, 3000);
+    })();
+
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+      // Drop the server-side request too, so leaving the step doesn't leave a
+      // code the user could still approve into a device that stopped listening.
+      cancelQrPairing().catch(() => { });
+    };
+  }, [url, active, nonce]);
+
+  return { qr, retry };
 }
 
 // PairCodeField — masked XXXX-XXXX entry. Shows an 8-slot template where each
@@ -12382,9 +12550,17 @@ borderRadius: '50%', background: V2.fg, width: '14px', height: '14px', transform
   );
 }
 
+// Connect-step routes, in the order the bumpers cycle them.
+type WizMode = 'qr' | 'pair' | 'login';
+const WIZ_MODES: WizMode[] = ['qr', 'pair', 'login'];
+
 function SetupWizard() {
   const [step, setStep] = useState(0);
-  const [mode, setMode] = useState<'login' | 'pair'>('pair');
+  // 'qr' leads because it is the only route that asks for nothing but the URL —
+  // the other two still cost a trip through the on-screen keyboard, and both
+  // stay available for servers too old for device auth (or users without a
+  // phone to hand).
+  const [mode, setMode] = useState<WizMode>('qr');
   const [logo, setLogo] = useState<string | null>(null);
   const [url, setUrl] = useState('');
   const [username, setUsername] = useState('');
@@ -12628,6 +12804,25 @@ function SetupWizard() {
     } finally { setPairing(false); }
   };
 
+  // QR pairing is armed by a button rather than started as soon as the mode is
+  // picked: device/init is rate-limited per-IP, and the URL field is still being
+  // typed when the step opens — auto-starting would fire a request per keystroke
+  // and burn the limit before the user finished the hostname.
+  const [qrArmed, setQrArmed] = useState(false);
+  useEffect(() => { setQrArmed(false); }, [url, mode]);
+  const { qr, retry: qrRetry } = useQrPairing(
+    url, cur === 'connect' && mode === 'qr' && qrArmed && !paired,
+    (r) => {
+      setPaired(true);
+      setTestResult({
+        success: true,
+        message: r?.connecting
+          ? 'Paired — loading your library in the background.'
+          : 'Paired.',
+      });
+    },
+  );
+
   const doFinish = async () => {
     setBusy(true);
     try {
@@ -12653,11 +12848,15 @@ function SetupWizard() {
         } catch (e) { console.error('[RomM] wizard desktop tile', e); }
       }
 
-      if (mode === 'pair') {
+      if (mode !== 'login') {
         // Belt and braces: the Connect step does not advance unless pairing
-        // succeeded, so this only fires if that invariant ever breaks.
+        // succeeded, so this only fires if that invariant ever breaks. QR has
+        // no code to redeem here — its token only ever arrives by approval —
+        // so an unpaired QR run can only bail out.
         if (!paired) {
-          const r = await pairDevice(url.trim(), pairCode.trim());
+          const r = mode === 'qr'
+            ? { paired: false, message: 'Scan the QR code to finish pairing.' }
+            : await pairDevice(url.trim(), pairCode.trim());
           if (!r?.paired) {
             toaster.toast({ title: 'Ludo', body: r?.message || 'Pairing failed.' });
             return;
@@ -12688,9 +12887,13 @@ function SetupWizard() {
 
   const next = () => setStep((s) => Math.min(s + 1, TOTAL - 1));
   const back = () => setStep((s) => Math.max(s - 1, 0));
-  const canConnect = mode === 'pair'
-    ? (url.trim() && pairCode.trim())
-    : (url.trim() && username.trim() && (password.length > 0 || hasPassword));
+  // QR has no field to fill in beyond the URL, so the gate is the approval
+  // itself — the step won't advance until the phone comes back.
+  const canConnect = mode === 'qr'
+    ? (url.trim() && paired)
+    : mode === 'pair'
+      ? (url.trim() && pairCode.trim())
+      : (url.trim() && username.trim() && (password.length > 0 || hasPassword));
 
   const onField = (set: (v: string) => void, isPair = false) => (v: string) => { set(v); if (!isPair) setTestResult(null); };
   // Pair codes follow XXXX-XXXX — strip junk, uppercase, auto-insert the dash.
@@ -12779,7 +12982,9 @@ function SetupWizard() {
           const b = evt?.detail?.button;
           if (b === GamepadButton.BUMPER_LEFT || b === GamepadButton.BUMPER_RIGHT) {
             playSteamSound('deck_ui_tab_transition_01');
-            setMode((m) => (m === 'login' ? 'pair' : 'login'));
+            const dir = b === GamepadButton.BUMPER_LEFT ? -1 : 1;
+            setMode((m) => WIZ_MODES[
+              (WIZ_MODES.indexOf(m) + dir + WIZ_MODES.length) % WIZ_MODES.length]);
             setTestResult(null);
           }
         }}
@@ -12814,14 +13019,15 @@ function SetupWizard() {
           {cur === 'connect' && (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px', width: '100%' }}>
               <div style={{ fontSize: '20px', fontWeight: 700 }}>Connect to RomM</div>
-              {/* Login / Pair toggle — same segmented pill as the update channel,
-                  flanked by L1/R1 keycaps like the home nav: bumpers switch mode. */}
+              {/* QR / Pair / Login toggle — same segmented pill as the update
+                  channel, flanked by L1/R1 keycaps like the home nav: bumpers
+                  cycle the mode. */}
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px' }}>
                 <Bumper label="L1" />
                 <V2Segment
-                  options={[{ id: 'login', label: 'Username & password' }, { id: 'pair', label: 'Pair code' }]}
+                  options={[{ id: 'qr', label: 'Scan QR' }, { id: 'pair', label: 'Pair code' }, { id: 'login', label: 'Username & password' }]}
                   value={mode}
-                  onChange={(m) => { setMode(m as 'login' | 'pair'); setTestResult(null); }}
+                  onChange={(m) => { setMode(m as WizMode); setTestResult(null); }}
                 />
                 <Bumper label="R1" />
               </div>
@@ -12839,6 +13045,69 @@ function SetupWizard() {
                   )}
                   <GameActionButton variant="surface" label={testing ? 'Testing…' : 'Test connection'} icon={null}
                     disabled={testing || !url.trim() || !username.trim()} onClick={doTest} />
+                </>
+              ) : mode === 'qr' ? (
+                <>
+                  {!qrArmed ? (
+                    <>
+                      <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.6, maxWidth: '380px' }}>
+                        Scan a code with your phone and approve it there — nothing else to type on this device.
+                      </div>
+                      <GameActionButton variant="surface" label="Show QR code" icon={null}
+                        disabled={!url.trim()} onClick={() => setQrArmed(true)} />
+                    </>
+                  ) : qr.status === 'starting' ? (
+                    <div style={{ fontSize: '13px', color: V2.fg2 }}>Getting a code…</div>
+                  ) : qr.status === 'error' ? (
+                    <>
+                      <div style={{ fontSize: '13px', color: V2.danger, maxWidth: '380px', lineHeight: 1.5 }}>
+                        ❌ {qr.message}
+                      </div>
+                      {/* An old server is a dead end for QR but not for pairing —
+                          point at the route that still works rather than leaving
+                          a retry button that will fail the same way. */}
+                      {qr.unavailable
+                        ? <GameActionButton variant="surface" label="Use a pair code instead" icon={null}
+                          onClick={() => { setMode('pair'); setTestResult(null); }} />
+                        : <GameActionButton variant="surface" label="Try again" icon={null} onClick={qrRetry} />}
+                    </>
+                  ) : (
+                    <>
+                      {qr.matrix
+                        ? <QrCode matrix={qr.matrix} size={200} />
+                        : (
+                          // No QR encoder bundled — the flow still works, the
+                          // user just opens the URL by hand.
+                          <div style={{ fontSize: '13px', color: V2.fg2, maxWidth: '380px', wordBreak: 'break-all' }}>
+                            {qr.verifyUrl}
+                          </div>
+                        )}
+                      <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.6, maxWidth: '380px' }}>
+                        {qr.status === 'approved'
+                          ? 'Approved!'
+                          : 'Scan with your phone, then approve on your RomM server.'}
+                      </div>
+                      {/* The code is shown alongside the QR, not instead of it:
+                          anyone already signed in on another device can go to
+                          /pair/device and type these eight characters. */}
+                      {qr.userCode && qr.status !== 'approved' && (
+                        <div style={{ fontFamily: 'monospace', fontSize: '20px', fontWeight: 700, letterSpacing: '0.24em', color: V2.fg }}>
+                          {qr.userCode}
+                        </div>
+                      )}
+                      {qr.status === 'waiting' && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: V2.fgMuted }}>
+                          <FaSync size={11} style={{ animation: 'spin 1s linear infinite' }} />
+                          Waiting for approval…
+                        </div>
+                      )}
+                    </>
+                  )}
+                  {testResult && (
+                    <div style={{ fontSize: '13px', color: testResult.success ? V2.success : V2.danger }}>
+                      {testResult.success ? '✅' : '❌'} {testResult.message}
+                    </div>
+                  )}
                 </>
               ) : (
                 <>
@@ -12958,7 +13227,7 @@ function SetupWizard() {
               <div className="wiz-check"><FaCheckCircle size={56} color={V2.success} /></div>
               <div style={{ fontSize: '24px', fontWeight: 800 }}>Ready to go</div>
               <div style={{ fontSize: '14px', color: V2.fg2, lineHeight: 1.6, maxWidth: '420px' }}>
-                {mode === 'pair'
+                {mode !== 'login'
                   ? paired
                     ? 'This device is paired with your RomM server. We\'ll save your folders and open your library.'
                     : 'We\'ll pair this device with your RomM server and open your library.'

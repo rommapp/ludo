@@ -67,6 +67,8 @@ py_modules/idna-*.dist-info/
 py_modules/PIL/
 py_modules/pillow-*.dist-info/
 py_modules/pillow.libs/
+py_modules/qrcode/
+py_modules/qrcode-*.dist-info/
 py_modules/requests/
 py_modules/requests-*.dist-info/
 py_modules/urllib3/

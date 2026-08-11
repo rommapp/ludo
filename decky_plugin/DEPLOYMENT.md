@@ -152,6 +152,7 @@ Decky Loader's installer validates all of these. **Any missing file causes silen
 | `py_modules/watchdog/` | YES | Bundled dependency (not on SteamOS) |
 | `py_modules/PIL/` | YES | Bundled dependency (Pillow for image processing) |
 | `py_modules/pillow.libs/` | YES | Bundled shared libs for Pillow C extensions |
+| `py_modules/qrcode/` | YES | Bundled dependency (QR encoding for device pairing) |
 | `py_modules/urllib3/`, `certifi/`, `charset_normalizer/`, `idna/` | YES | Transitive deps of requests |
 | `assets/logo.png` | NO | Plugin icon (also Steam library-tile artwork via `get_plugin_logo`) |
 | `assets/romm-isotipo.svg` | NO | RomM brand mark shown on the setup-wizard welcome; served pre-connection by `get_romm_logo` (bundled because RomM server assets need auth) |
@@ -178,6 +179,7 @@ ludo/
     requests/
     watchdog/
     PIL/
+    qrcode/
     pillow.libs/
     urllib3/
     certifi/

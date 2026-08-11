@@ -136,10 +136,17 @@ echo "==> Verifying bundled runtime"
 import sys
 sys.path.insert(0, '.')
 import server
-from romm_sync_engine import paths
+from romm_sync_engine import paths, sync_core
 assert server.plugin_module.asset_suffix() == '-x86_64.AppImage', 'wrong update asset'
+# qr_matrix swallows a missing qrcode and returns None, which would ship as a
+# pairing screen with no QR on it rather than a crash. py_modules (where the
+# Deck gets qrcode) is deliberately not bundled here, so prove the interpreter
+# has its own copy while we can still fail the build.
+assert sync_core.qr_matrix('https://example.com/pair/device?user_code=TEST1234'), \\
+    'qrcode missing from the bundled runtime — QR pairing would ship broken'
 print('    backend imports OK, suffix =', server.plugin_module.asset_suffix())
 print('    engine  =', paths.__file__)
+print('    qr encoder OK')
 " )
 
 # Importing during verification recreates caches the trim removed, so sweep

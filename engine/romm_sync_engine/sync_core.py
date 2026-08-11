@@ -2343,6 +2343,53 @@ ROM_TRIM_FIELDS = (
 )
 
 
+# Scopes Ludo asks for in the device-auth flow. Deliberately narrower than the
+# 22 RomM defines: read the library, read/write the assets that ARE the sync
+# (saves and states), read firmware for BIOS, and register this device. No
+# users.*, tasks.run, logs.read, or any *.write that would let a paired Deck
+# modify the server's library.
+DEVICE_AUTH_SCOPES = [
+    'me.read',
+    'roms.read',
+    'platforms.read',
+    'collections.read',
+    'firmware.read',
+    'assets.read', 'assets.write',
+    'roms.user.read', 'roms.user.write',
+    'devices.read', 'devices.write',
+]
+
+# Identifies Ludo to the server; shown to the user on the approval screen.
+DEVICE_AUTH_CLIENT = 'ludo'
+
+
+def qr_matrix(text):
+    """Encode `text` as a QR code, returned as a list of bool rows.
+
+    A matrix rather than an image: the caller renders it (the Decky panel draws
+    SVG rects), which keeps it crisp at any size and theme-aware, and avoids
+    dragging PIL into a code path that is just drawing squares. Returns None if
+    the qrcode module isn't bundled, which callers treat as "offer the typed
+    code instead" rather than an error.
+    """
+    try:
+        import qrcode
+    except ImportError:
+        return None
+    try:
+        # ERROR_CORRECT_M survives a fingerprinted Deck screen; version=None
+        # with fit=True picks the smallest version that holds the URL.
+        qr = qrcode.QRCode(version=None,
+                           error_correction=qrcode.constants.ERROR_CORRECT_M,
+                           box_size=1, border=0)
+        qr.add_data(text)
+        qr.make(fit=True)
+        return [[bool(cell) for cell in row] for row in qr.get_matrix()]
+    except Exception as e:
+        print(f"⚠️ QR encode failed: {e}")
+        return None
+
+
 class RomMClient:
     """Client for interacting with RomM API"""
     
@@ -2469,6 +2516,95 @@ class RomMClient:
         except Exception as e:
             print(f"❌ Pairing exchange error: {e}")
             return None
+
+    def device_auth_init(self, device_identifier, name, platform=None,
+                         client_version=None, scopes=None):
+        """Start RomM's device-authorization flow (RFC 8628) for QR pairing.
+
+        Unlike exchange_pair_code — where the code originates in the web UI and
+        the user carries it to the device — here the DEVICE asks first and the
+        user approves in a browser. That inversion is what makes a QR possible:
+        we hold the code, so we can draw it.
+
+        Returns (info, reason). On success info is the server's dict
+        (device_code, user_code, verification_path_complete, expires_in,
+        interval) and reason is None. On failure info is None and reason is
+        'unsupported' for a pre-device-flow RomM (which 404s here) or
+        'unreachable' for anything else. The two are worth telling apart: only
+        the first means "try the typed pairing code instead" — the second is
+        usually a mistyped URL, which would fail that route too.
+        """
+        try:
+            resp = self.session.post(
+                urljoin(self.base_url, '/api/auth/device/init'),
+                json={
+                    'client_device_identifier': str(device_identifier)[:255],
+                    'name': str(name)[:255],
+                    'client': DEVICE_AUTH_CLIENT,
+                    'platform': (platform or 'SteamOS')[:50],
+                    'client_version': (client_version or '')[:50] or None,
+                    'requested_scopes': list(scopes or DEVICE_AUTH_SCOPES),
+                },
+                timeout=15,
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                if data.get('device_code') and data.get('user_code'):
+                    print(f"✅ Device auth started (user code {data['user_code']})")
+                    return (data, None)
+                print("⚠️ device/init succeeded but returned no code")
+                return (None, 'unreachable')
+            if resp.status_code == 404:
+                print("ℹ️ Server has no device-auth endpoint — QR pairing unavailable")
+                return (None, 'unsupported')
+            print(f"❌ device/init failed: HTTP {resp.status_code}: {resp.text[:200]}")
+            return (None, 'unreachable')
+        except Exception as e:
+            print(f"❌ device/init error: {e}")
+            return (None, 'unreachable')
+
+    def device_auth_poll(self, device_code):
+        """Poll device/token once. Returns (state, value).
+
+        state is one of 'approved' (value is the token string), 'pending',
+        'slow_down' (back off — value is None), 'denied', 'expired', or 'error'
+        (value is a human-readable reason). The server speaks RFC 8628's error
+        vocabulary in `detail` alongside HTTP 400, so a 400 is usually "keep
+        waiting", not a failure — hence the states rather than a bare token.
+        """
+        if not device_code:
+            return ('error', 'No device code')
+        try:
+            resp = self.session.post(
+                urljoin(self.base_url, '/api/auth/device/token'),
+                json={'device_code': str(device_code)},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                token = (resp.json() or {}).get('access_token')
+                if token:
+                    print("✅ Device authorization approved")
+                    return ('approved', token)
+                return ('error', 'Approved but no token returned')
+            detail = ''
+            try:
+                detail = str((resp.json() or {}).get('detail', ''))
+            except Exception:
+                detail = resp.text[:120]
+            if 'authorization_pending' in detail:
+                return ('pending', None)
+            if 'slow_down' in detail:
+                return ('slow_down', None)
+            if 'access_denied' in detail:
+                return ('denied', 'Request was declined on the server')
+            if 'expired_token' in detail:
+                return ('expired', 'The pairing request expired')
+            return ('error', detail or f'HTTP {resp.status_code}')
+        except Exception as e:
+            # A dropped Wi-Fi packet mid-poll is not a failed pairing. Report it
+            # as pending so the caller keeps trying until the code really expires.
+            print(f"⚠️ device/token poll error (will retry): {e}")
+            return ('pending', None)
 
     def authenticate(self, username, password):
         """Authenticate with RomM using Basic Auth, Token, or Session fallback"""

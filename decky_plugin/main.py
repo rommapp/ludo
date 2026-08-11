@@ -76,6 +76,7 @@ try:
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
         flush_pending_game_toasts as _flush_pending_game_toasts,
+        qr_matrix,
     )
     SYNC_CORE_AVAILABLE = True
 except ImportError as e:
@@ -554,6 +555,10 @@ class Plugin:
     _emu_install: dict = {'active': False, 'phase': '', 'pct': None,
                           'detail': '', 'error': None, 'installed': False,
                           'repaired': []}
+
+    # In-flight QR device-auth request (see start_qr_pairing): the device_code
+    # we poll with, plus its interval and expiry. None when nothing is pending.
+    _qr_pairing: dict = None
 
     # Background retry thread (reconnect + collection-list refresh every 5 min)
     _stop_event: threading.Event = None
@@ -4213,6 +4218,18 @@ class Plugin:
             if not token:
                 return {'success': False, 'message': 'Invalid or expired pairing code'}
 
+            return await self._apply_pairing(url, token)
+        except Exception as e:
+            logging.error(f"pair_device error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def _apply_pairing(self, url, token):
+        """Store a freshly obtained Client API Token and start connecting.
+
+        Shared by both pairing routes — the typed 8-digit code and the QR device
+        flow — because everything after "we hold a token" is identical.
+        """
+        try:
             self._settings.set('RomM', 'url', url)
             self._settings.set('RomM', 'client_token', token)
             self._settings.set('RomM', 'auto_connect', 'true')
@@ -4243,8 +4260,123 @@ class Plugin:
                     'connecting': True,
                     'message': 'Paired'}
         except Exception as e:
-            logging.error(f"pair_device error: {e}", exc_info=True)
+            logging.error(f"_apply_pairing error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
+
+    async def start_qr_pairing(self, url: str):
+        """Begin RomM's device-auth flow and hand back a QR code to display.
+
+        The Deck has no camera, so the QR goes the other way: we draw it, the
+        user scans it with a phone and approves there. That spares them typing a
+        code on the on-screen keyboard — the URL above is the only thing left.
+        Returns the QR matrix plus the user_code, which stays on screen as the
+        fallback for anyone without a phone handy.
+        """
+        try:
+            url = (url or self._settings.get('RomM', 'url', '')).strip().rstrip('/')
+            if not url:
+                return {'success': False, 'message': 'RomM URL is required'}
+
+            import socket as _socket
+            name = (self._settings.get('Device', 'device_name', '')
+                    or _socket.gethostname())
+            # Reuse the stored device_id when we have one so re-pairing updates
+            # the same RomM device rather than littering the user's device list.
+            ident = (self._settings.get('Device', 'device_id', '')
+                     or f"ludo-{hashlib.sha256(name.encode()).hexdigest()[:24]}")
+
+            loop = asyncio.get_event_loop()
+            info, reason = await loop.run_in_executor(
+                None,
+                lambda: RomMClient(url).device_auth_init(
+                    ident, name,
+                    platform=self._settings.get('Device', 'device_platform', 'SteamOS'),
+                    client_version=PLUGIN_VERSION,
+                ),
+            )
+            if not info:
+                # 'unavailable' is only for a RomM too old for device auth —
+                # there the typed pairing code still works, so the UI points at
+                # it. Anything else is usually a wrong URL, which that route
+                # would fail on too; sending them there would just waste a step.
+                if reason == 'unsupported':
+                    return {'success': False, 'unavailable': True,
+                            'message': 'This server is too old for QR pairing.'}
+                return {'success': False,
+                        'message': 'Could not reach RomM at that address.'}
+
+            verify_url = urljoin(url + '/', (info.get('verification_path_complete')
+                                             or '/pair/device').lstrip('/'))
+            self._qr_pairing = {
+                'url': url,
+                'device_code': info['device_code'],
+                'interval': max(1, int(info.get('interval') or 5)),
+                'deadline': time.time() + int(info.get('expires_in') or 600),
+            }
+            return {
+                'success': True,
+                'user_code': info.get('user_code', ''),
+                'verification_url': verify_url,
+                'expires_in': int(info.get('expires_in') or 600),
+                # None when the qrcode module is missing — the panel then shows
+                # the code and URL alone instead of a broken image.
+                'matrix': qr_matrix(verify_url),
+            }
+        except Exception as e:
+            logging.error(f"start_qr_pairing error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def poll_qr_pairing(self):
+        """Check whether the user has approved the pending QR request yet.
+
+        Polled by the frontend rather than run as a background task so that a
+        wizard the user backs out of stops the polling by simply not asking
+        again. On approval this stores the token and starts the connect, so the
+        result mirrors pair_device's.
+        """
+        try:
+            state = getattr(self, '_qr_pairing', None)
+            if not state:
+                return {'success': False, 'status': 'idle',
+                        'message': 'No pairing in progress'}
+            if time.time() > state['deadline']:
+                self._qr_pairing = None
+                return {'success': False, 'status': 'expired',
+                        'message': 'The pairing request expired'}
+
+            loop = asyncio.get_event_loop()
+            status, value = await loop.run_in_executor(
+                None,
+                lambda: RomMClient(state['url']).device_auth_poll(state['device_code']),
+            )
+            if status == 'approved':
+                self._qr_pairing = None
+                result = await self._apply_pairing(state['url'], value)
+                return {**result, 'status': 'approved'}
+            if status == 'slow_down':
+                # The server is asking us to back off; widen the interval the
+                # frontend waits by before its next call.
+                state['interval'] = min(state['interval'] + 5, 30)
+                return {'success': True, 'status': 'pending',
+                        'interval': state['interval']}
+            if status == 'pending':
+                return {'success': True, 'status': 'pending',
+                        'interval': state['interval']}
+            self._qr_pairing = None
+            return {'success': False, 'status': status,
+                    'message': value or 'Pairing failed'}
+        except Exception as e:
+            logging.error(f"poll_qr_pairing error: {e}", exc_info=True)
+            return {'success': False, 'status': 'error', 'message': str(e)}
+
+    async def cancel_qr_pairing(self):
+        """Drop a pending QR request (the user left the step or switched modes).
+
+        Only local — the outstanding code is left to expire on its own, which it
+        does in ten minutes.
+        """
+        self._qr_pairing = None
+        return {'success': True}
 
     async def set_device_name(self, name: str = ''):
         """Rename this device for save syncing, without touching anything else.
