@@ -144,6 +144,14 @@ SNAPSHOT_SCHEMA = 2
 # it is a measurement, not a preference, and it must survive a restart.
 benchmark_file = CONFIG_DIR / 'fetch_benchmark.json'
 
+# Developer-only surfaces. The cold-fetch timer wipes the library cache and
+# refetches everything — minutes of work with no user-facing benefit — so it is
+# hidden unless LUDO_DEBUG=1 is in the plugin's environment. Same shape as
+# ROMM_COVER_TRACE: an env var, not a setting, so it can't be left on by a
+# stray tap and doesn't need a UI to turn back off. Read once at import; the
+# environment can't change under a running plugin.
+DEBUG_MODE = os.environ.get('LUDO_DEBUG', '') == '1'
+
 # Partial-fetch checkpoint. A full library fetch is ~6 minutes at 80k ROMs, and
 # anything that interrupts it — suspend, a network blip, a Decky reload — used to
 # throw away every page already paid for. Pages are appended here as they arrive
@@ -2241,6 +2249,10 @@ class Plugin:
             logging.debug(f"clear_recent_activity error: {e}")
             return {'success': False}
 
+    async def is_debug_mode(self):
+        """Whether developer-only Settings rows should be shown (LUDO_DEBUG=1)."""
+        return DEBUG_MODE
+
     async def get_fetch_benchmark(self):
         """Last recorded library-fetch timing, or {} if none yet."""
         try:
@@ -2255,6 +2267,8 @@ class Plugin:
     async def time_cold_fetch(self):
         """Settings ▸ Debug: drop every cache and refetch the library, timed.
 
+        Requires LUDO_DEBUG=1; the row is hidden without it.
+
         Returns immediately; the caller polls get_fetch_benchmark() and watches
         for `at` to change. The fetch itself runs for minutes on a big library,
         which is far longer than any RPC should block.
@@ -2267,6 +2281,11 @@ class Plugin:
         fetch, which is the thing being measured.
         """
         try:
+            # Gated server-side too, not just by hiding the row: this is
+            # destructive to the cache and the RPC is callable directly.
+            if not DEBUG_MODE:
+                return {'success': False, 'message': 'Debug mode is off'}
+
             if not (self._romm_client and self._romm_client.authenticated):
                 return {'success': False, 'message': 'Not connected to RomM'}
 
@@ -6515,10 +6534,44 @@ class Plugin:
                 return [x for x in out if x]
 
             local = self._games_index().get(rom_id) or {}
+
+            # Names present on this device, so each file row can say whether it
+            # is actually here — RomM's Files table marks per-file state too.
+            # Best-effort: an empty set means "unknown", not "nothing here", so
+            # rows stay unmarked rather than claiming a file is missing.
+            on_disk = set()
+            try:
+                lp = local.get('local_path')
+                if local.get('is_downloaded') and lp:
+                    p = Path(lp)
+                    folder = p if p.is_dir() else p.parent
+                    if folder.is_dir():
+                        on_disk = {e.name for e in folder.iterdir()}
+            except Exception:
+                on_disk = set()
+
             files = []
             for f in (d.get('files') or []):
-                files.append({'name': f.get('file_name') or f.get('fs_name'),
-                              'size': f.get('file_size_bytes') or f.get('size_bytes')})
+                name = f.get('file_name') or f.get('fs_name')
+                files.append({
+                    'id':       f.get('id'),
+                    'name':     name,
+                    'size':     f.get('file_size_bytes') or f.get('size_bytes'),
+                    'path':     f.get('file_path'),
+                    'full_path': f.get('full_path'),
+                    # 'game' for the ROM itself; 'dlc'/'update'/'patch'/'manual'
+                    # … for the extras RomM files alongside it.
+                    'category': f.get('category'),
+                    'last_modified': f.get('last_modified') or f.get('updated_at'),
+                    # Gone from the server's filesystem but still in its DB —
+                    # RomM strikes these through, and so do we.
+                    'missing':  bool(f.get('missing_from_fs')),
+                    'crc':      f.get('crc_hash'),
+                    'md5':      f.get('md5_hash'),
+                    'sha1':     f.get('sha1_hash'),
+                    # True/False only when we could read the ROM's folder.
+                    'on_disk':  (bool(name in on_disk) if on_disk else None),
+                })
 
             # RetroAchievements — mirror RomM's GameDetails wiring: the rom's
             # merged_ra_metadata.achievements list, with each achievement marked

@@ -17,13 +17,15 @@ import {
 } from "@decky/ui";
 import { callable, definePlugin, toaster, routerHook, openFilePicker, FileSelectionType } from "@decky/api";
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, forwardRef, memo, cloneElement, type Ref, type ChangeEvent } from "react";
-import { FaSync, FaTrash, FaCog, FaGithub, FaBug, FaUndo, FaCopy, FaGamepad, FaBookmark, FaHome, FaSearch, FaTimes, FaTimesCircle, FaDownload, FaPlay, FaInfoCircle, FaRegClock, FaLayerGroup, FaChevronLeft, FaChevronRight, FaCheckCircle, FaUsers, FaExternalLinkAlt, FaPuzzlePiece, FaBoxOpen, FaClone, FaRedo, FaClock, FaCheck, FaEllipsisH, FaGlobe, FaChevronDown, FaChartBar, FaSave, FaUser, FaExclamationTriangle, FaHistory, FaPowerOff, FaCloudUploadAlt, FaMicrochip, FaStopwatch, FaUnlink } from "react-icons/fa";
+import { FaSync, FaTrash, FaCog, FaGithub, FaBug, FaUndo, FaCopy, FaGamepad, FaBookmark, FaHome, FaSearch, FaTimes, FaTimesCircle, FaDownload, FaPlay, FaInfoCircle, FaRegClock, FaLayerGroup, FaChevronLeft, FaChevronRight, FaCheckCircle, FaUsers, FaExternalLinkAlt, FaPuzzlePiece, FaBoxOpen, FaClone, FaRedo, FaClock, FaCheck, FaEllipsisH, FaGlobe, FaChevronDown, FaChartBar, FaSave, FaUser, FaExclamationTriangle, FaHistory, FaPowerOff, FaCloudUploadAlt, FaMicrochip, FaStopwatch, FaUnlink, FaFolder, FaLink } from "react-icons/fa";
 import { BsGearFill } from "react-icons/bs";
 import { MdVerified } from "react-icons/md";
 
 // Call backend methods
 const getServiceStatus = callable<[], any>("get_service_status");
 const timeColdFetch = callable<[], any>("time_cold_fetch");
+// LUDO_DEBUG=1 in the plugin's environment. Gates developer-only Settings rows.
+const isDebugMode = callable<[], boolean>("is_debug_mode");
 const getFetchBenchmark = callable<[], any>("get_fetch_benchmark");
 
 // "2m 29s", not "149.3s" — this number gets read aloud in bug reports, and
@@ -1788,10 +1790,15 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
             This is RomM's Card Flags.vue: one translucent chip per axis, at
             most three emoji each, titled with the full list. Like the rest of
             the corner badges they fade out on focus so the action overlay is
-            unobstructed. */}
+            unobstructed.
+
+            On a wide (continue-playing) card the same corner already holds the
+            CoverPip box art, so the chips step to the left of it — 46px pip +
+            its 6px inset + a 6px gap — instead of covering the cover. */}
         {((game.regions?.length || 0) > 0 || (game.languages?.length || 0) > 0) && (
           <div style={{
-            position: 'absolute', right: '7px', bottom: '7px', zIndex: 2,
+            position: 'absolute', bottom: '7px', zIndex: 2,
+            right: wide && game.has_cover ? '58px' : '7px',
             display: 'flex', alignItems: 'center', gap: '4px',
             maxWidth: 'calc(100% - 14px)', overflow: 'hidden',
             opacity: focused ? 0 : 1, transition: 'opacity 0.18s ease',
@@ -4362,6 +4369,162 @@ function MetadataTab({ detail }: { detail: any }) {
         <Focusable noFocusRing style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '10px' }}>
           {ordered.map((p) => <ProviderCard key={p.key} p={p} id={providers[p.key]} />)}
         </Focusable>
+      </div>
+    </div>
+  );
+}
+
+// ── Files tab ───────────────────────────────────────────────────────────────
+// Mirrors RomM's ROM Files tab: a header card for the entry itself (filename,
+// file count + total size, ROM-level hashes), then one card per RomFile with its
+// category, size and own hashes. Everything is visible at once — nothing
+// collapses — and the file's path and modified date are deliberately absent,
+// because RomM shows neither.
+const FILE_CATEGORY_LABEL: Record<string, string> = {
+  game: 'Game', dlc: 'DLC', update: 'Update', mod: 'Mod', patch: 'Patch',
+  demo: 'Demo', manual: 'Manual', hack: 'Hack', prototype: 'Prototype',
+  translation: 'Translation',
+};
+
+// RomM abbreviates a hash to its head and tail (e014f6…8c8fe5) — the full value
+// is only useful pasted somewhere, and the chip is a copy button, not a readout.
+function shortHash(v: string): string {
+  return v.length > 16 ? `${v.slice(0, 6)}…${v.slice(-6)}` : v;
+}
+
+// A hash as RomM draws it: the algorithm name on a darker inset, the abbreviated
+// value in monospace, and a copy affordance. Activating it copies the FULL hash.
+function HashChip({ label, value }: { label: string; value: string | null | undefined }) {
+  if (!value) return null;
+  const copy = () => {
+    try { navigator.clipboard?.writeText(value); toaster.toast({ title: `${label} copied`, body: value }); } catch { /* ignore */ }
+  };
+  return (
+    <Focusable noFocusRing onActivate={copy} onClick={copy} style={{
+      display: 'inline-flex', alignItems: 'center', gap: '8px', maxWidth: '100%',
+      background: V2.surface, border: `1px solid ${V2.borderStrong}`,
+      borderRadius: V2.radiusChip, overflow: 'hidden', cursor: 'pointer', fontSize: '11px',
+    }}>
+      <span style={{
+        alignSelf: 'stretch', display: 'flex', alignItems: 'center', padding: '3px 8px',
+        background: 'rgba(0,0,0,0.28)', fontWeight: 700, letterSpacing: '0.04em',
+        color: V2.fgFaint,
+      }}>{label}</span>
+      <span style={{
+        fontFamily: 'monospace', color: V2.fg2, overflow: 'hidden',
+        textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      }}>{shortHash(value)}</span>
+      <FaCopy size={10} style={{ color: V2.fgFaint, flexShrink: 0, marginRight: '8px' }} />
+    </Focusable>
+  );
+}
+
+function HashChipRow({ crc, md5, sha1 }: { crc?: string | null; md5?: string | null; sha1?: string | null }) {
+  if (!crc && !md5 && !sha1) return null;
+  return (
+    // RomM's order: the strongest hash first.
+    <Focusable noFocusRing style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+      <HashChip label="SHA-1" value={sha1} />
+      <HashChip label="MD5" value={md5} />
+      <HashChip label="CRC" value={crc} />
+    </Focusable>
+  );
+}
+
+// One RomFile, laid out as RomM's file card: name line, then category + size,
+// then the file's own hashes. No path or modified date — RomM shows neither.
+function FileRow({ f }: { f: any }) {
+  const cat = String(f?.category || '').toLowerCase();
+  const catLabel = FILE_CATEGORY_LABEL[cat] || (cat ? cat : '');
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', gap: '8px',
+      // radiusLg is the surface radius the Screenshots, Save Data and
+      // Achievements tabs use — the file cards and the header card above them
+      // all share it so the tab reads as one stack.
+      padding: '12px', borderRadius: V2.radiusLg,
+      background: V2.surface, border: `1px solid ${V2.border}`,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+        {/* On this device? Only shown when the backend could actually read the
+            ROM's folder — an unknown state stays blank rather than guessing. */}
+        {f?.on_disk === true
+          ? <FaCheckCircle size={12} style={{ color: V2.success, flexShrink: 0 }} />
+          : <FaLink size={11} style={{ color: V2.fgFaint, flexShrink: 0 }} />}
+        <span style={{
+          fontSize: '13px', color: f?.missing ? V2.fgFaint : V2.fg, minWidth: 0,
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          textDecoration: f?.missing ? 'line-through' : 'none',
+        }}>{f?.name || '—'}</span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '11.5px' }}>
+        {catLabel && (
+          <span style={{
+            flexShrink: 0, padding: '2px 8px', borderRadius: V2.radiusChip,
+            background: 'rgba(139,116,232,0.18)', color: V2.brandHover,
+            fontSize: '10.5px', fontWeight: 700,
+          }}>{catLabel}</span>
+        )}
+        <span style={{ color: V2.fgMuted }}>{fmtBytes(f?.size)}</span>
+        {/* RomM flags files its scanner can no longer find on disk. */}
+        {f?.missing && (
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', color: V2.fgMuted }}>
+            <FaExclamationTriangle size={11} />Missing on server
+          </span>
+        )}
+      </div>
+      <HashChipRow crc={f?.crc} md5={f?.md5} sha1={f?.sha1} />
+    </div>
+  );
+}
+
+function FilesTab({ detail }: { detail: any }) {
+  const list = detail?.files || [];
+  const total = list.reduce((a: number, f: any) => a + (Number(f?.size) || 0), 0)
+    || Number(detail?.fs_size_bytes) || 0;
+  // RomM groups the ROM's own files ahead of the extras (DLC, updates, manuals);
+  // within a group it keeps filename order, which is what disc numbering needs.
+  const ordered = [...list].sort((a: any, b: any) => {
+    const rank = (f: any) => (String(f?.category || 'game').toLowerCase() === 'game' ? 0 : 1);
+    return rank(a) - rank(b) || String(a?.name || '').localeCompare(String(b?.name || ''));
+  });
+  const hashes = detail?.hashes || {};
+  const count = ordered.length;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+      {/* ROM header — the whole entry: its filename, what it weighs, and the
+          ROM-level hashes. RomM leads the Files tab with this card, above the
+          per-file list. */}
+      <div style={{
+        display: 'flex', flexDirection: 'column', gap: '10px',
+        padding: '14px', borderRadius: V2.radiusLg,
+        background: V2.surface, border: `1px solid ${V2.border}`,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
+          <FaFolder size={14} style={{ color: V2.fg2, flexShrink: 0 }} />
+          <span style={{
+            fontSize: '15px', fontWeight: 600, color: V2.fg, minWidth: 0,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>{detail?.fs_name || detail?.name || '—'}</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: V2.fgMuted, fontSize: '11.5px' }}>
+          <span>{count} file{count === 1 ? '' : 's'}</span>
+          {total > 0 && <><span>·</span><span>{fmtBytes(total)}</span></>}
+          {ordered.some((f: any) => f?.on_disk === true) && (
+            <><span>·</span><span>{ordered.filter((f: any) => f?.on_disk === true).length} on this device</span></>
+          )}
+        </div>
+        <HashChipRow crc={hashes.crc} md5={hashes.md5} sha1={hashes.sha1} />
+      </div>
+
+      {/* Per-file list, under the same "N files" label RomM puts above it. */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        <div style={{ fontSize: '11.5px', color: V2.fgMuted, padding: '0 2px' }}>
+          {count} file{count === 1 ? '' : 's'}
+        </div>
+        {count === 0 ? (
+          <div style={{ color: V2.fgMuted, fontSize: '12px' }}>No file information.</div>
+        ) : ordered.map((f: any, i: number) => <FileRow key={f?.id ?? i} f={f} />)}
       </div>
     </div>
   );
@@ -9837,17 +10000,7 @@ function GameDetailPage() {
                 )}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   {isMultiDisc && <SectionHeading icon={<FaBoxOpen size={12} />}>Files</SectionHeading>}
-                  {(detail?.files || []).length === 0 ? (
-                    <div style={{ color: V2.fgMuted, fontSize: '12px' }}>No file information.</div>
-                  ) : (detail.files).map((f: any, i: number) => (
-                    <div key={i} style={{
-                      display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px',
-                      padding: '9px 12px', borderRadius: V2.radiusMd, background: V2.surface, fontSize: '12px',
-                    }}>
-                      <span style={{ color: V2.fg2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
-                      <span style={{ color: V2.fgMuted, flexShrink: 0 }}>{fmtBytes(f.size)}</span>
-                    </div>
-                  ))}
+                  <FilesTab detail={detail} />
                 </div>
               </div>
             ) : tab === 'screenshots' ? (
@@ -11462,6 +11615,7 @@ function FoldersSection() {
 
 function SettingsPage() {
   const [loggingEnabled, setLoggingEnabled] = useState<boolean>(true);
+  const [debugMode, setDebugMode] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
   const [confirmLogout, setConfirmLogout] = useState<boolean>(false);
   const [loggingOut, setLoggingOut] = useState<boolean>(false);
@@ -11650,6 +11804,9 @@ function SettingsPage() {
       try {
         const enabled = await getLoggingEnabled();
         setLoggingEnabled(enabled);
+        // Defaults false, so a failed read hides the developer rows rather
+        // than showing a cache-wiping button to an ordinary user.
+        try { setDebugMode(await isDebugMode()); } catch { /* stays hidden */ }
       } catch (error) {
         console.error('Failed to load logging preference:', error);
       } finally {
@@ -12231,7 +12388,7 @@ function SettingsPage() {
           right={<V2Switch checked={loggingEnabled} />}
           disabled={loading}
         />
-        <V2SettingsRow
+        {debugMode && <V2SettingsRow
           icon={<FaStopwatch size={16} />}
           title={timingFetch ? 'Timing a cold fetch…' : 'Time a cold library fetch'}
           subtitle={
@@ -12248,7 +12405,7 @@ function SettingsPage() {
           }
           onClick={timingFetch ? undefined : handleTimeColdFetch}
           disabled={timingFetch}
-        />
+        />}
       </V2SettingsSection>
 
       <V2SettingsSection title="About">
