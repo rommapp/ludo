@@ -2408,6 +2408,11 @@ class RomMClient:
         # check this — see _fetch_pages_parallel.
         self.last_fetch_incomplete = False
 
+        # Platform slugs the user has switched off, skipped by the per-platform
+        # walk. Empty unless a caller sets it (see set_disabled_platforms), so
+        # every existing consumer keeps fetching the whole library.
+        self.disabled_platform_slugs = frozenset()
+
         # OAuth2 token storage
         self.access_token = None
         self.refresh_token = None
@@ -3163,6 +3168,29 @@ class RomMClient:
             print(f"Error fetching platforms: {e}")
         return []
 
+    def set_disabled_platforms(self, slugs):
+        """Platforms to skip when walking the library, by slug.
+
+        Slugs rather than ids because that is what survives: the setting is
+        written once and read against whatever /api/platforms returns later,
+        and a slug means the same thing across servers and re-adds while an id
+        does not. Matched against both `slug` and `fs_slug`, case-insensitively.
+
+        Only the per-platform walk honours this. The flat fallback has no
+        platform axis to filter on, so a server that forces that path fetches
+        everything and the caller filters locally — slower, never wrong.
+        """
+        self.disabled_platform_slugs = frozenset(
+            str(s).strip().lower() for s in (slugs or ()) if str(s).strip())
+
+    def _platform_is_disabled(self, platform):
+        """Is this /api/platforms row one the user switched off?"""
+        if not self.disabled_platform_slugs:
+            return False
+        names = {str(platform.get(k) or '').strip().lower()
+                 for k in ('slug', 'fs_slug')} - {''}
+        return bool(names & self.disabled_platform_slugs)
+
     def get_current_user(self):
         """Return the authenticated RomM account (/api/users/me) as a dict, or
         None. Works for both password and Client API Token auth."""
@@ -3510,9 +3538,41 @@ class RomMClient:
                 # uses but RomM does not guarantee.
                 sized.sort(key=lambda t: (-t[0], t[1]))
 
+                # The server's own total, taken BEFORE anything is skipped. It
+                # is returned as the row count and callers compare it against
+                # count_roms() to decide whether the library moved — a total
+                # narrowed to the enabled platforms would never match, and the
+                # comparison would demand a refetch on every single connect.
                 library_total = sum(c for c, _, _ in sized)
+
+                # Partitioned in one pass on the predicate itself. Filtering
+                # `sized` by membership in the skipped list instead would compare
+                # whole (count, id, row) tuples by VALUE — so two platforms that
+                # happen to compare equal drop as a pair — and cost O(n²) to
+                # re-derive an answer the predicate already gave.
+                skipped, keep = [], []
+                for t in sized:
+                    (skipped if self._platform_is_disabled(t[2]) else keep).append(t)
+                if skipped:
+                    sized = keep
+                    names = ', '.join(str(p.get('display_name') or p.get('name')
+                                           or p.get('slug')) for _, _, p in skipped)
+                    print(f"⏭️  Skipping {len(skipped)} platform(s) turned off for "
+                          f"sync: {names}")
+                    if not sized:
+                        # Every platform is off. NOT a reason to return None:
+                        # that means "no basis for a per-platform walk" and
+                        # sends get_roms to the flat walk, which would fetch the
+                        # whole library the user just asked us not to fetch.
+                        self.last_fetch_incomplete = False
+                        return [], library_total
+
+                # What this run will actually fetch — the denominator every
+                # progress readout is measured against, so the bar fills to the
+                # end instead of stalling short by the skipped platforms' share.
+                walk_total = sum(c for c, _, _ in sized)
                 platform_total = len(sized)
-                print(f"📚 Fetching {library_total:,} games across {platform_total} platforms "
+                print(f"📚 Fetching {walk_total:,} games across {platform_total} platforms "
                       f"(largest first)...")
 
                 all_games = []
@@ -3546,7 +3606,7 @@ class RomMClient:
                         trim_fields, platform_resume, platform_sink,
                         platform_id=pid, loaded_base=loaded_base,
                         progress_extra={
-                            'total': library_total,
+                            'total': walk_total,
                             'platform_name': name,
                             'platform_slug': slug,
                             'platform_index': index + 1,

@@ -136,6 +136,10 @@ const getSessionHostPath = callable<[], any>("get_session_host_path");
 // dir. Distinct from get_bios_status, which reports background download progress.
 const getBiosInventory = callable<[(boolean)?], any>("get_bios_inventory");
 const downloadBios = callable<[string, (string)?], any>("download_bios");
+// Per-platform sync switches. get_ returns every platform with its rom_count and
+// whether it's on; set_ takes the whole disabled set, so it's idempotent.
+const getPlatformSync = callable<[], any>("get_platform_sync");
+const setPlatformSync = callable<[string[]], any>("set_platform_sync");
 const getLocalDiscs = callable<[number], any>("get_local_discs");
 const getLocalSiblings = callable<[number], any>("get_local_siblings");
 const getHomeData = callable<[], any>("get_home_data");
@@ -11143,6 +11147,199 @@ function BiosPage() {
   );
 }
 
+// ─── Per-platform sync ───────────────────────────────────────────────────────
+// Which platforms Ludo reads from RomM at all. The backend stores the DISABLED
+// set (see main.py), so a platform added on the server after the user last
+// looked syncs by default rather than being silently ignored.
+//
+// Switching one off never deletes anything: downloaded games stay on disk and
+// stay in the library, and only listings for games that were never downloaded
+// go. That is why the copy below says "stop syncing", never "remove".
+function usePlatformSync() {
+  const [rows, setRows] = useState<any[]>([]);
+  const [off, setOff] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(true);
+  const [connected, setConnected] = useState(true);
+  const [unavailable, setUnavailable] = useState(false);
+  // Slugs with a write in flight. A set, not a single slug: switches are quick
+  // to flip and each write is a round-trip, so several are routinely open at
+  // once and a scalar would blank the first one's "Saving…" the moment the
+  // second started.
+  const [saving, setSaving] = useState<Set<string>>(new Set());
+  // The latest INTENDED disabled set, including toggles still in flight. `off`
+  // is a render snapshot, so building the next set from it would let two quick
+  // toggles each send a set that omits the other's change — last write wins and
+  // silently reverts one of them.
+  const offRef = useRef<Set<string>>(new Set());
+  // A platform coming back ON needs a walk to bring its games in. Deferred to
+  // the moment the user leaves rather than fired per toggle: turning three
+  // platforms back on should cost one walk, not three — and re-fetching under
+  // someone who is still flipping switches is the worst possible timing.
+  const needsRefresh = useRef(false);
+
+  const load = async () => {
+    // Set on every call, not just the first: the wizard re-runs this once the
+    // connection exists, and a reload that left `loading` false would let the
+    // caller read the previous (unconnected, empty) answer as the real one.
+    setLoading(true);
+    try {
+      const r = await getPlatformSync();
+      if (r?.success) {
+        setRows(r.platforms || []);
+        const stored = new Set<string>(r.disabled || []);
+        offRef.current = stored;
+        setOff(stored);
+        setConnected(!!r.connected);
+        setUnavailable(!!r.unavailable);
+      }
+    } catch { /* leave the page in its loading state; the retry below covers it */ }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); }, []);
+
+  // The platform list shares a server with the library fetch, so an empty
+  // answer during a big walk is a timing accident, not a verdict. Same
+  // self-healing retry the BIOS page uses.
+  useEffect(() => {
+    if (!unavailable) return;
+    const t = setTimeout(load, 5000);
+    return () => clearTimeout(t);
+  }, [unavailable]);
+
+  const mark = (slug: string, busy: boolean) => setSaving((prev) => {
+    const next = new Set(prev);
+    if (busy) next.add(slug); else next.delete(slug);
+    return next;
+  });
+
+  const toggle = async (slug: string) => {
+    // Built from the ref, so a toggle started while another is still in flight
+    // sends both changes rather than clobbering the earlier one.
+    const turningOff = !offRef.current.has(slug);
+    const next = new Set(offRef.current);
+    if (turningOff) next.add(slug); else next.delete(slug);
+    // Optimistic: the switch has to move under the thumb. A failed write puts
+    // it back, which is the only honest thing to show if nothing was stored.
+    offRef.current = next;
+    setOff(next);
+    mark(slug, true);
+    try {
+      const r = await setPlatformSync([...next]);
+      if (r?.success === false) throw new Error(r.message || 'failed');
+      if (r?.needs_refresh) needsRefresh.current = true;
+    } catch {
+      // Undo THIS slug only, against whatever the current intent is. Restoring
+      // the snapshot taken before this write would also wipe out any toggle the
+      // user made while it was in flight — including ones that succeeded.
+      const undone = new Set(offRef.current);
+      if (turningOff) undone.delete(slug); else undone.add(slug);
+      offRef.current = undone;
+      setOff(undone);
+    } finally {
+      mark(slug, false);
+    }
+  };
+
+  useEffect(() => () => {
+    if (!needsRefresh.current) return;
+    needsRefresh.current = false;
+    try {
+      refreshFromRomm(false)
+        .then(() => _broadcastLibRefresh())
+        .catch(() => { /* the next connect reconciles it anyway */ });
+    } catch { /* ignore */ }
+  }, []);
+
+  const on = rows.filter((r) => !off.has(r.slug));
+  return {
+    rows, off, loading, connected, unavailable, saving, toggle, reload: load,
+    enabledCount: on.length,
+    enabledRoms: on.reduce((n, r) => n + (r.rom_count || 0), 0),
+    totalRoms: rows.reduce((n, r) => n + (r.rom_count || 0), 0),
+  };
+}
+
+// The toggle list itself, shared by Settings ▸ Platforms and the setup wizard's
+// optional Platforms step — the two must never drift, because they are the same
+// decision made at two different moments.
+function PlatformSyncList({ sync }: { sync: ReturnType<typeof usePlatformSync> }) {
+  const { rows, off, loading, connected, unavailable, saving, toggle } = sync;
+  if (loading) {
+    return <V2SettingsRow icon={<FaLayerGroup size={16} />} title="Reading your platforms…" />;
+  }
+  if (!connected) {
+    return <V2SettingsRow icon={<FaLayerGroup size={16} />}
+      title="Not connected to RomM"
+      subtitle="Your platforms come from your own RomM server — connect to choose which ones to sync." />;
+  }
+  if (unavailable) {
+    return <V2SettingsRow icon={<FaLayerGroup size={16} />}
+      title="Couldn’t read your platforms"
+      subtitle="Your RomM server didn’t answer — often because it’s busy sending the library. Retrying…" />;
+  }
+  if (!rows.length) {
+    return <V2SettingsRow icon={<FaLayerGroup size={16} />}
+      title="No platforms on the server"
+      subtitle="Add a platform in RomM and it will show up here." />;
+  }
+  return (
+    <>
+      {rows.map((row) => {
+        const isOff = off.has(row.slug);
+        const count = (row.rom_count || 0).toLocaleString();
+        return (
+          <V2SettingsRow key={row.slug}
+            bareIcon
+            icon={<PlatformIcon slug={row.slug} size={28} />}
+            title={row.name}
+            subtitle={saving.has(row.slug)
+              ? 'Saving…'
+              : isOff
+                ? `Not syncing — ${count} game${row.rom_count === 1 ? '' : 's'} left on RomM. Anything you already downloaded stays on this device.`
+                : `${count} game${row.rom_count === 1 ? '' : 's'}`}
+            onClick={() => toggle(row.slug)}
+            right={<V2Switch checked={!isOff} />} />
+        );
+      })}
+    </>
+  );
+}
+
+// PlatformsPage — Settings ▸ Platforms. The header counts what the switches add
+// up to, because the number that makes someone want to turn a platform off is
+// how many games it costs, not how many platforms there are.
+function PlatformsPage() {
+  const sync = usePlatformSync();
+  const { rows, enabledCount, enabledRoms, totalRoms, loading } = sync;
+  const summary = loading || !rows.length
+    ? 'Platforms'
+    : `${enabledCount} of ${rows.length} syncing · ${enabledRoms.toLocaleString()} of ${totalRoms.toLocaleString()} games`;
+  return v2Page(
+    <Focusable noFocusRing
+      onCancelButton={() => libBack("/romm-sync-settings")}
+      style={{ maxWidth: '760px', margin: '0 auto', padding: '20px 20px 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
+        <GameActionButton icon={<FaChevronLeft size={16} />} onClick={() => libBack("/romm-sync-settings")} />
+        <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Platforms</div>
+      </div>
+
+      <V2SettingsSection title={summary}>
+        <PlatformSyncList sync={sync} />
+      </V2SettingsSection>
+
+      <div style={{
+        fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45,
+        padding: '0 4px 24px',
+      }}>
+        Turning a platform off stops Ludo reading it from RomM, so your library
+        loads faster and stays smaller. Nothing is deleted — games you already
+        downloaded stay on this device and stay playable. Turn it back on and
+        Ludo fetches that platform again.
+      </div>
+    </Focusable>
+  );
+}
+
 // Per-platform status pill: green once every file the server holds is on disk,
 // red when the resolved core cannot boot without what's missing, amber when it
 // has an HLE fallback and will merely run worse. Shared by the index row and
@@ -11716,6 +11913,23 @@ function SettingsPage() {
       .then((r) => setAutoUpdateLib(r?.enabled !== false))
       .catch(() => { /* keep the default */ });
   }, []);
+  // Row subtitle for Platforms — only set once something is actually switched
+  // off. With everything on there is nothing to report, and the explanatory
+  // copy is what a first-time reader needs from that row instead.
+  const [platformSummary, setPlatformSummary] = useState<string>('');
+  useEffect(() => {
+    getPlatformSync()
+      .then((r) => {
+        const rows = r?.platforms || [];
+        const on = r?.enabled_count ?? rows.length;
+        if (!r?.success || !rows.length || on === rows.length) return;
+        setPlatformSummary(
+          `${on} of ${rows.length} platforms syncing · `
+          + `${(r.enabled_roms || 0).toLocaleString()} games`);
+      })
+      .catch(() => { /* the row keeps its explanatory subtitle */ });
+  }, []);
+
   const handleAutoUpdateLibToggle = async (enabled: boolean) => {
     setAutoUpdateLib(enabled);
     try {
@@ -12188,6 +12402,14 @@ function SettingsPage() {
           subtitle="When RomM has changed, Ludo re-reads only the platforms that changed and tells you what it found. Turn this off to be asked first — you'll still see a notice when your library is out of date, with a button to update it."
           onClick={() => handleAutoUpdateLibToggle(!autoUpdateLib)}
           right={<V2Switch checked={autoUpdateLib} />}
+        />
+        <V2SettingsRow
+          icon={<FaLayerGroup size={16} />}
+          title="Platforms"
+          subtitle={platformSummary
+            || 'Choose which platforms Ludo syncs from RomM. Turning one off makes your library load faster; nothing already downloaded is removed.'}
+          onClick={() => libNavigate("/romm-sync-platforms")}
+          right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
         />
       </V2SettingsSection>
 
@@ -12763,6 +12985,18 @@ function SetupWizard() {
   useEffect(() => {
     if (emu && hasEmuStep === null) setHasEmuStep(!emu.installed);
   }, [emu, hasEmuStep]);
+  // Platforms step — optional, and only offered when the choice is worth making.
+  // A three-platform, 200-game server has nothing to gain from it, and a step
+  // whose honest answer is always "leave it alone" is a step that teaches people
+  // to click through steps. Frozen like hasEmuStep, and only ever decided while
+  // the user is still on or before Folders: inserting a step at the index the
+  // user is currently standing on would swap the page out from under them.
+  const platformSync = usePlatformSync();
+  const [hasPlatformStep, setHasPlatformStep] = useState<boolean | null>(null);
+  // Set once the re-read that runs after the connection exists has been asked
+  // for. The hook's own load fires at mount, when there is no server to ask.
+  const platformProbed = useRef(false);
+
   // Silences the install's own toasts for as long as this screen owns them.
   useEffect(() => {
     _wizardOpen = true;
@@ -12779,14 +13013,35 @@ function SetupWizard() {
   // Steps are addressed by name, not by index: the Emulator step is conditional,
   // so every `step === 2` in here would otherwise mean a different page
   // depending on what is installed.
-  const STEPS = ['welcome', 'connect', ...(hasEmuStep ? ['emulator'] : []), 'folders', 'ready'];
+  const STEPS = ['welcome', 'connect', ...(hasEmuStep ? ['emulator'] : []), 'folders',
+    ...(hasPlatformStep ? ['platforms'] : []), 'ready'];
   const TOTAL = STEPS.length;
   const cur = STEPS[Math.min(step, TOTAL - 1)];
   const startFocusRef = useAutoFocus(cur === 'welcome', step);
   const urlFocusRef = useAutoFocus(cur === 'connect', step);
   const emuNextRef = useAutoFocus(cur === 'emulator', step);
   const foldersNextRef = useAutoFocus(cur === 'folders', step);
+  const platformsNextRef = useAutoFocus(cur === 'platforms', step);
   const finishFocusRef = useAutoFocus(cur === 'ready', step);
+
+  // Decide whether the Platforms step exists, and freeze it. Runs only while the
+  // user is on Folders — the step lands immediately after it, so inserting it
+  // here shifts nothing the user is currently looking at.
+  useEffect(() => {
+    if (cur !== 'folders' || hasPlatformStep !== null) return;
+    if (!platformProbed.current) {
+      // The connection is live by now, unlike at mount. Ask again.
+      platformProbed.current = true;
+      platformSync.reload();
+      return;
+    }
+    if (platformSync.loading) return;
+    setHasPlatformStep(
+      platformSync.connected
+      && platformSync.rows.length >= 5
+      && platformSync.totalRoms >= 1500);
+  }, [cur, hasPlatformStep, platformSync.loading, platformSync.rows,
+      platformSync.connected]);
   const [kbRoom, _setKbRoomRaw] = useState(false);
   const kbOffTimer = useRef<any>(null);
   const scrollHostRef = useRef<HTMLDivElement | null>(null);
@@ -13379,6 +13634,29 @@ function SetupWizard() {
             </div>
           )}
 
+          {/* Optional, and pre-filled with everything ON: the step's only job is
+              subtraction, so skipping it and completing it produce the same
+              working setup. Nothing here can leave the user worse off. */}
+          {cur === 'platforms' && (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', width: '100%' }}>
+              <div style={{ fontSize: '20px', fontWeight: 700 }}>Platforms</div>
+              <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.5, maxWidth: '440px', textAlign: 'center' }}>
+                Your server has {platformSync.rows.length} platforms and{' '}
+                {platformSync.totalRoms.toLocaleString()} games. Turn off any you
+                don’t want on this device and your library loads faster — you can
+                change this any time in Settings.
+              </div>
+              <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <PlatformSyncList sync={platformSync} />
+              </div>
+              {footer(
+                <GameActionButton variant="emphasized" focusRef={platformsNextRef}
+                  label={platformSync.off.size ? 'Next' : 'Sync everything'}
+                  icon={<FaChevronRight size={13} />} onClick={next} />
+              )}
+            </div>
+          )}
+
           {cur === 'ready' && (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', textAlign: 'center', width: '100%' }}>
               <div className="wiz-check"><FaCheckCircle size={56} color={V2.success} /></div>
@@ -13854,6 +14132,7 @@ export default definePlugin(() => {
   routerHook.addRoute("/romm-sync-stats", () => <RouteGuard><StatsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-cores", () => <RouteGuard><CoresPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-bios", () => <RouteGuard><BiosPage /></RouteGuard>, { exact: true });
+  routerHook.addRoute("/romm-sync-platforms", () => <RouteGuard><PlatformsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-downloads", () => <RouteGuard><DownloadsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-config", () => <RouteGuard><ConfigPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-library", () => <RouteGuard><LibraryRootPage /></RouteGuard>, { exact: true });
@@ -14001,6 +14280,7 @@ export default definePlugin(() => {
       routerHook.removeRoute("/romm-sync-stats");
       routerHook.removeRoute("/romm-sync-cores");
       routerHook.removeRoute("/romm-sync-bios");
+      routerHook.removeRoute("/romm-sync-platforms");
       routerHook.removeRoute("/romm-sync-downloads");
       routerHook.removeRoute("/romm-sync-config");
       routerHook.removeRoute("/romm-sync-library");

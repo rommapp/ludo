@@ -1513,6 +1513,11 @@ class Plugin:
                 logging.error("RomM authentication failed")
                 return False
 
+            # Platforms the user switched off, before anything fetches. A client
+            # built without this walks the whole library once and only picks the
+            # setting up on the next connect.
+            self._apply_platform_sync_to_client()
+
             # Initialize cover art manager for Steam grid images
             self._romm_client.cover_manager = CoverArtManager(self._settings, self._romm_client)
 
@@ -1767,6 +1772,10 @@ class Plugin:
                 # missing rows for reasons that have nothing to do with the
                 # server's contents, and every one of them would look deleted.
                 if not incomplete:
+                    paused = self._preserve_disabled_platform_games(games)
+                    if paused:
+                        logging.info(f"Kept {paused} downloaded game(s) on platforms "
+                                     f"turned off for sync")
                     orphans = self._preserve_orphaned_downloads(games, self._available_games)
                     if orphans:
                         logging.info(f"Kept {orphans} downloaded game(s) no longer on RomM")
@@ -2430,6 +2439,21 @@ class Plugin:
                     new_roms, _ = new_roms_data
                     fetched_rows = new_roms or []
 
+                    # The incremental walk is flat — `updated_after` cuts across
+                    # every platform, so it cannot be filtered server-side the
+                    # way the per-platform walk is. Drop the switched-off rows
+                    # here instead, or a disabled platform would quietly refill
+                    # the library one changed ROM at a time.
+                    disabled = self._disabled_platforms()
+                    if disabled and new_roms:
+                        kept = [r for r in new_roms
+                                if str(r.get('platform_slug') or '').strip().lower()
+                                not in disabled]
+                        if len(kept) != len(new_roms):
+                            logging.info(f"Incremental: ignored {len(new_roms) - len(kept)} "
+                                         f"row(s) on platforms turned off for sync")
+                        new_roms = kept
+
                     if new_roms:
                         # Update existing games list
                         download_dir = Path(self._settings.get('Download', 'rom_directory',
@@ -2586,6 +2610,11 @@ class Plugin:
                     # Same guard as _connect_to_romm: absence only means deleted
                     # if the walk that failed to return it actually finished.
                     if not refresh_incomplete:
+                        paused = self._preserve_disabled_platform_games(games)
+                        if paused:
+                            logging.info(
+                                f"Kept {paused} downloaded game(s) on platforms "
+                                f"turned off for sync")
                         orphans = self._preserve_orphaned_downloads(
                             games, self._available_games)
                         if orphans:
@@ -2680,6 +2709,142 @@ class Plugin:
             logging.error(f"set_library_auto_update error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
+    async def get_platform_sync(self):
+        """Every platform RomM holds, with its size and whether it syncs.
+
+        Sizes come from /api/platforms' free `rom_count`, so the list can say
+        what each switch actually costs without reading a single ROM.
+        """
+        disabled = self._disabled_platforms()
+        if not (self._romm_client and self._romm_client.authenticated):
+            return {'success': True, 'connected': False, 'platforms': [],
+                    'disabled': sorted(disabled)}
+        try:
+            rows = self._romm_client.get_platforms() or []
+        except Exception as e:
+            logging.error(f"get_platform_sync error: {e}", exc_info=True)
+            return {'success': False, 'connected': True, 'platforms': [],
+                    'disabled': sorted(disabled), 'message': str(e)}
+        if not rows:
+            # The server answered with nothing usable. Reported as unavailable
+            # rather than as "no platforms": painting an empty list here invites
+            # the user to conclude their library vanished.
+            return {'success': True, 'connected': True, 'unavailable': True,
+                    'platforms': [], 'disabled': sorted(disabled)}
+
+        platforms = []
+        for p in rows:
+            slug = (p.get('slug') or p.get('fs_slug') or '').strip()
+            if not slug:
+                continue
+            platforms.append({
+                'slug': slug,
+                'name': p.get('display_name') or p.get('name') or slug,
+                'rom_count': p.get('rom_count') or 0,
+                'enabled': not self._platform_row_disabled(p, disabled),
+            })
+        # Largest first — the platforms worth switching off are the ones that
+        # cost the most to sync, so they should not be buried under an
+        # alphabetical list of 30-ROM systems.
+        platforms.sort(key=lambda p: (-p['rom_count'], p['name'].lower()))
+        return {'success': True, 'connected': True, 'platforms': platforms,
+                'disabled': sorted(disabled),
+                'enabled_count': sum(1 for p in platforms if p['enabled']),
+                'enabled_roms': sum(p['rom_count'] for p in platforms if p['enabled'])}
+
+    async def set_platform_sync(self, disabled=None):
+        """Replace the set of platforms that are switched off, by slug.
+
+        Takes the whole set rather than one toggle so it is idempotent and the
+        frontend never has to reason about merge order.
+
+        Switching a platform OFF does not delete anything. Downloaded games stay
+        on disk and stay in the library, flagged `sync_disabled`; entries that
+        were only ever listings are dropped, because re-enabling fetches them
+        back and keeping them would mean showing tiles for a platform the user
+        just said to stop syncing. Removing the files is a separate, deliberate
+        action — never a side effect of a switch.
+        """
+        try:
+            wanted = {str(s).strip().lower() for s in (disabled or []) if str(s).strip()}
+            before = self._disabled_platforms()
+            if wanted == before:
+                return {'success': True, 'changed': False,
+                        'disabled': sorted(wanted)}
+
+            self._settings.set(self._PLATFORM_SYNC_SECTION,
+                               self._PLATFORM_SYNC_KEY, '|'.join(sorted(wanted)))
+            self._apply_platform_sync_to_client()
+
+            # Newly switched-off platforms lose their reconciliation baseline —
+            # the invariant _reconcile_platforms depends on to re-walk them if
+            # they ever come back on.
+            newly_off = wanted - before
+            newly_on = before - wanted
+            if newly_off and self._library_platform_totals:
+                for pid, name in list(self._platform_ids_for(newly_off).items()):
+                    self._library_platform_totals.pop(pid, None)
+                    logging.info(f"Platform sync: dropped baseline for {name}")
+
+            # The connect skip check compares the server's total against
+            # _library_server_total, and neither number moves when a switch is
+            # flipped — so a re-enabled platform would be skipped on every
+            # future connect and never arrive. Forget the total instead: the
+            # next connect reconciles, sees a platform with no baseline, and
+            # walks exactly that one.
+            if newly_on:
+                self._library_server_total = None
+
+            dropped = 0
+            if newly_off and self._available_games:
+                kept = []
+                for g in self._available_games:
+                    if str(g.get('platform_slug') or '').strip().lower() not in newly_off:
+                        kept.append(g)
+                        continue
+                    on_disk = (g.get('is_downloaded')
+                               and Path(g.get('local_path') or '').exists())
+                    if on_disk:
+                        g['sync_disabled'] = True
+                        kept.append(g)
+                    else:
+                        dropped += 1
+                self._available_games = kept
+
+            # Anything still marked from a previous run on a platform that is on
+            # again is just a normal game now.
+            if newly_on:
+                for g in self._available_games or ():
+                    if (g.get('sync_disabled')
+                            and str(g.get('platform_slug') or '').strip().lower() in newly_on):
+                        g.pop('sync_disabled', None)
+
+            logging.info(f"Platform sync: {len(wanted)} platform(s) off "
+                         f"(+{len(newly_off)} / -{len(newly_on)}), "
+                         f"dropped {dropped} listing(s)")
+            return {'success': True, 'changed': True, 'disabled': sorted(wanted),
+                    # The caller refreshes when something came back on; switching
+                    # off needs no fetch at all.
+                    'needs_refresh': bool(newly_on), 'dropped': dropped}
+        except Exception as e:
+            logging.error(f"set_platform_sync error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    def _platform_ids_for(self, slugs: set) -> dict:
+        """{platform_id: display name} for the given slugs, or {} if unknown."""
+        out = {}
+        try:
+            for p in (self._romm_client.get_platforms() or []):
+                if p.get('id') is None:
+                    continue
+                names = {str(p.get(k) or '').strip().lower()
+                         for k in ('slug', 'fs_slug')} - {''}
+                if names & slugs:
+                    out[p['id']] = p.get('display_name') or p.get('name') or p.get('slug')
+        except Exception as e:
+            logging.debug(f"Couldn't resolve platform ids: {e}")
+        return out
+
     async def check_library_stale(self):
         """Ask whether the server's library moved, WITHOUT changing anything.
 
@@ -2722,9 +2887,14 @@ class Plugin:
 
         added = removed = 0
         names = []
+        # A switched-off platform deliberately has no baseline, which reads
+        # exactly like a platform that just appeared — so without this every
+        # disabled platform reports its entire contents as new, on every check,
+        # and the "your library changed" banner never goes away.
+        disabled = self._disabled_platforms()
         for p in platforms:
             pid = p.get('id')
-            if pid is None:
+            if pid is None or self._platform_row_disabled(p, disabled):
                 continue
             base = baselines.get(pid)
             count = p.get('rom_count') or 0
@@ -4864,6 +5034,90 @@ class Plugin:
             return ''
         return ', '.join(parts)
 
+    # Per-platform sync switches. Stored as the DISABLED set, pipe-joined, the
+    # same shape as [Collections] selected_for_sync. Disabled rather than
+    # enabled on purpose: a platform added on the server after the user last
+    # looked is then synced by default, where an enabled-list would silently
+    # ignore it and the user would have no reason to suspect a setting.
+    _PLATFORM_SYNC_SECTION = 'Platforms'
+    _PLATFORM_SYNC_KEY = 'disabled'
+
+    def _disabled_platforms(self) -> set:
+        """Slugs the user switched off, lowercased. Empty when unset."""
+        try:
+            raw = self._settings.get(self._PLATFORM_SYNC_SECTION,
+                                     self._PLATFORM_SYNC_KEY, '') or ''
+        except Exception:
+            return set()
+        return {s.strip().lower() for s in raw.split('|') if s.strip()}
+
+    def _apply_platform_sync_to_client(self):
+        """Push the disabled set down to the client that does the fetching."""
+        try:
+            if self._romm_client:
+                self._romm_client.set_disabled_platforms(self._disabled_platforms())
+        except Exception as e:
+            logging.warning(f"Couldn't apply platform sync settings: {e}")
+
+    @staticmethod
+    def _platform_row_disabled(platform: dict, disabled: set) -> bool:
+        """Is this /api/platforms row switched off? Matches the engine's rule."""
+        if not disabled:
+            return False
+        names = {str(platform.get(k) or '').strip().lower()
+                 for k in ('slug', 'fs_slug')} - {''}
+        return bool(names & disabled)
+
+    def _platform_sync_off(self, game: dict) -> bool:
+        """Is this library entry's platform switched off?"""
+        disabled = self._disabled_platforms()
+        if not disabled:
+            return False
+        return str(game.get('platform_slug') or '').strip().lower() in disabled
+
+    def _preserve_disabled_platform_games(self, new_games: list) -> int:
+        """Carry downloaded games on switched-off platforms across a full walk.
+
+        Turning a platform off stops Ludo asking the server about it; it does
+        not repossess what is already on the disk. But both full-walk paths
+        rebuild the library purely from what the walk returned, and the walk no
+        longer returns those platforms — so without this the user's downloaded
+        games silently disappear from the library the moment they flip a switch,
+        while the files sit there taking up the space.
+
+        Runs BEFORE _preserve_orphaned_downloads, which would otherwise see the
+        same entries missing from the walk and mark them `is_orphan` — "no
+        longer on RomM", which is false and alarming. Appending them here puts
+        their ids in that pass's server-id set, so it correctly leaves them be.
+
+        Same narrow rule as the orphan veto: only entries whose file is
+        verifiably on disk survive. A game that was merely *listed* under a
+        disabled platform is not data — re-enabling fetches it back.
+        """
+        disabled = self._disabled_platforms()
+        if not disabled or not self._available_games:
+            return 0
+        present = {g.get('rom_id') for g in new_games if g.get('rom_id') is not None}
+        kept = 0
+        for old in self._available_games:
+            rom_id = old.get('rom_id')
+            if rom_id is None or rom_id in present:
+                continue
+            if not self._platform_sync_off(old) or not old.get('is_downloaded'):
+                continue
+            local_path = old.get('local_path')
+            # Re-check the disk, not the flag — see _preserve_orphaned_downloads.
+            if not (local_path and Path(local_path).exists()):
+                continue
+            entry = dict(old)
+            # What the frontend keys "kept, but not syncing" off. Distinct from
+            # is_orphan: the server still has this game, we just stopped asking.
+            entry['sync_disabled'] = True
+            entry.pop('is_orphan', None)
+            new_games.append(entry)
+            kept += 1
+        return kept
+
     @staticmethod
     def _platform_matches(platform: dict, wanted) -> bool:
         """Does this /api/platforms row identify the platform the caller named?
@@ -4917,6 +5171,24 @@ class Plugin:
         if not platforms:
             logging.warning("Reconcile: no platforms returned; skipping")
             return stats
+
+        # Switched-off platforms are not reconciled. The invariant that makes
+        # re-enabling work is that they never hold a baseline: a platform with
+        # no baseline reads as changed below and is walked, so flipping one back
+        # on always fetches it — even if its rom_count never moved while it was
+        # off, which is the common case and the one a retained baseline would
+        # silently swallow.
+        disabled = self._disabled_platforms()
+        if disabled:
+            off_ids = {p.get('id') for p in platforms
+                       if self._platform_row_disabled(p, disabled)}
+            platforms = [p for p in platforms if p.get('id') not in off_ids]
+            for pid in off_ids:
+                (self._library_platform_totals or {}).pop(pid, None)
+            if not platforms:
+                logging.info("Reconcile: every platform is turned off for sync")
+                stats['checked'] = 0
+                return stats
 
         baselines = self._library_platform_totals
         if baselines is None and only_platform is not None:
@@ -5163,8 +5435,14 @@ class Plugin:
             return None
         if not platforms:
             return None
+        # A switched-off platform must never gain a baseline — see the same rule
+        # in _reconcile_platforms, which relies on its absence to re-walk the
+        # platform when the user turns it back on.
+        disabled = self._disabled_platforms()
         return {p['id']: (p.get('rom_count') or 0)
-                for p in platforms if p.get('id') is not None}
+                for p in platforms
+                if p.get('id') is not None
+                and not self._platform_row_disabled(p, disabled)}
 
     def _rom_exists_on_server(self, rom_id: int):
         """True / False / None (couldn't tell) for one ROM id.
