@@ -177,6 +177,36 @@ def main():
         check('a single matching line is not enough',
               E.looks_like_keys(b'foo = 0123456789abcdef0123456789abcdef'), False)
 
+        # --- master key generation ------------------------------------
+        # Parsed from the key file's own text, never from a filename: the
+        # real upload is named "ProdKeys.NET-v22.5.0.zip", and 22.5.0 is a
+        # firmware version someone typed, not the generation inside.
+        gen = d / 'gen.keys'
+        gen.write_bytes(KEY_TEXT + b'''master_key_09 = ''' + b'a' * 32 + b'''
+master_key_15 = ''' + b'b' * 32 + b'''
+master_key_source = ''' + b'c' * 32 + b'''
+''')
+        # Indices are HEX, so master_key_15 is generation 21, not 15 -- and
+        # master_key_source is not an index at all.
+        check('highest master key is parsed as hex',
+              E.highest_master_key(gen), 21)
+        # KEY_TEXT carries master_key_00 and nothing higher: generation 0 is
+        # a real answer, and must not be confused with "no keys found".
+        check('a key file reaching only generation 0 reports 0',
+              E.highest_master_key(bare), 0)
+        check('generation 0 is not falsy-confused with absent',
+              E.highest_master_key(bare) is not None, True)
+        check('missing file reports None',
+              E.highest_master_key(d / 'nope.keys'), None)
+
+        E.install_keys_file(gen, extra_data_dir=data)
+        st = E.keys_status(extra_data_dir=data)
+        check('keys_status reports the generation', st['master_key'], 21)
+        check('keys_status points at the file',
+              st['path'], data / 'keys/prod.keys')
+        check('keys_status is None without keys',
+              E.keys_status(extra_data_dir=d / 'absent'), None)
+
         # --- currency -------------------------------------------------
         # Markers live under config_dir(), which is derived from HOME --
         # NOT from XDG_CACHE_HOME. Overriding the wrong variable let earlier

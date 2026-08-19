@@ -11519,9 +11519,10 @@ function biosChip(row: any, chevron?: boolean) {
 // dialog furniture -- and is built from ModalRoot/Focusable/DialogButton
 // because @decky/ui's ConfirmModal is exported by neither @decky/ui 4.7.2 nor
 // the desktop shim, so importing it would break both builds.
-function SwitchFirmwareConfirm({ fileName, size, reason, installed, keysOk, onAnswer, closeModal }: {
+function SwitchFirmwareConfirm({ fileName, size, reason, installed, keysOk, masterKey, onAnswer, closeModal }: {
   fileName: string; size: string; reason?: string; installed: number;
-  keysOk?: boolean; onAnswer: (ok: boolean) => void; closeModal?: () => void;
+  keysOk?: boolean; masterKey?: number | null;
+  onAnswer: (ok: boolean) => void; closeModal?: () => void;
 }) {
   // Answer exactly once. Every dismissal route lands here, and a modal that
   // closes without resolving leaves the caller awaiting a promise forever.
@@ -11582,6 +11583,12 @@ function SwitchFirmwareConfirm({ fileName, size, reason, installed, keysOk, onAn
           </div>
           <div style={{ fontSize: '13px', color: V2.fgMuted, lineHeight: 1.5, marginBottom: '18px' }}>
             {fileName} · {size} · installs into Eden’s system directory
+            {typeof masterKey === 'number' && (
+              // Read out of prod.keys itself, not from any filename. It says
+              // how far the installed keys can decrypt; it does NOT prove
+              // they cover this firmware, so it is stated and left at that.
+              <><br />prod.keys reaches master key {masterKey}</>
+            )}
           </div>
           {/* Said BEFORE the download, not after it. Firmware without keys
               installs perfectly and then boots nothing, and the only useful
@@ -11674,6 +11681,7 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
                 reason={avail.reason}
                 installed={avail.installed || 0}
                 keysOk={avail.keys_ok}
+                masterKey={avail.master_key}
                 onAnswer={resolve}
               />
             );

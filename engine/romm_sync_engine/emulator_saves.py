@@ -67,6 +67,10 @@ KEYS_MAX_BYTES = 4 * 1024 * 1024
 _KEY_LINE_RE = re.compile(rb'^[a-z0-9_]+\s*=\s*[0-9a-fA-F]{16,}\s*$')
 _KEY_LINES_REQUIRED = 4
 
+# "master_key_15 = ..." -- the index is HEX, and master_key_source is not an
+# index at all, which is why this matches the digits rather than the prefix.
+_MASTER_KEY_RE = re.compile(rb'^master_key_([0-9a-f]{2})\s*=', re.IGNORECASE)
+
 # Depth to descend below the save root before giving up. The deepest known
 # layout puts the title three levels down; the margin covers a future one
 # without letting a symlink loop or a user's misplaced backup folder turn
@@ -485,6 +489,43 @@ def looks_like_keys(data):
             if matched >= _KEY_LINES_REQUIRED:
                 return True
     return False
+
+
+def highest_master_key(path=None, extra_data_dir=None):
+    """The highest master key generation in a prod.keys, or None.
+
+    Each Switch firmware generation introduces one master key, and prod.keys
+    accumulates them -- so this number is how far a key file can decrypt. It
+    does NOT come from the filename: "ProdKeys.NET-v22.5.0.zip" is a label
+    someone typed, while the keys themselves are the fact.
+
+    Reported rather than enforced. Knowing a key file stops at generation 21
+    does not, on its own, say which firmware needs 22 -- that mapping is a
+    table that goes stale with every release, and guessing it wrong would
+    block an install that would have worked.
+    """
+    if path is None:
+        path = find_prod_keys(extra_data_dir)
+    if path is None:
+        return None
+    try:
+        with open(path, 'rb') as fh:
+            data = fh.read(256 * 1024)
+    except OSError as e:
+        log.debug("could not read %s: %s", path, e)
+        return None
+    found = [int(m.group(1), 16)
+             for m in (_MASTER_KEY_RE.match(line.strip())
+                       for line in data.splitlines()) if m]
+    return max(found) if found else None
+
+
+def keys_status(extra_data_dir=None):
+    """What key file is installed: {'path', 'master_key'}, or None."""
+    path = find_prod_keys(extra_data_dir)
+    if path is None:
+        return None
+    return {'path': path, 'master_key': highest_master_key(path)}
 
 
 def identify_upload(path):

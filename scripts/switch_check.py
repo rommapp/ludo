@@ -163,9 +163,13 @@ def main():
     for data_dir in data_dirs:
         print(f"  data dir   : {data_dir}")
     keys = emulator_saves.find_prod_keys()
-    print(f"  prod.keys  : {keys or 'ABSENT — Eden cannot decrypt firmware or '
-                                     'boot any game, and Sigil cannot read '
-                                     'Switch containers'}")
+    if keys:
+        generation = emulator_saves.highest_master_key(keys)
+        detail = f" (reaches master key {generation})" if generation is not None else ""
+        print(f"  prod.keys  : {keys}{detail}")
+    else:
+        print("  prod.keys  : ABSENT — Eden cannot decrypt firmware or boot any "
+              "game, and Sigil cannot read Switch containers")
     status = emulator_saves.firmware_status()
     if status:
         print(f"  firmware   : {status['count']} NCAs, {human(status['bytes'])}")

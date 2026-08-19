@@ -12179,7 +12179,8 @@ class AutoSyncManager:
         # is known now, BEFORE a ~340 MB transfer, which is the only useful
         # time to say it. Keys already on disk count; so does a keys entry on
         # the server, which sync_switch_firmware installs first.
-        keys_ok = emulator_saves.find_prod_keys() is not None
+        keys = emulator_saves.keys_status()
+        keys_ok = keys is not None
         if not keys_ok:
             try:
                 keys_ok = bios.find_keys_entry('switch') is not None
@@ -12187,12 +12188,17 @@ class AutoSyncManager:
                 keys_ok = False
         if emulator_saves.firmware_is_current(entry):
             return {'available': False, 'file_name': entry.get('file_name'),
-                    'installed': status.get('count', 0), 'keys_ok': keys_ok}
+                    'installed': status.get('count', 0), 'keys_ok': keys_ok,
+                    'master_key': (keys or {}).get('master_key')}
         return {'available': True,
                 'file_name': entry.get('file_name'),
                 'size': entry.get('file_size_bytes') or 0,
                 'installed': status.get('count', 0),
                 'keys_ok': keys_ok,
+                # Shown, not enforced: which firmware needs which generation
+                # is a table that goes stale with every Nintendo release, and
+                # guessing it wrong would block an install that would work.
+                'master_key': (keys or {}).get('master_key'),
                 'reason': 'missing' if not status.get('count') else 'changed'}
 
     def sync_switch_firmware(self, progress=None):
