@@ -142,6 +142,18 @@ def main():
             (roms / name).write_bytes(b'')
             check(f'rom: {name[:42]}', T.title_id_from_rom(roms / name), want)
 
+        # Name-only extraction: the same IDs, without the file existing. This
+        # is what matches a save whose ROM is not downloaded.
+        for name, want in library.items():
+            check(f'name-only: {name[:38]}', T.title_id_from_name(name), want)
+        check('name-only ignores an untagged name',
+              T.title_id_from_name('Super Mario Party.xci'), None)
+        check('name-only reads a bare update tag',
+              T.title_id_from_name('X [01006FE013472800].nsp'), '01006FE013472000')
+        check('raw tag is reported un-normalised',
+              T.raw_switch_tag_in_name('X [01006FE013472800].nsp'),
+              '01006FE013472800')
+
         index = T.index_roms([roms])
         check('index collapses to distinct base titles', len(index), 3)
         # A game and its DLC claim the same base ID; the base game must win, or

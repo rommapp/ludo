@@ -78,11 +78,36 @@ def main():
     index = {}
     if rom_dir and Path(rom_dir).is_dir():
         index = title_ids.index_roms([rom_dir], prod_keys=keys)
-        print(f"  identified : {len(index)} ROMs")
+        print(f"  local files: {len(index)} identified")
         for title_id, path in sorted(index.items()):
             print(f"    {title_id}  {path.name}")
     else:
         print("  (no ROM directory to scan)")
+
+    # The server's filenames identify titles without any download, which is how
+    # a save for a game that is not stored here still finds its ROM.
+    library = {}
+    snapshot = paths.config_dir() / 'library_snapshot.json'
+    if snapshot.is_file():
+        import json
+        try:
+            games = json.loads(snapshot.read_text()).get('games') or []
+        except Exception as e:
+            games = []
+            print(f"  (could not read the library snapshot: {e})")
+        for game in games:
+            rom_id = game.get('rom_id')
+            name = game.get('file_name') or ''
+            base = title_ids.title_id_from_name(name) if name else None
+            if not base or not rom_id:
+                continue
+            raw = title_ids.raw_switch_tag_in_name(name)
+            rank = 0 if title_ids.switch_kind(raw) == 'base' else 1
+            if base not in library or rank < library[base][1]:
+                library[base] = (rom_id, rank, name)
+        print(f"  server name: {len(library)} identified")
+        for title_id, (rom_id, _rank, name) in sorted(library.items()):
+            print(f"    {title_id}  rom {rom_id}  {name[:52]}")
 
     # ── Eden saves ────────────────────────────────────────────────────────
     print("\n=== Eden saves ===")
@@ -90,12 +115,20 @@ def main():
     if not saves:
         print("  none found (no game has written a save yet)")
     for save in sorted(saves, key=lambda s: s['title_id']):
-        owner = index.get(save['title_id'])
-        mark = 'matched' if owner else 'UNMATCHED — no local ROM has this title ID'
+        local = index.get(save['title_id'])
+        served = library.get(save['title_id'])
         files = sum(1 for p in save['path'].rglob('*') if p.is_file())
+        if served:
+            mark = f"matched -> rom {served[0]} (server filename)"
+        elif local:
+            mark = "matched (local ROM file)"
+        else:
+            mark = "UNMATCHED — no ROM anywhere carries this title ID"
         print(f"  {save['title_id']}  {files} files  {mark}")
-        if owner:
-            print(f"      rom: {owner.name}")
+        if served:
+            print(f"      rom: {served[2][:60]}")
+        elif local:
+            print(f"      rom: {local.name}")
         print(f"      dir: {save['path']}")
 
     if args.pack_saves and saves:

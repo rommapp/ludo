@@ -418,6 +418,30 @@ def base_switch_title_id(value):
     return f'{number:016X}'
 
 
+def title_id_from_name(name):
+    """Base Switch application ID tagged in a FILE NAME, without the file.
+
+    The server knows its ROMs' filenames long before any of them are
+    downloaded, and a tagged name identifies the title just as well as the
+    container does. That makes this the only path that can match a save for a
+    game the user has played but does not currently have on this device —
+    which, for saves, is the common case rather than the edge one.
+    """
+    for candidate in _SWITCH_TAG_RE.findall(str(name)):
+        base = base_switch_title_id(candidate)
+        if base:
+            return base
+    return None
+
+
+def raw_switch_tag_in_name(name):
+    """The un-normalised Switch ID in a name, for base-vs-derived ranking."""
+    for candidate in _SWITCH_TAG_RE.findall(str(name)):
+        if switch_kind(candidate):
+            return candidate
+    return None
+
+
 def _switch_title_id(path):
     """Base Switch application ID for a ROM, from its filename, or None.
 
@@ -542,7 +566,4 @@ def index_roms(directories, extensions=None, prod_keys=None):
 
 def _raw_switch_tag(path):
     """The un-normalised Switch ID in a ROM's filename, for ranking."""
-    for candidate in _SWITCH_TAG_RE.findall(Path(path).name):
-        if switch_kind(candidate):
-            return candidate
-    return None
+    return raw_switch_tag_in_name(Path(path).name)

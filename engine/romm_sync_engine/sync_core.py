@@ -12828,6 +12828,34 @@ class AutoSyncManager:
         """
         if self._title_id_index is None:
             self._title_id_index = {}
+            # The SERVER's filenames first. RomM knows what a ROM is called long
+            # before it is downloaded, and a tagged name identifies the title as
+            # well as the container does — so this is the only path that can
+            # match a save for a game played on this device but not currently
+            # stored on it, which for saves is the common case rather than the
+            # edge one. Matching only local files left every such save
+            # unattributable, observed against a real library.
+            try:
+                ranks = {}
+                for game in (self.get_games() or []):
+                    rom_id = game.get('rom_id')
+                    name = (game.get('file_name')
+                            or (game.get('romm_data') or {}).get('fs_name') or '')
+                    if not rom_id or not name:
+                        continue
+                    base = title_ids.title_id_from_name(name)
+                    if not base:
+                        continue
+                    # A game, its update and its DLC all normalise to one base
+                    # ID; the base entry owns the save.
+                    raw = title_ids.raw_switch_tag_in_name(name)
+                    rank = 0 if title_ids.switch_kind(raw) == 'base' else 1
+                    if base not in self._title_id_index or rank < ranks[base]:
+                        self._title_id_index[base] = rom_id
+                        ranks[base] = rank
+            except Exception as e:
+                logging.debug(f"could not index the server library by title ID: {e}")
+
             try:
                 rom_dir = self.settings.get('Download', 'rom_directory', '')
                 if rom_dir:
@@ -12841,6 +12869,8 @@ class AutoSyncManager:
                         # Reuse the name-based tiers to turn the ROM file into a
                         # rom_id. The suffix is irrelevant to them; only the stem
                         # is compared.
+                        if tid in self._title_id_index:
+                            continue
                         rom_id = self.find_rom_id_for_save_file(
                             path.with_suffix('.srm'))
                         if rom_id:
