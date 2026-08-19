@@ -12510,6 +12510,15 @@ class AutoSyncManager:
                      f"title ID; not restoring it")
             return False
 
+        # Check before spending the transfer. unpack_save checks again and is
+        # the authoritative one -- Eden can start while the download runs --
+        # but without this a restore attempted with Eden open pays for the
+        # whole save every sync just to be refused at the end.
+        if emulator_saves.eden_is_running():
+            self.log(f"ℹ️ Save-sync: Eden is running; {title_id} will restore "
+                     f"once it is closed.")
+            return False
+
         staged = cache_dir() / 'incoming_saves' / file_name
         staged.parent.mkdir(parents=True, exist_ok=True)
         if not self.romm_client.download_save_by_id(
