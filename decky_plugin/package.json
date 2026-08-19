@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "rollup -c",
+    "typecheck": "tsc --noEmit",
     "watch": "rollup -c -w",
     "package": "cp -f --remove-destination ../src/sync_core.py py_modules/sync_core.py && rollup -c",
     "postpackage": "rm -f py_modules/sync_core.py && ln -s ../../src/sync_core.py py_modules/sync_core.py",

@@ -3869,6 +3869,10 @@ function useWideTopBar(): boolean {
       mq.addEventListener('change', l);
       return () => mq.removeEventListener('change', l);
     } catch { /* ignore */ }
+    // Explicit: with no matchMedia there is nothing to tear down. React
+    // treats a missing return the same way, but noImplicitReturns wants the
+    // two paths to agree.
+    return undefined;
   }, []);
   return wide;
 }
@@ -4084,6 +4088,8 @@ function GameActionButton({ icon, label, onClick, variant = 'surface', accent, d
       return () => clearTimeout(t);
     }
     if (!hasProgress) wasProg.current = false;
+    // No timer was started on this path, so there is nothing to clear.
+    return undefined;
   }, [hasProgress]);
   const base: any = {
     position: 'relative', overflow: 'hidden',

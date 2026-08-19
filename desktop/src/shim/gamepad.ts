@@ -37,7 +37,9 @@ const registry = new Map<HTMLElement, FocusHandlers>();
 
 export function registerFocusable(el: HTMLElement, handlers: FocusHandlers) {
   registry.set(el, handlers);
-  return () => registry.delete(el);
+  // Discard Map.delete's boolean: callers return this straight out of a
+  // useEffect, and React's cleanup type admits only void.
+  return () => { registry.delete(el); };
 }
 
 // ── Action-description legend (the desktop equivalent of Steam's bottom
