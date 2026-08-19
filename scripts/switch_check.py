@@ -43,23 +43,17 @@ def _restore(args, settings, client, emulator_saves, title_ids, paths):
         print("  not a base Switch title ID (saves live under the base title)")
         return 1
 
-    rom_dir = settings.get('Download', 'rom_directory', '')
-    index = title_ids.index_roms([rom_dir], prod_keys=emulator_saves.find_prod_keys()) \
-        if rom_dir else {}
-    rom = index.get(title_id)
-    print(f"  local ROM  : {rom.name if rom else 'none — cannot map to a RomM game'}")
-    if not rom:
-        return 1
-
     local = next((s for s in emulator_saves.find_eden_saves()
                   if s['title_id'] == title_id), None)
     print(f"  local save : {local['path'] if local else 'none — game never booted here'}")
     if not local:
         return 1
 
-    # Which RomM game? Read the snapshot Ludo already maintains rather than
-    # re-fetching the library: that call is server-bound and takes minutes on a
-    # library this size, and the snapshot holds the one field needed here.
+    # Which RomM game? Matched on the SERVER's filename, the same way the sync
+    # engine does it — a save exists because the game was played, so requiring
+    # the ROM to still be on disk here would refuse exactly the case restore is
+    # for. Read from the snapshot Ludo already maintains rather than re-fetching
+    # the library, which is server-bound and takes minutes at this size.
     import json
     snapshot = paths.config_dir() / 'library_snapshot.json'
     try:
@@ -67,12 +61,24 @@ def _restore(args, settings, client, emulator_saves, title_ids, paths):
     except (OSError, ValueError) as e:
         print(f"  snapshot   : unreadable ({e}) — open the app once to build it")
         return 1
-    match = next((g for g in games if (g.get('file_name') or '') == rom.name), None)
+
+    match = None
+    for game in games:
+        name = game.get('file_name') or ''
+        if name and title_ids.title_id_from_name(name) == title_id:
+            # A base entry beats its own DLC/update, which can carry a tag that
+            # normalises to the same base title.
+            raw = title_ids.raw_switch_tag_in_name(name)
+            if match and title_ids.switch_kind(raw) != 'base':
+                continue
+            match = game
     if not match:
-        print(f"  server ROM : {rom.name!r} not in the snapshot")
+        print(f"  server ROM : no library entry is tagged {title_id}")
         return 1
     rom_id = match['rom_id']
     print(f"  server ROM : id={rom_id}  {match.get('display_name') or match.get('name')}")
+    print(f"  matched on : {match.get('file_name')}"
+          f"{'' if match.get('is_downloaded') else '  (not downloaded — fine)'}")
 
     # /api/saves/summary answers {'slots': [{'slot', 'count', 'latest': {...}}]},
     # so the save records are one level down under each slot's 'latest'.
