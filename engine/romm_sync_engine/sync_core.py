@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
+from . import emulator_saves, title_ids
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -10319,6 +10320,11 @@ class AutoSyncManager:
         self.vmu_owners_file = cache_dir() / 'vmu_owners.json'
         self._vmu_owners = {}
         self._load_vmu_owners()
+        # {title_id: rom_id} for saves the emulator names after the game's own
+        # ID rather than after the ROM file (see title_ids). Built on first use
+        # and only when such a save actually turns up, so a library with none
+        # never pays for the scan.
+        self._title_id_index = None
 
         # Add lock mechanism
         self.lock = AutoSyncLock()
@@ -11964,6 +11970,8 @@ class AutoSyncManager:
                 '_autocleanup_limit': _limit,
             })
 
+        inventory.extend(self._eden_inventory_entries())
+
         # Dedupe by (rom_id, slot), keeping the newest file. Stale duplicate
         # copies of the same save (e.g. a leftover flat saves/Game.srm next to
         # the live saves/<core>/Game.srm) otherwise ping-pong forever: the
@@ -11982,6 +11990,124 @@ class AutoSyncManager:
             else:
                 best[k] = e
         return list(best.values())
+
+    def _eden_inventory_entries(self):
+        """Inventory rows for Eden's Switch saves, packed one zip per game.
+
+        Eden keeps its saves in its own tree, as a directory per title named by
+        title ID — outside RetroArch's save root, so get_save_files never sees
+        them, and named after the game rather than the ROM, so the filename
+        tiers could not match them even if it did. Both halves are why Switch
+        saves have never appeared in an inventory.
+
+        The pack is written into our cache, never into Eden's directories. It
+        is deterministic (see emulator_saves.pack_save), so an untouched save
+        re-packs to the same bytes and the same content hash, and the negotiate
+        engine correctly sees nothing to do.
+
+        Upload only. Restoring a save means writing into a live emulator's data
+        directory, which is a different risk and gets its own pass — an
+        unmatched or unpacked-wrong Switch save must never overwrite one.
+        """
+        entries = []
+        # [Emulators] is optional, and ConfigParser's fallback= does not cover a
+        # missing SECTION — it still raises. Read it on its own so that a config
+        # without the section leaves the override empty instead of being caught
+        # below as "discovery failed" and disabling Eden sync outright.
+        try:
+            override = (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip()
+        except Exception:
+            override = ''
+
+        try:
+            saves = emulator_saves.find_eden_saves(extra_data_dir=override or None)
+        except Exception as e:
+            logging.debug(f"Eden save discovery failed: {e}")
+            return entries
+
+        if not saves:
+            return entries
+
+        pack_dir = cache_dir() / 'packed_saves'
+        for save in saves:
+            title_id = save['title_id']
+            rom_id = self._rom_id_for_title_id(title_id)
+            if not rom_id:
+                # No local ROM carries this title ID. Without Sigil the ID is
+                # only legible in a ROM's filename, so an unmatched save is the
+                # expected outcome for a library named without title tags —
+                # skip it rather than attach it to a guess.
+                logging.debug(f"Eden save {title_id} matches no known ROM; skipping")
+                continue
+            try:
+                packed = emulator_saves.pack_save(
+                    save['path'], pack_dir / f'{title_id}.zip')
+                stat = packed.stat()
+            except Exception as e:
+                self.log(f"⚠️ Could not pack the Eden save for {title_id}: {e}")
+                continue
+
+            updated_at = datetime.datetime.fromtimestamp(
+                save['modified'], tz=datetime.timezone.utc).isoformat()
+            entries.append({
+                'rom_id': rom_id,
+                'file_name': packed.name,
+                'slot': 'autosave',
+                'emulator': 'Eden',
+                'content_hash': RomMClient.compute_content_hash(packed),
+                'updated_at': updated_at,
+                'file_size_bytes': stat.st_size,
+                '_path': str(packed),
+                '_autocleanup': True,
+                '_autocleanup_limit': 10,
+            })
+        return entries
+
+    def sync_switch_firmware(self, progress=None):
+        """Fetch Switch firmware from RomM and install it into Eden.
+
+        Returns a dict describing what happened, with 'status' one of:
+        'installed', 'up-to-date', 'no-firmware' (nothing on the server),
+        'no-emulator' (Eden not installed here), or 'failed'.
+
+        Deliberately not automatic. Firmware is a single ~324 MB object, it
+        changes about as often as the emulator does, and it is the one thing
+        here that writes into another application's system directory — so it
+        runs when something asks for it, not on every sync pass.
+        """
+        # The BIOS manager hangs off RetroArchInterface, not off this class.
+        bios = getattr(self.retroarch, 'bios_manager', None)
+        if not bios:
+            return {'status': 'failed', 'message': 'BIOS manager unavailable'}
+        if emulator_saves.eden_firmware_dir() is None:
+            return {'status': 'no-emulator',
+                    'message': 'Eden is not installed on this device'}
+
+        entry = bios.find_firmware_entry('switch')
+        if not entry:
+            return {'status': 'no-firmware',
+                    'message': 'No Switch firmware on the server'}
+
+        archive = bios.download_firmware_entry(
+            entry, cache_dir() / 'firmware' / entry['file_name'], progress=progress)
+        if not archive:
+            return {'status': 'failed',
+                    'message': f"Could not download {entry.get('file_name')}"}
+
+        try:
+            result = emulator_saves.install_firmware_zip(archive)
+        except Exception as e:
+            self.log(f"❌ Firmware install failed: {e}")
+            return {'status': 'failed', 'message': str(e)}
+
+        if not result['installed']:
+            return {'status': 'up-to-date', 'installed': 0,
+                    'skipped': result['skipped'],
+                    'message': 'Firmware already installed'}
+
+        self.log(f"✅ Installed {result['installed']} firmware files "
+                 f"({result['skipped']} already present)")
+        return {'status': 'installed', **result}
 
     def flush_after_reconnect(self):
         """Flush local save changes accumulated while offline. Called when the
@@ -12356,6 +12482,20 @@ class AutoSyncManager:
             if alias_id:
                 return alias_id
 
+            # TIER 0.5: the save states its own owner. Dolphin's .gci carries
+            # the six-byte GameCube ID ("GALE01") in its header, and the same
+            # ID is readable from the first six bytes of the disc image, so the
+            # two meet on a value neither filename contains. Every tier below
+            # compares names, and a GCI's name ("01-GALE01-MeleeSaveData") has
+            # nothing in common with the ROM's — before this, those saves were
+            # discovered by get_save_files, matched by nothing, and dropped by
+            # build_sync_inventory.
+            title_id = title_ids.title_id_from_save(file_path)
+            if title_id:
+                by_title = self._rom_id_for_title_id(title_id)
+                if by_title:
+                    return by_title
+
             # DEBUG: Log what we're trying to match
             
 
@@ -12673,6 +12813,43 @@ class AutoSyncManager:
             if n and n in self._launch_aliases:
                 return self._launch_aliases[n]
         return None
+
+    def _rom_id_for_title_id(self, title_id):
+        """rom_id owning a game-native title ID, or None.
+
+        The index maps a title ID to the local ROM that carries it; that ROM's
+        filename is the one the ordinary tiers already know how to match, so
+        resolution finishes by handing the name back to find_rom_id_for_save_file.
+        Going through the ROM rather than querying RomM for a serial is
+        deliberate: RomM's ROM payload carries no title ID, and the disc does.
+
+        Built once per session. A ROM downloaded afterwards is picked up on the
+        next start, which is the same latency the rest of the library has.
+        """
+        if self._title_id_index is None:
+            self._title_id_index = {}
+            try:
+                rom_dir = self.settings.get('Download', 'rom_directory', '')
+                if rom_dir:
+                    # Eden's prod.keys, when present, is what lets Sigil read a
+                    # Switch title ID out of the container instead of guessing
+                    # from the filename — the difference between matching a
+                    # plainly-named dump and not.
+                    prod_keys = emulator_saves.find_prod_keys()
+                    for tid, path in title_ids.index_roms(
+                            [rom_dir], prod_keys=prod_keys).items():
+                        # Reuse the name-based tiers to turn the ROM file into a
+                        # rom_id. The suffix is irrelevant to them; only the stem
+                        # is compared.
+                        rom_id = self.find_rom_id_for_save_file(
+                            path.with_suffix('.srm'))
+                        if rom_id:
+                            self._title_id_index[tid] = rom_id
+                    logging.debug(
+                        f"title-ID index: {len(self._title_id_index)} ROMs identified")
+            except Exception as e:
+                logging.debug(f"could not build the title-ID index: {e}")
+        return self._title_id_index.get(title_id)
 
     def sync_before_launch(self, game, core_name=None):
         """Sync saves before launching a specific game.

@@ -543,6 +543,129 @@ class BiosManager:
                 self.log(traceback.format_exc()) # More detailed error for debugging
                 return False
     
+    def find_firmware_entry(self, platform_slug, file_name=None):
+        """The server's firmware record for a platform, or None.
+
+        Matched on SLUG rather than on the display name the BIOS paths above
+        use. Those names exist because RetroArch cores want a canonical
+        "Sony - PlayStation"; a slug is what RomM actually keys on, and it is
+        unambiguous. ``file_name`` picks one when a platform has several;
+        without it the largest wins, which for a firmware set is the complete
+        archive rather than a stray loose file beside it.
+        """
+        platforms = self._fetch_platforms()
+        if platforms is None:
+            return None
+        for platform in platforms:
+            if (platform.get('slug') or '').lower() != platform_slug.lower():
+                continue
+            firmware = platform.get('firmware') or []
+            if file_name:
+                for entry in firmware:
+                    if entry.get('file_name') == file_name:
+                        return entry
+                return None
+            if not firmware:
+                return None
+            return max(firmware, key=lambda f: f.get('file_size_bytes') or 0)
+        return None
+
+    def download_firmware_entry(self, entry, destination, progress=None):
+        """Download a firmware file, resuming and verifying. Returns the path.
+
+        Firmware is the largest thing this engine transfers — a Switch set is
+        ~324 MB against a BIOS file's ~512 KB — so the two things the existing
+        BIOS download can skip, this cannot:
+
+          * Resume. RomM answers Range requests (Accept-Ranges: bytes), so an
+            interrupted transfer continues rather than restarting. A server
+            that ignores the range and replies 200 is handled by starting over,
+            because appending to a full body would corrupt the file.
+          * Verification. RomM records md5/sha1/crc per firmware. A truncated
+            or corrupted archive that we then extract into an emulator's system
+            directory is a much worse failure than a failed download, and the
+            hash is right there.
+
+        Returns None on failure, having left no partial file behind.
+        """
+        from urllib.parse import urljoin
+
+        if not self.romm_client or not self.romm_client.authenticated:
+            self.log("❌ Not connected to RomM")
+            return None
+
+        firmware_id = entry.get('id')
+        file_name = entry.get('file_name')
+        expected_size = entry.get('file_size_bytes') or 0
+        expected_md5 = (entry.get('md5_hash') or '').lower()
+        if not firmware_id or not file_name:
+            self.log("❌ Firmware record is missing an id or file name")
+            return None
+
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        # Already here and intact — re-downloading 324 MB to confirm what the
+        # hash can confirm for free is the wrong trade.
+        if destination.is_file() and expected_md5:
+            if self.calculate_md5(destination) == expected_md5:
+                logging.debug(f"[BIOS] {file_name} already downloaded and verified")
+                return destination
+
+        partial = destination.with_name(destination.name + '.part')
+        have = partial.stat().st_size if partial.is_file() else 0
+        if expected_size and have > expected_size:
+            # A stale part from a different version of the file.
+            partial.unlink()
+            have = 0
+
+        url = urljoin(self.romm_client.base_url,
+                      f'/api/firmware/{firmware_id}/content/{file_name}')
+        headers = {'Range': f'bytes={have}-'} if have else {}
+        try:
+            response = self.romm_client.session.get(
+                url, headers=headers, stream=True, timeout=120)
+            if response.status_code not in (200, 206):
+                self.log(f"❌ Firmware download failed: HTTP {response.status_code}")
+                return None
+            # Asked to resume but served the whole file: start over rather than
+            # appending a second copy onto what we already had.
+            mode = 'ab'
+            if have and response.status_code == 200:
+                logging.debug("[BIOS] server ignored the range request; restarting")
+                have = 0
+                mode = 'wb'
+
+            with open(partial, mode) as sink:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    sink.write(chunk)
+                    have += len(chunk)
+                    if progress and expected_size:
+                        progress(have, expected_size)
+        except Exception as e:
+            self.log(f"❌ Firmware download error: {e}")
+            return None
+
+        if expected_size and partial.stat().st_size != expected_size:
+            self.log(f"❌ {file_name} is {partial.stat().st_size} bytes, "
+                     f"expected {expected_size}")
+            partial.unlink(missing_ok=True)
+            return None
+
+        if expected_md5:
+            actual = self.calculate_md5(partial)
+            if actual != expected_md5:
+                self.log(f"❌ {file_name} failed its checksum "
+                         f"({actual} != {expected_md5})")
+                partial.unlink(missing_ok=True)
+                return None
+
+        partial.replace(destination)
+        logging.debug(f"[BIOS] {file_name} downloaded and verified")
+        return destination
+
     def search_romm_for_bios(self, bios_filename):
         """Search RomM for a BIOS file"""
         if not self.romm_client:
