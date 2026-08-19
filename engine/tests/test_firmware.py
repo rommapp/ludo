@@ -115,8 +115,13 @@ def main():
         # The point of the marker is to answer "is the server's archive the
         # one already installed" WITHOUT downloading it. Presence alone can't:
         # a newer firmware sharing NCA names looks present file by file.
+        # Markers live under config_dir(), which is derived from HOME --
+        # NOT from XDG_CACHE_HOME. Overriding the wrong variable let earlier
+        # runs write into the user's real ~/.config, where a marker left by
+        # one run then made the next run's "nothing recorded yet" case pass
+        # a stale True.
         import os
-        os.environ['XDG_CACHE_HOME'] = str(d / 'cache')
+        os.environ['HOME'] = str(d / 'home')
         entry = {'file_name': 'Firmware_17.0.1.zip', 'md5_hash': 'AABBCCDD' * 4}
         installed = E.firmware_status(extra_data_dir=data)['count']
 
@@ -141,18 +146,17 @@ def main():
         check('drifted NCA count is not current',
               E.firmware_is_current(entry, extra_data_dir=data), False)
 
-        # The repair path for an install that predates key syncing: marker and
-        # count both agree, but without prod.keys the firmware decrypts
-        # nothing, so it must NOT read as current -- re-installing is what
-        # delivers the keys.
+        # Firmware currency is about the firmware, and nothing else. Keys
+        # are fetched separately (see test_keys.py) because they are ~11 KB
+        # against ~324 MB and are uploaded as their own file -- so keys
+        # missing from disk must NOT invalidate firmware that is already
+        # correct, or every missing key file would cost a full re-download.
         E.write_firmware_marker(entry['file_name'], entry['md5_hash'], installed)
         keys_file = data / 'keys/prod.keys'
         keys_file.rename(data / 'keys/prod.keys.bak')
-        check('firmware without keys is not current',
-              E.firmware_is_current(entry, extra_data_dir=data), False)
-        (data / 'keys/prod.keys.bak').rename(keys_file)
-        check('current again once keys are back',
+        check('firmware stays current when keys are absent',
               E.firmware_is_current(entry, extra_data_dir=data), True)
+        (data / 'keys/prod.keys.bak').rename(keys_file)
 
         E.write_firmware_marker(entry['file_name'], entry['md5_hash'], installed + 3)
         check('an entry with no md5 is never current',

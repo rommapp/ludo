@@ -12087,6 +12087,44 @@ class AutoSyncManager:
             })
         return entries
 
+    _NO_KEYS_MESSAGE = (
+        'Firmware is installed, but prod.keys is missing, so Eden cannot '
+        'decrypt any of it. Upload prod.keys to the Switch platform on RomM '
+        "(it is recognised on its own, beside the firmware), or place it in "
+        "Eden's keys/ directory."
+    )
+
+    def _sync_switch_keys(self, bios, progress=None):
+        """Fetch a separately uploaded prod.keys. Returns {'installed', ...}.
+
+        Best-effort by design: a missing or failed key fetch must not abort a
+        firmware install that would otherwise succeed. The caller reports the
+        combined state, and 'no-keys' is what tells the user the set cannot
+        boot -- not an exception from here.
+        """
+        try:
+            entry = bios.find_keys_entry('switch')
+            if not entry:
+                return {'installed': 0, 'status': 'no-keys-on-server'}
+            if emulator_saves.keys_are_current(entry):
+                return {'installed': 0, 'status': 'up-to-date'}
+
+            path = bios.download_firmware_entry(
+                entry, cache_dir() / 'firmware' / entry['file_name'],
+                progress=progress)
+            if not path:
+                return {'installed': 0, 'status': 'failed'}
+
+            written = emulator_saves.install_keys_file(path)
+            if written:
+                emulator_saves.write_keys_marker(
+                    entry.get('file_name'), entry.get('md5_hash'))
+                self.log(f"🔑 Installed {entry.get('file_name')}")
+            return {'installed': written, 'status': 'installed'}
+        except Exception as e:
+            self.log(f"⚠️ Could not sync Switch keys: {e}")
+            return {'installed': 0, 'status': 'failed'}
+
     def sync_switch_firmware(self, progress=None):
         """Fetch Switch firmware from RomM and install it into Eden.
 
@@ -12109,8 +12147,18 @@ class AutoSyncManager:
             return {'status': 'no-emulator',
                     'message': 'Eden is not installed on this device'}
 
+        # Keys first, and independently. They are ~11 KB against the firmware's
+        # ~324 MB, they are uploaded separately because that is how they
+        # circulate, and firmware that is already correct on disk must not be
+        # re-downloaded merely because the keys beside it are missing.
+        keys_result = self._sync_switch_keys(bios, progress=progress)
+
         entry = bios.find_firmware_entry('switch')
         if not entry:
+            if keys_result.get('installed'):
+                return {'status': 'installed', 'installed': 0, 'skipped': 0,
+                        'keys': 1,
+                        'message': 'Installed prod.keys; no firmware on the server'}
             return {'status': 'no-firmware',
                     'message': 'No Switch firmware on the server'}
 
@@ -12119,8 +12167,13 @@ class AutoSyncManager:
         # discovered that after pulling ~324 MB. Compare the server's md5 to
         # what the last successful install recorded instead.
         if emulator_saves.firmware_is_current(entry):
+            skipped = (emulator_saves.firmware_status() or {}).get('count', 0)
+            if emulator_saves.find_prod_keys() is None:
+                return {'status': 'no-keys', 'installed': 0, 'skipped': skipped,
+                        'keys': 0, 'message': self._NO_KEYS_MESSAGE}
             return {'status': 'up-to-date', 'installed': 0,
-                    'skipped': (emulator_saves.firmware_status() or {}).get('count', 0),
+                    'skipped': skipped,
+                    'keys': keys_result.get('installed', 0),
                     'message': f"{entry.get('file_name')} is already installed"}
 
         archive = bios.download_firmware_entry(
@@ -12149,9 +12202,7 @@ class AutoSyncManager:
             self.log("⚠️ Firmware installed, but prod.keys is missing — "
                      "Eden cannot decrypt it")
             return {'status': 'no-keys', **result,
-                    'message': 'Firmware installed, but prod.keys is missing. '
-                               'Add it to the firmware archive on RomM, or '
-                               "place it in Eden's keys/ directory."}
+                    'message': self._NO_KEYS_MESSAGE}
 
         if result['keys']:
             self.log(f"🔑 Installed {result['keys']} key file(s)")

@@ -574,6 +574,40 @@ class BiosManager:
                 self.log(traceback.format_exc()) # More detailed error for debugging
                 return False
     
+    @staticmethod
+    def _is_keys_entry(entry):
+        """True when a firmware record is a key file rather than firmware.
+
+        Switch firmware sets and prod.keys are dumped, shared and uploaded
+        separately -- so both land in the same RomM firmware list, and telling
+        them apart is on us. Name-based, because that is all RomM records:
+        anything ending in .keys, or a container whose name says keys.
+        """
+        name = (entry.get('file_name') or '').lower()
+        if name.endswith('.keys'):
+            return True
+        return 'keys' in name and name.endswith(('.zip', '.7z', '.rar'))
+
+    def find_keys_entry(self, platform_slug):
+        """The server's prod.keys record for a platform, or None.
+
+        Separate from find_firmware_entry because the two files are uploaded
+        separately in practice. Newest wins when several exist: keys are
+        cumulative, so the most recent one opens everything the older ones did.
+        """
+        platforms = self._fetch_platforms()
+        if platforms is None:
+            return None
+        for platform in platforms:
+            if (platform.get('slug') or '').lower() != platform_slug.lower():
+                continue
+            keys = [f for f in (platform.get('firmware') or [])
+                    if self._is_keys_entry(f)]
+            if not keys:
+                return None
+            return max(keys, key=lambda f: f.get('updated_at') or '')
+        return None
+
     def find_firmware_entry(self, platform_slug, file_name=None):
         """The server's firmware record for a platform, or None.
 
@@ -596,6 +630,12 @@ class BiosManager:
                     if entry.get('file_name') == file_name:
                         return entry
                 return None
+            # A separately uploaded prod.keys is not firmware. Size alone
+            # would already pick the 324 MB archive over an 11 KB key file,
+            # but not on a platform whose only upload IS the keys -- and
+            # handing that to install_firmware_zip would install no NCAs and
+            # report success.
+            firmware = [f for f in firmware if not self._is_keys_entry(f)]
             if not firmware:
                 return None
             return max(firmware, key=lambda f: f.get('file_size_bytes') or 0)

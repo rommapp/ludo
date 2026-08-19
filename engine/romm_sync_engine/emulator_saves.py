@@ -290,6 +290,49 @@ def write_firmware_marker(file_name, md5, nca_count):
         log.debug("could not write firmware marker: %s", e)
 
 
+def _keys_marker_path():
+    return cache_dir() / 'firmware' / 'keys.json'
+
+
+def read_keys_marker():
+    """The last key file we installed: {'file_name', 'md5'}, or {}."""
+    try:
+        with open(_keys_marker_path()) as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_keys_marker(file_name, md5):
+    path = _keys_marker_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.part')
+        with open(tmp, 'w') as fh:
+            json.dump({'file_name': file_name, 'md5': (md5 or '').lower()}, fh)
+        tmp.replace(path)
+    except OSError as e:
+        log.debug("could not write keys marker: %s", e)
+
+
+def keys_are_current(entry, extra_data_dir=None):
+    """True when the server's key `entry` is the one already installed.
+
+    Keys update independently of firmware in practice -- a re-dump after a
+    console update lands on the server on its own -- so this is tracked
+    separately rather than folded into the firmware marker.
+    """
+    if find_prod_keys(extra_data_dir) is None:
+        return False
+    marker = read_keys_marker()
+    expected = (entry.get('md5_hash') or '').lower()
+    if not expected:
+        # Nothing to compare against: a key file already on disk is good
+        # enough, since re-installing an 11 KB file has no cost worth a guess.
+        return True
+    return bool(marker) and marker.get('md5') == expected
+
+
 def firmware_is_current(entry, extra_data_dir=None):
     """True when the server's firmware `entry` is the one already installed.
 
@@ -309,13 +352,10 @@ def firmware_is_current(entry, extra_data_dir=None):
     expected = (entry.get('md5_hash') or '').lower()
     if not marker or not expected or marker.get('md5') != expected:
         return False
-    # Firmware without keys cannot decrypt anything, so it is not "current" in
-    # any sense the caller cares about -- re-installing is what delivers the
-    # prod.keys that rides in the same archive. This is also the repair path
-    # for anyone who installed firmware before keys were carried at all: the
-    # marker still matches, and only this check sends them back for the keys.
-    if find_prod_keys(extra_data_dir) is None:
-        return False
+    # Deliberately NOT gated on prod.keys. Missing keys make the firmware
+    # unusable, but they are an 11 KB fetch of their own -- see
+    # keys_are_current. Folding them in here would answer "keys absent" with a
+    # 324 MB re-download of firmware that is already correct on disk.
     status = firmware_status(extra_data_dir)
     if not status or not status['count']:
         return False
@@ -414,6 +454,67 @@ def install_firmware_zip(zip_path, extra_data_dir=None, dry_run=False):
 
     return {'installed': installed, 'skipped': skipped, 'target': target,
             'keys': keys_installed, 'keys_target': keys_target}
+
+
+def install_keys_file(path, extra_data_dir=None, dry_run=False):
+    """Install a key file into Eden's keys/ directory. Returns the count.
+
+    Accepts either a bare prod.keys or an archive containing one, because a
+    RomM firmware entry is whatever the user uploaded and both are how these
+    files circulate. Members are taken by BASENAME into a directory this code
+    picks -- the same rule install_firmware_zip applies, for the same reason.
+
+    A key file is text, tiny, and its size is not its identity: a newer
+    prod.keys can gain a master key without changing length. So it is always
+    rewritten rather than compared, and staged-then-renamed so Eden never
+    reads a half-written key file.
+    """
+    path = Path(path)
+    target = eden_keys_dir(extra_data_dir, create=not dry_run)
+    if target is None:
+        if dry_run:
+            return 1
+        raise FileNotFoundError("no Eden installation to install keys into")
+
+    def _write(name, read):
+        destination = target / name.lower()
+        if dry_run:
+            return
+        staging = destination.with_name(destination.name + '.part')
+        try:
+            with open(staging, 'wb') as sink:
+                shutil.copyfileobj(read, sink, 1024 * 1024)
+            staging.replace(destination)
+        except BaseException:
+            staging.unlink(missing_ok=True)
+            raise
+
+    if zipfile.is_zipfile(path):
+        written = 0
+        with zipfile.ZipFile(path) as archive:
+            for member in archive.infolist():
+                if member.is_dir():
+                    continue
+                name = Path(member.filename).name
+                if name.lower() not in _KEY_FILES:
+                    continue
+                with archive.open(member) as source:
+                    _write(name, source)
+                written += 1
+        return written
+
+    # A bare upload: trust the destination name we choose, not the one it
+    # arrived under -- a file named "prod.keys.txt" by a browser is still the
+    # keys, and a file named anything else is not something we rename into
+    # place blindly.
+    name = path.name.lower()
+    for known in _KEY_FILES:
+        if name.startswith(known):
+            with open(path, 'rb') as source:
+                _write(known, source)
+            return 1
+    log.debug("no key file recognised in %s", path)
+    return 0
 
 
 def eden_is_running():
