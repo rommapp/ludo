@@ -11519,9 +11519,9 @@ function biosChip(row: any, chevron?: boolean) {
 // dialog furniture -- and is built from ModalRoot/Focusable/DialogButton
 // because @decky/ui's ConfirmModal is exported by neither @decky/ui 4.7.2 nor
 // the desktop shim, so importing it would break both builds.
-function SwitchFirmwareConfirm({ fileName, size, reason, installed, onAnswer, closeModal }: {
+function SwitchFirmwareConfirm({ fileName, size, reason, installed, keysOk, onAnswer, closeModal }: {
   fileName: string; size: string; reason?: string; installed: number;
-  onAnswer: (ok: boolean) => void; closeModal?: () => void;
+  keysOk?: boolean; onAnswer: (ok: boolean) => void; closeModal?: () => void;
 }) {
   // Answer exactly once. Every dismissal route lands here, and a modal that
   // closes without resolving leaves the caller awaiting a promise forever.
@@ -11583,6 +11583,26 @@ function SwitchFirmwareConfirm({ fileName, size, reason, installed, onAnswer, cl
           <div style={{ fontSize: '13px', color: V2.fgMuted, lineHeight: 1.5, marginBottom: '18px' }}>
             {fileName} · {size} · installs into Eden’s system directory
           </div>
+          {/* Said BEFORE the download, not after it. Firmware without keys
+              installs perfectly and then boots nothing, and the only useful
+              moment to mention that is while the transfer is still a
+              choice. Not a block: installing now and adding keys later is a
+              legitimate order to do this in. */}
+          {keysOk === false && (
+            <div style={{
+              display: 'flex', gap: '8px', alignItems: 'flex-start',
+              background: 'rgba(251,191,36,0.10)',
+              border: `1px solid rgba(251,191,36,0.35)`,
+              borderRadius: V2.radiusMd, padding: '10px 12px', marginBottom: '18px',
+            }}>
+              <FaExclamationTriangle size={13} style={{ color: V2.warning, flexShrink: 0, marginTop: '2px' }} />
+              <div style={{ fontSize: '12px', color: V2.fg2, lineHeight: 1.45 }}>
+                No prod.keys found here or on RomM. Eden can’t decrypt firmware
+                without it, so games still won’t boot until you upload prod.keys
+                to the Switch platform.
+              </div>
+            </div>
+          )}
           <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
             <V2Button variant="text" onClick={() => answer(false)}>Cancel</V2Button>
             <V2Button variant="primary" onClick={() => answer(true)}>Install</V2Button>
@@ -11653,6 +11673,7 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
                 size={mb}
                 reason={avail.reason}
                 installed={avail.installed || 0}
+                keysOk={avail.keys_ok}
                 onAnswer={resolve}
               />
             );

@@ -12174,13 +12174,25 @@ class AutoSyncManager:
         if not entry:
             return {'available': False}
         status = emulator_saves.firmware_status() or {}
+        # Will this firmware be usable once it lands? Every NCA in it is
+        # encrypted, so firmware without keys boots nothing -- and the answer
+        # is known now, BEFORE a ~340 MB transfer, which is the only useful
+        # time to say it. Keys already on disk count; so does a keys entry on
+        # the server, which sync_switch_firmware installs first.
+        keys_ok = emulator_saves.find_prod_keys() is not None
+        if not keys_ok:
+            try:
+                keys_ok = bios.find_keys_entry('switch') is not None
+            except Exception:
+                keys_ok = False
         if emulator_saves.firmware_is_current(entry):
             return {'available': False, 'file_name': entry.get('file_name'),
-                    'installed': status.get('count', 0)}
+                    'installed': status.get('count', 0), 'keys_ok': keys_ok}
         return {'available': True,
                 'file_name': entry.get('file_name'),
                 'size': entry.get('file_size_bytes') or 0,
                 'installed': status.get('count', 0),
+                'keys_ok': keys_ok,
                 'reason': 'missing' if not status.get('count') else 'changed'}
 
     def sync_switch_firmware(self, progress=None):
