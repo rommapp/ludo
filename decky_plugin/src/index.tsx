@@ -3091,6 +3091,75 @@ function UserMenuRow({ icon, label, danger, armed, disabled, onSelect }:
   );
 }
 
+// Names reaching these lists are whatever the caller had to hand, which for an
+// unmatched rom (or an activity-log entry) is the file name as it sits on disk:
+// "Chrono Trigger (USA).sfc", or the Switch scene form
+// "Mario Kart 8 Deluxe [0100152000022000][v0] (6.77 GB)". Reduce it to the title
+// the rest of the UI shows, by peeling three things off the END only:
+//   • a trailing ROM/archive extension,
+//   • trailing [...] groups (title id, [v0] version, [BASE]/[DLC] tags),
+//   • a trailing size in parentheses.
+// Matched against a known extension set rather than "text after the last dot",
+// because plenty of real titles end in one ("Mr. Do!", "R-Type II"), and size
+// parens are matched by shape so region/revision tags — "(USA)", "(Rev 1)" —
+// survive: those distinguish real entries from one another.
+const _ROM_EXTS = new Set([
+  'zip', '7z', 'rar', 'gz', 'chd', 'iso', 'bin', 'cue', 'img', 'm3u', 'pbp', 'rvz', 'wbfs',
+  'nes', 'fds', 'sfc', 'smc', 'n64', 'z64', 'v64', 'gb', 'gbc', 'gba', 'nds', 'dsi', '3ds',
+  'cia', 'nsp', 'xci', 'nca', 'gcm', 'gcz', 'wad', 'sms', 'gg', 'md', 'smd', 'gen', '32x',
+  'cdi', 'a26', 'a78', 'lnx', 'ngp', 'ngc', 'ws', 'wsc', 'pce', 'sgx', 'vb', 'vec', 'col',
+  'int', 'd64', 'tap', 'tzx', 'adf', 'dsk', 'st', 'ipf', 'rom', 'cart', 'j64', 'jag', 'min',
+  'sv', 'xcz', 'nsz',
+]);
+const _SIZE_TAIL = /\s*\((?:<\s*)?\d+(?:[.,]\d+)?\s*(?:[KMGT]i?B|bytes)\)$/i;
+const _BRACKET_TAIL = /\s*\[[^\][]*\]$/;
+function _gameLabel(name: string): string {
+  let out = (name || '').trim();
+  // Extension first: it sits inside the tags in "Game [id][v0].nsp (6.77 GB)"
+  // only after the size/brackets are gone, so this loops until nothing peels.
+  for (let i = 0; i < 8; i++) {
+    const before = out;
+    out = out.replace(_SIZE_TAIL, '').replace(_BRACKET_TAIL, '').trimEnd();
+    const dot = out.lastIndexOf('.');
+    if (dot > 0 && _ROM_EXTS.has(out.slice(dot + 1).toLowerCase())) out = out.slice(0, dot).trimEnd();
+    if (out === before) break;
+  }
+  // Never hand back an empty label — a name that was ALL tags is better shown raw.
+  return out || name;
+}
+
+// Box art for a Downloads-page row, so each entry is recognisable at a glance
+// rather than being a name in a list. Same cache/queue path as the tiles, so a
+// game whose grid cover was already painted renders on the first frame. The
+// frame is drawn whether or not art arrives — a rom with no cover (or one still
+// loading) keeps the row's text aligned with its neighbours instead of shifting
+// left, which is why this doesn't return null the way ToastCover does.
+function DownloadRowCover({ romId }: { romId: number }) {
+  const ck = `cover:${romId}:false`;
+  const [uri, setUri] = useState<string | null>(peekCover(ck) ?? null);
+  useEffect(() => {
+    if (peekCover(ck) !== undefined) return;
+    let alive = true;
+    awaitCover(ck, () => qGetGameCover(romId, false))
+      .then((u) => { if (alive) setUri(u); })
+      .catch(() => { /* no art — the empty frame stands in */ });
+    return () => { alive = false; };
+  }, [romId]);
+  return (
+    <div style={{
+      flexShrink: 0, width: '30px', aspectRatio: '3 / 4', borderRadius: V2.radiusSm,
+      overflow: 'hidden', background: V2.surface,
+      border: '1px solid rgba(255,255,255,0.10)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      color: V2.fgFaint,
+    }}>
+      {uri
+        ? <img src={uri} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+        : <FaGamepad size={11} />}
+    </div>
+  );
+}
+
 // One entry on the Downloads page: game name over a live progress track, with
 // speed/percent on the right and a bytes/ETA detail line while transferring.
 function DownloadStatusRow({ romId, name }: { romId: number; name: string }) {
@@ -3105,14 +3174,16 @@ function DownloadStatusRow({ romId, name }: { romId: number; name: string }) {
     : [bytes, eta ? `${eta} left` : ''].filter(Boolean).join('  ·  ');
   const barColor = V2.brand;
   return (
-    <div style={{ padding: '10px 14px 12px' }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 14px 12px' }}>
+      <DownloadRowCover romId={romId} />
+      <div style={{ flex: '1 1 auto', minWidth: 0 }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '10px', minWidth: 0 }}>
         <span style={{
           fontSize: '13px', fontWeight: 600, color: V2.fg, minWidth: 0, display: 'inline-flex',
           alignItems: 'center', gap: '7px', overflow: 'hidden',
         }}>
           {extracting && <FaBoxOpen size={12} style={{ color: V2.fgMuted, flexShrink: 0 }} />}
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{_gameLabel(name)}</span>
         </span>
         <span style={{ fontSize: '11.5px', fontWeight: 600, color: V2.fgMuted, flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>
           {extracting ? `Extracting… ${pct}%` : `${prog && prog.speed > 0 ? `${formatSpeed(prog.speed)} · ` : ''}${pct}%`}
@@ -3122,6 +3193,7 @@ function DownloadStatusRow({ romId, name }: { romId: number; name: string }) {
         <div style={{ height: '100%', width: `${pct}%`, background: barColor, borderRadius: '2px', transition: 'width 0.3s ease, background 0.3s ease' }} />
       </div>
       {sub && <div style={{ fontSize: '10.5px', color: V2.fgMuted, marginTop: '5px', fontVariantNumeric: 'tabular-nums' }}>{sub}</div>}
+      </div>
     </div>
   );
 }
@@ -10279,11 +10351,11 @@ function RecentActivitySection() {
                 <div style={{
                   fontSize: '12px', fontWeight: 600, color: err ? V2.danger : V2.fg,
                   whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                }}>{e.title}</div>
+                }}>{_gameLabel(e.title)}</div>
                 {e.detail && <div style={{
                   fontSize: '11px', color: V2.fgMuted,
                   whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                }}>{e.detail}</div>}
+                }}>{_gameLabel(e.detail)}</div>}
               </div>
               <div style={{ flexShrink: 0, fontSize: '10px', color: V2.fgMuted, whiteSpace: 'nowrap' }}>
                 {fmtAgo(e.timestamp)}
@@ -10519,7 +10591,7 @@ function CompletedDownloadRow({ event, first }: {
   first: boolean;
 }) {
   const { active, highlightHandlers } = useRowHighlight();
-  const name = event.detail || event.title;
+  const name = _gameLabel(event.detail || event.title);
   const romId = event.rom_id;
   const open = romId != null
     ? () => openGameById(romId, name, "/romm-sync-downloads")
@@ -10542,11 +10614,16 @@ function CompletedDownloadRow({ event, first }: {
         cursor: open ? 'pointer' : 'default',
         transition: 'background 0.15s, box-shadow 0.15s',
       }}>
-      <div style={{ flexShrink: 0, color: V2.success, display: 'flex' }}><FaCheckCircle size={13} /></div>
+      {romId != null
+        ? <DownloadRowCover romId={romId} />
+        : <div style={{ flexShrink: 0, color: V2.success, display: 'flex' }}><FaCheckCircle size={13} /></div>}
       <div style={{
         flex: '1 1 auto', minWidth: 0, fontSize: '12.5px', fontWeight: 600, color: V2.fg,
-        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-      }}>{name}</div>
+        display: 'flex', alignItems: 'center', gap: '7px',
+      }}>
+        {romId != null && <FaCheckCircle size={12} style={{ flexShrink: 0, color: V2.success }} />}
+        <span style={{ minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</span>
+      </div>
       <div style={{ flexShrink: 0, fontSize: '10.5px', color: V2.fgMuted, whiteSpace: 'nowrap' }}>
         {fmtAgo(event.timestamp)}
       </div>
@@ -10570,7 +10647,7 @@ function DownloadsPage() {
   const syncingCols = ((status?.collections || []) as any[]).filter((c) => c.sync_state === 'syncing');
   const activeCount = activeDls.length + syncingCols.length;
 
-  const [recent, setRecent] = useState<Array<{ kind: string, title: string, detail: string, timestamp: number }>>([]);
+  const [recent, setRecent] = useState<Array<{ kind: string, title: string, detail: string, timestamp: number, rom_id?: number }>>([]);
   useEffect(() => {
     let alive = true;
     const load = async () => {
@@ -10638,11 +10715,11 @@ function DownloadsPage() {
                 display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 14px',
                 borderTop: i > 0 ? `1px solid ${V2.border}` : 'none',
               }}>
-                <div style={{ flexShrink: 0, color: V2.fgMuted, display: 'flex' }}><FaRegClock size={12} /></div>
+                <DownloadRowCover romId={q.romId} />
                 <div style={{
                   flex: '1 1 auto', minWidth: 0, fontSize: '12.5px', fontWeight: 500, color: V2.fg2,
                   whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                }}>{q.name}</div>
+                }}>{_gameLabel(q.name)}</div>
                 <div style={{ flexShrink: 0, fontSize: '10.5px', color: V2.fgMuted }}>Waiting</div>
               </div>
             ))}
