@@ -10,6 +10,8 @@ import logging
 import threading
 import time
 
+from . import emulator_saves
+
 # ─── Platforms whose firmware belongs in a subfolder of the system dir ───────
 # Most cores read the system directory flat, but a few insist on their own
 # subfolder and report "no BIOS" for a file sitting one level up. Flycast is the
@@ -579,10 +581,20 @@ class BiosManager:
         """True when a firmware record is a key file rather than firmware.
 
         Switch firmware sets and prod.keys are dumped, shared and uploaded
-        separately -- so both land in the same RomM firmware list, and telling
-        them apart is on us. Name-based, because that is all RomM records:
-        anything ending in .keys, or a container whose name says keys.
+        separately, so both land in the same RomM firmware list and telling
+        them apart is on us.
+
+        SIZE is the signal, not the name. The real uploads are ~14 KB of keys
+        against ~340 MB of NCAs; nothing that small can be a firmware set, and
+        no naming convention is a contract -- "ProdKeys.NET-v22.5.0.zip" is
+        what one site happens to call it. The name is kept only as a fallback
+        for a record with no size, and the final word belongs to
+        emulator_saves.identify_upload, which reads the file itself once it is
+        cheap to do so.
         """
+        size = entry.get('file_size_bytes')
+        if size:
+            return size <= emulator_saves.KEYS_MAX_BYTES
         name = (entry.get('file_name') or '').lower()
         if name.endswith('.keys'):
             return True

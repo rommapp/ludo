@@ -8270,6 +8270,28 @@ class Plugin:
             logging.error(f"download_bios error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
+    async def switch_firmware_status(self):
+        """Is a Switch firmware install worth prompting for, and how big.
+
+        Answered without downloading anything, so the prompt can state the
+        size before the user commits to it. 'reason' separates "Eden has no
+        firmware at all" (required to play anything) from "the server's
+        archive changed" (optional), because those deserve different wording.
+        """
+        try:
+            sync = self._auto_sync
+            if not sync:
+                return {'available': False}
+            if not (self._romm_client and self._romm_client.authenticated):
+                return {'available': False}
+            if not self._bios_manager():
+                return {'available': False}
+            return await asyncio.get_event_loop().run_in_executor(
+                None, sync.switch_firmware_update_available)
+        except Exception as e:
+            logging.error(f"switch_firmware_status error: {e}", exc_info=True)
+            return {'available': False}
+
     async def install_switch_firmware(self):
         """Install RomM's Switch firmware into Eden.
 

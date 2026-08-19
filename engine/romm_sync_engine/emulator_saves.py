@@ -24,6 +24,7 @@ caller. It writes nothing inside an emulator's directories.
 import json
 import logging
 import os
+import re
 import shutil
 import time
 import zipfile
@@ -53,6 +54,18 @@ _EDEN_FIRMWARE_DIR = ('nand', 'system', 'Contents', 'registered')
 # shipping them apart invites the one skew that cannot boot a game.
 _EDEN_KEYS_DIR = ('keys',)
 _KEY_FILES = ('prod.keys', 'title.keys')
+
+# A key file is small and a firmware set is not: the real uploads are ~14 KB
+# of keys against ~340 MB of NCAs, five orders of magnitude apart. The cutoff
+# only has to land somewhere in that gap, and it is what lets an entry be
+# identified by CONTENT -- fetching a candidate this size to look inside costs
+# nothing, while fetching a firmware archive to look inside would not.
+KEYS_MAX_BYTES = 4 * 1024 * 1024
+
+# prod.keys is text: "name = hex", one per line. Matching several lines rather
+# than one keeps a stray config file from passing as keys.
+_KEY_LINE_RE = re.compile(rb'^[a-z0-9_]+\s*=\s*[0-9a-fA-F]{16,}\s*$')
+_KEY_LINES_REQUIRED = 4
 
 # Depth to descend below the save root before giving up. The deepest known
 # layout puts the title three levels down; the margin covers a future one
@@ -456,6 +469,59 @@ def install_firmware_zip(zip_path, extra_data_dir=None, dry_run=False):
             'keys': keys_installed, 'keys_target': keys_target}
 
 
+def looks_like_keys(data):
+    """True when `data` is the text of a Switch key file.
+
+    Content, not name. A file called prod.keys that is actually a stray
+    download would otherwise be installed into Eden's keys directory and fail
+    at boot with the same undiagnosable dialog as no keys at all.
+    """
+    if not data:
+        return False
+    matched = 0
+    for line in data[:64 * 1024].splitlines():
+        if _KEY_LINE_RE.match(line.strip()):
+            matched += 1
+            if matched >= _KEY_LINES_REQUIRED:
+                return True
+    return False
+
+
+def identify_upload(path):
+    """What a downloaded RomM entry actually is: 'keys', 'firmware', or None.
+
+    Names are a hint and nothing more -- "ProdKeys.NET-v22.5.0.zip" and
+    "Firmware.22.5.0.zip" are conventions, not a contract, and a keys archive
+    named without the word would otherwise be handed to the firmware
+    installer, which would extract zero NCAs and report success. So decide by
+    looking: keys are recognised by their line format, firmware by containing
+    NCAs.
+    """
+    path = Path(path)
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                names = [Path(m.filename).name.lower()
+                         for m in archive.infolist() if not m.is_dir()]
+                for member in archive.infolist():
+                    if member.is_dir():
+                        continue
+                    if Path(member.filename).name.lower() not in _KEY_FILES:
+                        continue
+                    with archive.open(member) as fh:
+                        if looks_like_keys(fh.read(64 * 1024)):
+                            return 'keys'
+                if any(n.endswith('.nca') for n in names):
+                    return 'firmware'
+                return None
+        with open(path, 'rb') as fh:
+            if looks_like_keys(fh.read(64 * 1024)):
+                return 'keys'
+    except (OSError, zipfile.BadZipFile) as e:
+        log.debug("could not identify %s: %s", path, e)
+    return None
+
+
 def install_keys_file(path, extra_data_dir=None, dry_run=False):
     """Install a key file into Eden's keys/ directory. Returns the count.
 
@@ -498,6 +564,15 @@ def install_keys_file(path, extra_data_dir=None, dry_run=False):
                 name = Path(member.filename).name
                 if name.lower() not in _KEY_FILES:
                     continue
+                # Verify before writing. A member named prod.keys that is not
+                # key text would install cleanly and then fail at boot with
+                # the same dialog as no keys at all -- the least diagnosable
+                # outcome available, so it is worth one read to prevent.
+                with archive.open(member) as probe:
+                    if not looks_like_keys(probe.read(64 * 1024)):
+                        log.warning("%s in %s is not key data; not installing",
+                                    name, path.name)
+                        continue
                 with archive.open(member) as source:
                     _write(name, source)
                 written += 1
@@ -507,14 +582,19 @@ def install_keys_file(path, extra_data_dir=None, dry_run=False):
     # arrived under -- a file named "prod.keys.txt" by a browser is still the
     # keys, and a file named anything else is not something we rename into
     # place blindly.
+    with open(path, 'rb') as probe:
+        if not looks_like_keys(probe.read(64 * 1024)):
+            log.debug("%s is not key data", path)
+            return 0
+
+    # Content says keys; the name only decides WHICH of the two it is. A bare
+    # upload whose name says neither is assumed to be prod.keys, since that is
+    # the file Eden cannot start without and title.keys is optional.
     name = path.name.lower()
-    for known in _KEY_FILES:
-        if name.startswith(known):
-            with open(path, 'rb') as source:
-                _write(known, source)
-            return 1
-    log.debug("no key file recognised in %s", path)
-    return 0
+    known = next((k for k in _KEY_FILES if name.startswith(k)), 'prod.keys')
+    with open(path, 'rb') as source:
+        _write(known, source)
+    return 1
 
 
 def eden_is_running():

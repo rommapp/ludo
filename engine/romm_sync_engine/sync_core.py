@@ -11993,7 +11993,19 @@ class AutoSyncManager:
                 '_autocleanup_limit': _limit,
             })
 
-        inventory.extend(self._eden_inventory_entries())
+        eden_entries = self._eden_inventory_entries()
+        if eden_entries:
+            # Keys ride along with an ordinary Switch pass: ~14 KB, needed
+            # before Eden can start anything, and useless to defer behind a
+            # prompt. Firmware does not -- see sync_switch_firmware, which
+            # stays a prompted action because it is ~340 MB written into
+            # another application's system tree. Guarded so a key fetch can
+            # never fail an inventory build.
+            try:
+                self.ensure_switch_keys()
+            except Exception as e:
+                self.log(f"⚠️ Switch key check failed: {e}")
+        inventory.extend(eden_entries)
 
         # Dedupe by (rom_id, slot), keeping the newest file. Stale duplicate
         # copies of the same save (e.g. a leftover flat saves/Game.srm next to
@@ -12115,6 +12127,13 @@ class AutoSyncManager:
             if not path:
                 return {'installed': 0, 'status': 'failed'}
 
+            # Last word on what this file is: the entry looked like keys by
+            # size, now the bytes have to agree. install_keys_file re-checks
+            # per member, but failing here gives the caller a reason.
+            if emulator_saves.identify_upload(path) != 'keys':
+                self.log(f"⚠️ {entry.get('file_name')} is not a key file")
+                return {'installed': 0, 'status': 'not-keys'}
+
             written = emulator_saves.install_keys_file(path)
             if written:
                 emulator_saves.write_keys_marker(
@@ -12124,6 +12143,45 @@ class AutoSyncManager:
         except Exception as e:
             self.log(f"⚠️ Could not sync Switch keys: {e}")
             return {'installed': 0, 'status': 'failed'}
+
+    def ensure_switch_keys(self, progress=None):
+        """Install prod.keys from RomM when it is missing or out of date.
+
+        Safe to call on every Switch pass: it costs one platform listing when
+        the keys on disk already match, and an ~14 KB download when they do
+        not. Returns the same dict as _sync_switch_keys.
+        """
+        bios = getattr(self.retroarch, 'bios_manager', None)
+        if not bios:
+            return {'installed': 0, 'status': 'no-bios-manager'}
+        if emulator_saves.eden_keys_dir() is None:
+            return {'installed': 0, 'status': 'no-emulator'}
+        return self._sync_switch_keys(bios, progress=progress)
+
+    def switch_firmware_update_available(self):
+        """What a prompt needs to know, without downloading anything.
+
+        Returns {'available', 'file_name', 'size', 'installed', 'reason'}.
+        'reason' is 'missing' when Eden has no firmware at all and 'changed'
+        when the server's archive differs from the one we installed -- worth
+        distinguishing, because the first is required to play anything and the
+        second is optional.
+        """
+        bios = getattr(self.retroarch, 'bios_manager', None)
+        if not bios or emulator_saves.eden_firmware_dir() is None:
+            return {'available': False}
+        entry = bios.find_firmware_entry('switch')
+        if not entry:
+            return {'available': False}
+        status = emulator_saves.firmware_status() or {}
+        if emulator_saves.firmware_is_current(entry):
+            return {'available': False, 'file_name': entry.get('file_name'),
+                    'installed': status.get('count', 0)}
+        return {'available': True,
+                'file_name': entry.get('file_name'),
+                'size': entry.get('file_size_bytes') or 0,
+                'installed': status.get('count', 0),
+                'reason': 'missing' if not status.get('count') else 'changed'}
 
     def sync_switch_firmware(self, progress=None):
         """Fetch Switch firmware from RomM and install it into Eden.
@@ -12181,6 +12239,22 @@ class AutoSyncManager:
         if not archive:
             return {'status': 'failed',
                     'message': f"Could not download {entry.get('file_name')}"}
+
+        # An archive holding no NCAs is not firmware, whatever it is called.
+        # install_firmware_zip would extract nothing from it and report a
+        # perfectly successful install of zero files.
+        kind = emulator_saves.identify_upload(archive)
+        if kind != 'firmware':
+            if kind == 'keys':
+                written = emulator_saves.install_keys_file(archive)
+                emulator_saves.write_keys_marker(
+                    entry.get('file_name'), entry.get('md5_hash'))
+                return {'status': 'installed', 'installed': 0, 'skipped': 0,
+                        'keys': written,
+                        'message': f"{entry.get('file_name')} is a key file, "
+                                   'not firmware; installed it as keys'}
+            return {'status': 'failed',
+                    'message': f"{entry.get('file_name')} contains no firmware"}
 
         try:
             result = emulator_saves.install_firmware_zip(archive)

@@ -142,6 +142,9 @@ const downloadBios = callable<[string, (string)?], any>("download_bios");
 // Switch firmware is an Eden-tree install, not a BIOS-directory drop, so it has
 // its own call rather than riding download_bios. See install_switch_firmware.
 const installSwitchFirmware = callable<[], any>("install_switch_firmware");
+// Asked before the download, so the prompt can name the size. Firmware is the
+// one transfer here big enough that starting it unasked would be rude.
+const switchFirmwareStatus = callable<[], any>("switch_firmware_status");
 // Per-platform sync switches. get_ returns every platform with its rom_count and
 // whether it's on; set_ takes the whole disabled set, so it's idempotent.
 const getPlatformSync = callable<[], any>("get_platform_sync");
@@ -11504,6 +11507,47 @@ function biosChip(row: any, chevron?: boolean) {
   );
 }
 
+// Confirmation for the one transfer big enough to deserve one. Built from
+// ModalRoot/DialogButton rather than @decky/ui's ConfirmModal because those
+// two are already used throughout this file and are therefore known to exist
+// in the version we ship against.
+function SwitchFirmwareConfirm({ fileName, size, reason, installed, onAnswer, closeModal }: {
+  fileName: string; size: string; reason?: string; installed: number;
+  onAnswer: (ok: boolean) => void; closeModal?: () => void;
+}) {
+  // Answer exactly once: dismissing by any route must resolve the promise, or
+  // the caller waits forever on a modal that is no longer on screen.
+  const answered = useRef(false);
+  const answer = (ok: boolean) => {
+    if (answered.current) return;
+    answered.current = true;
+    onAnswer(ok);
+    closeModal?.();
+  };
+  return (
+    <ModalRoot bHideCloseIcon onCancel={() => answer(false)}
+      onEscKeypress={() => answer(false)}>
+      <Focusable noFocusRing className="romm-ui" style={{ padding: '1em' }}
+        onCancelButton={() => answer(false)}>
+        <div style={{ fontSize: '1.3em', fontWeight: 600, marginBottom: '0.5em' }}>
+          Install Switch firmware?
+        </div>
+        <div style={{ opacity: 0.85, marginBottom: '1.2em', lineHeight: 1.4 }}>
+          {reason === 'missing'
+            ? `Eden has no system firmware installed. ${fileName} is ${size}.`
+            : `A different firmware set is on the server. ${fileName} is ${size}, replacing ${installed} installed file(s).`}
+          {' It installs into Eden\u2019s system directory.'}
+        </div>
+        <div style={{ display: 'flex', gap: '0.6em' }}>
+          <DialogButton onClick={() => answer(true)}>Install</DialogButton>
+          <DialogButton onClick={() => answer(false)}>Cancel</DialogButton>
+        </div>
+      </Focusable>
+    </ModalRoot>
+  );
+}
+
+
 // One platform's firmware, as a panel rather than a page — the same shape as
 // CorePickerModal, which is the other "settle one platform's emulation detail"
 // surface. Opened from a BiosPage row or straight from a platform's actions
@@ -11543,6 +11587,32 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
     setBusy(true);
     try {
       if (isSwitch) {
+        // Prompt first. ~340 MB into another application's system tree is not
+        // something to start on a single button press without saying so --
+        // and when nothing has changed, this answers without transferring
+        // anything at all. Keys are deliberately NOT gated behind this: they
+        // are ~14 KB, Eden cannot start a game without them, and they sync
+        // with an ordinary Switch pass.
+        const avail = await switchFirmwareStatus();
+        if (avail && avail.available === false && avail.file_name) {
+          toaster.toast({ title: 'Switch firmware', body: 'Already up to date' });
+          return;
+        }
+        if (avail?.available) {
+          const mb = avail.size ? `${(avail.size / 1048576).toFixed(0)} MB` : 'a large download';
+          const ok = await new Promise<boolean>((resolve) => {
+            showModal(
+              <SwitchFirmwareConfirm
+                fileName={avail.file_name}
+                size={mb}
+                reason={avail.reason}
+                installed={avail.installed || 0}
+                onAnswer={resolve}
+              />
+            );
+          });
+          if (!ok) return;
+        }
         const r = await installSwitchFirmware();
         // 'up-to-date' is a success with nothing to do; say so rather than
         // leaving the row looking like the press did nothing.

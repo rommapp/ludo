@@ -17,6 +17,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from romm_sync_engine import emulator_saves as E        # noqa: E402
 from romm_sync_engine.bios_manager import BiosManager    # noqa: E402
 
+# Real prod.keys shape: "name = hex", one per line. Values here are invented,
+# but the FORMAT is what identification keys on, so it has to be the real one.
+KEY_TEXT = b"""aes_kek_generation_source = 4d870986c45d20722fba1053da92e8a9
+aes_key_generation_source = 89615ee05c31b6805fe58f3da24f7aa8
+bis_kek_source = 34c1a0c48258f8b4fa9e5e6adafc7e4f
+header_key = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+master_key_00 = c2caaff089b9aed55694876055271c7d
+"""
+OTHER_KEY_TEXT = KEY_TEXT.replace(b'master_key_00', b'master_key_0a')
+
 FAILURES = []
 
 
@@ -29,25 +39,32 @@ def check(name, got, want):
 
 def main():
     # --- telling a key upload from a firmware upload -------------------
-    for name, want in [
-        ('ProdKeys.NET-v22.5.0.zip', True),   # the real keys upload
-        ('prod.keys', True),                  # a bare upload
-        ('title.keys', True),
-        ('switch-keys.zip', True),
-        ('Firmware.22.5.0.zip', False),       # the real firmware upload
-        ('Firmware_17.0.1.zip', False),
-        ('firmware.zip', False),
-        # "keys" inside a name that is not an archive of keys must not
-        # match, or firmware would be installed as a key file.
-        ('Monkeys.nca', False),
+    # Size decides, because names are a convention and not a contract. The
+    # real uploads are ~7 KB zipped keys against ~340 MB of firmware.
+    KEYS, FW = 7413, 340773992
+    for name, size, want in [
+        ('ProdKeys.NET-v22.5.0.zip', KEYS, True),   # the real keys upload
+        ('Firmware.22.5.0.zip', FW, False),         # the real firmware upload
+        # The two cases a name-based rule got wrong, and the reason for
+        # deciding on size instead.
+        ('switch-22.5.0.zip', KEYS, True),          # keys, name says nothing
+        ('keys-firmware.zip', FW, False),           # firmware, name says keys
     ]:
         check(f'classify {name}',
+              BiosManager._is_keys_entry(
+                  {'file_name': name, 'file_size_bytes': size}), want)
+
+    # With no size recorded, the name is all there is.
+    for name, want in [('prod.keys', True), ('title.keys', True),
+                       ('switch-keys.zip', True), ('Firmware.22.5.0.zip', False),
+                       ('Monkeys.nca', False)]:
+        check(f'classify {name} (no size)',
               BiosManager._is_keys_entry({'file_name': name}), want)
 
     # A platform holding both uploads must resolve each to the right one.
     entries = [
-        {'file_name': 'Firmware.22.5.0.zip', 'file_size_bytes': 340773992},
-        {'file_name': 'ProdKeys.NET-v22.5.0.zip', 'file_size_bytes': 7413},
+        {'file_name': 'Firmware.22.5.0.zip', 'file_size_bytes': FW},
+        {'file_name': 'ProdKeys.NET-v22.5.0.zip', 'file_size_bytes': KEYS},
     ]
     firmware = [e for e in entries if not BiosManager._is_keys_entry(e)]
     keys = [e for e in entries if BiosManager._is_keys_entry(e)]
@@ -64,32 +81,32 @@ def main():
         # --- a zipped keys upload, shaped like the real one ------------
         archive = d / 'ProdKeys.NET-v22.5.0.zip'
         with zipfile.ZipFile(archive, 'w') as z:
-            z.writestr('title.keys', b'TITLE')
-            z.writestr('prod.keys', b'MASTER')
+            z.writestr('title.keys', OTHER_KEY_TEXT)
+            z.writestr('prod.keys', KEY_TEXT)
         check('installs both key files',
               E.install_keys_file(archive, extra_data_dir=data), 2)
         check('prod.keys content', (data / 'keys/prod.keys').read_bytes(),
-              b'MASTER')
+              KEY_TEXT)
         check('title.keys content', (data / 'keys/title.keys').read_bytes(),
-              b'TITLE')
+              OTHER_KEY_TEXT)
         check('find_prod_keys sees it',
               E.find_prod_keys(extra_data_dir=data), data / 'keys/prod.keys')
 
         # --- a bare upload --------------------------------------------
         bare = d / 'prod.keys'
-        bare.write_bytes(b'BARE')
+        bare.write_bytes(KEY_TEXT)
         check('installs a bare key file',
               E.install_keys_file(bare, extra_data_dir=data), 1)
         check('bare content replaces', (data / 'keys/prod.keys').read_bytes(),
-              b'BARE')
+              KEY_TEXT)
 
         # A browser that appended an extension still delivered the keys.
         renamed = d / 'prod.keys.txt'
-        renamed.write_bytes(b'RENAMED')
+        renamed.write_bytes(OTHER_KEY_TEXT)
         check('installs a renamed key file',
               E.install_keys_file(renamed, extra_data_dir=data), 1)
         check('renamed lands under the canonical name',
-              (data / 'keys/prod.keys').read_bytes(), b'RENAMED')
+              (data / 'keys/prod.keys').read_bytes(), OTHER_KEY_TEXT)
 
         # Anything else is not silently renamed into place.
         junk = d / 'notes.txt'
@@ -107,12 +124,58 @@ def main():
         # Traversal in a keys archive buys nothing, same rule as firmware.
         evil = d / 'evil.zip'
         with zipfile.ZipFile(evil, 'w') as z:
-            z.writestr('../../../prod.keys', b'ESCAPED')
+            z.writestr('../../../prod.keys', KEY_TEXT)
         E.install_keys_file(evil, extra_data_dir=data)
         check('traversal stays inside keys/',
               sorted(p.relative_to(data).as_posix()
                      for p in data.rglob('prod.keys')),
               ['keys/prod.keys'])
+
+        # --- identification by content, not by name -------------------
+        # The final authority. A keys archive named like firmware would
+        # otherwise be handed to install_firmware_zip, which extracts zero
+        # NCAs and reports a perfectly successful install of nothing.
+        misnamed = d / 'Firmware.99.0.0.zip'
+        with zipfile.ZipFile(misnamed, 'w') as z:
+            z.writestr('prod.keys', KEY_TEXT)
+        check('a keys archive named like firmware is keys',
+              E.identify_upload(misnamed), 'keys')
+
+        fw_named_keys = d / 'super-keys-pack.zip'
+        with zipfile.ZipFile(fw_named_keys, 'w') as z:
+            z.writestr('deadbeefdeadbeefdeadbeefdeadbeef.nca', b'N' * 32)
+        check('an NCA archive named like keys is firmware',
+              E.identify_upload(fw_named_keys), 'firmware')
+
+        check('a bare key file identifies', E.identify_upload(bare), 'keys')
+        check('an unrelated file identifies as neither',
+              E.identify_upload(junk), None)
+
+        empty = d / 'empty.zip'
+        with zipfile.ZipFile(empty, 'w') as z:
+            z.writestr('readme.txt', b'nothing here')
+        check('an archive of neither is neither',
+              E.identify_upload(empty), None)
+
+        # A member with the right NAME but the wrong CONTENT must not be
+        # installed: it would land in keys/ and fail at boot with the same
+        # dialog as no keys at all, which is the least diagnosable outcome.
+        impostor = d / 'impostor.zip'
+        with zipfile.ZipFile(impostor, 'w') as z:
+            z.writestr('prod.keys', b'<html>404 Not Found</html>')
+        check('a fake prod.keys is not identified',
+              E.identify_upload(impostor), None)
+        before = (data / 'keys/prod.keys').read_bytes()
+        check('a fake prod.keys installs nothing',
+              E.install_keys_file(impostor, extra_data_dir=data), 0)
+        check('a fake prod.keys leaves the real one alone',
+              (data / 'keys/prod.keys').read_bytes(), before)
+
+        check('nonsense is not keys', E.looks_like_keys(b'hello world'), False)
+        check('empty is not keys', E.looks_like_keys(b''), False)
+        # One matching line is a coincidence; several are a key file.
+        check('a single matching line is not enough',
+              E.looks_like_keys(b'foo = 0123456789abcdef0123456789abcdef'), False)
 
         # --- currency -------------------------------------------------
         # Markers live under config_dir(), which is derived from HOME --
