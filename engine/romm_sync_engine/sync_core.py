@@ -12092,7 +12092,9 @@ class AutoSyncManager:
 
         Returns a dict describing what happened, with 'status' one of:
         'installed', 'up-to-date', 'no-firmware' (nothing on the server),
-        'no-emulator' (Eden not installed here), or 'failed'.
+        'no-keys' (firmware landed, but prod.keys is absent, so nothing it
+        contains can be decrypted), 'no-emulator' (Eden not installed here),
+        or 'failed'.
 
         Deliberately not automatic. Firmware is a single ~324 MB object, it
         changes about as often as the emulator does, and it is the one thing
@@ -12139,6 +12141,20 @@ class AutoSyncManager:
         status = emulator_saves.firmware_status() or {}
         emulator_saves.write_firmware_marker(
             entry.get('file_name'), entry.get('md5_hash'), status.get('count', 0))
+
+        # Keys are not optional bookkeeping: every NCA here is encrypted, so an
+        # install without prod.keys boots nothing. Report that rather than
+        # claiming success for a set that cannot run a game.
+        if emulator_saves.find_prod_keys() is None:
+            self.log("⚠️ Firmware installed, but prod.keys is missing — "
+                     "Eden cannot decrypt it")
+            return {'status': 'no-keys', **result,
+                    'message': 'Firmware installed, but prod.keys is missing. '
+                               'Add it to the firmware archive on RomM, or '
+                               "place it in Eden's keys/ directory."}
+
+        if result['keys']:
+            self.log(f"🔑 Installed {result['keys']} key file(s)")
 
         if not result['installed']:
             return {'status': 'up-to-date', 'installed': 0,

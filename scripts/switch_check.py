@@ -163,7 +163,9 @@ def main():
     for data_dir in data_dirs:
         print(f"  data dir   : {data_dir}")
     keys = emulator_saves.find_prod_keys()
-    print(f"  prod.keys  : {keys or 'absent — Sigil cannot read Switch containers'}")
+    print(f"  prod.keys  : {keys or 'ABSENT — Eden cannot decrypt firmware or '
+                                     'boot any game, and Sigil cannot read '
+                                     'Switch containers'}")
     status = emulator_saves.firmware_status()
     if status:
         print(f"  firmware   : {status['count']} NCAs, {human(status['bytes'])}")

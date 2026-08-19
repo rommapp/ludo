@@ -38,8 +38,10 @@ def main():
             # Not firmware — must be ignored rather than written into the
             # emulator's system directory.
             z.writestr('README.txt', b'notes')
-            # Path traversal, and a directory-prefixed member: both must land
-            # flat in registered/ by basename, or not at all.
+            # Path traversal on a member we DO want. prod.keys is installed
+            # now -- but by basename into the keys directory we choose, so the
+            # "../../" must buy the archive nothing: same destination as a
+            # member named plainly "prod.keys".
             z.writestr('../../keys/prod.keys', b'SECRET')
             z.writestr('nested/dir/ffffffffffffffffffffffffffffffff.nca', b'F' * 20)
 
@@ -55,9 +57,17 @@ def main():
         ])
         check('installed count', result['installed'], 4)
         check('README.txt not written', (target / 'README.txt').exists(), False)
-        # The traversal member must not have escaped the target directory.
-        check('prod.keys not written anywhere',
-              list(data.rglob('prod.keys')), [])
+        # Routed to the keys directory, and to exactly one place -- the
+        # traversal prefix neither escaped the data directory nor put a copy
+        # in registered/.
+        check('prod.keys lands in keys/ only',
+              [p.relative_to(data).as_posix() for p in data.rglob('prod.keys')],
+              ['keys/prod.keys'])
+        check('prod.keys content installed',
+              (data / 'keys/prod.keys').read_bytes(), b'SECRET')
+        check('key files not counted as firmware', result['keys'], 1)
+        check('find_prod_keys sees it',
+              E.find_prod_keys(extra_data_dir=data), data / 'keys/prod.keys')
         check('no .part files left behind', list(target.glob('*.part')), [])
         check('nested member flattened, no subdirs',
               [p.name for p in target.iterdir() if p.is_dir()], [])
@@ -78,6 +88,18 @@ def main():
         check('content restored',
               (target / 'a9ae812b2773995aab7c2630e80a7fd7.nca').read_bytes(),
               b'A' * 70)
+
+        # An archive carrying no keys must not create an empty keys/ as a
+        # side effect of looking for them.
+        bare_data = d / 'bare/eden'
+        (bare_data / 'nand/system/Contents/registered').mkdir(parents=True)
+        bare = d / 'nokeys.zip'
+        with zipfile.ZipFile(bare, 'w', zipfile.ZIP_STORED) as z:
+            z.writestr('deadbeefdeadbeefdeadbeefdeadbeef.nca', b'D' * 10)
+        bare_result = E.install_firmware_zip(bare, extra_data_dir=bare_data)
+        check('no keys in archive, none reported', bare_result['keys'], 0)
+        check('no empty keys directory created',
+              (bare_data / 'keys').exists(), False)
 
         # No Eden at all is an error the caller must see, not a silent no-op.
         try:
@@ -119,6 +141,20 @@ def main():
         check('drifted NCA count is not current',
               E.firmware_is_current(entry, extra_data_dir=data), False)
 
+        # The repair path for an install that predates key syncing: marker and
+        # count both agree, but without prod.keys the firmware decrypts
+        # nothing, so it must NOT read as current -- re-installing is what
+        # delivers the keys.
+        E.write_firmware_marker(entry['file_name'], entry['md5_hash'], installed)
+        keys_file = data / 'keys/prod.keys'
+        keys_file.rename(data / 'keys/prod.keys.bak')
+        check('firmware without keys is not current',
+              E.firmware_is_current(entry, extra_data_dir=data), False)
+        (data / 'keys/prod.keys.bak').rename(keys_file)
+        check('current again once keys are back',
+              E.firmware_is_current(entry, extra_data_dir=data), True)
+
+        E.write_firmware_marker(entry['file_name'], entry['md5_hash'], installed + 3)
         check('an entry with no md5 is never current',
               E.firmware_is_current({'file_name': 'x.zip'}, extra_data_dir=data),
               False)

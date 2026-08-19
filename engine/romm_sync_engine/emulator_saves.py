@@ -46,6 +46,14 @@ _EDEN_SAVE_ROOT = ('nand', 'user', 'save')
 # no subdirectories at all.
 _EDEN_FIRMWARE_DIR = ('nand', 'system', 'Contents', 'registered')
 
+# Key files that ride along in a firmware archive, written into Eden's keys/
+# directory rather than the firmware directory. Every Switch firmware
+# generation introduces a new master key, and prod.keys is what carries it --
+# so firmware and keys are one versioned set, not two independent ones, and
+# shipping them apart invites the one skew that cannot boot a game.
+_EDEN_KEYS_DIR = ('keys',)
+_KEY_FILES = ('prod.keys', 'title.keys')
+
 # Depth to descend below the save root before giving up. The deepest known
 # layout puts the title three levels down; the margin covers a future one
 # without letting a symlink loop or a user's misplaced backup folder turn
@@ -220,6 +228,21 @@ def eden_firmware_dir(extra_data_dir=None, create=False):
     return None
 
 
+def eden_keys_dir(extra_data_dir=None, create=False):
+    """Where Eden looks for prod.keys, or None when Eden is absent."""
+    for data_dir in eden_data_dirs(extra_data_dir):
+        target = data_dir.joinpath(*_EDEN_KEYS_DIR)
+        if target.is_dir():
+            return target
+        if create:
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                return target
+            except OSError as e:
+                log.debug("could not create %s: %s", target, e)
+    return None
+
+
 def firmware_status(extra_data_dir=None):
     """What firmware is installed: {'path', 'count', 'bytes'}, or None."""
     target = eden_firmware_dir(extra_data_dir)
@@ -286,6 +309,13 @@ def firmware_is_current(entry, extra_data_dir=None):
     expected = (entry.get('md5_hash') or '').lower()
     if not marker or not expected or marker.get('md5') != expected:
         return False
+    # Firmware without keys cannot decrypt anything, so it is not "current" in
+    # any sense the caller cares about -- re-installing is what delivers the
+    # prod.keys that rides in the same archive. This is also the repair path
+    # for anyone who installed firmware before keys were carried at all: the
+    # marker still matches, and only this check sends them back for the keys.
+    if find_prod_keys(extra_data_dir) is None:
+        return False
     status = firmware_status(extra_data_dir)
     if not status or not status['count']:
         return False
@@ -298,16 +328,23 @@ def install_firmware_zip(zip_path, extra_data_dir=None, dry_run=False):
     Returns {'installed', 'skipped', 'target'} — skipped counts NCAs already
     present with the same size, so re-running is cheap and idempotent.
 
-    Only .nca members are extracted, and each is written under its BASENAME
-    into registered/. Both rules are deliberate:
+    Two kinds of member are extracted, each written under its BASENAME into a
+    destination THIS code picks -- .nca into registered/, prod.keys and
+    title.keys into keys/. Everything else is ignored. The rules are
+    deliberate:
 
-      * A firmware zip is NCAs and nothing else; anything else in the archive
-        is not firmware and has no business being written into an emulator's
-        system directory.
-      * Taking the basename neutralises path traversal ("../../keys/prod.keys")
-        and also flattens an archive that happens to carry a directory prefix,
-        which is the difference between the zip we tell users to build and one
-        downloaded from elsewhere.
+      * Nothing in the archive chooses where it lands. Taking the basename
+        neutralises path traversal ("../../keys/prod.keys") and also flattens
+        an archive carrying a directory prefix, which is the difference
+        between the zip we tell users to build and one downloaded from
+        elsewhere. Routing by basename to a fixed directory is not traversal:
+        the archive names the file, we name the location.
+      * Keys belong in the same archive as the firmware because they are the
+        same versioned set. Each firmware generation adds a master key, and an
+        older prod.keys cannot decrypt newer NCAs -- so installing them
+        together is what makes "firmware installed" mean "firmware usable".
+        Split across two entries, updating one and forgetting the other
+        yields a complete-looking install that fails at boot.
 
     Firmware is replaceable content, not user data — an NCA is identified by
     the hash in its own name, so a same-named file is the same file. Saves are
@@ -318,22 +355,46 @@ def install_firmware_zip(zip_path, extra_data_dir=None, dry_run=False):
     if target is None:
         raise FileNotFoundError("no Eden installation to install firmware into")
 
-    installed = skipped = 0
+    keys_target = None
+    installed = skipped = keys_installed = 0
     with zipfile.ZipFile(zip_path) as archive:
         for member in archive.infolist():
             if member.is_dir():
                 continue
             name = Path(member.filename).name
-            if not name.lower().endswith('.nca'):
+            lowered = name.lower()
+            is_key = lowered in _KEY_FILES
+            if not is_key and not lowered.endswith('.nca'):
                 log.debug("skipping non-firmware member %s", member.filename)
                 continue
 
-            destination = target / name
-            if destination.is_file() and destination.stat().st_size == member.file_size:
-                skipped += 1
-                continue
+            if is_key:
+                # Resolved lazily: an archive with no keys must not create an
+                # empty keys/ directory as a side effect.
+                if keys_target is None:
+                    keys_target = eden_keys_dir(extra_data_dir,
+                                                create=not dry_run)
+                    if keys_target is None:
+                        if dry_run:
+                            keys_installed += 1
+                            continue
+                        log.debug("no keys directory available; skipping %s", name)
+                        continue
+                # Size is not identity for a key file the way an NCA's hashed
+                # name is: a newer prod.keys can carry an added master key at
+                # the same length. Always rewrite -- it is 11 KB.
+                destination = keys_target / lowered
+            else:
+                destination = target / name
+                if (destination.is_file()
+                        and destination.stat().st_size == member.file_size):
+                    skipped += 1
+                    continue
             if dry_run:
-                installed += 1
+                if is_key:
+                    keys_installed += 1
+                else:
+                    installed += 1
                 continue
 
             # Stage then rename: Eden reading registered/ while a half-written
@@ -346,9 +407,13 @@ def install_firmware_zip(zip_path, extra_data_dir=None, dry_run=False):
             except BaseException:
                 staging.unlink(missing_ok=True)
                 raise
-            installed += 1
+            if is_key:
+                keys_installed += 1
+            else:
+                installed += 1
 
-    return {'installed': installed, 'skipped': skipped, 'target': target}
+    return {'installed': installed, 'skipped': skipped, 'target': target,
+            'keys': keys_installed, 'keys_target': keys_target}
 
 
 def eden_is_running():
