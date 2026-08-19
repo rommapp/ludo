@@ -643,6 +643,15 @@ class Plugin:
     # in place.
     _library_progress: dict = None
 
+    # Set between pairing and the end of the setup wizard, to hold back the
+    # whole-library walk until the user has picked their platforms. Pairing has
+    # to connect immediately — the Platforms step is populated from
+    # /api/platforms, which needs an authenticated client — but that step exists
+    # precisely to trim what gets fetched, and a walk already minutes deep by the
+    # time it is answered makes the switches pointless. finish_onboarding()
+    # clears it and starts the fetch the choices describe.
+    _defer_library_fetch: bool = False
+
     # Open append handle for the partial-fetch checkpoint, and the lock guarding
     # it — pages are written from the fetch's worker threads, and a torn line
     # would cost every page after it on the next resume.
@@ -1682,7 +1691,11 @@ class Plugin:
                 if kind == 'loaded' and isinstance(payload, dict):
                     self._library_progress = payload
 
-            if skip_fetch or hold_for_consent or reconciled is not None:
+            if self._defer_library_fetch:
+                logging.info("Setup in progress — holding the library fetch until "
+                             "the wizard's platform choices are in")
+                roms_result = None
+            elif skip_fetch or hold_for_consent or reconciled is not None:
                 roms_result = None
             else:
                 fetch_started = time.time()
@@ -1838,7 +1851,17 @@ class Plugin:
             else:
                 self._auto_sync.romm_client = self._romm_client
 
-            if self._settings.get('AutoSync', 'auto_enable_on_connect') == 'true':
+            # Same hold as the library walk, for the same reason. The connect
+            # negotiate is bidirectional: it sends an empty local inventory and
+            # the server answers with download ops, which land in the saves dir
+            # whether or not the ROM is here — so a device that pairs into an
+            # account with save history pulls files during the wizard, for
+            # platforms the user may be about to switch off. (The negotiate
+            # honours no platform filter, but at least it can wait until setup
+            # is a decision rather than a screen in progress.)
+            if self._defer_library_fetch:
+                logging.info("Setup in progress — holding save auto-sync until setup ends")
+            elif self._settings.get('AutoSync', 'auto_enable_on_connect') == 'true':
                 self._auto_sync.upload_enabled   = True
                 self._auto_sync.download_enabled = True
                 try:
@@ -2333,6 +2356,39 @@ class Plugin:
             logging.error(f"time_cold_fetch error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
+    async def finish_onboarding(self):
+        """Release the library fetch that pairing held back for the wizard.
+
+        Called when setup ends (and on Back out of the platform step's own exit,
+        via the same route) so the walk starts against the platform switches the
+        user actually chose. Safe to call when nothing was deferred — a normal
+        connect has already fetched, and the reconnect below no-ops on the skip
+        check rather than re-walking.
+        """
+        try:
+            if not self._defer_library_fetch:
+                return {'success': True, 'started': False}
+            self._defer_library_fetch = False
+            # Reconnect rather than calling the fetch directly: _connect_to_romm
+            # is where the walk lives, and it rebuilds the client with the
+            # platform filter applied (_apply_platform_sync_to_client) — which
+            # is the whole point of having waited.
+            def _run():
+                try:
+                    self._stop_sync()
+                    time.sleep(0.5)
+                    self._start_sync()
+                except Exception as e:
+                    logging.error(f"finish_onboarding: {e}", exc_info=True)
+
+            threading.Thread(target=_run, daemon=True,
+                             name="ludo-onboarding-fetch").start()
+            logging.info("Setup finished — starting the library fetch")
+            return {'success': True, 'started': True}
+        except Exception as e:
+            logging.error(f"finish_onboarding error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
     async def refresh_from_romm(self, force_full_refresh: bool = False):
         """Refresh data from RomM server (collections and games).
 
@@ -2351,6 +2407,12 @@ class Plugin:
                 'message': 'Not connected to RomM',
                 'status': await self.get_service_status()
             }
+
+        # A refresh asked for by hand outranks the wizard hold — and clearing it
+        # here is also the escape hatch for a setup that was abandoned after
+        # pairing, which would otherwise sit with the fetch parked until the
+        # next plugin load.
+        self._defer_library_fetch = False
 
         # One refresh at a time. Two buttons could already start concurrent
         # refreshes — the header one and the account-menu one each tracked only
@@ -4437,6 +4499,11 @@ class Plugin:
             # route for password auth; pairing was the odd one out.
             self._stop_sync()
             await asyncio.sleep(0.5)
+            # Connect, but stop short of the library walk: the wizard's next
+            # steps include the platform switches, and fetching everything now
+            # would finish (or be minutes into) exactly the work those switches
+            # exist to avoid. finish_onboarding() lifts this.
+            self._defer_library_fetch = True
             self._start_sync()
             _record_activity('account', 'Signed in', url)
             # 'paired' is reported separately from 'success' because the two mean
@@ -4444,9 +4511,14 @@ class Plugin:
             # single-use and is spent by the time we get here, so a retry after a
             # merely-failed CONNECTION would come back "invalid or expired" and
             # strand a device that is, in fact, paired.
+            # 'connecting' is False now not because nothing is happening, but
+            # because the thing it announced to the user — "loading your
+            # library" — is the part being held back. 'deferred' says so
+            # explicitly for a caller that wants to word it differently.
             return {'success': True,
                     'paired': True,
-                    'connecting': True,
+                    'connecting': False,
+                    'deferred': True,
                     'message': 'Paired'}
         except Exception as e:
             logging.error(f"_apply_pairing error: {e}", exc_info=True)

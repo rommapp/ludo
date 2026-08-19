@@ -54,6 +54,47 @@ npm run electron:dev   # launch against the Vite dev server (hot reload)
 The interpreter is `desktop/.venv/bin/python` (or `.venv/Scripts/python.exe` on
 Windows) if present, else `python3`/`python`; override with `ROMM_PYTHON`.
 
+### Launch from the host, not from a container (NVIDIA)
+
+**On an NVIDIA host, do not run the app from inside a distrobox/toolbox
+container.** It will start, look correct, and render entirely on the CPU.
+
+`/dev/dri` is passed into the container, but that is only half of what NVIDIA
+needs: its GL/EGL implementation lives in proprietary userspace libraries
+(`libGLX_nvidia`, `libEGL_nvidia`, `libnvidia-glcore`) that must version-match
+the host kernel module exactly, and they are not present unless the box was
+created with `distrobox create --nvidia`. EGL init fails and Chromium silently
+falls back to the SwiftShader software rasterizer.
+
+Mesa has no such split — the driver ships inside the image and needs only the
+device node — so **the same container is fast on AMD/Intel**. That asymmetry is
+what makes this look like an app performance bug instead of a missing driver.
+
+Measured on one machine (RTX 2080 Ti, 2560×1440@180Hz, Wayland), scrolling the
+library:
+
+| Launched from | Renderer | fps |
+| --- | --- | --- |
+| host | NVIDIA RTX 2080 Ti (OpenGL 4.5) | ~175 |
+| distrobox (no `--nvidia`) | SwiftShader (CPU) | unusable |
+
+Build in the container if that is where `npm` lives, but launch outside it. The
+host does not need `node` — the Electron binary takes the app directory:
+
+```bash
+distrobox enter <box> -- bash -lc 'cd /path/to/ludo/desktop && npm run build'
+cd /path/to/ludo/desktop && env -u ELECTRON_RUN_AS_NODE ./node_modules/electron/dist/electron .
+```
+
+`env -u ELECTRON_RUN_AS_NODE` applies the same guard `electron/launch.cjs`
+exists to provide; bypassing the launcher means applying it yourself.
+
+Alternatively recreate the box with `distrobox create --nvidia`, then re-check —
+that integration has to keep matching the host driver across updates.
+
+The shell warns on startup (`[gpu] SOFTWARE RENDERING`) whenever it detects this,
+so check the console before investigating a performance complaint.
+
 What the shell reproduces from `app.py`:
 
 - **Zoom-to-fit** — the UI is authored for the Deck's 1280×800 gamepad viewport,

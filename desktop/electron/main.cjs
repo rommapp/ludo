@@ -280,6 +280,44 @@ function applyZoom() {
   win.webContents.setZoomFactor(zoom);
 }
 
+// Chromium does not fail loudly when it cannot reach the GPU — it falls back to
+// the SwiftShader software rasterizer and carries on, correct and slow. On a
+// high-DPI display that is the difference between ~175fps and a UI that feels
+// broken, with nothing in the log to say why.
+//
+// The fallback that prompted this: running inside a distrobox/toolbox container
+// on an NVIDIA host. `/dev/dri` is passed through, but NVIDIA's GL/EGL lives in
+// proprietary userspace libs that must version-match the host kernel module, and
+// those are absent unless the box was created with `--nvidia`. Mesa has no such
+// split — the driver ships in the image and needs only the device node — so the
+// same container is perfectly fast on AMD, which makes the failure look like an
+// app bug rather than a missing driver. Launching from the host fixes it; see
+// desktop/README.md.
+//
+// Must run after a BrowserWindow exists: with no window there is no compositing
+// surface, the GPU process never initializes, and every feature reads as
+// software even on a healthy host.
+function warnIfSoftwareRendering() {
+  // A frame has to be composited before the status is meaningful, and that
+  // cannot happen synchronously from window construction.
+  setTimeout(() => {
+    try {
+      const status = app.getGPUFeatureStatus() || {};
+      if (!String(status.gpu_compositing || "").startsWith("disabled_software")) return;
+      console.warn(
+        "[gpu] SOFTWARE RENDERING — no GPU acceleration. The UI will be slow.\n" +
+        "[gpu]   gpu_compositing=" + status.gpu_compositing +
+        "  rasterization=" + status.rasterization + "  webgl=" + status.webgl + "\n" +
+        "[gpu]   On Linux this usually means the app was launched inside a\n" +
+        "[gpu]   container without the host's GPU userspace drivers. Run it from\n" +
+        "[gpu]   the host instead (see desktop/README.md)."
+      );
+    } catch (err) {
+      console.warn("[gpu] could not read GPU feature status:", err.message);
+    }
+  }, 3000);
+}
+
 function createWindow(url, fullscreen) {
   win = new BrowserWindow({
     width: 1280,
@@ -302,6 +340,8 @@ function createWindow(url, fullscreen) {
   });
 
   win.setMenuBarVisibility(false);
+
+  warnIfSoftwareRendering();
 
   // Keep zoom tracking the height. setZoomFactor only sticks once a document is
   // committed, so (re)apply on load and on every resize.

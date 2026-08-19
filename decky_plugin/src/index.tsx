@@ -103,6 +103,9 @@ const pairDevice = callable<[string, string], any>("pair_device");
 const startQrPairing = callable<[string], any>("start_qr_pairing");
 const pollQrPairing = callable<[], any>("poll_qr_pairing");
 const cancelQrPairing = callable<[], any>("cancel_qr_pairing");
+// Releases the library fetch that pairing deferred, so the walk starts against
+// the platform switches the wizard just collected rather than ahead of them.
+const finishOnboarding = callable<[], any>("finish_onboarding");
 const setDeviceNameRpc = callable<[string], any>("set_device_name");
 const getSaveHistory = callable<[number], any>("get_save_history");
 const getPendingUploads = callable<[], any>("get_pending_uploads");
@@ -5386,7 +5389,7 @@ function ConfigPage() {
         {testResult && (
           <PanelSectionRow>
             <div style={{ color: testResult.success ? '#4ade80' : '#f87171', fontSize: '0.9em', padding: '4px 0' }}>
-              {testResult.success ? '✅' : '❌'} {testResult.message}
+              {testResult.success ? <FaCheck size={11} style={{ verticalAlign: '-1px' }} /> : <FaTimes size={11} style={{ verticalAlign: '-1px' }} />} {testResult.message}
             </div>
           </PanelSectionRow>
         )}
@@ -11262,6 +11265,59 @@ function usePlatformSync() {
 // The toggle list itself, shared by Settings ▸ Platforms and the setup wizard's
 // optional Platforms step — the two must never drift, because they are the same
 // decision made at two different moments.
+// A bounded scroll box whose edges fade out only while there is more content
+// past them. The fade IS the affordance: a hard-cut edge mid-row reads as a
+// layout bug, and on a controller there is no scrollbar to say otherwise —
+// nothing else on screen tells you the list continues. Both edges are computed
+// independently so the top fade appears only once you have actually scrolled,
+// rather than veiling the first row from the start.
+function ScrollFade({ maxHeight, refresh, children, style }: {
+  maxHeight: string;
+  // Bump when the content's height can have changed without a scroll (rows
+  // arriving, a subtitle growing on toggle) — there is no scroll event for that.
+  refresh?: any;
+  children: any;
+  style?: any;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [edges, setEdges] = useState({ top: false, bottom: false });
+
+  const measure = () => {
+    const el = ref.current;
+    if (!el) return;
+    // 2px slack: fractional scroll offsets (dpad scrollIntoView lands on
+    // sub-pixel positions) would otherwise leave a fade stuck on at the end.
+    const top = el.scrollTop > 2;
+    const bottom = el.scrollTop + el.clientHeight < el.scrollHeight - 2;
+    setEdges((p) => (p.top === top && p.bottom === bottom ? p : { top, bottom }));
+  };
+
+  useEffect(() => { measure(); }, [refresh, maxHeight]);
+
+  const F = '30px';
+  const mask = edges.top && edges.bottom
+    ? `linear-gradient(to bottom, transparent 0, #000 ${F}, #000 calc(100% - ${F}), transparent 100%)`
+    : edges.top
+      ? `linear-gradient(to bottom, transparent 0, #000 ${F})`
+      : edges.bottom
+        ? `linear-gradient(to bottom, #000 calc(100% - ${F}), transparent 100%)`
+        : undefined;
+
+  return (
+    <div ref={ref} onScroll={measure}
+      style={{
+        maxHeight, overflowY: 'auto', overflowX: 'hidden',
+        WebkitMaskImage: mask, maskImage: mask,
+        // Both properties, or the mask is applied per-box and each row fades
+        // against its own edges instead of the container's.
+        WebkitMaskSize: '100% 100%', maskSize: '100% 100%',
+        ...style,
+      }}>
+      {children}
+    </div>
+  );
+}
+
 function PlatformSyncList({ sync }: { sync: ReturnType<typeof usePlatformSync> }) {
   const { rows, off, loading, connected, unavailable, saving, toggle } = sync;
   if (loading) {
@@ -11323,8 +11379,18 @@ function PlatformsPage() {
         <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Platforms</div>
       </div>
 
+      {/* Same bounded-with-fades treatment as the wizard's platform step. The
+          page would happily scroll the whole list, but then the header and the
+          "nothing is deleted" note scroll away with it — and on a 30-platform
+          server the note is the thing a hesitant user scrolls back up looking
+          for. Capping the list keeps both in view and puts the scrolling where
+          the content actually is. */}
       <V2SettingsSection title={summary}>
-        <PlatformSyncList sync={sync} />
+        <ScrollFade maxHeight="calc(100vh - 300px)"
+          refresh={`${rows.length}:${sync.off.size}`}
+          style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '2px' }}>
+          <PlatformSyncList sync={sync} />
+        </ScrollFade>
       </V2SettingsSection>
 
       <div style={{
@@ -13286,6 +13352,11 @@ function SetupWizard() {
           console.error('[RomM] wizard paired-finish', e);
           toaster.toast({ title: 'Ludo', body: 'Saved, but your folders may need checking in Settings.' });
         }
+        // Only now — after the folders are written and the platform switches
+        // are in — is it safe to let the library walk go. It reads the ROM
+        // directory for every entry it builds, so starting it before
+        // setLibraryPaths would mark a whole library as not-downloaded.
+        try { await finishOnboarding(); } catch (e) { console.error('[RomM] wizard finish onboarding', e); }
         finish();
       } else {
         const dev = deviceName.trim() || deviceNameDefault;
@@ -13452,7 +13523,7 @@ function SetupWizard() {
                     onEnter={() => { if (canConnect) next(); }} />
                   {testResult && (
                     <div style={{ fontSize: '13px', color: testResult.success ? V2.success : V2.danger }}>
-                      {testResult.success ? '✅' : '❌'} {testResult.message}
+                      {testResult.success ? <FaCheck size={11} style={{ verticalAlign: '-1px' }} /> : <FaTimes size={11} style={{ verticalAlign: '-1px' }} />} {testResult.message}
                     </div>
                   )}
                   <GameActionButton variant="surface" label={testing ? 'Testing…' : 'Test connection'} icon={null}
@@ -13461,13 +13532,8 @@ function SetupWizard() {
               ) : mode === 'qr' ? (
                 <>
                   {!qrArmed ? (
-                    <>
-                      <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.6, maxWidth: '380px' }}>
-                        Scan a code with your phone and approve it there — nothing else to type on this device.
-                      </div>
-                      <GameActionButton variant="surface" label="Show QR code" icon={null}
-                        disabled={!url.trim()} onClick={() => setQrArmed(true)} />
-                    </>
+                    <GameActionButton variant="surface" label="Show QR code" icon={null}
+                      disabled={!url.trim()} onClick={() => setQrArmed(true)} />
                   ) : qr.status === 'starting' ? (
                     <div style={{ fontSize: '13px', color: V2.fg2 }}>Getting a code…</div>
                   ) : qr.status === 'error' ? (
@@ -13494,11 +13560,15 @@ function SetupWizard() {
                             {qr.verifyUrl}
                           </div>
                         )}
-                      <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.6, maxWidth: '380px' }}>
-                        {qr.status === 'approved'
-                          ? 'Approved!'
-                          : 'Scan with your phone, then approve on your RomM server.'}
-                      </div>
+                      {/* Only while there is still something to do. Approval is
+                          reported once, by the green line below — this used to
+                          say "Approved!" directly above it, so the same news
+                          arrived twice. */}
+                      {qr.status !== 'approved' && (
+                        <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.6, maxWidth: '380px' }}>
+                          Scan with your phone, then approve on your RomM server.
+                        </div>
+                      )}
                       {/* The code is shown alongside the QR, not instead of it:
                           anyone already signed in on another device can go to
                           /pair/device and type these eight characters. */}
@@ -13517,7 +13587,7 @@ function SetupWizard() {
                   )}
                   {testResult && (
                     <div style={{ fontSize: '13px', color: testResult.success ? V2.success : V2.danger }}>
-                      {testResult.success ? '✅' : '❌'} {testResult.message}
+                      {testResult.success ? <FaCheck size={11} style={{ verticalAlign: '-1px' }} /> : <FaTimes size={11} style={{ verticalAlign: '-1px' }} />} {testResult.message}
                     </div>
                   )}
                 </>
@@ -13528,7 +13598,7 @@ function SetupWizard() {
                     onEnter={() => { if (canConnect && !paired) doPair(); }} />
                   {testResult && (
                     <div style={{ fontSize: '13px', color: testResult.success ? V2.success : V2.danger }}>
-                      {testResult.success ? '✅' : '❌'} {testResult.message}
+                      {testResult.success ? <FaCheck size={11} style={{ verticalAlign: '-1px' }} /> : <FaTimes size={11} style={{ verticalAlign: '-1px' }} />} {testResult.message}
                     </div>
                   )}
                 </>
@@ -13641,14 +13711,33 @@ function SetupWizard() {
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', width: '100%' }}>
               <div style={{ fontSize: '20px', fontWeight: 700 }}>Platforms</div>
               <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.5, maxWidth: '440px', textAlign: 'center' }}>
-                Your server has {platformSync.rows.length} platforms and{' '}
-                {platformSync.totalRoms.toLocaleString()} games. Turn off any you
-                don’t want on this device and your library loads faster — you can
-                change this any time in Settings.
+                Turn off any you don’t want on this device and your library loads
+                faster — you can change this any time in Settings.
               </div>
-              <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {/* The running total, not the server's total: this is the number
+                  the switches move, and it is the whole reason to touch them.
+                  Held at a fixed height so flipping a switch doesn't reflow the
+                  list under the user's thumb. */}
+              <div style={{ fontSize: '13px', fontWeight: 600, color: V2.fg, height: '18px' }}>
+                {platformSync.loading
+                  ? ' '
+                  : `${platformSync.enabledCount} of ${platformSync.rows.length} platforms · ${platformSync.enabledRoms.toLocaleString()} of ${platformSync.totalRoms.toLocaleString()} games`}
+              </div>
+              {/* Scrolls inside its own box rather than growing the card. The
+                  card centers itself with margin:auto, which silently collapses
+                  once the content outgrows the viewport — so an unbounded list
+                  (30+ platforms on a real server) is what pinned this one step
+                  to the top while every other step sat centered. */}
+              <ScrollFade maxHeight="42vh"
+                refresh={`${platformSync.rows.length}:${platformSync.off.size}`}
+                style={{
+                  width: '100%', display: 'flex', flexDirection: 'column', gap: '8px',
+                  // Room for the focus ring on the first/last row, which a flush
+                  // scroll edge would clip.
+                  padding: '2px',
+                }}>
                 <PlatformSyncList sync={platformSync} />
-              </div>
+              </ScrollFade>
               {footer(
                 <GameActionButton variant="emphasized" focusRef={platformsNextRef}
                   label={platformSync.off.size ? 'Next' : 'Sync everything'}
