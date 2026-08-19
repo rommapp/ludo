@@ -11513,41 +11513,81 @@ function biosChip(row: any, chevron?: boolean) {
   );
 }
 
-// Confirmation for the one transfer big enough to deserve one. Built from
-// ModalRoot/DialogButton rather than @decky/ui's ConfirmModal because those
-// two are already used throughout this file and are therefore known to exist
-// in the version we ship against.
+// Confirmation for the one transfer big enough to deserve one: ~340 MB into
+// another application's system tree. Wears the same chrome as the other
+// modals here (scrim, blurred card, V2 tokens, V2Button) rather than raw
+// dialog furniture -- and is built from ModalRoot/Focusable/DialogButton
+// because @decky/ui's ConfirmModal is exported by neither @decky/ui 4.7.2 nor
+// the desktop shim, so importing it would break both builds.
 function SwitchFirmwareConfirm({ fileName, size, reason, installed, onAnswer, closeModal }: {
   fileName: string; size: string; reason?: string; installed: number;
   onAnswer: (ok: boolean) => void; closeModal?: () => void;
 }) {
-  // Answer exactly once: dismissing by any route must resolve the promise, or
-  // the caller waits forever on a modal that is no longer on screen.
+  // Answer exactly once. Every dismissal route lands here, and a modal that
+  // closes without resolving leaves the caller awaiting a promise forever.
   const answered = useRef(false);
+  const panelRef = useRef<HTMLDivElement>(null);
   const answer = (ok: boolean) => {
     if (answered.current) return;
     answered.current = true;
     onAnswer(ok);
     closeModal?.();
   };
+  useEffect(() => {
+    const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60);
+    return () => clearTimeout(t);
+  }, []);
   return (
-    <ModalRoot bHideCloseIcon onCancel={() => answer(false)}
-      onEscKeypress={() => answer(false)}>
-      <Focusable noFocusRing className="romm-ui" style={{ padding: '1em' }}
-        onCancelButton={() => answer(false)}>
-        <div style={{ fontSize: '1.3em', fontWeight: 600, marginBottom: '0.5em' }}>
-          Install Switch firmware?
-        </div>
-        <div style={{ opacity: 0.85, marginBottom: '1.2em', lineHeight: 1.4 }}>
-          {reason === 'missing'
-            ? `Eden has no system firmware installed. ${fileName} is ${size}.`
-            : `A different firmware set is on the server. ${fileName} is ${size}, replacing ${installed} installed file(s).`}
-          {' It installs into Eden\u2019s system directory.'}
-        </div>
-        <div style={{ display: 'flex', gap: '0.6em' }}>
-          <DialogButton onClick={() => answer(true)}>Install</DialogButton>
-          <DialogButton onClick={() => answer(false)}>Cancel</DialogButton>
-        </div>
+    <ModalRoot bHideCloseIcon onCancel={() => answer(false)} onEscKeypress={() => answer(false)}
+      className="romm-modal-collapse" modalClassName="romm-modal-collapse">
+      <Focusable noFocusRing className="romm-ui"
+        onCancelButton={() => answer(false)}
+        onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) answer(false); }}
+        style={{
+          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(7,7,15,0.45)',
+          WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
+        }}>
+        <style>{`
+          ${V2_FOCUS_STYLE}
+          .romm-modal-collapse, .romm-modal-collapse > div {
+            background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important;
+          }
+          @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }
+        `}</style>
+        {/* Click-away cancels, like every other modal here. */}
+        <div onClick={() => answer(false)} style={{ position: 'absolute', inset: 0 }} />
+        <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
+          position: 'relative', width: '420px', maxWidth: '90vw', boxSizing: 'border-box',
+          fontFamily: V2.font, color: V2.fg, padding: '20px',
+          display: 'flex', flexDirection: 'column',
+          background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
+          WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
+          border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
+          boxShadow: '0 16px 48px rgba(0,0,0,0.55)',
+          maxHeight: '82vh', overflowY: 'auto',
+          animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
+            <FaMicrochip size={16} style={{ color: V2.brand, flexShrink: 0 }} />
+            <div style={{ fontSize: '16px', fontWeight: 700, color: V2.fg }}>
+              Install Switch firmware?
+            </div>
+          </div>
+          <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.5, marginBottom: '4px' }}>
+            {reason === 'missing'
+              ? 'Eden has no system firmware installed.'
+              : `A different firmware set is on the server, replacing ${installed} installed file(s).`}
+          </div>
+          <div style={{ fontSize: '13px', color: V2.fgMuted, lineHeight: 1.5, marginBottom: '18px' }}>
+            {fileName} · {size} · installs into Eden’s system directory
+          </div>
+          <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+            <V2Button variant="text" onClick={() => answer(false)}>Cancel</V2Button>
+            <V2Button variant="primary" onClick={() => answer(true)}>Install</V2Button>
+          </div>
+        </Focusable>
       </Focusable>
     </ModalRoot>
   );
