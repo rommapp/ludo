@@ -89,6 +89,40 @@ def main():
         check('status is None without Eden',
               E.firmware_status(extra_data_dir=d / 'absent'), None)
 
+        # --- version, not presence -------------------------------------
+        # The point of the marker is to answer "is the server's archive the
+        # one already installed" WITHOUT downloading it. Presence alone can't:
+        # a newer firmware sharing NCA names looks present file by file.
+        import os
+        os.environ['XDG_CACHE_HOME'] = str(d / 'cache')
+        entry = {'file_name': 'Firmware_17.0.1.zip', 'md5_hash': 'AABBCCDD' * 4}
+        installed = E.firmware_status(extra_data_dir=data)['count']
+
+        check('not current before anything is recorded',
+              E.firmware_is_current(entry, extra_data_dir=data), False)
+
+        E.write_firmware_marker(entry['file_name'], entry['md5_hash'], installed)
+        check('current once recorded',
+              E.firmware_is_current(entry, extra_data_dir=data), True)
+        check('md5 is compared case-insensitively',
+              E.firmware_is_current({**entry, 'md5_hash': 'aabbccdd' * 4},
+                                    extra_data_dir=data), True)
+
+        # A new firmware release on the server must not read as current.
+        check('a different server md5 is not current',
+              E.firmware_is_current({**entry, 'md5_hash': '11223344' * 4},
+                                    extra_data_dir=data), False)
+
+        # And neither must a marker whose firmware has since been removed or
+        # replaced underneath us -- the marker alone would lie here.
+        E.write_firmware_marker(entry['file_name'], entry['md5_hash'], installed + 3)
+        check('drifted NCA count is not current',
+              E.firmware_is_current(entry, extra_data_dir=data), False)
+
+        check('an entry with no md5 is never current',
+              E.firmware_is_current({'file_name': 'x.zip'}, extra_data_dir=data),
+              False)
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

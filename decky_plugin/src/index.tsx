@@ -139,6 +139,9 @@ const getSessionHostPath = callable<[], any>("get_session_host_path");
 // dir. Distinct from get_bios_status, which reports background download progress.
 const getBiosInventory = callable<[(boolean)?], any>("get_bios_inventory");
 const downloadBios = callable<[string, (string)?], any>("download_bios");
+// Switch firmware is an Eden-tree install, not a BIOS-directory drop, so it has
+// its own call rather than riding download_bios. See install_switch_firmware.
+const installSwitchFirmware = callable<[], any>("install_switch_firmware");
 // Per-platform sync switches. get_ returns every platform with its rom_count and
 // whether it's on; set_ takes the whole disabled set, so it's idempotent.
 const getPlatformSync = callable<[], any>("get_platform_sync");
@@ -11452,15 +11455,36 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
 
   // Stays open through the download: the panel is the only thing confirming it
   // worked, and closing on activate would take the answer away with it.
+  // Switch firmware is not a BIOS file. It is a ~324 MB archive of NCAs that
+  // belongs in Eden's NAND tree, and download_bios would drop it in RetroArch's
+  // system directory where Eden never looks — so this platform routes to its
+  // own installer. Everything else keeps the original path unchanged.
+  const isSwitch = slug === 'switch' || /nintendo\s*switch/i.test(
+    row?.platform_name || row?.name || platformName || '');
+
   const fetchAll = async () => {
     setBusy(true);
     try {
-      const r = await downloadBios(slug, '');
-      if (!r?.success) toaster.toast({ title: 'BIOS', body: r?.message || 'Download failed' });
+      if (isSwitch) {
+        const r = await installSwitchFirmware();
+        // 'up-to-date' is a success with nothing to do; say so rather than
+        // leaving the row looking like the press did nothing.
+        toaster.toast({
+          title: 'Switch firmware',
+          body: r?.status === 'installed' ? `Installed ${r.installed} file(s) into Eden`
+              : r?.status === 'up-to-date' ? 'Already installed'
+              : r?.status === 'no-emulator' ? 'Eden isn’t installed on this device'
+              : r?.status === 'no-firmware' ? 'No Switch firmware on the server'
+              : r?.message || 'Install failed',
+        });
+      } else {
+        const r = await downloadBios(slug, '');
+        if (!r?.success) toaster.toast({ title: 'BIOS', body: r?.message || 'Download failed' });
+      }
       await load();
       onChanged?.();
     } catch {
-      toaster.toast({ title: 'BIOS', body: 'Download failed' });
+      toaster.toast({ title: isSwitch ? 'Switch firmware' : 'BIOS', body: 'Download failed' });
     } finally { setBusy(false); }
   };
 
@@ -11524,7 +11548,9 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
                   icon={busy
                     ? <FaSync size={13} style={{ animation: 'spin 1s linear infinite' }} />
                     : <FaDownload size={13} />}
-                  label={busy ? 'Downloading…' : `Download ${missing} missing file${missing === 1 ? '' : 's'}`}
+                  label={busy ? (isSwitch ? 'Installing…' : 'Downloading…')
+                             : isSwitch ? 'Install firmware into Eden'
+                             : `Download ${missing} missing file${missing === 1 ? '' : 's'}`}
                   disabled={busy}
                   onSelect={() => { if (!busy) fetchAll(); }} />
               ) : (

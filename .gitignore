@@ -101,3 +101,6 @@ node_modules/
 # desktop packaging outputs
 desktop/runtime/
 desktop/release/
+
+# Local libsigil build (scripts/build_sigil.sh)
+sigil-build/

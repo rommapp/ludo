@@ -11408,7 +11408,8 @@ class AutoSyncManager:
         the server copy. Updates ``summary`` and returns True if a fingerprint
         was recorded (caller persists), False if deferred/failed.
         """
-        choice = self._resolve_save_conflict(op, entry['_path'])
+        choice = self._resolve_save_conflict(op, entry['_path'],
+                                             entry.get('updated_at'))
         if choice == 'local':
             if self.romm_client.upload_save(
                 rom_id, 'saves', entry['_path'], emulator=entry.get('emulator'),
@@ -11430,6 +11431,16 @@ class AutoSyncManager:
             except Exception:
                 pass
             target = self._resolve_download_target(op, saves_dir)
+            if target is None:
+                # Standalone emulator: restored through its own path, which
+                # backs the local save up before replacing it — the guarantee
+                # this branch would otherwise be relying on the caller for.
+                if self._restore_standalone_save(op, device_id, session_id):
+                    summary['downloaded'] += 1
+                    summary['_per_game'][rom_id]['down'] += 1
+                    return False
+                summary['conflicts'].append(op)
+                return False
             if self.romm_client.download_save_by_id(
                 op.get('save_id'), 'saves', target,
                 device_id=device_id, session_id=session_id):
@@ -11442,7 +11453,7 @@ class AutoSyncManager:
         summary['conflicts'].append(op)
         return False
 
-    def _resolve_save_conflict(self, op, local_path):
+    def _resolve_save_conflict(self, op, local_path, local_updated_at=None):
         """Decide how to resolve a save conflict: 'local' or 'server'.
 
         Maps the user's existing overwrite-behavior preference:
@@ -11467,16 +11478,28 @@ class AutoSyncManager:
             return self._ask_conflict_dialog(op, local_path)
 
         # Smart (prefer newer): compare local mtime to server's updated_at.
+        #
+        # local_updated_at overrides the file's own mtime, and a packed save
+        # REQUIRES it: an Eden entry's '_path' is a zip built in our cache
+        # during inventory, so its mtime is when we packed it — always "now",
+        # which would make local win every conflict and mean a genuinely newer
+        # save on the server could never come back. The inventory carries the
+        # save's real modification time; use that when it is there.
         import datetime as _dt
+
+        def _parse(value):
+            dt = _dt.datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            return dt.timestamp()
+
         try:
-            local_ts = Path(local_path).stat().st_mtime
+            if local_updated_at:
+                local_ts = _parse(local_updated_at)
+            else:
+                local_ts = Path(local_path).stat().st_mtime
             sv = op.get('server_updated_at')
-            server_ts = 0.0
-            if sv:
-                sdt = _dt.datetime.fromisoformat(sv.replace('Z', '+00:00'))
-                if sdt.tzinfo is None:
-                    sdt = sdt.replace(tzinfo=_dt.timezone.utc)
-                server_ts = sdt.timestamp()
+            server_ts = _parse(sv) if sv else 0.0
             return 'local' if local_ts >= server_ts else 'server'
         except Exception:
             return 'server'
@@ -12005,9 +12028,10 @@ class AutoSyncManager:
         re-packs to the same bytes and the same content hash, and the negotiate
         engine correctly sees nothing to do.
 
-        Upload only. Restoring a save means writing into a live emulator's data
-        directory, which is a different risk and gets its own pass — an
-        unmatched or unpacked-wrong Switch save must never overwrite one.
+        Restore is the other direction and deliberately does NOT share this
+        path: see _restore_standalone_save, which backs the existing save up
+        before replacing it and refuses while Eden is running. Packing here
+        stays read-only — nothing in this method writes into Eden's tree.
         """
         entries = []
         # [Emulators] is optional, and ConfigParser's fallback= does not cover a
@@ -12088,6 +12112,15 @@ class AutoSyncManager:
             return {'status': 'no-firmware',
                     'message': 'No Switch firmware on the server'}
 
+        # Short-circuit BEFORE the transfer. install_firmware_zip is idempotent,
+        # so re-running the same firmware was always harmless -- but it only
+        # discovered that after pulling ~324 MB. Compare the server's md5 to
+        # what the last successful install recorded instead.
+        if emulator_saves.firmware_is_current(entry):
+            return {'status': 'up-to-date', 'installed': 0,
+                    'skipped': (emulator_saves.firmware_status() or {}).get('count', 0),
+                    'message': f"{entry.get('file_name')} is already installed"}
+
         archive = bios.download_firmware_entry(
             entry, cache_dir() / 'firmware' / entry['file_name'], progress=progress)
         if not archive:
@@ -12099,6 +12132,13 @@ class AutoSyncManager:
         except Exception as e:
             self.log(f"❌ Firmware install failed: {e}")
             return {'status': 'failed', 'message': str(e)}
+
+        # Record the set that is now on disk either way: 'installed nothing'
+        # still means this archive's contents are present, and without the
+        # marker the next run would download it all over again to find out.
+        status = emulator_saves.firmware_status() or {}
+        emulator_saves.write_firmware_marker(
+            entry.get('file_name'), entry.get('md5_hash'), status.get('count', 0))
 
         if not result['installed']:
             return {'status': 'up-to-date', 'installed': 0,
@@ -12294,6 +12334,17 @@ class AutoSyncManager:
 
                 elif action == 'download':
                     target = self._resolve_download_target(op, saves_dir)
+                    if target is None:
+                        if self._restore_standalone_save(op, device_id, session_id):
+                            summary['downloaded'] += 1
+                            _bump(rom_id, 'down')
+                        else:
+                            # Deferred, not failed: Eden open, or the game not
+                            # booted here yet. The op stands for next sync, so
+                            # it must not be recorded as synced.
+                            summary['skipped_standalone'] = \
+                                summary.get('skipped_standalone', 0) + 1
+                        continue
                     ok = self.romm_client.download_save_by_id(
                         op.get('save_id'), 'saves', target,
                         device_id=device_id, session_id=session_id,
@@ -12313,7 +12364,8 @@ class AutoSyncManager:
                     if conflict_resolver:
                         choice = conflict_resolver(op)
                     elif entry:
-                        choice = self._resolve_save_conflict(op, entry['_path'])
+                        choice = self._resolve_save_conflict(op, entry['_path'],
+                                             entry.get('updated_at'))
                     else:
                         choice = 'skip'
                     if choice == 'local':
@@ -12435,13 +12487,97 @@ class AutoSyncManager:
                 _record_activity('error', 'Save sync issues', ', '.join(parts))
         return summary
 
+    def _restore_standalone_save(self, op, device_id, session_id):
+        """Download a standalone emulator's save and unpack it into its tree.
+
+        The counterpart to _eden_inventory_entries. Kept off the RetroArch
+        download path entirely: the artifact is a packed directory, its
+        destination is chosen by save discovery rather than by the filename,
+        and it is written into a live emulator's data -- none of which
+        _resolve_download_target's assumptions survive.
+
+        Returns True when the save was restored. Every refusal below is a
+        deliberate no-op that leaves BOTH sides untouched, so the next sync
+        sees the same operation and can apply it once the obstacle is gone.
+        """
+        file_name = op.get('file_name') or ''
+        title_id = Path(file_name).stem
+        # is_switch_title_id is the save-directory test specifically: Eden files
+        # a save under the BASE title, never an update or DLC id. The name came
+        # from our own pack, so anything failing here did not come from us.
+        if not title_ids.is_switch_title_id(title_id):
+            self.log(f"⚠️ Save-sync: {file_name!r} is not named after a base "
+                     f"title ID; not restoring it")
+            return False
+
+        staged = cache_dir() / 'incoming_saves' / file_name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if not self.romm_client.download_save_by_id(
+                op.get('save_id'), 'saves', staged,
+                device_id=device_id, session_id=session_id):
+            return False
+
+        try:
+            override = (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip()
+        except Exception:
+            override = ''
+
+        try:
+            result = emulator_saves.unpack_save(
+                staged, title_id, extra_data_dir=override or None,
+                backup_dir=cache_dir() / 'save_backups')
+        except RuntimeError as e:
+            # Eden is open. Not a failure -- retrying after it closes is the
+            # right outcome, and overwriting a save the emulator has in memory
+            # is exactly what this must not do.
+            self.log(f"ℹ️ Save-sync: {e}. The newer save is still on the server "
+                     f"and will restore next sync.")
+            return False
+        except FileNotFoundError as e:
+            self.log(f"ℹ️ Save-sync: {e}")
+            return False
+        except Exception as e:
+            self.log(f"⚠️ Save-sync: could not restore {title_id}: {e}")
+            return False
+        finally:
+            staged.unlink(missing_ok=True)
+
+        self.log(f"✅ Restored {result['files']} save file(s) for {title_id} "
+                 f"(previous save backed up to {result['backup'].name})")
+        return True
+
+    @staticmethod
+    def _is_standalone_emulator(emulator):
+        """True when a save belongs to a standalone emulator, not RetroArch.
+
+        Downloads are resolved against RetroArch's layout — one save root, core
+        subdirectories, RetroArch filenames. A standalone emulator's save obeys
+        none of that (Eden's is a packed directory keyed by title ID, living in
+        Eden's own tree), so a download op for one must never be run through
+        that path. See _resolve_download_target.
+        """
+        if not emulator:
+            return False
+        name = str(emulator).strip().lower()
+        return any(name == key or name == spec['name'].lower()
+                   for key, spec in STANDALONE_EMULATORS.items())
+
     def _resolve_download_target(self, op, saves_dir):
         """Resolve the local RetroArch path for a server save download operation.
 
         Places the file in the saves dir, inside the emulator's core subdirectory
         when that emulator maps to a known directory, with the filename converted
         back to RetroArch's expected form.
+
+        Returns None for a standalone emulator's save, whose restore goes
+        through _restore_standalone_save instead: the artifact is a packed
+        directory and its destination comes from save discovery, so run down
+        this path the zip would land in the RetroArch save root under a
+        converted name, be counted as downloaded, and be marked in-sync --
+        leaving the emulator without the save and the failure invisible.
         """
+        if self._is_standalone_emulator(op.get('emulator')):
+            return None
         target_dir = Path(saves_dir)
         emulator = op.get('emulator')
         if emulator:

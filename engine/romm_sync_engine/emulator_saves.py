@@ -21,13 +21,16 @@ does each belong to", and leaves every decision about syncing them to the
 caller. It writes nothing inside an emulator's directories.
 """
 
+import json
 import logging
 import os
 import shutil
+import time
 import zipfile
 from pathlib import Path
 
 from . import title_ids
+from .paths import cache_dir
 
 log = logging.getLogger(__name__)
 
@@ -230,6 +233,65 @@ def firmware_status(extra_data_dir=None):
     }
 
 
+def _firmware_marker_path():
+    """Where the record of the last installed firmware set lives.
+
+    In our own cache, never in Eden's registered/ directory: that directory is
+    Eden's, install_firmware_zip treats it as NCAs-and-nothing-else, and a
+    stray file there is our bookkeeping leaking into another application's
+    system tree.
+    """
+    return cache_dir() / 'firmware' / 'installed.json'
+
+
+def read_firmware_marker():
+    """The last firmware set we installed: {'file_name','md5','nca_count'}, or {}."""
+    try:
+        with open(_firmware_marker_path()) as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_firmware_marker(file_name, md5, nca_count):
+    """Record what was just installed, so the next run can skip the download."""
+    path = _firmware_marker_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.part')
+        with open(tmp, 'w') as fh:
+            json.dump({'file_name': file_name, 'md5': (md5 or '').lower(),
+                       'nca_count': nca_count}, fh)
+        tmp.replace(path)
+    except OSError as e:
+        log.debug("could not write firmware marker: %s", e)
+
+
+def firmware_is_current(entry, extra_data_dir=None):
+    """True when the server's firmware `entry` is the one already installed.
+
+    Presence is not version. install_firmware_zip is per-file idempotent, so a
+    second run of the SAME firmware installs nothing -- but it only learns that
+    after downloading ~324 MB and opening the archive. Worse, a genuinely newer
+    firmware that happens to share NCA names would look equally "already
+    present" file by file.
+
+    So compare the server's md5 for the archive against the one we recorded on
+    the last successful install, and confirm the installed NCA count still
+    matches what that install produced. The count guard is what catches
+    firmware deleted or replaced underneath us: the marker alone would claim
+    current for an emulator whose registered/ has since been emptied.
+    """
+    marker = read_firmware_marker()
+    expected = (entry.get('md5_hash') or '').lower()
+    if not marker or not expected or marker.get('md5') != expected:
+        return False
+    status = firmware_status(extra_data_dir)
+    if not status or not status['count']:
+        return False
+    return status['count'] == marker.get('nca_count')
+
+
 def install_firmware_zip(zip_path, extra_data_dir=None, dry_run=False):
     """Extract a firmware archive into Eden's registered/ directory.
 
@@ -287,6 +349,118 @@ def install_firmware_zip(zip_path, extra_data_dir=None, dry_run=False):
             installed += 1
 
     return {'installed': installed, 'skipped': skipped, 'target': target}
+
+
+def eden_is_running():
+    """True when an Eden process appears to be running.
+
+    Restoring into a live emulator's save directory races whatever Eden holds
+    in memory: it can flush its own copy over the restored one at exit, or read
+    a half-swapped directory. Cheap /proc scan rather than a dependency -- a
+    false negative only costs us the guard, and a false positive only defers a
+    restore the user can retry.
+    """
+    try:
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                comm = (entry / 'comm').read_text().strip().lower()
+            except OSError:
+                continue
+            if comm.startswith('eden'):
+                return True
+    except OSError as e:
+        log.debug("could not scan /proc for Eden: %s", e)
+    return False
+
+
+def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None):
+    """Restore a packed save into Eden's tree for `title_id`.
+
+    The mirror of pack_save, but the write direction cannot be a mirror of the
+    read direction's assumptions -- this puts a file from elsewhere into
+    another application's live data, so:
+
+      * The destination is the save directory find_eden_saves would CHOOSE for
+        this title (newest of the per-user copies), not a path derived from the
+        archive. Nothing in the zip picks where it lands.
+      * Members are written by basename under the save root, so a crafted
+        "../../keys/prod.keys" cannot escape -- the same rule
+        install_firmware_zip applies, for the same reason. Subdirectories in
+        the archive are preserved only when they stay inside the destination.
+      * The existing save is copied to `backup_dir` FIRST. A save is user data,
+        the one thing here that cannot be re-downloaded, and prefer-newer
+        resolution is a heuristic that can be wrong.
+      * The new save is staged in a sibling directory and swapped in, so an
+        interrupted restore never leaves Eden reading a half-written save.
+
+    Returns {'path', 'files', 'backup'}. Raises FileNotFoundError when Eden or
+    the title's save directory is absent, and RuntimeError when Eden is
+    running.
+    """
+    zip_path = Path(zip_path)
+    if eden_is_running():
+        raise RuntimeError("Eden is running; close it before restoring a save")
+
+    existing = None
+    for save in find_eden_saves(extra_data_dir):
+        if save['title_id'].lower() == title_id.lower():
+            existing = save['path']
+            break
+    if existing is None:
+        # No directory for this title means the game has never booted here.
+        # Creating one would mean guessing a user ID, and a save under the
+        # wrong profile is invisible to the player -- refuse instead.
+        raise FileNotFoundError(
+            f"no Eden save directory for {title_id}; boot the game once first")
+
+    backup = None
+    if backup_dir is not None:
+        backup_dir = Path(backup_dir)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup = backup_dir / f"{title_id}-{int(time.time())}.zip"
+        pack_save(existing, backup)
+
+    staging = existing.with_name(existing.name + '.incoming')
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    written = 0
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            for member in archive.infolist():
+                if member.is_dir():
+                    continue
+                # Resolve inside staging and confirm it stayed there.
+                destination = (staging / member.filename).resolve()
+                if staging.resolve() not in destination.parents:
+                    log.warning("refusing archive member outside the save: %s",
+                                member.filename)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as source, open(destination, 'wb') as sink:
+                    shutil.copyfileobj(source, sink, 1024 * 1024)
+                written += 1
+
+        if not written:
+            raise ValueError("archive contained no save files")
+
+        # Swap: move the old aside, put the new in place, then drop the old.
+        # Never a window where the save directory does not exist.
+        retired = existing.with_name(existing.name + '.previous')
+        shutil.rmtree(retired, ignore_errors=True)
+        existing.rename(retired)
+        try:
+            staging.rename(existing)
+        except BaseException:
+            retired.rename(existing)
+            raise
+        shutil.rmtree(retired, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    return {'path': existing, 'files': written, 'backup': backup}
 
 
 def pack_save(directory, destination):

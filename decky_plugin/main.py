@@ -6687,8 +6687,15 @@ class Plugin:
                 urljoin(self._romm_client.base_url, path), timeout=20)
             if resp.status_code != 200 or not resp.content:
                 # Transient, not "no screenshot" — see get_game_cover above.
-                logging.warning(f"image {path} -> {resp.status_code} "
-                                f"({len(resp.content or b'')} bytes)")
+                # A 404 on /assets/* is not a fault: RPlatformIcon walks a
+                # candidate chain (slug.svg, slug.ico, default.ico) and a miss
+                # on an earlier candidate is how the chain advances. Only real
+                # failures deserve a warning.
+                expected_miss = (resp.status_code == 404
+                                 and path.startswith('/assets/'))
+                logging.log(logging.DEBUG if expected_miss else logging.WARNING,
+                            f"image {path} -> {resp.status_code} "
+                            f"({len(resp.content or b'')} bytes)")
                 return {'success': resp.status_code == 404, 'data_uri': None}
             mime = resp.headers.get('content-type') or mimetypes.guess_type(path)[0] or 'image/png'
             uri = self._store_thumb(ck, tkey, resp.content, mime, False)
@@ -8262,6 +8269,47 @@ class Plugin:
         except Exception as e:
             logging.error(f"download_bios error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
+
+    async def install_switch_firmware(self):
+        """Install RomM's Switch firmware into Eden.
+
+        Switch firmware is not a BIOS file: it is a ~324 MB archive of NCAs that
+        belongs in Eden's own NAND tree, not in RetroArch's system directory. So
+        it does not go through download_bios -- that would drop the zip
+        somewhere Eden never looks. sync_switch_firmware owns the whole job
+        (find, resume-capable download, checksum, extract, install) and reports
+        which of those outcomes happened.
+
+        Returns {success, status, message, installed, skipped}, where status is
+        one of installed / up-to-date / no-firmware / no-emulator / failed.
+        """
+        try:
+            sync = self._auto_sync
+            if not sync:
+                return {'success': False, 'status': 'failed',
+                        'message': 'Sync manager unavailable'}
+            if not (self._romm_client and self._romm_client.authenticated):
+                return {'success': False, 'status': 'failed',
+                        'message': 'Not connected to RomM'}
+            # sync_switch_firmware reaches the BIOS manager through
+            # self.retroarch.bios_manager, which RetroArchInterface builds
+            # WITHOUT a RomM client -- the same trap _bios_manager documents.
+            # Attach one first or the firmware lookup reports 'no-firmware'
+            # while the plugin is perfectly connected.
+            if not self._bios_manager():
+                return {'success': False, 'status': 'failed',
+                        'message': 'BIOS manager unavailable'}
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, sync.sync_switch_firmware)
+            status = (result or {}).get('status', 'failed')
+            return {'success': status in ('installed', 'up-to-date'),
+                    'status': status,
+                    'installed': (result or {}).get('installed', 0),
+                    'skipped': (result or {}).get('skipped', 0),
+                    'message': (result or {}).get('message', '')}
+        except Exception as e:
+            logging.error(f"install_switch_firmware error: {e}", exc_info=True)
+            return {'success': False, 'status': 'failed', 'message': str(e)}
 
     async def prepare_steam_launch(self, rom_id: int, disc: str = None,
                                    sibling_rom_id: int = None,

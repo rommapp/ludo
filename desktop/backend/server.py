@@ -270,6 +270,9 @@ def _rasterize_svg(data: bytes):
     return buf.getvalue()
 
 
+_RASTERIZE_UNAVAILABLE = False
+
+
 def get_image(path: str = ""):
     """Serve bundled /assets/* images locally, delegate the rest to the engine.
 
@@ -296,6 +299,17 @@ def get_image(path: str = ""):
                 if f.suffix.lower() == ".svg":
                     try:
                         raw, mime = _rasterize_svg(raw), "image/png"
+                    except ImportError as e:
+                        # pycairo/librsvg simply are not installed. The SVG is
+                        # still served as-is and everything renders -- this
+                        # only forfeits the repaint optimisation, so say it
+                        # once per process instead of warning on every startup.
+                        global _RASTERIZE_UNAVAILABLE
+                        if not _RASTERIZE_UNAVAILABLE:
+                            _RASTERIZE_UNAVAILABLE = True
+                            logging.info(
+                                f"svg rasterize unavailable ({e}); serving SVG "
+                                f"directly (backgrounds may repaint slower)")
                     except Exception as e:
                         logging.warning(f"svg rasterize failed for {f.name}: {e}")
                 uri = f"data:{mime};base64,{base64.b64encode(raw).decode()}"

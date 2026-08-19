@@ -28,6 +28,102 @@ def human(n):
         n /= 1024
 
 
+def _restore(args, settings, client, emulator_saves, title_ids, paths):
+    """Restore one Switch save from the server, previewing by default.
+
+    Deliberately its own mode rather than part of the report: this is the only
+    thing here that WRITES into Eden's save tree, and it should never happen
+    because someone ran the status check.
+    """
+    from romm_sync_engine.sync_core import RomMClient
+
+    title_id = args.restore.upper()
+    print(f"\n=== Restore {title_id} ===")
+    if not title_ids.is_switch_title_id(title_id):
+        print("  not a base Switch title ID (saves live under the base title)")
+        return 1
+
+    rom_dir = settings.get('Download', 'rom_directory', '')
+    index = title_ids.index_roms([rom_dir], prod_keys=emulator_saves.find_prod_keys()) \
+        if rom_dir else {}
+    rom = index.get(title_id)
+    print(f"  local ROM  : {rom.name if rom else 'none — cannot map to a RomM game'}")
+    if not rom:
+        return 1
+
+    local = next((s for s in emulator_saves.find_eden_saves()
+                  if s['title_id'] == title_id), None)
+    print(f"  local save : {local['path'] if local else 'none — game never booted here'}")
+    if not local:
+        return 1
+
+    # Which RomM game? Read the snapshot Ludo already maintains rather than
+    # re-fetching the library: that call is server-bound and takes minutes on a
+    # library this size, and the snapshot holds the one field needed here.
+    import json
+    snapshot = paths.config_dir() / 'library_snapshot.json'
+    try:
+        games = json.loads(snapshot.read_text()).get('games') or []
+    except (OSError, ValueError) as e:
+        print(f"  snapshot   : unreadable ({e}) — open the app once to build it")
+        return 1
+    match = next((g for g in games if (g.get('file_name') or '') == rom.name), None)
+    if not match:
+        print(f"  server ROM : {rom.name!r} not in the snapshot")
+        return 1
+    rom_id = match['rom_id']
+    print(f"  server ROM : id={rom_id}  {match.get('display_name') or match.get('name')}")
+
+    # /api/saves/summary answers {'slots': [{'slot', 'count', 'latest': {...}}]},
+    # so the save records are one level down under each slot's 'latest'.
+    summary = client.get_saves_summary(rom_id) or {}
+    eden = [slot['latest'] for slot in summary.get('slots') or []
+            if slot.get('latest')
+            and (slot['latest'].get('emulator') or '').lower() == 'eden']
+    if not eden:
+        print("  server save: none for Eden")
+        return 1
+    newest = max(eden, key=lambda s: s.get('updated_at') or '')
+    print(f"  server save: id={newest.get('id')}  {newest.get('file_name')}  "
+          f"updated={newest.get('updated_at')}")
+
+    # Compare before touching anything: identical content means a restore is a
+    # no-op in substance, which is exactly what makes it safe to rehearse.
+    import tempfile
+    packed = emulator_saves.pack_save(
+        local['path'], Path(tempfile.mkdtemp()) / f'{title_id}.zip')
+    local_hash = RomMClient.compute_content_hash(packed)
+    server_hash = newest.get('content_hash')
+    print(f"  local hash : {local_hash}")
+    print(f"  server hash: {server_hash}")
+    print(f"  identical  : {local_hash == server_hash}")
+
+    if not args.write:
+        print("\n(preview only; pass --write to restore, backing up the current save)")
+        return 0
+
+    if emulator_saves.eden_is_running():
+        print("\n  Eden is running — close it first")
+        return 1
+
+    staged = paths.cache_dir() / 'incoming_saves' / f'{title_id}.zip'
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    if not client.download_save_by_id(newest.get('id'), 'saves', staged):
+        print("  download failed")
+        return 1
+    print(f"  downloaded : {staged} ({staged.stat().st_size} bytes)")
+
+    result = emulator_saves.unpack_save(
+        staged, title_id, backup_dir=paths.cache_dir() / 'save_backups')
+    print(f"  restored   : {result['files']} file(s) into {result['path']}")
+    print(f"  backup     : {result['backup']}")
+
+    after = emulator_saves.pack_save(
+        result['path'], Path(tempfile.mkdtemp()) / f'{title_id}.zip')
+    print(f"  hash now   : {RomMClient.compute_content_hash(after)}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -37,6 +133,12 @@ def main():
                         help="download Switch firmware from RomM and install it into Eden")
     parser.add_argument('--pack-saves', action='store_true',
                         help="pack every discovered Eden save into a temp dir")
+    parser.add_argument('--restore', metavar='TITLE_ID',
+                        help="restore this title's save FROM the server into Eden "
+                             "(read-only preview unless --write is given)")
+    parser.add_argument('--write', action='store_true',
+                        help="with --restore, actually replace the local save "
+                             "(the current one is backed up first)")
     args = parser.parse_args()
 
     from romm_sync_engine import paths
@@ -172,6 +274,9 @@ def main():
         return 0
     print(f"  firmware   : {entry['file_name']}  "
           f"{human(entry.get('file_size_bytes') or 0)}  md5={entry.get('md5_hash')}")
+
+    if args.restore:
+        return _restore(args, settings, client, emulator_saves, title_ids, paths)
 
     if not args.install_firmware:
         print("\n(read-only; pass --install-firmware to download and install)")

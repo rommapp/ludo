@@ -75,6 +75,10 @@ class BiosManager:
             'nds': 'Nintendo - Nintendo DS',
             'game-boy-advance': 'Nintendo - Game Boy Advance',
             'gba': 'Nintendo - Game Boy Advance',
+            'game-boy': 'Nintendo - Game Boy',
+            'gb': 'Nintendo - Game Boy',
+            'game-boy-color': 'Nintendo - Game Boy Color',
+            'gbc': 'Nintendo - Game Boy Color',
             'pc-engine': 'NEC - PC Engine - TurboGrafx 16',
             'turbografx': 'NEC - PC Engine - TurboGrafx 16',
             'turbografx-16': 'NEC - PC Engine - TurboGrafx 16',
@@ -258,8 +262,13 @@ class BiosManager:
         if not platform_name:
             return None
 
-        # Convert to lowercase for comparison
-        platform_lower = platform_name.lower().replace('_', '-')
+        # Callers pass display names ('Game Boy Advance') as well as slugs
+        # ('game-boy-advance'); the alias table is keyed by slug, so fold
+        # spaces and underscores alike before looking one up. Without the
+        # space case every display name missed the table entirely.
+        platform_lower = platform_name.lower().replace('_', '-').replace(' ', '-')
+        while '--' in platform_lower:
+            platform_lower = platform_lower.replace('--', '-')
 
         # Check aliases
         if platform_lower in self.platform_aliases:
@@ -330,6 +339,8 @@ class BiosManager:
                 return None
 
             # Platform name variations for matching
+            # Keyed by the canonical name normalize_platform_name() returns,
+            # not by whatever the caller passed in.
             platform_mappings = {
                 'Sony - PlayStation': ['PlayStation', 'Sony PlayStation', 'PS1', 'PSX'],
                 'Sony - PlayStation 2': ['PlayStation 2', 'Sony PlayStation 2', 'PS2'],
@@ -350,19 +361,39 @@ class BiosManager:
             possible_names = platform_mappings.get(platform_name, [platform_name])
             logging.debug(f"[BIOS] Searching for matches: {possible_names}")
 
-            # Find matching platform
+            def _found(platform, name_check):
+                firmware_list = platform.get('firmware', [])
+                logging.debug(f"[BIOS] Found platform '{name_check}' with {len(firmware_list)} firmware files")
+                if firmware_list:
+                    logging.debug(f"[BIOS] Firmware files: {[f.get('file_name') for f in firmware_list]}")
+                return firmware_list
+
+            # Exact first, substring only as a fallback. A plain substring test
+            # is not safe here because platform names nest: 'Game Boy' is inside
+            # 'Game Boy Color', and 'PlayStation' inside 'PlayStation 2'. Taking
+            # the first substring hit meant GBC/GBA resolved to Game Boy's
+            # firmware and PS1 could inherit PS2's -- marking a platform ready
+            # while its real BIOS was missing. Longest candidate first so the
+            # most specific alias wins whatever order the server returns.
+            wanted = {name.strip().lower() for name in possible_names if name}
+
             for platform in platforms:
                 platform_name_check = platform.get('name', '')
+                if platform_name_check.strip().lower() in wanted:
+                    return _found(platform, platform_name_check)
 
-                if any(name.lower() in platform_name_check.lower() or
-                      platform_name_check.lower() in name.lower()
-                      for name in possible_names):
-
-                    firmware_list = platform.get('firmware', [])
-                    logging.debug(f"[BIOS] Found platform '{platform_name_check}' with {len(firmware_list)} firmware files")
-                    if firmware_list:
-                        logging.debug(f"[BIOS] Firmware files: {[f.get('file_name') for f in firmware_list]}")
-                    return firmware_list
+            for platform in sorted(platforms,
+                                   key=lambda p: len(p.get('name', '')),
+                                   reverse=True):
+                platform_name_check = platform.get('name', '')
+                if not platform_name_check:
+                    continue
+                check = platform_name_check.strip().lower()
+                if any(name in check or check in name for name in wanted):
+                    logging.debug(
+                        f"[BIOS] '{platform_name}' matched server platform "
+                        f"'{platform_name_check}' by substring, not exactly")
+                    return _found(platform, platform_name_check)
 
             logging.debug(f"[BIOS] Platform '{platform_name}' not found on server")
             return None  # Platform not found
