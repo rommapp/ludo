@@ -8281,7 +8281,10 @@ class Plugin:
         which of those outcomes happened.
 
         Returns {success, status, message, installed, skipped}, where status is
-        one of installed / up-to-date / no-firmware / no-emulator / failed.
+        one of installed / up-to-date / no-keys / no-firmware / no-emulator /
+        failed. 'no-keys' is not success: the firmware is on disk but Eden
+        cannot decrypt a byte of it without prod.keys, which is uploaded to
+        RomM as its own entry beside the firmware.
         """
         try:
             sync = self._auto_sync

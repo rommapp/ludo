@@ -11552,6 +11552,9 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
               : r?.status === 'up-to-date' ? 'Already installed'
               : r?.status === 'no-emulator' ? 'Eden isn’t installed on this device'
               : r?.status === 'no-firmware' ? 'No Switch firmware on the server'
+              // Firmware landed but nothing can decrypt it. Say what to do,
+              // not just that it failed -- the fix is an upload, not a retry.
+              : r?.status === 'no-keys' ? 'Installed, but prod.keys is missing — upload it to the Switch platform on RomM'
               : r?.message || 'Install failed',
         });
       } else {
