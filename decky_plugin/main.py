@@ -306,6 +306,10 @@ _NON_GAME_EXTS = (
     '.m3u', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp',
     '.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra',
     '.state', '.auto', '.txt', '.nfo', '.xml', '.dat', '.json', '.cue',
+    # An in-flight download. download_rom removes its own .part on failure,
+    # but a killed process cannot — and a half-written ROM listed as a game is
+    # exactly the impersonation the .part name exists to prevent.
+    '.part',
 )
 
 # Disc dumps that describe their own tracks: the descriptor is the thing to

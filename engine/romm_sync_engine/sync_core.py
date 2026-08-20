@@ -1707,6 +1707,15 @@ class DownloadProgress:
         self.start_time = time.time()
         self.last_update = self.start_time
         
+    def rewind(self, downloaded):
+        """Reset the byte count after a transfer restarted from scratch.
+
+        Only the count moves. start_time deliberately does not: the elapsed
+        time a user has been waiting is not undone by a reconnect, and a speed
+        computed from a reset clock would read as a burst that never happened.
+        """
+        self.downloaded = downloaded
+
     def update(self, chunk_size):
         """Update progress with new chunk"""
         self.downloaded += chunk_size
@@ -2420,6 +2429,28 @@ def qr_matrix(text):
     except Exception as e:
         print(f"⚠️ QR encode failed: {e}")
         return None
+
+
+class _FailedResponse:
+    """Stands in for a response that could not be re-opened.
+
+    _stream_download's retry budget is what ends a failing download, not the
+    first refusal — so a reconnect that itself fails has to come back around
+    the loop and be counted, rather than raising past the counter. Iterating
+    this re-raises the reconnect's own error, which is also the error the user
+    should see if the budget runs out here.
+    """
+
+    headers = {}
+
+    def __init__(self, error):
+        self._error = error
+
+    def iter_content(self, chunk_size=None):
+        raise self._error
+
+    def close(self):
+        pass
 
 
 class RomMClient:
@@ -4150,6 +4181,107 @@ class RomMClient:
         # Return just the grouped games (total_games is tracked by caller)
         return final_games
         
+    # A dropped connection is not a failed download, and for a file this size
+    # the difference matters: Mario Kart 8 broke at 4.4 GB of 6.8 GB with
+    # "Connection broken: IncompleteRead", and the whole transfer was thrown
+    # away. On a link that drops every few minutes, a 7 GB game started from
+    # zero each time never finishes at all.
+    _TRANSIENT_DOWNLOAD_ERRORS = (
+        requests.exceptions.ChunkedEncodingError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+    )
+    _DOWNLOAD_ATTEMPTS = 5
+    _DOWNLOAD_CHUNK = 8192
+
+    def _stream_download(self, response, sink, url, params, total_size,
+                         on_chunk=None, on_rewind=None,
+                         cancellation_checker=None, rom_name='', log=None):
+        """Write a streamed body into ``sink``, reconnecting when it drops.
+
+        Returns the bytes written. Raises the last transient error once the
+        attempts are spent, and DownloadCancelledException immediately.
+
+        Resume is by HTTP Range, and only when the server said it would honour
+        one: RomM serves a stored file with Accept-Ranges, but a FOLDER ROM is
+        a zip generated per request, and a byte offset into a stream that is
+        rebuilt each time means nothing. So the two cases degrade differently
+        and deliberately -- a single file resumes where it stopped, a folder
+        restarts -- and both beat giving up, which is what happened before.
+
+        The restart truncates the sink rather than appending to it. Appending
+        a second copy of the first 4 GB is not a partial file, it is a corrupt
+        one that would pass a size check and fail to unzip.
+        """
+        accepts_ranges = 'bytes' in (
+            response.headers.get('accept-ranges', '') or '').lower()
+        written = 0
+        attempt = 0
+        while True:
+            try:
+                for chunk in response.iter_content(chunk_size=self._DOWNLOAD_CHUNK):
+                    if cancellation_checker and cancellation_checker():
+                        raise DownloadCancelledException(
+                            f"Download cancelled: {rom_name}")
+                    if not chunk:
+                        continue
+                    sink.write(chunk)
+                    written += len(chunk)
+                    if on_chunk:
+                        on_chunk(len(chunk))
+                return written
+            except DownloadCancelledException:
+                raise
+            except self._TRANSIENT_DOWNLOAD_ERRORS as e:
+                attempt += 1
+                if attempt >= self._DOWNLOAD_ATTEMPTS:
+                    logging.warning("download of %s gave up after %d attempts: %s",
+                                    rom_name, attempt, e)
+                    raise
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                # Back off a little, but not much: the usual cause is a proxy
+                # or tunnel dropping a long-lived stream, and the connection
+                # that replaces it is fine immediately.
+                delay = min(2 ** attempt, 10)
+                note = (f"  ↩ {rom_name}: connection dropped at "
+                        f"{written / (1024 ** 3):.2f} GB; "
+                        + (f"resuming in {delay}s" if accepts_ranges else
+                           f"this download cannot resume, restarting in {delay}s")
+                        + f" (attempt {attempt + 1} of {self._DOWNLOAD_ATTEMPTS})")
+                logging.info(note)
+                if log:
+                    log(note)
+                time.sleep(delay)
+                if cancellation_checker and cancellation_checker():
+                    raise DownloadCancelledException(f"Download cancelled: {rom_name}")
+
+                headers = {'Range': f'bytes={written}-'} if (accepts_ranges and written) else None
+                try:
+                    response = self.session.get(
+                        url, params=params if params else None, stream=True,
+                        timeout=30, headers=headers)
+                except self._TRANSIENT_DOWNLOAD_ERRORS as reconnect_error:
+                    # Reconnecting failed too. Loop rather than raise: the
+                    # attempt budget is what ends this, not the first refusal.
+                    logging.debug("reconnect for %s failed: %s", rom_name, reconnect_error)
+                    response = _FailedResponse(reconnect_error)
+                    continue
+                if headers and response.status_code == 206:
+                    continue                    # appending where we stopped
+                if response.status_code not in (200, 206):
+                    raise requests.exceptions.ConnectionError(
+                        f"reconnect returned HTTP {response.status_code}")
+                # A 200 to a Range request means the server ignored it and is
+                # sending the whole body again.
+                sink.seek(0)
+                sink.truncate()
+                written = 0
+                if on_rewind:
+                    on_rewind()
+
     def download_rom(self, rom_id, rom_name, download_path, progress_callback=None, cancellation_checker=None, file_ids=None):
         """Download a ROM file with progress tracking
 
@@ -4312,20 +4444,23 @@ class RomMClient:
                                                      dir=str(download_path.parent)) as temp_file:
                         temp_path = temp_file.name
                         
-                        # Stream download directly to temporary file
-                        for chunk in response.iter_content(chunk_size=8192):
-                            # Check for cancellation
-                            if cancellation_checker and cancellation_checker():
-                                raise DownloadCancelledException(f"Download cancelled: {rom_name}")
+                        # Stream download directly to temporary file, through
+                        # the resuming reader — a folder ROM is the largest
+                        # thing here and so the likeliest to outlive a link.
+                        def _folder_chunk(size):
+                            if progress_callback and total_size > 0:
+                                progress_callback(progress.update(size))
 
-                            if chunk:
-                                temp_file.write(chunk)
-                                actual_downloaded += len(chunk)
+                        def _folder_rewind():
+                            if progress_callback and total_size > 0:
+                                progress.rewind(0)
+                                progress_callback(progress.update(0))
 
-                                # Update progress
-                                if progress_callback and total_size > 0:
-                                    progress_info = progress.update(len(chunk))
-                                    progress_callback(progress_info)
+                        actual_downloaded = self._stream_download(
+                            response, temp_file, full_url, params, total_size,
+                            on_chunk=_folder_chunk, on_rewind=_folder_rewind,
+                            cancellation_checker=cancellation_checker,
+                            rom_name=rom_name, log=getattr(self, 'log', None))
                 
                 except BaseException:
                     # Clean up the partial temp file on cancellation OR failure —
@@ -4362,36 +4497,58 @@ class RomMClient:
                     if temp_path and os.path.exists(temp_path):
                         os.unlink(temp_path)
             else:
-                with open(download_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        # Check for cancellation
-                        if cancellation_checker:
-                            if cancellation_checker():
-                                raise DownloadCancelledException(f"Download cancelled: {rom_name}")
+                # Written to a .part and renamed, never straight to the
+                # final name. A dropped connection used to leave 4.4 GB of a
+                # 6.8 GB .nsp sitting under the real filename: the library
+                # then reported the game as downloaded, the tile went green,
+                # and the truncated file failed in the emulator instead of
+                # here. A partial must not be able to impersonate a ROM.
+                partial_path = download_path.with_name(download_path.name + '.part')
+                with open(partial_path, 'wb') as f:
+                    _seen = {'n': 0}
 
-                        if chunk:
-                            f.write(chunk)
-                            actual_downloaded += len(chunk)
+                    def _file_chunk(size):
+                        _seen['n'] += size
+                        if not progress_callback:
+                            return
+                        if total_size > 0:
+                            progress_callback(progress.update(size))
+                            return
+                        # Unknown length: no fraction to report, so the bar
+                        # creeps and the byte count carries the truth.
+                        elapsed = time.time() - start_time
+                        progress_callback({
+                            'progress': min(0.8, _seen['n'] / (10 * 1024 * 1024)),
+                            'downloaded': _seen['n'],
+                            'total': max(_seen['n'], 1024 * 1024),
+                            'speed': _seen['n'] / elapsed if elapsed > 0 else 0,
+                            'eta': 0,
+                            'filename': rom_name,
+                        })
 
-                            # Update progress
-                            if progress_callback:
-                                if total_size > 0:
-                                    progress_info = progress.update(len(chunk))
-                                else:
-                                    # Create dynamic progress info
-                                    elapsed = time.time() - start_time
-                                    speed = actual_downloaded / elapsed if elapsed > 0 else 0
-                                    
-                                    progress_info = {
-                                        'progress': min(0.8, actual_downloaded / (10 * 1024 * 1024)),
-                                        'downloaded': actual_downloaded,
-                                        'total': max(actual_downloaded, 1024 * 1024),
-                                        'speed': speed,
-                                        'eta': 0,
-                                        'filename': rom_name
-                                    }
-                                progress_callback(progress_info)
-                
+                    def _file_rewind():
+                        _seen['n'] = 0
+                        if progress_callback and total_size > 0:
+                            progress.rewind(0)
+                            progress_callback(progress.update(0))
+
+                    try:
+                        actual_downloaded = self._stream_download(
+                            response, f, full_url, params, total_size,
+                            on_chunk=_file_chunk, on_rewind=_file_rewind,
+                            cancellation_checker=cancellation_checker,
+                            rom_name=rom_name, log=getattr(self, 'log', None))
+                    except BaseException:
+                        f.close()
+                        try:
+                            partial_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        raise
+
+                # Only now does it get the game's name.
+                partial_path.replace(download_path)
+
                 # After successful download, check if extraction is needed (only for
                 # single-file archives: .zip or .7z). Console ROM archives are left
                 # as-is (RetroArch loads them natively); only directory-based PC games
@@ -4440,6 +4597,15 @@ class RomMClient:
                 where = getattr(e, 'filename', None) or str(download_path.parent)
                 return False, f"Not enough free space on {where}"
             return False, f"Download error: {e}"
+        except self._TRANSIENT_DOWNLOAD_ERRORS as e:
+            # The transfer stopped; nothing about it was wrong. Say that,
+            # because "Download error: ('Connection broken: IncompleteRead(...
+            # bytes read, ... more expected)', ...)" reads as corruption and
+            # tells the user nothing they can act on.
+            logging.exception("Download exception")
+            return False, (f"The connection dropped during the download and "
+                           f"did not recover after {self._DOWNLOAD_ATTEMPTS} "
+                           f"attempts. Nothing was left half-written — try again.")
         except Exception as e:
             logging.exception("Download exception")
             return False, f"Download error: {e}"
