@@ -7490,10 +7490,20 @@ class Plugin:
             if not info:
                 return {'kind': None}
             installed = sync.switch_add_ons_installed_for(name)
+            # file_name is spelled two ways here, and reading only one of them
+            # broke both things it feeds. A library entry keys it 'file_name';
+            # a sibling row folded into the parent game keys it 'fs_name' — and
+            # RomM reports a patch as a sibling, so the add-ons are mostly the
+            # second kind. With the name missing, an installed add-on could not
+            # be matched against its server row and reappeared as available,
+            # labelled with the only string left: the base game's name. Hence
+            # two identical "Mario Kart 8 Deluxe · On the server" rows under
+            # the update and DLC that were already installed.
             available = [] if info['kind'] != 'base' else [
                 {'rom_id': a.get('rom_id') or a.get('id'),
                  'name': a.get('name'),
-                 'file_name': a.get('file_name'),
+                 'file_name': (a.get('file_name') or a.get('fs_name')
+                               or (a.get('romm_data') or {}).get('fs_name')),
                  'is_downloaded': bool(a.get('is_downloaded'))}
                 for a in sync.switch_add_ons_for_rom(
                     g, library=self._available_games)]

@@ -4922,7 +4922,10 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
       ))}
       {available.map((a: any) => (
         <V2SettingsRow key={a.rom_id} icon={<FaPuzzlePiece size={14} />}
-          title={a.name || a.file_name}
+          // The filename first, not the name: RomM reports an add-on's name as
+          // the base game's, so a list keyed on it is several identical rows.
+          // The filename is what carries the title ID and the DLC's label.
+          title={a.file_name || a.name}
           subtitle={busy === a.rom_id ? 'Downloading…'
             : a.is_downloaded ? 'Downloaded · not active in Eden'
             : 'On the server'}
@@ -4930,16 +4933,6 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
           onClick={() => fetchAddOn(a)}
           right={<FaDownload size={12} style={{ color: V2.fgMuted }} />} />
       ))}
-      {/* The cost of each mode, stated where the add-ons are. NAND is the one
-          worth calling out: it is the mode that silently stores every add-on
-          twice. */}
-      {(update || dlc.length > 0) && (
-        <div style={{ fontSize: '11px', color: V2.fgFaint, padding: '0 2px' }}>
-          {state.mode === 'nand'
-            ? 'Add-ons are copied into Eden’s NAND; the downloaded file stays in the library folder too.'
-            : 'Add-ons live in the extcontent folder, which Eden reads directly — one copy, and nothing in NAND.'}
-        </div>
-      )}
     </div>
   );
 }
