@@ -48,6 +48,7 @@ inherited:
 
 import json
 import logging
+import shutil
 import struct
 import time
 from pathlib import Path
@@ -125,6 +126,179 @@ def eden_content_dir(extra_data_dir=None, create=False):
             except OSError as e:
                 log.debug("could not create %s: %s", target, e)
     return None
+
+
+# ── External content ────────────────────────────────────────────────────────
+#
+# Eden 0.2.0-rc1 reads updates and DLC out of a plain folder, which is a better
+# home for them than NAND is. NAND installation splits one file the user chose
+# to keep into a dozen anonymous NCAs under a hashed name; the folder keeps it
+# as the container it was downloaded as, so removing an add-on is deleting the
+# file that obviously is it, and the library holds one copy rather than two.
+#
+# The folder is a subdirectory of the platform's ROM directory rather than a
+# path of its own. That is what keeps RetroDECK's game list clean: a patch NSP
+# left beside the base game is scanned as if it were a game, and a subfolder is
+# not -- ROM scanners and Eden's own game dirs both stop at the top level. It
+# is also why the folder has to be registered with Eden explicitly, in
+# eden_config: the same non-recursion that hides it from RetroDECK hides it
+# from Eden.
+EXTCONTENT_DIRNAME = 'extcontent'
+
+# What a manifest record's 'mode' says about how the add-on was installed.
+MODE_NAND = 'nand'
+MODE_EXTCONTENT = 'extcontent'
+
+
+# Switch containers. A folder ROM on this platform routinely holds the base
+# game AND its update and DLC, which is why the generic "several game files
+# means several regional variants" rule below is wrong here: they are not
+# alternatives to choose between, they are one game plus parts that are not
+# bootable at all.
+CONTAINER_EXTS = ('.nsp', '.xci', '.nsz', '.xcz')
+
+
+def base_game(files, prod_keys=None):
+    """The bootable base game among a Switch folder ROM's files, or None.
+
+    The file is read before its name is believed, and that order is the whole
+    point. A dump tagged with the base title ID can BE the update -- Eden then
+    answers "Game updates cannot be loaded directly", an error about a file the
+    user never chose and cannot act on. The CNMT inside the container says what
+    the container is; the name says what someone typed. Reading costs a few
+    kilobytes of header, so there is no reason to prefer the cheaper answer.
+
+    The name is the fallback, not the authority: without prod.keys nothing can
+    be decrypted and the tag is all there is.
+
+    Returns a single Path, never a list. There is no choice to offer here --
+    exactly one file in a Switch game folder can boot, and asking which
+    "version" to launch is asking the user to guess at something the file
+    already states.
+    """
+    scored = []
+    for f in files:
+        if f.suffix.lower() not in CONTAINER_EXTS:
+            continue
+        named = (title_ids.switch_content_from_name(f.name) or {}).get('kind')
+        read = None
+        try:
+            read = (title_ids.switch_content(f, prod_keys=prod_keys) or {}).get('kind')
+        except Exception:
+            read = None
+        kind = read or named
+        if kind in ('update', 'dlc'):
+            continue
+        # A confirmed base outranks a file nothing could identify, and among
+        # equals the larger file wins -- in a folder where identification
+        # failed entirely, the base game is the big one.
+        try:
+            size = f.stat().st_size
+        except OSError:
+            size = 0
+        scored.append((1 if kind == 'base' else 0, size, f))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: (t[0], t[1], str(t[2])), reverse=True)
+    return scored[0][2]
+
+
+def extcontent_dir(rom_dir, create=False):
+    """The external-content folder for a platform's ROM directory, or None.
+
+    ``rom_dir`` is where the base games live -- ``.../roms/switch``. Returns
+    None only when the folder is wanted and cannot be made.
+    """
+    if not rom_dir:
+        return None
+    target = Path(rom_dir).expanduser() / EXTCONTENT_DIRNAME
+    if target.is_dir():
+        return target
+    if create:
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            return target
+        except OSError as e:
+            log.debug("could not create %s: %s", target, e)
+            return None
+    return None
+
+
+def install_external(path, dest_dir, info=None, prod_keys=None):
+    """Place one update or DLC in Eden's external-content folder.
+
+    Statuses mirror ``install``: 'not-switch', 'base', 'current', 'ok'. There
+    is no 'compressed' -- a .nsz is exactly as readable to Eden here as a .nsp,
+    because nothing in this path opens the container at all. That is the whole
+    difference between the two modes: NAND installation has to parse the file
+    and copy its members out, and this only has to put the file somewhere.
+
+    A NAND install of the same title is removed when one exists. That is not
+    the mode migration the user did not ask for -- it is the same rule
+    ``install`` follows for a superseded patch, applied across modes: two
+    copies of one title ID, one in NAND and one in a folder, leave which
+    version applies up to Eden, and a title we installed is ours to replace.
+    """
+    path = Path(path)
+    if info is None:
+        info = title_ids.switch_content(path, prod_keys=prod_keys)
+    if not info or not info.get('base_id'):
+        return {'status': 'not-switch'}
+    kind = info.get('kind')
+    if kind not in ('update', 'dlc'):
+        return {'status': 'base'}
+
+    target = extcontent_dir(dest_dir, create=True)
+    if target is None:
+        return {'status': 'no-folder'}
+
+    title_id = info['title_id']
+    version = info.get('version')
+    record = read_manifest().get(title_id) or {}
+    destination = target / path.name
+    # Whether this changes anything is decided up front, but the file is placed
+    # either way. "Already current" describes the add-on, not the copy in front
+    # of us: a duplicate left beside the base game is still a duplicate the
+    # game list would show, so it goes into the folder and the status still
+    # says nothing changed.
+    current = (record.get('mode') == MODE_EXTCONTENT and destination.is_file()
+               and version is not None and record.get('version') == version)
+
+    # Before the move, not after: a same-named reinstall would otherwise have
+    # the forget delete the copy just written. Same order, and the same
+    # reasoning, as install's own delete-then-write.
+    _forget(title_id, keep_path=str(destination))
+
+    if path.resolve() != destination.resolve():
+        try:
+            # Move, not copy: the download landed here on its way to the
+            # folder, and leaving the original beside the base ROM would put
+            # back exactly the game-list pollution the folder exists to avoid.
+            # os.replace would fail across filesystems; shutil.move would not.
+            shutil.move(str(path), str(destination))
+        except OSError as e:
+            log.warning("could not move %s into %s: %s", path.name, target, e)
+            return {'status': 'failed', 'error': str(e)}
+
+    manifest = read_manifest()
+    manifest[title_id] = {
+        'base_id': info['base_id'],
+        'kind': kind,
+        'version': version,
+        'source': info.get('source'),
+        'file_name': destination.name,
+        'mode': MODE_EXTCONTENT,
+        'path': str(destination),
+        'ncas': [],
+        'installed_at': int(time.time()),
+    }
+    _write_manifest(manifest)
+    return {'status': 'current' if current else 'ok',
+            'installed': 0 if current else 1, 'skipped': 1 if current else 0,
+            'keys': 0,
+            'target': target, 'title_id': title_id,
+            'base_id': info['base_id'], 'kind': kind, 'version': version,
+            'mode': MODE_EXTCONTENT, 'path': str(destination)}
 
 
 def _read_at(fh, offset, size):
@@ -240,19 +414,42 @@ def installed_version(title_id):
     return record.get('version')
 
 
-def _forget(title_id, extra_data_dir=None):
-    """Delete the NCAs we installed for ``title_id``. Returns how many went.
+def _forget(title_id, extra_data_dir=None, keep_path=None):
+    """Delete what we installed for ``title_id``. Returns how many files went.
 
     Only files this manifest recorded are touched. Anything Eden installed
     through its own GUI, or a user dropped in by hand, is invisible here and
     stays untouched -- we did not write it and we do not know what else claims
     it.
+
+    ``keep_path`` spares one file. It exists for the reinstall case in
+    install_external, where the new copy can legitimately have the same path
+    as the record being forgotten and deleting "the old one" would delete it.
     """
     manifest = read_manifest()
     key = str(title_id).upper()
     record = manifest.get(key)
     if not record:
         return 0
+
+    if record.get('mode') == MODE_EXTCONTENT:
+        removed = 0
+        recorded = record.get('path')
+        if recorded and str(recorded) != str(keep_path or ''):
+            candidate = Path(recorded)
+            # Only inside an extcontent folder. The manifest is ours, but a
+            # path in it is still a path, and this one is about to be deleted.
+            if candidate.parent.name == EXTCONTENT_DIRNAME:
+                try:
+                    if candidate.is_file():
+                        candidate.unlink()
+                        removed += 1
+                except OSError as e:
+                    log.debug("could not remove %s: %s", candidate, e)
+        manifest.pop(key, None)
+        _write_manifest(manifest)
+        return removed
+
     target = eden_content_dir(extra_data_dir)
     removed = 0
     if target is not None:
@@ -452,6 +649,7 @@ def install(path, info=None, extra_data_dir=None, prod_keys=None,
         'version': version,
         'source': info.get('source'),
         'file_name': path.name,
+        'mode': MODE_NAND,
         'ncas': written,
         'installed_at': int(time.time()),
     }
@@ -459,7 +657,8 @@ def install(path, info=None, extra_data_dir=None, prod_keys=None,
 
     return {'status': 'ok', 'installed': installed, 'skipped': skipped,
             'keys': keys_written, 'target': target, 'title_id': title_id,
-            'base_id': info['base_id'], 'kind': kind, 'version': version}
+            'base_id': info['base_id'], 'kind': kind, 'version': version,
+            'mode': MODE_NAND}
 
 
 def installed_for_base(base_id):

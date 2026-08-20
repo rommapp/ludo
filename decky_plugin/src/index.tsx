@@ -124,6 +124,9 @@ const searchGames = callable<[string], any>("search_games");
 const getGameDetail = callable<[number], any>("get_game_detail");
 const getRaEarned = callable<[number], any>("get_ra_earned");
 const downloadGame = callable<[number], any>("download_game");
+const getSwitchAddOns = callable<[number], any>("switch_add_ons");
+const getSwitchAddonMode = callable<[], any>("get_switch_addon_mode");
+const setSwitchAddonMode = callable<[string], any>("set_switch_addon_mode");
 const toggleCollectionSync = callable<[string, boolean], any>("toggle_collection_sync");
 const deleteCollectionRoms = callable<[string, string], any>("delete_collection_roms");
 const getDownloadProgress = callable<[number], any>("get_download_progress");
@@ -4815,6 +4818,128 @@ function FileRow({ f }: { f: any }) {
         )}
       </div>
       <HashChipRow crc={f?.crc} md5={f?.md5} sha1={f?.sha1} />
+    </div>
+  );
+}
+
+// ── Switch updates and DLC ──────────────────────────────────────────────────
+// A Switch patch is not a file the game reads from beside itself. Eden applies
+// add-on content only out of its own registered cache, so "downloaded" and
+// "installed" are two different states for the same file, and neither one is
+// visible from the file list above — a patch NSP sitting in the library folder
+// looks identical whether or not it is doing anything. This section is the
+// only place that says which.
+//
+// Everything comes from the switch_add_ons RPC, which answers {kind: null} for
+// anything that is not Switch content, so this renders nothing at all on every
+// other platform without the Files tab having to know the platform.
+function switchVersionLabel(v: any): string {
+  return (v === null || v === undefined || v === '') ? '' : `v${v}`;
+}
+
+// Where an add-on actually lives, which is the thing a file list cannot show.
+// A record written before the two modes existed has no 'mode' and is a NAND
+// install by construction.
+function switchAddOnWhere(record: any): string {
+  return record?.mode === 'extcontent'
+    ? 'In the updates folder' : 'Installed in Eden’s NAND';
+}
+
+function SwitchAddOnsSection({ romId }: { romId: number }) {
+  const [state, setState] = useState<any | null>(null);
+  const [busy, setBusy] = useState<number | null>(null);
+
+  const load = async () => {
+    try { setState(await getSwitchAddOns(romId)); }
+    catch (e) { console.error('switch_add_ons failed', e); setState(null); }
+  };
+  useEffect(() => { load(); }, [romId]);
+
+  if (!state?.kind) return null;
+
+  // This ROM is itself a patch or an add-on. Its own detail page should say
+  // what it belongs to and whether it is live in Eden — listing "its" add-ons
+  // would just list itself.
+  if (state.kind !== 'base') {
+    const label = state.kind === 'update' ? 'Update' : 'DLC';
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        <SectionHeading icon={<FaPuzzlePiece size={12} />}>Switch add-on</SectionHeading>
+        <V2SettingsRow icon={<FaPuzzlePiece size={14} />}
+          title={`${label} for ${state.base_id}`}
+          subtitle={[state.title_id, switchVersionLabel(state.version),
+                     state.installed ? 'Active in Eden' : 'Not active in Eden']
+                    .filter(Boolean).join(' · ')}
+          right={state.installed
+            ? <FaCheckCircle size={12} style={{ color: V2.success }} />
+            : <FaLink size={11} style={{ color: V2.fgFaint }} />} />
+      </div>
+    );
+  }
+
+  const update = state.installed_update;
+  const dlc: any[] = state.installed_dlc || [];
+  // An available add-on is matched to an installed record by the filename the
+  // install recorded, which is the only identifier both sides carry: the
+  // server row has no title ID until its name is parsed, and the manifest has
+  // no ROM ID at all.
+  const installedNames = new Set<string>(
+    [update, ...dlc].filter(Boolean).map((r: any) => String(r.file_name || '')));
+  const available: any[] = (state.available || [])
+    .filter((a: any) => !installedNames.has(String(a.file_name || '')));
+
+  if (!update && !dlc.length && !available.length) return null;
+
+  const fetchAddOn = async (a: any) => {
+    setBusy(a.rom_id);
+    try {
+      // The plugin installs a downloaded .nsp/.xci into Eden on the download
+      // worker itself, so there is nothing to trigger here afterwards — only
+      // the state to re-read.
+      const ok = await downloadOne(a.rom_id, a.name || a.file_name);
+      toaster.toast({
+        title: ok ? 'Add-on installed' : 'Add-on download failed',
+        body: a.name || a.file_name,
+      });
+      await load();
+    } finally { setBusy(null); }
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+      <SectionHeading icon={<FaPuzzlePiece size={12} />}>Updates &amp; DLC</SectionHeading>
+      {update && (
+        <V2SettingsRow icon={<FaMicrochip size={14} />}
+          title={`Update ${switchVersionLabel(update.version)}`.trim()}
+          subtitle={[update.file_name, switchAddOnWhere(update)].filter(Boolean).join(' · ')}
+          right={<FaCheckCircle size={12} style={{ color: V2.success }} />} />
+      )}
+      {dlc.map((d: any) => (
+        <V2SettingsRow key={d.title_id} icon={<FaPuzzlePiece size={14} />}
+          title={d.file_name || d.title_id}
+          subtitle={[d.title_id, switchAddOnWhere(d)].filter(Boolean).join(' · ')}
+          right={<FaCheckCircle size={12} style={{ color: V2.success }} />} />
+      ))}
+      {available.map((a: any) => (
+        <V2SettingsRow key={a.rom_id} icon={<FaPuzzlePiece size={14} />}
+          title={a.name || a.file_name}
+          subtitle={busy === a.rom_id ? 'Downloading…'
+            : a.is_downloaded ? 'Downloaded · not active in Eden'
+            : 'On the server'}
+          disabled={busy !== null}
+          onClick={() => fetchAddOn(a)}
+          right={<FaDownload size={12} style={{ color: V2.fgMuted }} />} />
+      ))}
+      {/* The cost of each mode, stated where the add-ons are. NAND is the one
+          worth calling out: it is the mode that silently stores every add-on
+          twice. */}
+      {(update || dlc.length > 0) && (
+        <div style={{ fontSize: '11px', color: V2.fgFaint, padding: '0 2px' }}>
+          {state.mode === 'nand'
+            ? 'Add-ons are copied into Eden’s NAND; the downloaded file stays in the library folder too.'
+            : 'Add-ons live in the extcontent folder, which Eden reads directly — one copy, and nothing in NAND.'}
+        </div>
+      )}
     </div>
   );
 }
@@ -10480,6 +10605,10 @@ function GameDetailPage() {
                     ))}
                   </div>
                 )}
+                {/* Switch patches and DLC. Above the file list because they are
+                    the actionable half: the list says what exists, this says
+                    what Eden will actually apply. Renders nothing off Switch. */}
+                <SwitchAddOnsSection romId={game.rom_id} />
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   {isMultiDisc && <SectionHeading icon={<FaBoxOpen size={12} />}>Files</SectionHeading>}
                   <FilesTab detail={detail} />
@@ -12067,6 +12196,12 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
   // present; neither answers "which firmware am I running", which is the
   // question someone opens this panel with after an emulator update.
   const [fw, setFw] = useState<any>(null);
+  // Where Switch updates and DLC go. Eden 0.2.0-rc1 reads them from a folder;
+  // older Eden only applies what is installed into NAND. The panel is the one
+  // place that already knows this platform is Switch, so the choice lives here
+  // rather than in a global settings list where it would mean nothing.
+  const [addOn, setAddOn] = useState<any>(null);
+  const [addOnBusy, setAddOnBusy] = useState(false);
   useEffect(() => { const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60); return () => clearTimeout(t); }, []);
 
   const load = async () => {
@@ -12139,6 +12274,22 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
     try { setFw(await switchFirmwareStatus()); } catch { /* leave the line off */ }
   };
   useEffect(() => { if (isSwitch) loadFirmware(); }, [isSwitch]);
+
+  const loadAddOnMode = async () => {
+    try { setAddOn(await getSwitchAddonMode()); } catch { /* ignore */ }
+  };
+  useEffect(() => { if (isSwitch) loadAddOnMode(); }, [isSwitch]);
+  const changeAddOnMode = async (mode: string) => {
+    if (addOnBusy || mode === addOn?.mode) return;
+    setAddOnBusy(true);
+    // Optimistic, then replaced by what the backend reports: switching to the
+    // folder mode also tries to register it with Eden, and whether THAT
+    // worked is the part worth waiting to show.
+    setAddOn((a: any) => ({ ...a, mode }));
+    try { setAddOn(await setSwitchAddonMode(mode)); }
+    catch { await loadAddOnMode(); }
+    finally { setAddOnBusy(false); }
+  };
 
   const files = row?.files || [];
   const missing = row?.missing_count || 0;
@@ -12216,6 +12367,40 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
                       the only question is whether the set is complete, and
                       "keys installed" is the whole answer. */}
                   {fwLine}{fw?.keys_installed ? ' · Keys installed' : ''}
+                </div>
+                {/* Updates & DLC placement. Two modes, and the difference is
+                    not cosmetic: the folder keeps one file per add-on where
+                    the user (and RetroDECK) can see it, while NAND explodes it
+                    into anonymous NCAs. The folder needs Eden 0.2.0-rc1 and it
+                    needs Eden to know the path — an unregistered folder is the
+                    silent failure this block exists to make loud. */}
+                <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '4px 10px 12px' }}>
+                  <div style={{ fontSize: '12px', color: V2.fg2 }}>Updates &amp; DLC</div>
+                  {/* The pill sizes to its labels. In a column flex parent it
+                      would otherwise stretch edge to edge, which reads as a
+                      progress bar rather than a two-way choice. */}
+                  <div style={{ display: 'flex' }}>
+                    <V2Segment
+                      options={[{ id: 'extcontent', label: 'Folder' },
+                                { id: 'nand', label: 'Install to NAND' }]}
+                      value={addOn?.mode || 'extcontent'}
+                      disabled={addOnBusy}
+                      onChange={changeAddOnMode} />
+                  </div>
+                  <div style={{ fontSize: '11.5px', color: V2.fgMuted, lineHeight: 1.45 }}>
+                    {addOn?.mode === 'nand'
+                      ? 'Add-ons are installed into Eden’s NAND. Works on any Eden version, and stores each add-on twice.'
+                      : addOn?.eden_registered
+                      ? `Eden reads add-ons from ${addOn?.folder || 'the library folder'} — one copy, nothing in NAND.`
+                      : !addOn?.folder
+                      ? 'Add-ons will go in a folder Eden reads. Download a Switch game first, so there is a folder to put them in.'
+                      : !addOn?.eden_configured
+                      ? 'Add-ons go in a folder Eden reads. Run Eden once so it writes its config — Ludo will point it at the folder by itself after that.'
+                      : addOn?.eden_running
+                      ? 'Eden is open, and it rewrites its config when it closes — so Ludo will point it at the folder once Eden has quit. Nothing for you to do.'
+                      : 'Ludo could not write Eden’s config. Add the folder yourself under Settings → General → External Content. Needs Eden 0.2.0-rc1 or newer.'}
+                  </div>
                 </div>
                 </>
               )}

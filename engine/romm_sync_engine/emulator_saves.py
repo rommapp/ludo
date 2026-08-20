@@ -806,11 +806,15 @@ def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None):
     written = 0
     try:
         with zipfile.ZipFile(zip_path) as archive:
+            strip = _save_archive_prefix(archive, title_id)
             for member in archive.infolist():
                 if member.is_dir():
                     continue
+                name = member.filename[len(strip):] if strip else member.filename
+                if not name:
+                    continue
                 # Resolve inside staging and confirm it stayed there.
-                destination = (staging / member.filename).resolve()
+                destination = (staging / name).resolve()
                 if staging.resolve() not in destination.parents:
                     log.warning("refusing archive member outside the save: %s",
                                 member.filename)
@@ -841,7 +845,37 @@ def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None):
     return {'path': existing, 'files': written, 'backup': backup}
 
 
-def pack_save(directory, destination):
+def _save_archive_prefix(archive, title_id):
+    """The leading "<title id>/" every member shares, or '' when there is none.
+
+    Two clients pack a Switch save two ways. Ludo zips the save directory's
+    CONTENTS -- "Autosave.save" at the archive root. Argosy, the Android RomM
+    client, zips the directory ITSELF -- "010063301BD50000/Autosave.save". Both
+    describe the same save, and the destination is chosen here either way (see
+    unpack_save), so the nesting carries no information we need.
+
+    What it does carry, unhandled, is a broken restore: the members land in
+    <save dir>/010063301BD50000/, one level below where Eden reads, and the
+    game starts a new file with the old one sitting invisibly underneath. So
+    the prefix is stripped when the archive has exactly one top-level entry and
+    it names this title. Anything else -- two top-level entries, or one that
+    names a different title -- is left alone rather than flattened on a guess.
+    """
+    tops = set()
+    for member in archive.infolist():
+        if member.is_dir():
+            continue
+        head, sep, _ = member.filename.partition('/')
+        if not sep:
+            return ''   # a member at the root: nothing is uniformly nested
+        tops.add(head)
+    if len(tops) != 1:
+        return ''
+    top = tops.pop()
+    return f'{top}/' if top.lower() == str(title_id).lower() else ''
+
+
+def pack_save(directory, destination, prefix=None):
     """Zip a save directory into a single artifact, and return its path.
 
     A directory cannot be a save state: RomM keys one file per (rom_id, slot).
@@ -850,6 +884,20 @@ def pack_save(directory, destination):
     hashes a zip as sorted "name:md5(content)" lines, so a packed save hashes
     identically on both sides without any new agreement between them.
 
+    Members are nested under the save's title-ID directory: "010063.../
+    Autosave.save", not "Autosave.save". That is Argosy's layout, the Android
+    RomM client's, and matching it is what makes one save one save. The hash
+    is computed over the member NAMES as well as their bytes, so two clients
+    packing identical save files under different layouts produce different
+    hashes -- and the same save from a phone and a desktop then reads as two
+    saves that each look newer than the other, forever. unpack_save reads both
+    layouts (see _save_archive_prefix), so archives written before this stay
+    restorable; only what we WRITE has to agree.
+
+    ``prefix`` overrides the directory name for that nesting. It exists for
+    the caller that knows the title ID independently of the path; by default
+    the directory IS the title, which is how Eden names it.
+
     Written deterministically — entries sorted, timestamps and permissions
     fixed, no compression metadata that varies per run — so that repacking an
     unchanged save produces an identical file. Without that, every sync would
@@ -857,6 +905,7 @@ def pack_save(directory, destination):
     """
     directory = Path(directory)
     destination = Path(destination)
+    prefix = (prefix if prefix is not None else directory.name).strip('/')
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     members = sorted(
@@ -871,6 +920,8 @@ def pack_save(directory, destination):
         with zipfile.ZipFile(staging, 'w', zipfile.ZIP_DEFLATED) as archive:
             for member in members:
                 name = member.relative_to(directory).as_posix()
+                if prefix:
+                    name = f'{prefix}/{name}'
                 # A fixed DOS epoch timestamp; the mtime that matters is the
                 # save file's own, tracked separately in the inventory.
                 info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))

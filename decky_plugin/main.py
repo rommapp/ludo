@@ -29,6 +29,7 @@ _paths.set_client_name("Ludo")
 # app's ~/RomMSync — but only for someone who has no ~/RomMSync already, so
 # renaming the app never strands a library that is on disk (see paths.library_dir).
 _paths.set_library_dir_name("Ludo")
+from romm_sync_engine import eden_config, emulator_saves, switch_content, title_ids  # noqa: E402
 
 
 def _default_roms_dir() -> str:
@@ -396,6 +397,13 @@ def _detect_multi_disc(local_path, is_downloaded):
             return True, len(launchable)
         # No disc set — fall back to standalone game files (regional variants).
         games = _list_standalone_games(p)
+        # Except on Switch, where several containers in a folder are a game
+        # plus its update and DLC. Those are not variants to pick between —
+        # only the base boots — so the badge and the picker must not appear.
+        # This is the flag the tile reads, so leaving it out here is what
+        # stops the picker from asking which "version" to launch.
+        if any(f.suffix.lower() in switch_content.CONTAINER_EXTS for f in games):
+            return False, 0
         return len(games) > 1, len(games)
     return False, 0
 
@@ -6019,6 +6027,16 @@ class Plugin:
     # Auxiliary (non-game) extensions — must match module-level _NON_GAME_EXTS.
     _NON_GAME_EXTS = _NON_GAME_EXTS
 
+    def _prod_keys(self):
+        """Eden's prod.keys, or None. Only used to READ a container's identity."""
+        try:
+            sync = self._auto_sync
+            override = ((sync.settings.get('Emulators', 'eden_data_dir', '') or '').strip()
+                        if sync else '')
+            return emulator_saves.find_prod_keys(override or None)
+        except Exception:
+            return None
+
     def _list_local_discs(self, local_path):
         """Return launchable entries inside a downloaded multi-file folder.
 
@@ -6050,6 +6068,16 @@ class Plugin:
             disc_images = [d for d in discs if not d['is_m3u']]
             if len(disc_images) < 2:
                 games = _list_standalone_games(p)
+                # Switch first: several .nsp/.xci in one folder is a game plus
+                # its update and DLC, not a set of regional variants. Only the
+                # base can boot, so there is one entry and no picker — the
+                # add-ons are handled by _handle_switch_add_ons, which takes
+                # them out of the folder entirely.
+                if any(f.suffix.lower() in switch_content.CONTAINER_EXTS for f in games):
+                    base = switch_content.base_game(games, self._prod_keys())
+                    return ([{'name': base.name, 'path': str(base),
+                              'is_m3u': False, 'is_region': False}]
+                            if base else [])
                 if len(games) > 1:
                     return [{'name': f.name, 'path': str(f),
                              'is_m3u': False, 'is_region': True} for f in games]
@@ -7365,7 +7393,30 @@ class Plugin:
         try:
             sync = self._auto_sync
             path = Path(path)
-            if not sync or path.suffix.lower() not in ('.nsp', '.xci'):
+            if not sync:
+                return
+
+            # A folder ROM. RomM folds a base game and its patch into ONE entry
+            # whose download is a directory, so the add-ons arrive inside it and
+            # were previously never seen by any of this -- the directory has no
+            # .nsp suffix, so the check below dropped the whole game. They then
+            # sat in the folder applying nothing, while adding themselves to the
+            # "which version do you want to launch?" list.
+            if path.is_dir():
+                members = sorted(f for f in path.rglob('*')
+                                 if f.is_file()
+                                 and f.suffix.lower() in switch_content.CONTAINER_EXTS)
+                base = switch_content.base_game(members, self._prod_keys())
+                for member in members:
+                    if base is not None and member == base:
+                        continue
+                    sync.install_switch_add_on(member)
+                if base is None:
+                    return
+                # Carry on as that base game, so the server is still searched
+                # for add-ons this download did not include.
+                path = base
+            elif path.suffix.lower() not in ('.nsp', '.xci'):
                 return
 
             info = sync.switch_add_on_state(path.name)
@@ -7399,7 +7450,11 @@ class Plugin:
                 if not (add_on_id and file_name):
                     continue
                 target = path.parent / file_name
-                if not target.exists():
+                # In extcontent mode the previous run moved this file into the
+                # subfolder, so "already here" is two places, not one.
+                already = target.exists() or (
+                    path.parent / switch_content.EXTCONTENT_DIRNAME / file_name).exists()
+                if not already:
                     logging.info(f"fetching Switch add-on {file_name} for rom {rom_id}")
                     ok, msg = self._romm_client.download_rom(
                         add_on_id, add_on.get('name') or file_name, target,
@@ -7439,6 +7494,9 @@ class Plugin:
                 for a in sync.switch_add_ons_for_rom(
                     g, library=self._available_games)]
             return {
+                'mode': sync.switch_addon_mode(),
+                'extcontent_dir': str(
+                    switch_content.extcontent_dir(sync.switch_rom_dir()) or ''),
                 'kind': info['kind'],
                 'base_id': info['base_id'],
                 'title_id': info['title_id'],
@@ -7451,6 +7509,42 @@ class Plugin:
         except Exception as e:
             logging.error(f"switch_add_ons error: {e}", exc_info=True)
             return {'kind': None}
+
+    async def get_switch_addon_mode(self):
+        """How Switch updates and DLC are made to apply, for the settings UI.
+
+        Reading this also REGISTERS the folder with Eden when folder mode is on
+        and Eden does not know it yet — see switch_addon_status. Opening the
+        panel is therefore what fixes the common case, rather than what reports
+        it: the only reason a fresh install starts unregistered is that nothing
+        had asked yet.
+        """
+        try:
+            sync = self._auto_sync
+            if not sync:
+                return {'mode': switch_content.MODE_EXTCONTENT}
+            return await asyncio.get_event_loop().run_in_executor(
+                None, sync.switch_addon_status)
+        except Exception as e:
+            logging.error(f"get_switch_addon_mode error: {e}", exc_info=True)
+            return {'mode': switch_content.MODE_EXTCONTENT}
+
+    async def set_switch_addon_mode(self, mode: str):
+        """Switch between the extcontent folder and NAND installation.
+
+        Nothing already installed moves: an add-on in NAND keeps applying, and
+        the manifest remembers which mode wrote it, so both stay removable.
+        """
+        try:
+            sync = self._auto_sync
+            if not sync:
+                return {'success': False}
+            await asyncio.get_event_loop().run_in_executor(
+                None, sync.set_switch_addon_mode, mode)
+            return {'success': True, **(await self.get_switch_addon_mode())}
+        except Exception as e:
+            logging.error(f"set_switch_addon_mode error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
 
     async def download_game(self, rom_id: int):
         """Download a single ROM into the library (handles archive extraction)."""

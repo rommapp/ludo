@@ -122,9 +122,15 @@ def main():
         second = E.pack_save(real, d / 'out' / 'b.zip')
         check('repacking is byte-identical',
               first.read_bytes() == second.read_bytes(), True)
-        check('zip holds the save files',
+        check('zip holds the save files, nested under the title ID',
               sorted(zipfile.ZipFile(first).namelist()),
-              ['sg00.dat', 'userdata.dat'])
+              [f'{MK8D}/sg00.dat', f'{MK8D}/userdata.dat'])
+        # The layout Argosy writes, so one save is one save across devices:
+        # the content hash covers member names, and a flat pack from here
+        # would never match a nested one from a phone.
+        check('and our own pack is recognised as nested',
+              E._save_archive_prefix(zipfile.ZipFile(first), MK8D),
+              f'{MK8D}/')
 
         # The packed save must hash the same on both sides, or /negotiate
         # reports a conflict for every save forever.

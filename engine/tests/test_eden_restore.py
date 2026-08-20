@@ -69,9 +69,50 @@ def main():
         check('contents replaced', (save / 'sg00.dat').read_bytes(), b'NEW')
         check('backup written', result['backup'].is_file(), True)
         with zipfile.ZipFile(result['backup']) as z:
-            check('backup holds the PREVIOUS save', z.read('sg00.dat'), b'OLD')
+            # Nested under the title, like every pack we write now.
+            check('backup holds the PREVIOUS save',
+                  z.read(f'{MK8D}/sg00.dat'), b'OLD')
         check('no staging left behind',
               sorted(p.name for p in save.parent.iterdir()), [MK8D])
+
+        # --- the Android client's nesting ------------------------------
+        #
+        # Argosy zips the save DIRECTORY; Ludo zips its contents. Both name the
+        # same save, and a restore that honoured the nesting would put the
+        # files one level below where Eden reads -- so the game would start
+        # fresh with the real save sitting invisibly underneath it.
+        nroot1 = d / 'n1'
+        ndata1 = nroot1 / '.local/share/eden'
+        nsave1 = make_eden(nroot1, {'sg00.dat': b'OLD'})
+        nested = make_zip(d / 'nested.zip',
+                          {f'{MK8D}/sg00.dat': b'PHONE',
+                           f'{MK8D}/userdata.dat': b'PHONE'})
+        result = E.unpack_save(nested, MK8D, extra_data_dir=ndata1)
+        check('a save nested under its title ID is flattened',
+              (nsave1 / 'sg00.dat').read_bytes(), b'PHONE')
+        check('and the title directory is not recreated inside itself',
+              (nsave1 / MK8D).exists(), False)
+        check('every member landed', result['files'], 2)
+
+        # Only THIS title's prefix is stripped, and only when it is the single
+        # top-level entry. Anything else is a layout we have not seen, and
+        # flattening it on a guess would merge directories that mean something.
+        nroot2 = d / 'n2'
+        ndata2 = nroot2 / '.local/share/eden'
+        nsave2 = make_eden(nroot2, {'sg00.dat': b'OLD'})
+        other = make_zip(d / 'other.zip', {'0100000000001000/sg00.dat': b'X'})
+        E.unpack_save(other, MK8D, extra_data_dir=ndata2)
+        check('a different title’s directory is preserved, not flattened',
+              (nsave2 / '0100000000001000' / 'sg00.dat').read_bytes(), b'X')
+
+        nroot3 = d / 'n3'
+        ndata3 = nroot3 / '.local/share/eden'
+        nsave3 = make_eden(nroot3, {'sg00.dat': b'OLD'})
+        mixed = make_zip(d / 'mixed.zip',
+                         {f'{MK8D}/sg00.dat': b'A', 'loose.dat': b'B'})
+        E.unpack_save(mixed, MK8D, extra_data_dir=ndata3)
+        check('a mixed archive keeps its own shape',
+              (nsave3 / MK8D / 'sg00.dat').read_bytes(), b'A')
 
         # --- a member trying to escape ---------------------------------
         root2 = d / 'b'

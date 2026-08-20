@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
-from . import emulator_saves, switch_content, title_ids
+from . import eden_config, emulator_saves, switch_content, title_ids
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -12839,8 +12839,112 @@ class AutoSyncManager:
         rom_id = rom.get('id') or rom.get('rom_id')
         return [g for g in out if (g.get('id') or g.get('rom_id')) != rom_id]
 
+    # Two ways to make an add-on apply, and the setting picks between them.
+    # 'extcontent' puts the container in a folder Eden reads (0.2.0-rc1 and
+    # later) and is the default: one file, visibly the add-on, deletable, and
+    # no second copy of several gigabytes in NAND. 'nand' is Eden's older
+    # install, kept because it is the only thing that works on an older Eden --
+    # where extcontent is not merely unsupported but SILENT, applying nothing
+    # and reporting nothing.
+    ADD_ON_MODES = (switch_content.MODE_EXTCONTENT, switch_content.MODE_NAND)
+
+    def switch_addon_mode(self):
+        """'extcontent' or 'nand' -- how add-ons are made to apply."""
+        mode = (self.settings.get('Emulators', 'switch_addon_mode', '') or '').strip()
+        return mode if mode in self.ADD_ON_MODES else switch_content.MODE_EXTCONTENT
+
+    def set_switch_addon_mode(self, mode):
+        """Set the add-on mode. Returns the mode actually in force.
+
+        Changing this does not move anything that is already installed. An
+        add-on in NAND keeps working when the mode changes to extcontent, and
+        the manifest records which mode each one used, so both remain
+        removable -- migrating on a settings toggle would mean deleting from
+        NAND and re-downloading gigabytes because a switch was flipped.
+        """
+        if mode not in self.ADD_ON_MODES:
+            return self.switch_addon_mode()
+        self.settings.set('Emulators', 'switch_addon_mode', mode)
+        if mode == switch_content.MODE_EXTCONTENT:
+            self.register_switch_extcontent_dir()
+        return mode
+
+    def switch_rom_dir(self):
+        """The Switch platform's ROM directory, or None when there isn't one."""
+        try:
+            base = Path(self.settings.get('Download', 'rom_directory', '') or '')
+            if not str(base) or str(base) == '.':
+                return None
+            for name in (platform_folder_name('switch'), 'switch'):
+                candidate = base / name
+                if candidate.is_dir():
+                    return candidate
+        except Exception:
+            pass
+        return None
+
+    def register_switch_extcontent_dir(self):
+        """Create the extcontent folder and tell Eden about it. Returns a status.
+
+        Statuses are eden_config.register_external_content_dir's, plus
+        'no-folder' when there is no Switch ROM directory to put one beside.
+
+        Registration is what makes the folder do anything: Eden's game dirs are
+        scanned one level deep, so a subfolder of one is invisible to it
+        (which is also exactly why RetroDECK does not list the patches).
+        """
+        rom_dir = self.switch_rom_dir()
+        if not rom_dir:
+            return 'no-folder'
+        target = switch_content.extcontent_dir(rom_dir, create=True)
+        if target is None:
+            return 'no-folder'
+        status = eden_config.register_external_content_dir(target)
+        if status == 'ok':
+            self.log(f"📂 Eden will read updates and DLC from {target}")
+        elif status == 'running':
+            self.log("⚠️ Close Eden and reopen Ludo to finish setting up the "
+                     "updates/DLC folder — Eden rewrites its config on exit")
+        elif status == 'no-config':
+            self.log("ℹ️ Run Eden once so it writes its config, then Ludo can "
+                     "point it at the updates/DLC folder")
+        return status
+
+    def switch_addon_status(self, register=True):
+        """The add-on mode plus whether Eden can actually see the folder.
+
+        ``register`` makes this self-healing rather than merely diagnostic: in
+        folder mode, anything that asks for the status also gets the folder
+        registered if it is not already. There is nothing for the user to
+        confirm -- they chose the mode, and the registration is what the mode
+        means -- so making them press a second button to apply the first one
+        would be inventing a step.
+
+        The one case it cannot fix on the spot is Eden being open, because Eden
+        serialises its whole config on exit and would drop the edit. That is
+        not a dead end though: the next call finds Eden closed and lands it, so
+        the recovery is "next time Ludo looks", not "go and do it yourself".
+        """
+        mode = self.switch_addon_mode()
+        rom_dir = self.switch_rom_dir()
+        folder = switch_content.extcontent_dir(
+            rom_dir, create=(mode == switch_content.MODE_EXTCONTENT))
+        status = {
+            'mode': mode,
+            'folder': str(folder or ''),
+            'eden_configured': eden_config.config_path() is not None,
+            'eden_running': emulator_saves.eden_is_running(),
+            'eden_registered': bool(folder) and eden_config.is_registered(folder),
+        }
+        if (register and mode == switch_content.MODE_EXTCONTENT
+                and not status['eden_registered']):
+            status['register_status'] = self.register_switch_extcontent_dir()
+            status['eden_registered'] = bool(folder) and eden_config.is_registered(folder)
+            status['eden_running'] = emulator_saves.eden_is_running()
+        return status
+
     def install_switch_add_on(self, local_path, progress=None):
-        """Install a downloaded update or DLC into Eden. Returns its result dict.
+        """Make a downloaded update or DLC apply in Eden. Returns its result dict.
 
         Safe to call on any freshly downloaded file: anything that is not an
         installable Switch add-on comes back as a status the caller can ignore,
@@ -12856,9 +12960,28 @@ class AutoSyncManager:
                 (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip() or None)
         except Exception:
             prod_keys = None
+        local_path = Path(local_path)
+        mode = self.switch_addon_mode()
         try:
-            result = switch_content.install(local_path, prod_keys=prod_keys,
-                                            progress=progress)
+            if mode == switch_content.MODE_EXTCONTENT:
+                # One extcontent folder for the platform, not one per game.
+                # The file's own parent is not it: an add-on inside a folder
+                # ROM sits in roms/switch/<Game>/, and deriving from there
+                # would scatter a folder per game -- each of which Eden would
+                # have to be told about separately, and none of which it would
+                # be told about at all after the first.
+                rom_dir = self.switch_rom_dir()
+                if rom_dir is None:
+                    rom_dir = (local_path.parent.parent
+                               if local_path.parent.name == switch_content.EXTCONTENT_DIRNAME
+                               else local_path.parent)
+                result = switch_content.install_external(
+                    local_path, rom_dir, prod_keys=prod_keys)
+                if result.get('status') == 'ok':
+                    self.register_switch_extcontent_dir()
+            else:
+                result = switch_content.install(local_path, prod_keys=prod_keys,
+                                                progress=progress)
         except Exception as e:
             logging.error(f"Switch add-on install failed for {local_path}: {e}",
                           exc_info=True)
@@ -12868,12 +12991,21 @@ class AutoSyncManager:
         name = Path(local_path).name
         if status == 'ok':
             kind = 'Update' if result['kind'] == 'update' else 'DLC'
-            self.log(f"✅ {kind} installed for {result['base_id']} ({name})")
+            where = ('the updates/DLC folder'
+                     if result.get('mode') == switch_content.MODE_EXTCONTENT
+                     else "Eden's NAND")
+            self.log(f"✅ {kind} for {result['base_id']} ready in {where} ({name})")
         elif status == 'current':
             logging.debug(f"{name} is already installed")
         elif status == 'no-emulator':
             self.log(f"ℹ️ {name} is Switch add-on content, but Eden is not "
                      f"installed here — it stays in the library folder")
+        elif status == 'no-folder':
+            self.log(f"⚠️ Could not create the updates/DLC folder for {name}; "
+                     f"it stays beside the game")
+        elif status == 'failed':
+            self.log(f"⚠️ Could not move {name} into the updates/DLC folder: "
+                     f"{result.get('error')}")
         elif status == 'compressed':
             self.log(f"⚠️ {name} is compressed (.nsz/.xcz) and cannot be "
                      f"installed; a decompressed .nsp/.xci is needed")
@@ -13267,14 +13399,22 @@ class AutoSyncManager:
         sees the same operation and can apply it once the obstacle is gone.
         """
         file_name = op.get('file_name') or ''
-        title_id = Path(file_name).stem
         # is_switch_title_id is the save-directory test specifically: Eden files
-        # a save under the BASE title, never an update or DLC id. The name came
-        # from our own pack, so anything failing here did not come from us.
+        # a save under the BASE title, never an update or DLC id.
+        title_id = Path(file_name).stem
         if not title_ids.is_switch_title_id(title_id):
-            self.log(f"⚠️ Save-sync: {file_name!r} is not named after a base "
-                     f"title ID; not restoring it")
-            return False
+            # Not our pack's name. A save uploaded by another RomM client is
+            # named after the GAME -- "SUPER ROBOT WARS Y [010063301BD50000]
+            # [2026-08-20_21-43-34].srm" -- and refusing that meant a save made
+            # on a phone could never come back to the desktop, which is most of
+            # the reason to sync one at all. The title is in the name either
+            # way; only the spelling differs.
+            tag = title_ids.raw_switch_tag_in_name(file_name)
+            title_id = title_ids.base_switch_title_id(tag) if tag else ''
+            if not title_id:
+                self.log(f"⚠️ Save-sync: {file_name!r} names no Switch title; "
+                         f"not restoring it")
+                return False
 
         # Check before spending the transfer. unpack_save checks again and is
         # the authoritative one -- Eden can start while the download runs --
@@ -14302,9 +14442,23 @@ class AutoSyncManager:
                     # the path that knows how to unpack these, and the
                     # negotiated sync routes them there. Same reasoning as
                     # _resolve_download_target, which already returns None here.
-                    if self._is_standalone_emulator(romm_emulator):
-                        self.log(f"  ⏭️ {romm_emulator} save handled by the "
-                                 f"standalone restore path, not RetroArch's")
+                    # The emulator TAG is the server's word for who wrote the
+                    # save, and it is not always ours: a save uploaded by
+                    # another RomM client arrives tagged whatever that client
+                    # said, or nothing at all. When it is wrong here the
+                    # failure is silent and total -- a packed Switch save gets
+                    # dropped into RetroArch's save root as a .srm, counted as
+                    # restored, while Eden's own save directory is never
+                    # touched. So the PLATFORM decides too, and it decides
+                    # first: nothing on Switch is RetroArch's, whatever the
+                    # tag says.
+                    if (self._is_standalone_emulator(romm_emulator)
+                            or standalone_emulator_for_platform(
+                                game.get('platform_name'), _platform_slug)):
+                        self.log(f"  ⏭️ {romm_emulator} save for a "
+                                 f"{_platform_slug or 'standalone'} game is "
+                                 f"handled by the standalone restore path, "
+                                 f"not RetroArch's")
                         continue
 
                     # Compute local path to check if file exists before skipping

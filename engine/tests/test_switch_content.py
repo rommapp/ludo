@@ -203,6 +203,107 @@ def main():
         check('uninstall leaves other titles alone',
               (target / NCA_C).exists(), True)
 
+        # ── picking the file to boot ─────────────────────────────────────
+        #
+        # A folder ROM holds the game and its add-ons together. Only one of
+        # them boots, and which one is a question about the files, not a
+        # question for the user.
+        folder = d / 'Game Folder'
+        folder.mkdir()
+        base_file = make_nsp(folder / f'Game [{BASE_ID}].nsp', [(NCA_A, b'B' * 400)])
+        upd_file = make_nsp(folder / f'Game [{UPDATE_ID}][v131072].nsp',
+                            [(NCA_B, b'U' * 100)])
+        dlc_file = make_nsp(folder / f'Game DLC [{DLC_ID}].nsp', [(NCA_C, b'D' * 50)])
+        check('the base game is the one that boots',
+              S.base_game([base_file, upd_file, dlc_file]), base_file)
+        check('order does not decide it',
+              S.base_game([dlc_file, upd_file, base_file]), base_file)
+        check('an update alone leaves nothing to boot',
+              S.base_game([upd_file, dlc_file]), None)
+        plain = make_nsp(folder / 'Plain.nsp', [(NCA_A, b'P' * 10)])
+        check('a single untagged container is still the game',
+              S.base_game([plain]), plain)
+        check('non-Switch files are ignored entirely',
+              S.base_game([folder / 'cover.png', base_file]), base_file)
+
+        # Nothing identifiable: the base game is the large file, because it is
+        # the only thing a size can say and a patch is never the biggest.
+        blind = d / 'Blind'
+        blind.mkdir()
+        (blind / 'a.nsp').write_bytes(b'x' * 10)
+        (blind / 'b.nsp').write_bytes(b'x' * 9000)
+        check('with nothing to read, the biggest file is the game',
+              S.base_game(sorted(blind.iterdir())), blind / 'b.nsp')
+
+        # ── external content folder ──────────────────────────────────────
+        #
+        # The other way to make an add-on apply: put the container in a folder
+        # Eden reads. Nothing here opens the file, which is why a .nsz that
+        # install() refuses is installable this way.
+        roms = d / 'roms' / 'switch'
+        roms.mkdir(parents=True)
+        ext_id = '0100152000044800'
+        ext = make_nsp(roms / f'Ext [{ext_id}][v131072].nsp', [(NCA_A, b'E' * 10)])
+        nand_before = sorted(p.name for p in target.iterdir())
+        result = S.install_external(ext, roms)
+        check('external install ok', result['status'], 'ok')
+        check('and reports the folder mode', result['mode'], S.MODE_EXTCONTENT)
+        check('the container moved into extcontent/',
+              (roms / 'extcontent' / ext.name).is_file(), True)
+        check('and no longer sits beside the base game', ext.exists(), False)
+        check('the manifest records the version',
+              S.installed_version(ext_id), 131072)
+        check('NAND is untouched by a folder install',
+              sorted(p.name for p in target.iterdir()), nand_before)
+
+        check('reinstalling the same version is a no-op',
+              S.install_external(roms / 'extcontent' / ext.name, roms)['status'],
+              'current')
+        check('and the file survived that no-op',
+              (roms / 'extcontent' / ext.name).is_file(), True)
+
+        # A newer patch for the same title replaces the older file rather than
+        # joining it: two versions of one title ID leave which applies up to
+        # directory order, exactly as in NAND.
+        newer_ext = make_nsp(roms / f'Ext [{ext_id}][v196608].nsp',
+                             [(NCA_A, b'F' * 10)])
+        result = S.install_external(newer_ext, roms)
+        check('a newer patch installs', result['status'], 'ok')
+        check('the older file is gone',
+              (roms / 'extcontent' / f'Ext [{ext_id}][v131072].nsp').exists(), False)
+        check('only the newer one remains',
+              sorted(p.name for p in (roms / 'extcontent').iterdir()),
+              [f'Ext [{ext_id}][v196608].nsp'])
+        check('and the version tracks it', S.installed_version(ext_id), 196608)
+
+        # Reinstalling under the SAME filename is the case that would delete
+        # the file just written if the forget ran after the move.
+        rewritten = make_nsp(roms / f'Ext [{ext_id}][v196608].nsp', [(NCA_A, b'G' * 10)])
+        check('a same-named reinstall reports nothing changed',
+              S.install_external(rewritten, roms)['status'], 'current')
+        check('and the file is still there',
+              (roms / 'extcontent' / f'Ext [{ext_id}][v196608].nsp').is_file(), True)
+        check('while the duplicate beside the game was taken away',
+              rewritten.exists(), False)
+
+        compressed_id = '0100152000045800'
+        (roms / f'Ext [{compressed_id}][v0].nsz').write_bytes(b'compressed')
+        check('a compressed add-on is fine here, unlike in NAND',
+              S.install_external(roms / f'Ext [{compressed_id}][v0].nsz',
+                                 roms)['status'], 'ok')
+
+        base_ext = roms / f'Game [{BASE_ID}].nsp'
+        base_ext.write_bytes(b'not an add-on')
+        check('a base game is refused here too',
+              S.install_external(base_ext, roms)['status'], 'base')
+        check('and stays where it is, for the other emulators',
+              base_ext.is_file(), True)
+
+        S.uninstall(ext_id)
+        check('uninstall removes the container',
+              (roms / 'extcontent' / f'Ext [{ext_id}][v196608].nsp').exists(), False)
+        check('and forgets the title', S.installed_version(ext_id), None)
+
         # ── truncated container ──────────────────────────────────────────
         truncated_id = '0100152000088800'
         blob = build_partition(S._PFS0_MAGIC, S._PFS0_ENTRY,
