@@ -3,6 +3,7 @@
 
 import requests
 import json
+import errno
 import os
 import sys
 import shutil
@@ -4299,10 +4300,16 @@ class RomMClient:
                 if cancellation_checker and cancellation_checker():
                     raise DownloadCancelledException(f"Download cancelled: {rom_name}")
 
-                # Download to temporary file instead of memory to avoid OOM crashes
+                # Download to temporary file instead of memory to avoid OOM crashes.
+                # The temp file lives NEXT TO the destination, not in /tmp: on the
+                # Deck (and inside the AppImage mount) /tmp is a small tmpfs under a
+                # user quota, so a multi-GB folder ROM died with "Disk quota
+                # exceeded" while the library drive had room to spare. Same
+                # filesystem as the extract target also keeps the write local.
                 temp_path = None
                 try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_file:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip',
+                                                     dir=str(download_path.parent)) as temp_file:
                         temp_path = temp_file.name
                         
                         # Stream download directly to temporary file
@@ -4320,10 +4327,16 @@ class RomMClient:
                                     progress_info = progress.update(len(chunk))
                                     progress_callback(progress_info)
                 
-                except DownloadCancelledException:
-                    # Clean up temp file on cancellation
+                except BaseException:
+                    # Clean up the partial temp file on cancellation OR failure —
+                    # it now sits in the library folder next to the game, so a
+                    # leaked one is visible to the user (and a full-disk failure
+                    # would leave the bytes that caused it on disk).
                     if temp_path and os.path.exists(temp_path):
-                        os.unlink(temp_path)
+                        try:
+                            os.unlink(temp_path)
+                        except OSError:
+                            pass
                     raise
                 
                 # Check for cancellation before extraction
@@ -4418,6 +4431,15 @@ class RomMClient:
         except DownloadCancelledException as e:
             print(f"Download cancelled: {e}")
             return False, "cancelled"
+        except OSError as e:
+            # ENOSPC / EDQUOT reach the user as a traceback otherwise, and
+            # "Download error: [Errno 122] Disk quota exceeded" says nothing
+            # about WHERE the space ran out.
+            logging.exception("Download exception")
+            if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                where = getattr(e, 'filename', None) or str(download_path.parent)
+                return False, f"Not enough free space on {where}"
+            return False, f"Download error: {e}"
         except Exception as e:
             logging.exception("Download exception")
             return False, f"Download error: {e}"

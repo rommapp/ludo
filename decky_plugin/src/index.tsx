@@ -860,8 +860,7 @@ async function maybePromptSwitchFirmware(romId: number): Promise<void> {
       showModal(
         <SwitchFirmwareConfirm
           fileName={info.file_name} size={mb} reason={info.reason}
-          installed={info.installed || 0} keysOk={info.keys_ok}
-          masterKey={info.master_key} version={info.version}
+          keysOk={info.keys_ok} version={info.version}
           installedVersion={info.installed_version}
           onAnswer={resolve} />
       );
@@ -1769,7 +1768,7 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
       onButtonUp={onBtnUp}
       onSecondaryButton={() => onOpen(game)}
       onSecondaryActionDescription="Details"
-      onOptionsButton={() => { if (dl) requestDelete(); }}
+      onOptionsButton={dl ? requestDelete : undefined}
       onOptionsActionDescription={dl ? (confirmDelete ? 'Confirm delete' : 'Delete') : undefined}
       onOKActionDescription={dl ? (isMultiRegion ? 'Launch (hold: regions)' : isMultiDisc ? (discsAreRegion ? 'Launch (hold: regions)' : 'Launch (hold: discs)') : (resume ? 'Resume' : 'Launch')) : 'Download'}
       onFocus={() => { setFocused(true); activate(); ensureDiscs(); ensureSiblings(); if (index !== undefined) onFocusIdx?.(index); _tileFocusScrub(selfRef.current, game.name); }}
@@ -8125,15 +8124,6 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
     if (b === GamepadButton.BUMPER_LEFT) cycle(-1);
     else if (b === GamepadButton.BUMPER_RIGHT) cycle(1);
     else if (b === GamepadButton.SELECT) { playSteamSound('deck_ui_show_modal'); libNavigate("/romm-sync-settings"); }
-    // Y → the focused platform's own menu when there is one, account menu
-    // otherwise. On the platforms grid the platform is what Y is nearest to and
-    // what someone pressing it there means; the account menu stays one press
-    // away on ☰ Start, and the footer hint below follows the same condition so
-    // the label never disagrees with what the button does.
-    else if (b === GamepadButton.OPTIONS) {
-      if (active === 'platforms' && focusedPlatform) focusedPlatform.open();
-      else openUserMenu();
-    }
     else if (b === GamepadButton.START) openUserMenu();                 // ☰ Start → account menu
     // L2/R2 → alphabet fast-scroll on the platform/collection grids (repeats
     // allowed so holding the trigger keeps scrubbing).
@@ -8150,6 +8140,18 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   // As an action handler, the focused tile consumes X first and this only runs
   // when nothing focused claims it.
   const onSecondary = chrome.rdEnabled ? launchRd : undefined;
+
+  // Y → the focused platform's own menu when there is one, account menu
+  // otherwise. Same reason X goes through the action-button dispatch rather
+  // than onButtonDown: onButtonDown sees every press in the tree, so a Y press
+  // on a home tile ran the tile's Delete AND opened the account menu over it
+  // (and again over the delete confirmation). As an action handler this only
+  // runs when nothing focused claims Y — game tiles claim it while a game is
+  // downloaded; platform tiles don't, so their menu still opens from here.
+  const onOptions = () => {
+    if (active === 'platforms' && focusedPlatform) focusedPlatform.open();
+    else openUserMenu();
+  };
 
   // B at the library root: consume it and leave the plugin UI deliberately.
   // Every inner page "backs out" by PUSHING /romm-sync-library (Steam's default
@@ -8169,7 +8171,7 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   // the specific buttons it defines).
   return v2Page(
     <Focusable noFocusRing onButtonDown={onButtonDown}
-      onSecondaryButton={onSecondary} onCancelButton={onExit}
+      onSecondaryButton={onSecondary} onOptionsButton={onOptions} onCancelButton={onExit}
       actionDescriptionMap={{ [GamepadButton.SELECT]: 'Settings', [GamepadButton.START]: 'Account' }}
       onOptionsActionDescription={platformY ? 'Platform' : 'Account'}
       onSecondaryActionDescription={chrome.rdEnabled ? 'RetroDECK' : undefined}>
@@ -11915,10 +11917,16 @@ function biosChip(row: any, chevron?: boolean) {
 // dialog furniture -- and is built from ModalRoot/Focusable/DialogButton
 // because @decky/ui's ConfirmModal is exported by neither @decky/ui 4.7.2 nor
 // the desktop shim, so importing it would break both builds.
-function SwitchFirmwareConfirm({ fileName, size, reason, installed, keysOk, masterKey,
+// No `installed` count and no `masterKey` here any more. The count was printed
+// as "replacing 238 installed file(s)", a number nobody can judge, and the
+// master-key generation says how far prod.keys can decrypt WITHOUT proving it
+// covers this firmware — so it could not settle the question being asked. The
+// keysOk warning below is the keys fact that changes what you'd do. Both are
+// still on the backend payload; this component just stopped rendering them.
+function SwitchFirmwareConfirm({ fileName, size, reason, keysOk,
                                  version, installedVersion, onAnswer, closeModal }: {
-  fileName: string; size: string; reason?: string; installed: number;
-  keysOk?: boolean; masterKey?: number | null;
+  fileName: string; size: string; reason?: string;
+  keysOk?: boolean;
   version?: string | null; installedVersion?: string | null;
   onAnswer: (ok: boolean) => void; closeModal?: () => void;
 }) {
@@ -11970,29 +11978,39 @@ function SwitchFirmwareConfirm({ fileName, size, reason, installed, keysOk, mast
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
             <FaMicrochip size={16} style={{ color: V2.brand, flexShrink: 0 }} />
+            {/* The version belongs in the question, since it is the thing
+                being decided. Falls back to the generic title only when no
+                filename anywhere carried a version to name. */}
             <div style={{ fontSize: '16px', fontWeight: 700, color: V2.fg }}>
-              Install Switch firmware?
+              {version ? `Install firmware ${version}?` : 'Install Switch firmware?'}
             </div>
           </div>
           <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.5, marginBottom: '4px' }}>
+            {/* One line, and it answers only "what happens to what I have".
+                The version being installed is in the title above, so this says
+                what it replaces — the fact the decision turns on.
+
+                It used to report the installed FILE COUNT ("replacing 238
+                installed file(s)"), which is not something anyone can act on:
+                nobody knows whether 238 is the right number, and the version
+                they are running is the thing they would actually recognise.
+                The count is still there in the panel for anyone who wants it. */}
             {reason === 'missing'
-              ? 'Eden has no system firmware installed.'
-              : version && installedVersion && version !== installedVersion
-                ? `Firmware ${version} is on the server. ${installedVersion} is installed.`
-                : version
-                  ? `Firmware ${version} is on the server, replacing ${installed} installed file(s).`
-                  // No version in either filename: say what is certain (a
-                  // different archive) instead of inventing a number.
-                  : `A different firmware set is on the server, replacing ${installed} installed file(s).`}
+              ? 'Eden has no firmware installed.'
+              : installedVersion
+                ? `Replaces ${installedVersion}, installed now.`
+                // A firmware set is installed but nothing named a version for
+                // it — an older marker, or an archive named without one. Say
+                // that it gets replaced and stop, rather than reach for the
+                // file count to have a number to print.
+                : 'Replaces the firmware installed now.'}
           </div>
           <div style={{ fontSize: '13px', color: V2.fgMuted, lineHeight: 1.5, marginBottom: '18px' }}>
-            {fileName} · {size} · installs into Eden’s system directory
-            {typeof masterKey === 'number' && (
-              // Read out of prod.keys itself, not from any filename. It says
-              // how far the installed keys can decrypt; it does NOT prove
-              // they cover this firmware, so it is stated and left at that.
-              <><br />prod.keys reaches master key {masterKey}</>
-            )}
+            {/* The filename appears only when the title could not name a
+                version — then it is the one identifier there is. Alongside
+                "Install firmware 20.5.0?" it just restates that, in a worse
+                format. */}
+            {!version && fileName ? `${fileName} · ` : ''}{size} · goes into Eden’s system directory
           </div>
           {/* Said BEFORE the download, not after it. Firmware without keys
               installs perfectly and then boots nothing, and the only useful
@@ -12092,9 +12110,7 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
                 fileName={avail.file_name}
                 size={mb}
                 reason={avail.reason}
-                installed={avail.installed || 0}
                 keysOk={avail.keys_ok}
-                masterKey={avail.master_key}
                 version={avail.version}
                 installedVersion={avail.installed_version}
                 onAnswer={resolve}
