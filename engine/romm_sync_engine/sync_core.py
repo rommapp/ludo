@@ -12186,15 +12186,26 @@ class AutoSyncManager:
                 keys_ok = bios.find_keys_entry('switch') is not None
             except Exception:
                 keys_ok = False
+        # Version labels, parsed from filenames. The installed one comes from
+        # the marker -- the name of the archive we actually unpacked -- so
+        # "17.0.1 installed" is a statement about this machine's history, not
+        # a guess from what happens to be lying in the NAND.
+        server_version = emulator_saves.firmware_version_from_name(
+            entry.get('file_name'))
+        installed_version = emulator_saves.installed_firmware_version()
         if emulator_saves.firmware_is_current(entry):
             return {'available': False, 'file_name': entry.get('file_name'),
                     'installed': status.get('count', 0), 'keys_ok': keys_ok,
+                    'version': server_version,
+                    'installed_version': installed_version,
                     'master_key': (keys or {}).get('master_key')}
         return {'available': True,
                 'file_name': entry.get('file_name'),
                 'size': entry.get('file_size_bytes') or 0,
                 'installed': status.get('count', 0),
                 'keys_ok': keys_ok,
+                'version': server_version,
+                'installed_version': installed_version,
                 # Shown, not enforced: which firmware needs which generation
                 # is a table that goes stale with every Nintendo release, and
                 # guessing it wrong would block an install that would work.

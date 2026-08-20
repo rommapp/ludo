@@ -71,6 +71,13 @@ _KEY_LINES_REQUIRED = 4
 # index at all, which is why this matches the digits rather than the prefix.
 _MASTER_KEY_RE = re.compile(rb'^master_key_([0-9a-f]{2})\s*=', re.IGNORECASE)
 
+# "Firmware.22.5.0.zip", "Firmware_17.0.1.zip". The version lives in the
+# filename and nowhere else we can cheaply reach: the authoritative copy is
+# inside a system NCA that cannot be read without the very keys whose adequacy
+# is in question. Treated as a LABEL throughout -- shown to a human, never
+# compared to decide whether an install may proceed.
+_FW_VERSION_RE = re.compile(r'(?<!\d)(\d{1,2}\.\d{1,2}\.\d{1,2})(?!\d)')
+
 # Depth to descend below the save root before giving up. The deepest known
 # layout puts the title three levels down; the margin covers a future one
 # without letting a symlink loop or a user's misplaced backup folder turn
@@ -489,6 +496,25 @@ def looks_like_keys(data):
             if matched >= _KEY_LINES_REQUIRED:
                 return True
     return False
+
+
+def firmware_version_from_name(name):
+    """A firmware version parsed out of an upload's filename, or None.
+
+    A label, not a fact. "Firmware.22.5.0.zip" says 22.5.0 because someone
+    typed it, and a renamed file says whatever the renamer chose. Good enough
+    to tell a person which set is which -- never good enough to gate an
+    install, which is why nothing here compares these to decide anything.
+    """
+    if not name:
+        return None
+    match = _FW_VERSION_RE.search(str(name))
+    return match.group(1) if match else None
+
+
+def installed_firmware_version():
+    """The version label of the firmware set we last installed, or None."""
+    return firmware_version_from_name(read_firmware_marker().get('file_name'))
 
 
 def highest_master_key(path=None, extra_data_dir=None):

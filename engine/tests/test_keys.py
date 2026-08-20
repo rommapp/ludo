@@ -207,6 +207,28 @@ master_key_source = ''' + b'c' * 32 + b'''
         check('keys_status is None without keys',
               E.keys_status(extra_data_dir=d / 'absent'), None)
 
+        # --- version labels -------------------------------------------
+        # Parsed from filenames because that is the only place a version
+        # exists cheaply -- the authoritative copy lives inside a system NCA
+        # that cannot be read without the very keys in question. A label for
+        # a human, never a comparison that gates an install.
+        for name, want in [
+            ('Firmware.22.5.0.zip', '22.5.0'),      # the real upload
+            ('Firmware_17.0.1.zip', '17.0.1'),      # the other real upload
+            ('Firmware 18.1.0 (Rebootless).zip', '18.1.0'),
+            ('firmware.zip', None),                 # no version to find
+            ('Switch-2024-set.zip', None),          # a year is not a version
+        ]:
+            check(f'version of {name}',
+                  E.firmware_version_from_name(name), want)
+        check('no name at all', E.firmware_version_from_name(None), None)
+
+        # installed_firmware_version reads the marker -- what was actually
+        # unpacked here -- not whatever happens to be lying in the NAND.
+        E.write_firmware_marker('Firmware_17.0.1.zip', 'ff' * 16, 3)
+        check('installed version comes from the marker',
+              E.installed_firmware_version(), '17.0.1')
+
         # --- currency -------------------------------------------------
         # Markers live under config_dir(), which is derived from HOME --
         # NOT from XDG_CACHE_HOME. Overriding the wrong variable let earlier

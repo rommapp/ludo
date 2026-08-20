@@ -145,6 +145,9 @@ const installSwitchFirmware = callable<[], any>("install_switch_firmware");
 // Asked before the download, so the prompt can name the size. Firmware is the
 // one transfer here big enough that starting it unasked would be rude.
 const switchFirmwareStatus = callable<[], any>("switch_firmware_status");
+// Asked before downloading a ROM: is this a Switch game whose firmware or keys
+// need attention? {needed:false} for everything else, and no transfer either way.
+const switchPrereqForRom = callable<[number], any>("switch_prereq_for_rom");
 // Per-platform sync switches. get_ returns every platform with its rom_count and
 // whether it's on; set_ takes the whole disabled set, so it's idempotent.
 const getPlatformSync = callable<[], any>("get_platform_sync");
@@ -772,6 +775,52 @@ function _setDlActive(romId: number, on: boolean, name?: string) {
   else { _dlActive.delete(romId); _dlNames.delete(romId); }
   _notifyDl();
 }
+// Getting a Switch game is the moment the firmware actually matters, so the
+// prompt belongs here rather than only on the BIOS page, which someone may
+// never open. Deliberately not a gate: declining installs no firmware and the
+// game still downloads, because a ROM on disk with no firmware is a recoverable
+// state and blocking the download would not make it less so.
+//
+// Once per session. The check is cheap, but a modal in front of every download
+// is not something anyone wants twice.
+let _switchPromptDone = false;
+async function maybePromptSwitchFirmware(romId: number): Promise<void> {
+  if (_switchPromptDone) return;
+  try {
+    const info = await switchPrereqForRom(romId);
+    if (!info?.needed) return;
+    _switchPromptDone = true;
+    // Keys missing but no firmware to fetch: nothing to confirm, so say it
+    // and move on rather than opening a modal whose only button is Cancel.
+    if (!info.available) {
+      toaster.toast({
+        title: 'Switch firmware',
+        body: 'prod.keys is missing — Switch games won’t boot until it’s uploaded to RomM',
+      });
+      return;
+    }
+    const mb = info.size ? `${(info.size / 1048576).toFixed(0)} MB` : 'a large download';
+    const ok = await new Promise<boolean>((resolve) => {
+      showModal(
+        <SwitchFirmwareConfirm
+          fileName={info.file_name} size={mb} reason={info.reason}
+          installed={info.installed || 0} keysOk={info.keys_ok}
+          masterKey={info.master_key} version={info.version}
+          installedVersion={info.installed_version}
+          onAnswer={resolve} />
+      );
+    });
+    if (!ok) return;
+    const r = await installSwitchFirmware();
+    toaster.toast({
+      title: 'Switch firmware',
+      body: r?.status === 'installed' ? `Installed ${r.installed} file(s) into Eden`
+          : r?.status === 'up-to-date' ? 'Already installed'
+          : r?.message || 'Install failed',
+    });
+  } catch { /* never let this stop a download */ }
+}
+
 // Downloads one game through the same path as the tile button: registers it in
 // the global registry (so its cover tile shows the ring), kicks off the backend
 // download, then polls to completion. Returns whether it succeeded.
@@ -781,6 +830,7 @@ async function downloadOne(romId: number, name?: string): Promise<boolean> {
   }
   _setDlActive(romId, true, name);
   try {
+    await maybePromptSwitchFirmware(romId);
     const start = await downloadGame(romId);
     if (!start?.success) return false;
     const ok = (await awaitDownload(romId)).ok;
@@ -1489,6 +1539,7 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
     setActiveDlRomId(game.rom_id);
     _setDlActive(game.rom_id, true, game.name);
     try {
+      await maybePromptSwitchFirmware(game.rom_id);
       const start = await downloadGame(game.rom_id);
       if (!start?.success) { toaster.toast({ title: 'Download failed', body: start?.message || 'Error' }); return; }
       const res = await awaitDownload(game.rom_id);
@@ -1551,6 +1602,7 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
       setActiveDlRomId(selectedRomId);
       _setDlActive(selectedRomId, true, game.name);
       try {
+        await maybePromptSwitchFirmware(selectedRomId);
         const start = await downloadGame(selectedRomId);
         if (!start?.success) { toaster.toast({ title: 'Download failed', body: start?.message || 'Error' }); return; }
         const res = await awaitDownload(selectedRomId);
@@ -9693,6 +9745,7 @@ function GameDetailPage() {
     setBusy('download');
     _setDlActive(game.rom_id, true, detail?.name || game.name);
     try {
+      await maybePromptSwitchFirmware(game.rom_id);
       const start = await downloadGame(game.rom_id);
       if (!start?.success) {
         toaster.toast({ title: 'Download failed', body: start?.message || 'Unknown error' });
@@ -11519,9 +11572,11 @@ function biosChip(row: any, chevron?: boolean) {
 // dialog furniture -- and is built from ModalRoot/Focusable/DialogButton
 // because @decky/ui's ConfirmModal is exported by neither @decky/ui 4.7.2 nor
 // the desktop shim, so importing it would break both builds.
-function SwitchFirmwareConfirm({ fileName, size, reason, installed, keysOk, masterKey, onAnswer, closeModal }: {
+function SwitchFirmwareConfirm({ fileName, size, reason, installed, keysOk, masterKey,
+                                 version, installedVersion, onAnswer, closeModal }: {
   fileName: string; size: string; reason?: string; installed: number;
   keysOk?: boolean; masterKey?: number | null;
+  version?: string | null; installedVersion?: string | null;
   onAnswer: (ok: boolean) => void; closeModal?: () => void;
 }) {
   // Answer exactly once. Every dismissal route lands here, and a modal that
@@ -11579,7 +11634,13 @@ function SwitchFirmwareConfirm({ fileName, size, reason, installed, keysOk, mast
           <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.5, marginBottom: '4px' }}>
             {reason === 'missing'
               ? 'Eden has no system firmware installed.'
-              : `A different firmware set is on the server, replacing ${installed} installed file(s).`}
+              : version && installedVersion && version !== installedVersion
+                ? `Firmware ${version} is on the server. ${installedVersion} is installed.`
+                : version
+                  ? `Firmware ${version} is on the server, replacing ${installed} installed file(s).`
+                  // No version in either filename: say what is certain (a
+                  // different archive) instead of inventing a number.
+                  : `A different firmware set is on the server, replacing ${installed} installed file(s).`}
           </div>
           <div style={{ fontSize: '13px', color: V2.fgMuted, lineHeight: 1.5, marginBottom: '18px' }}>
             {fileName} · {size} · installs into Eden’s system directory
@@ -11682,6 +11743,8 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
                 installed={avail.installed || 0}
                 keysOk={avail.keys_ok}
                 masterKey={avail.master_key}
+                version={avail.version}
+                installedVersion={avail.installed_version}
                 onAnswer={resolve}
               />
             );

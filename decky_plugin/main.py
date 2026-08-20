@@ -7080,6 +7080,44 @@ class Plugin:
             logging.error(f"get_game_detail error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
+    async def switch_prereq_for_rom(self, rom_id: int):
+        """Does downloading this ROM warrant the Switch firmware prompt?
+
+        Asked by the frontend just before a download so the prompt appears at
+        the moment it matters -- getting a Switch game -- rather than only if
+        someone happens to visit the BIOS page. Returns {'needed': False} for
+        anything that is not a Switch ROM, and otherwise the same shape as
+        switch_firmware_update_available plus 'needed'.
+
+        Cheap by construction: the platform comes from the in-memory games
+        index, and the firmware check is a cached platform listing and a
+        marker read. No transfer happens here.
+        """
+        try:
+            g = self._games_index().get(rom_id) or {}
+            slug = (g.get('platform_slug')
+                    or (g.get('romm_data') or {}).get('platform_slug') or '')
+            if slug.lower() != 'switch':
+                return {'needed': False}
+            sync = self._auto_sync
+            if not sync or not (self._romm_client
+                                and self._romm_client.authenticated):
+                return {'needed': False}
+            if not self._bios_manager():
+                return {'needed': False}
+            info = await asyncio.get_event_loop().run_in_executor(
+                None, sync.switch_firmware_update_available)
+            info = info or {}
+            # Worth interrupting for only when something is actually wrong:
+            # firmware to fetch, or keys missing so nothing would boot. A
+            # complete, current setup must stay silent.
+            info['needed'] = bool(info.get('available')
+                                  or info.get('keys_ok') is False)
+            return info
+        except Exception as e:
+            logging.error(f"switch_prereq_for_rom error: {e}", exc_info=True)
+            return {'needed': False}
+
     async def download_game(self, rom_id: int):
         """Download a single ROM into the library (handles archive extraction)."""
         try:
@@ -8168,6 +8206,40 @@ class Plugin:
         return await asyncio.to_thread(self._get_bios_inventory_blocking,
                                        bool(refresh))
 
+    def _switch_bios_presence(self):
+        """A predicate answering "is this Switch firmware record installed?".
+
+        Returns None when the engine cannot answer, so the caller keeps its
+        normal sysdir logic rather than silently reporting everything present.
+
+        Presence here means *this* upload is what is installed, not merely
+        that something is: firmware compares the server's md5 against the
+        install marker, so a newer archive on the server correctly reads as
+        missing and the row prompts for it.
+        """
+        try:
+            from romm_sync_engine import emulator_saves
+            from romm_sync_engine.bios_manager import BiosManager
+        except Exception as e:
+            logging.debug(f"[BIOS] Switch presence unavailable: {e}")
+            return None
+        if emulator_saves.eden_firmware_dir() is None:
+            return None
+
+        def present(f):
+            entry = {'file_name': f.get('file_name'),
+                     'md5_hash': f.get('md5'),
+                     'file_size_bytes': f.get('size')}
+            try:
+                if BiosManager._is_keys_entry(entry):
+                    return emulator_saves.keys_are_current(entry)
+                return emulator_saves.firmware_is_current(entry)
+            except Exception as e:
+                logging.debug(f"[BIOS] Switch presence for {f}: {e}")
+                return False
+
+        return present
+
     def _get_bios_inventory_blocking(self, refresh: bool = False):
         try:
             sysdir = self._bios_dir()
@@ -8187,12 +8259,20 @@ class Plugin:
                         severity = 'required'
                 except Exception as e:
                     logging.debug(f"[BIOS] core resolution for {slug}: {e}")
+                # Switch firmware and keys never land in RetroArch's system
+                # directory -- they go into Eden's NAND and keys/ -- so the
+                # index built from sysdir says "missing" for both no matter
+                # how many times they are installed. Ask Eden instead.
+                switch_state = self._switch_bios_presence() if slug == 'switch' else None
                 files, missing = [], 0
                 for f in entry.get('files') or []:
                     key = f['file_name'].lower()
-                    present = key in rel or key in base
+                    if switch_state is not None:
+                        present = switch_state(f)
+                    else:
+                        present = key in rel or key in base
                     local_size = 0
-                    if present and sysdir:
+                    if present and sysdir and switch_state is None:
                         try:
                             local_size = (sysdir / f['file_name']).stat().st_size
                         except OSError:
