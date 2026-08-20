@@ -11822,12 +11822,19 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
               {/* Exact filenames, because RetroArch matches BIOS on the name:
                   knowing it wants scph5501.bin specifically is the difference
                   between a fix and a guess. */}
+              {/* A superseded firmware set is neither present nor missing:
+                  a device holds exactly one, so an older upload sitting
+                  beside the current one is history, not a gap. Shown greyed
+                  with its own label rather than a red cross that would never
+                  clear no matter how much is installed. */}
               {files.map((f: any) => (
                 <UserMenuRow key={f.name}
-                  icon={f.present
-                    ? <FaCheckCircle size={13} style={{ color: V2.success }} />
-                    : <FaTimesCircle size={13} style={{ color: row.severity === 'required' ? V2.danger : V2.warning }} />}
-                  label={`${f.name}  ·  ${fmtBytes(f.size)}`}
+                  icon={f.superseded
+                    ? <FaHistory size={13} style={{ color: V2.fgFaint }} />
+                    : f.present
+                      ? <FaCheckCircle size={13} style={{ color: V2.success }} />
+                      : <FaTimesCircle size={13} style={{ color: row.severity === 'required' ? V2.danger : V2.warning }} />}
+                  label={`${f.name}  ·  ${fmtBytes(f.size)}${f.superseded ? '  ·  superseded' : ''}`}
                   disabled onSelect={() => {}} />
               ))}
               <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
@@ -11843,7 +11850,9 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
                   onSelect={() => { if (!busy) fetchAll(); }} />
               ) : (
                 <div style={{ padding: '8px 10px 12px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
-                  Everything RomM holds for this platform is in place.
+                  {files.some((f: any) => f.superseded)
+                    ? 'The current firmware and keys are installed. Older sets on the server are kept for reference.'
+                    : 'Everything RomM holds for this platform is in place.'}
                 </div>
               )}
             </>

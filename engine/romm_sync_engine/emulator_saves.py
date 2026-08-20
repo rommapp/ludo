@@ -512,6 +512,19 @@ def firmware_version_from_name(name):
     return match.group(1) if match else None
 
 
+def firmware_version_key(name):
+    """A sortable key for a firmware upload's version label.
+
+    (1, (22, 5, 0)) for a parseable name, (0, ()) for one without a version --
+    so anything carrying a version outranks anything that does not, and the
+    unversioned fall back to whatever secondary key the caller applies.
+    """
+    version = firmware_version_from_name(name)
+    if not version:
+        return (0, ())
+    return (1, tuple(int(part) for part in version.split('.')))
+
+
 def installed_firmware_version():
     """The version label of the firmware set we last installed, or None."""
     return firmware_version_from_name(read_firmware_marker().get('file_name'))

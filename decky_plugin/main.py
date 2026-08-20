@@ -8226,19 +8226,31 @@ class Plugin:
         if emulator_saves.eden_firmware_dir() is None:
             return None
 
-        def present(f):
+        def classify(f, chosen_name):
+            """(present, superseded) for one Switch firmware record.
+
+            Exactly one firmware set belongs on a device. A platform
+            accumulates them as they are uploaded -- 17.0.1 sitting beside
+            22.5.0 -- and counting every one as a file you are missing is
+            wrong twice over: it asks for ~340 MB that would replace the set
+            you just installed, and it never reaches zero however many you
+            install. Only the newest counts; the rest are superseded, listed
+            for reference and not counted as missing.
+            """
             entry = {'file_name': f.get('file_name'),
                      'md5_hash': f.get('md5'),
                      'file_size_bytes': f.get('size')}
             try:
                 if BiosManager._is_keys_entry(entry):
-                    return emulator_saves.keys_are_current(entry)
-                return emulator_saves.firmware_is_current(entry)
+                    return emulator_saves.keys_are_current(entry), False
+                if chosen_name and f.get('file_name') != chosen_name:
+                    return False, True
+                return emulator_saves.firmware_is_current(entry), False
             except Exception as e:
                 logging.debug(f"[BIOS] Switch presence for {f}: {e}")
-                return False
+                return False, False
 
-        return present
+        return classify
 
     def _get_bios_inventory_blocking(self, refresh: bool = False):
         try:
@@ -8264,11 +8276,30 @@ class Plugin:
                 # index built from sysdir says "missing" for both no matter
                 # how many times they are installed. Ask Eden instead.
                 switch_state = self._switch_bios_presence() if slug == 'switch' else None
+                chosen = ''
+                if switch_state is not None:
+                    # Which firmware set this device should actually hold --
+                    # the same choice sync_switch_firmware makes, so the page
+                    # and the installer never disagree about what is wanted.
+                    try:
+                        from romm_sync_engine.bios_manager import BiosManager as _BM
+                        candidates = [f for f in (entry.get('files') or [])
+                                      if not _BM._is_keys_entry(
+                                          {'file_name': f.get('file_name'),
+                                           'file_size_bytes': f.get('size')})]
+                        if candidates:
+                            from romm_sync_engine import emulator_saves as _ES
+                            chosen = max(candidates, key=lambda f: (
+                                _ES.firmware_version_key(f.get('file_name')),
+                                f.get('size') or 0)).get('file_name') or ''
+                    except Exception as e:
+                        logging.debug(f"[BIOS] Switch firmware choice: {e}")
                 files, missing = [], 0
                 for f in entry.get('files') or []:
                     key = f['file_name'].lower()
+                    superseded = False
                     if switch_state is not None:
-                        present = switch_state(f)
+                        present, superseded = switch_state(f, chosen)
                     else:
                         present = key in rel or key in base
                     local_size = 0
@@ -8277,11 +8308,12 @@ class Plugin:
                             local_size = (sysdir / f['file_name']).stat().st_size
                         except OSError:
                             local_size = 0
-                    if not present:
+                    if not present and not superseded:
                         missing += 1
                     files.append({'name': f['file_name'], 'size': f['size'],
                                   'present': present, 'local_size': local_size,
-                                  'verified': f['verified']})
+                                  'verified': f['verified'],
+                                  'superseded': superseded})
                 out.append({'slug': slug, 'name': entry.get('name') or pname,
                             'platform_name': pname, 'core': core,
                             'severity': severity, 'missing_count': missing,

@@ -229,6 +229,37 @@ master_key_source = ''' + b'c' * 32 + b'''
         check('installed version comes from the marker',
               E.installed_firmware_version(), '17.0.1')
 
+        # --- which firmware set is THE one -----------------------------
+        # A platform accumulates firmware as it is uploaded; a device holds
+        # exactly one. Newest wins, and size is only the tie-break -- these
+        # are the user's real three entries plus a smaller newer set, which
+        # is where ranking by size alone silently picked the older firmware.
+        real = [
+            {'file_name': 'Firmware.22.5.0.zip', 'file_size_bytes': 340773992},
+            {'file_name': 'Firmware_17.0.1.zip', 'file_size_bytes': 339309958},
+            {'file_name': 'ProdKeys.NET-v22.5.0.zip', 'file_size_bytes': 7413},
+        ]
+        pick = lambda entries: max(
+            [f for f in entries if not BiosManager._is_keys_entry(f)],
+            key=lambda f: (E.firmware_version_key(f['file_name']),
+                           f.get('file_size_bytes') or 0))['file_name']
+        check('newest of the real three', pick(real), 'Firmware.22.5.0.zip')
+        newer_smaller = real + [{'file_name': 'Firmware 23.0.0 (Rebootless).zip',
+                                 'file_size_bytes': 180000000}]
+        check('a smaller newer set still wins',
+              pick(newer_smaller), 'Firmware 23.0.0 (Rebootless).zip')
+        check('size alone would have got that wrong',
+              max([f for f in newer_smaller if not BiosManager._is_keys_entry(f)],
+                  key=lambda f: f['file_size_bytes'])['file_name'],
+              'Firmware.22.5.0.zip')
+        # Unversioned names rank below versioned ones, and fall back to size.
+        # Both must be firmware-sized: anything under KEYS_MAX_BYTES is
+        # classified as keys and never reaches the ranking at all.
+        unversioned = [{'file_name': 'firmware.zip', 'file_size_bytes': 999999999},
+                       {'file_name': 'Firmware_17.0.1.zip', 'file_size_bytes': 300000000}]
+        check('a versioned name outranks a bigger unversioned one',
+              pick(unversioned), 'Firmware_17.0.1.zip')
+
         # --- currency -------------------------------------------------
         # Markers live under config_dir(), which is derived from HOME --
         # NOT from XDG_CACHE_HOME. Overriding the wrong variable let earlier

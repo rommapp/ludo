@@ -650,7 +650,17 @@ class BiosManager:
             firmware = [f for f in firmware if not self._is_keys_entry(f)]
             if not firmware:
                 return None
-            return max(firmware, key=lambda f: f.get('file_size_bytes') or 0)
+            # NEWEST, not largest. A platform accumulates firmware sets as
+            # they are uploaded -- 17.0.1 and 22.5.0 sit side by side -- and
+            # only one of them is the one to install. Size ranked them
+            # correctly here by luck (22.5.0 happens to be the bigger file);
+            # a smaller newer set, a rebootless variant among them, would have
+            # silently selected the older firmware. Size remains the
+            # tie-breaker for uploads whose names carry no version at all.
+            return max(firmware,
+                       key=lambda f: (emulator_saves.firmware_version_key(
+                           f.get('file_name')),
+                           f.get('file_size_bytes') or 0))
         return None
 
     def download_firmware_entry(self, entry, destination, progress=None):
