@@ -148,6 +148,9 @@ const switchFirmwareStatus = callable<[], any>("switch_firmware_status");
 // Asked before downloading a ROM: is this a Switch game whose firmware or keys
 // need attention? {needed:false} for everything else, and no transfer either way.
 const switchPrereqForRom = callable<[number], any>("switch_prereq_for_rom");
+// The install runs detached (a ~340 MB transfer cannot occupy Decky's single
+// RPC socket), so its progress is polled rather than awaited.
+const getSwitchFirmwareProgress = callable<[], any>("get_switch_firmware_progress");
 // Per-platform sync switches. get_ returns every platform with its rom_count and
 // whether it's on; set_ takes the whole disabled set, so it's idempotent.
 const getPlatformSync = callable<[], any>("get_platform_sync");
@@ -775,6 +778,56 @@ function _setDlActive(romId: number, on: boolean, name?: string) {
   else { _dlActive.delete(romId); _dlNames.delete(romId); }
   _notifyDl();
 }
+// Starts the detached install and polls it to completion, reporting progress
+// as it goes. Returns the final state, so callers still read as "await the
+// install" while the RPC socket stays free the whole time.
+async function installSwitchFirmwareWatched(
+  onTick?: (p: { phase: string; have: number; total: number; bps: number }) => void,
+): Promise<any> {
+  const start = await installSwitchFirmware();
+  if (!start?.success) return start;
+  // Poll a little under a second: the backend recomputes speed on roughly
+  // that cadence, so asking faster returns the same numbers.
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 700));
+    let p: any;
+    try { p = await getSwitchFirmwareProgress(); } catch { continue; }
+    if (!p) continue;
+    onTick?.({ phase: p.phase || '', have: p.have || 0, total: p.total || 0, bps: p.bps || 0 });
+    if (!p.active) return p;
+  }
+}
+
+// Human-readable transfer line: "142 / 325 MB · 8.4 MB/s". Speed is omitted
+// until the backend has a sample worth showing rather than printing 0 MB/s.
+function fmtFirmwareProgress(p: { phase: string; have: number; total: number; bps: number }): string {
+  if (p.phase === 'installing') return 'Unpacking…';
+  if (!p.total) return 'Starting…';
+  const mb = (n: number) => (n / 1048576).toFixed(0);
+  const speed = p.bps > 0 ? `  ·  ${(p.bps / 1048576).toFixed(1)} MB/s` : '';
+  return `${mb(p.have)} / ${mb(p.total)} MB${speed}`;
+}
+
+// What actually happened, in the terms someone cares about. "229 file(s)" is
+// an implementation detail of how a firmware set is packaged -- what a person
+// installed is "the firmware", and separately "the keys".
+function switchInstallSummary(r: any): string {
+  const status = r?.status;
+  if (status === 'no-emulator') return 'Eden isn’t installed on this device';
+  if (status === 'no-firmware') return 'No Switch firmware on the server';
+  // Firmware landed but nothing can decrypt it: the fix is an upload, not a
+  // retry, so say which.
+  if (status === 'no-keys') return 'Firmware installed, but prod.keys is missing — upload it to the Switch platform on RomM';
+  if (status === 'installed') {
+    const parts: string[] = [];
+    if (r.installed) parts.push('Firmware');
+    if (r.keys) parts.push('keys');
+    return parts.length ? `${parts.join(' and ')} installed` : 'Installed';
+  }
+  if (status === 'up-to-date') return 'Firmware and keys are already installed';
+  return r?.message || 'Install failed';
+}
+
 // Getting a Switch game is the moment the firmware actually matters, so the
 // prompt belongs here rather than only on the BIOS page, which someone may
 // never open. Deliberately not a gate: declining installs no firmware and the
@@ -811,13 +864,8 @@ async function maybePromptSwitchFirmware(romId: number): Promise<void> {
       );
     });
     if (!ok) return;
-    const r = await installSwitchFirmware();
-    toaster.toast({
-      title: 'Switch firmware',
-      body: r?.status === 'installed' ? `Installed ${r.installed} file(s) into Eden`
-          : r?.status === 'up-to-date' ? 'Already installed'
-          : r?.message || 'Install failed',
-    });
+    const r = await installSwitchFirmwareWatched();
+    toaster.toast({ title: 'Switch firmware', body: switchInstallSummary(r) });
   } catch { /* never let this stop a download */ }
 }
 
@@ -11281,9 +11329,11 @@ function BiosPage() {
             bareIcon
             icon={<PlatformIcon slug={row.slug} size={28} />}
             title={row.platform_name || row.name}
-            subtitle={row.missing_count === 0
-              ? `${(row.files || []).length} file${(row.files || []).length === 1 ? '' : 's'} in place`
-              : `${(row.files || []).length} file${(row.files || []).length === 1 ? '' : 's'} — A to review`}
+            subtitle={row.missing_label
+              ? `${row.missing_label} missing — A to review`
+              : row.missing_count === 0
+                ? `${(row.files || []).length} file${(row.files || []).length === 1 ? '' : 's'} in place`
+                : `${(row.files || []).length} file${(row.files || []).length === 1 ? '' : 's'} — A to review`}
             onClick={() => openDetail(row)}
             right={biosChip(row, true)} />
         ))}
@@ -11560,7 +11610,12 @@ function biosChip(row: any, chevron?: boolean) {
       <span style={{
         fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
         color, border: `1px solid ${color}`, borderRadius: V2.radiusChip, padding: '1px 6px',
-      }}>{ok ? 'complete' : `${row.missing_count} missing`}</span>
+      }}>{ok ? 'complete'
+            // Switch names what is missing instead of counting files: the
+            // platform has exactly two things worth having, and "2 missing"
+            // is a number you must open the panel to decode.
+            : row.missing_label ? `${row.missing_label} missing`
+            : `${row.missing_count} missing`}</span>
       {chevron && <FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
     </div>
   );
@@ -11697,6 +11752,10 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
   const [row, setRow] = useState<any>(seed || null);
   const [loading, setLoading] = useState(!seed);
   const [busy, setBusy] = useState(false);
+  // Live transfer line while the detached firmware install runs. Empty at
+  // rest; a bare "Installing…" with nothing moving is indistinguishable from
+  // a hang, which is what this row used to be.
+  const [progress, setProgress] = useState('');
   useEffect(() => { const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60); return () => clearTimeout(t); }, []);
 
   const load = async () => {
@@ -11751,20 +11810,10 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
           });
           if (!ok) return;
         }
-        const r = await installSwitchFirmware();
-        // 'up-to-date' is a success with nothing to do; say so rather than
-        // leaving the row looking like the press did nothing.
-        toaster.toast({
-          title: 'Switch firmware',
-          body: r?.status === 'installed' ? `Installed ${r.installed} file(s) into Eden`
-              : r?.status === 'up-to-date' ? 'Already installed'
-              : r?.status === 'no-emulator' ? 'Eden isn’t installed on this device'
-              : r?.status === 'no-firmware' ? 'No Switch firmware on the server'
-              // Firmware landed but nothing can decrypt it. Say what to do,
-              // not just that it failed -- the fix is an upload, not a retry.
-              : r?.status === 'no-keys' ? 'Installed, but prod.keys is missing — upload it to the Switch platform on RomM'
-              : r?.message || 'Install failed',
-        });
+        const r = await installSwitchFirmwareWatched(
+          (tick) => setProgress(fmtFirmwareProgress(tick)));
+        setProgress('');
+        toaster.toast({ title: 'Switch firmware', body: switchInstallSummary(r) });
       } else {
         const r = await downloadBios(slug, '');
         if (!r?.success) toaster.toast({ title: 'BIOS', body: r?.message || 'Download failed' });
@@ -11843,9 +11892,11 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
                   icon={busy
                     ? <FaSync size={13} style={{ animation: 'spin 1s linear infinite' }} />
                     : <FaDownload size={13} />}
-                  label={busy ? (isSwitch ? 'Installing…' : 'Downloading…')
-                             : isSwitch ? 'Install firmware into Eden'
-                             : `Download ${missing} missing file${missing === 1 ? '' : 's'}`}
+                  label={busy
+                    ? (isSwitch ? (progress || 'Installing…') : 'Downloading…')
+                    : isSwitch ? 'Install firmware into Eden'
+                    : `Download ${missing} missing file${missing === 1 ? '' : 's'}`}
+
                   disabled={busy}
                   onSelect={() => { if (!busy) fetchAll(); }} />
               ) : (

@@ -835,6 +835,10 @@ class Plugin:
         self._stop_event = None
         self._romm_client = None
         self._auto_sync = None
+        # Detached Switch firmware install: task handle plus the progress the
+        # frontend polls while it runs.
+        self._switch_fw_task = None
+        self._switch_fw_progress = {}
         self._collection_sync = None
         self._romm_collections = None
         self._romm_virtual_collections = None
@@ -8295,6 +8299,7 @@ class Plugin:
                     except Exception as e:
                         logging.debug(f"[BIOS] Switch firmware choice: {e}")
                 files, missing = [], 0
+                missing_kinds = []
                 for f in entry.get('files') or []:
                     key = f['file_name'].lower()
                     superseded = False
@@ -8310,13 +8315,29 @@ class Plugin:
                             local_size = 0
                     if not present and not superseded:
                         missing += 1
+                        if switch_state is not None:
+                            # Switch has exactly two things worth having, and
+                            # naming them beats counting them: "2 missing" is
+                            # a number the user has to open the panel to
+                            # decode, while "firmware + keys" is the answer.
+                            from romm_sync_engine.bios_manager import BiosManager as _BMK
+                            kind = 'keys' if _BMK._is_keys_entry(
+                                {'file_name': f.get('file_name'),
+                                 'file_size_bytes': f.get('size')}) else 'firmware'
+                            if kind not in missing_kinds:
+                                missing_kinds.append(kind)
                     files.append({'name': f['file_name'], 'size': f['size'],
                                   'present': present, 'local_size': local_size,
                                   'verified': f['verified'],
                                   'superseded': superseded})
+                # Ordered firmware-then-keys so the label reads the way the
+                # install happens, not in whatever order the server listed.
+                label = ' + '.join(k for k in ('firmware', 'keys')
+                                   if k in missing_kinds)
                 out.append({'slug': slug, 'name': entry.get('name') or pname,
                             'platform_name': pname, 'core': core,
                             'severity': severity, 'missing_count': missing,
+                            'missing_label': label,
                             'files': files})
             return {'success': True, 'bios_dir': str(sysdir) if sysdir else '',
                     'connected': bool(self._romm_client
@@ -8436,17 +8457,76 @@ class Plugin:
             if not self._bios_manager():
                 return {'success': False, 'status': 'failed',
                         'message': 'BIOS manager unavailable'}
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, sync.sync_switch_firmware)
-            status = (result or {}).get('status', 'failed')
-            return {'success': status in ('installed', 'up-to-date'),
-                    'status': status,
-                    'installed': (result or {}).get('installed', 0),
-                    'skipped': (result or {}).get('skipped', 0),
-                    'message': (result or {}).get('message', '')}
+            if (self._switch_fw_task and not self._switch_fw_task.done()):
+                return {'success': True, 'status': 'running',
+                        'message': 'Already installing'}
+
+            # Decky serves RPC calls sequentially on one socket, so awaiting a
+            # ~340 MB transfer here would block every other call for its whole
+            # duration -- get_switch_firmware_progress included. The panel then
+            # shows "Installing…" with nothing behind it and looks frozen,
+            # which is exactly what it was. Same trap download_game documents.
+            # Run it detached and let the frontend poll.
+            self._switch_fw_progress = {
+                'active': True, 'phase': 'starting', 'have': 0, 'total': 0,
+                'bps': 0, 'status': '', 'message': '',
+            }
+            self._switch_fw_task = asyncio.create_task(
+                self._run_switch_firmware_install())
+            return {'success': True, 'status': 'running',
+                    'message': 'Installing'}
         except Exception as e:
             logging.error(f"install_switch_firmware error: {e}", exc_info=True)
             return {'success': False, 'status': 'failed', 'message': str(e)}
+
+    async def _run_switch_firmware_install(self):
+        """Drive sync_switch_firmware off the RPC thread, recording progress."""
+        import time as _time
+        state = self._switch_fw_progress
+        last = {'at': _time.monotonic(), 'have': 0}
+
+        def on_progress(have, total):
+            now = _time.monotonic()
+            elapsed = now - last['at']
+            # Sample about once a second: the download calls this per 1 MB
+            # chunk, and a speed computed over a few milliseconds swings wildly
+            # enough to be unreadable.
+            if elapsed >= 1.0:
+                state['bps'] = int((have - last['have']) / elapsed)
+                last['at'], last['have'] = now, have
+            state['phase'] = 'downloading'
+            state['have'], state['total'] = have, total
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._auto_sync.sync_switch_firmware(
+                    progress=on_progress))
+            result = result or {}
+            state['status'] = result.get('status', 'failed')
+            state['message'] = result.get('message', '')
+            state['installed'] = result.get('installed', 0)
+            state['skipped'] = result.get('skipped', 0)
+            state['keys'] = result.get('keys', 0)
+        except Exception as e:
+            logging.error(f"switch firmware install failed: {e}", exc_info=True)
+            state['status'], state['message'] = 'failed', str(e)
+        finally:
+            state['active'] = False
+            state['phase'] = 'done'
+
+    async def get_switch_firmware_progress(self):
+        """Poll the detached install. {active, phase, have, total, bps, status}.
+
+        'phase' is 'downloading' while bytes move and 'installing' once the
+        archive is complete and being unpacked -- unpacking 229 NCAs is not
+        instant, and a bar stuck at 100% reads as a hang just as much as no
+        bar at all.
+        """
+        state = dict(self._switch_fw_progress or {})
+        if (state.get('active') and state.get('total')
+                and state.get('have') == state.get('total')):
+            state['phase'] = 'installing'
+        return state
 
     async def prepare_steam_launch(self, rom_id: int, disc: str = None,
                                    sibling_rom_id: int = None,
