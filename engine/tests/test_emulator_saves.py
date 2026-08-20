@@ -62,8 +62,15 @@ def main():
         stale = write(root / '0000000000000000' / ZERO_USER / MK8D,
                       {'userdata.dat': b'x'})
         old = time.time() - 86400
-        for path in stale.rglob('*'):
+        # The DIRECTORIES are backdated along with the files. A save that has
+        # not been touched in a day has day-old directories too — a directory
+        # left at "now" means something was added to it or removed from it just
+        # now, which is the opposite of stale. Discovery counts directory mtimes
+        # (that is how it sees a deletion, which changes no surviving file), so
+        # backdating only the files described a tree Eden cannot produce.
+        for path in sorted(stale.rglob('*'), reverse=True):
             os.utime(path, (old, old))
+        os.utime(stale, (old, old))
 
         # Layout B — device save, no user level.
         write(root / '0000000000000000' / '0100AAAABBBB1000', {'d.sav': b'D'})
@@ -92,6 +99,22 @@ def main():
         after = {s['title_id']: s for s in
                  E.find_eden_saves(extra_data_dir=data)}[JAMBOREE]['modified']
         check('mtime follows the files inside', after > before, True)
+
+        # Deleting a save slot changes no surviving file's mtime — only the
+        # parent directory's. A files-only scan therefore reports the newest of
+        # what REMAINS, so removing the most recent slot makes the save appear
+        # to travel BACKWARDS in time; RomM then sees a client copy older than
+        # its own, declines the upload, and offers the deleted slot back as a
+        # download. Observed on a live install: a slot deleted at 20:48:47 left
+        # discovery reporting 13:56:58, and the sync 14s later said "0 up".
+        doomed = root / '0000000000000000' / REAL_USER / OTHER
+        (doomed / 'slot2.bin').write_bytes(b'S')
+        was = {s['title_id']: s for s in
+               E.find_eden_saves(extra_data_dir=data)}[OTHER]['modified']
+        (doomed / 'slot2.bin').unlink()
+        now = {s['title_id']: s for s in
+               E.find_eden_saves(extra_data_dir=data)}[OTHER]['modified']
+        check('deleting a slot moves the save FORWARD in time', now >= was, True)
 
         # ── Packing ───────────────────────────────────────────────────────
         first = E.pack_save(real, d / 'out' / 'a.zip')
@@ -127,6 +150,40 @@ def main():
         (keys / 'prod.keys').write_bytes(b'stub')
         check('prod.keys found', E.find_prod_keys(extra_data_dir=data),
               keys / 'prod.keys')
+
+        # --- a zombie is not a running emulator -----------------------
+        # Ludo launches Eden with Popen and used not to wait on it, so a
+        # finished Eden stayed in the process table as an unreaped child for
+        # as long as Ludo lived, with /proc/<pid>/comm still readable. That
+        # made eden_is_running() answer True forever: the save-sync boundary
+        # never fired and Switch saves only reached the server after a Ludo
+        # restart. A real zombie is spawned here because that is the only way
+        # to exercise the state that actually shipped.
+        import shutil, subprocess
+        fake = d / 'edenfake'
+        shutil.copy('/bin/sleep', fake)
+        proc = subprocess.Popen([str(fake), '30'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            time.sleep(0.5)
+            check('a live eden* process reads as running',
+                  E.eden_is_running(), True)
+            proc.kill()
+            # Deliberately NOT waited on: this IS the shipped state.
+            for _ in range(20):
+                time.sleep(0.1)
+                state = ''
+                for line in Path(f'/proc/{proc.pid}/status').read_text().splitlines():
+                    if line.startswith('State:'):
+                        state = line.split()[1]
+                        break
+                if state == 'Z':
+                    break
+            check('the killed process really is a zombie', state, 'Z')
+            check('and a zombie does not read as running',
+                  E.eden_is_running(), False)
+        finally:
+            proc.wait()
 
     print()
     if FAILURES:

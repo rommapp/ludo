@@ -48,12 +48,15 @@ const notifyNetworkState = callable<[boolean], any>("notify_network_state");
 // uploads) and absent on collection-wide ones.
 const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number, rom_id?: number | null, has_cover?: boolean }> }>("drain_notifications");
 const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
+const rebuildLibrary = callable<[], any>("rebuild_library");
 // Re-reads one platform and reconciles that slice. Takes a slug (what the
 // platform groups are keyed by) or a numeric id.
 const resyncPlatform = callable<[string], any>("resync_platform");
 const checkLibraryStale = callable<[], any>("check_library_stale");
 const getLibraryAutoUpdate = callable<[], any>("get_library_auto_update");
 const setLibraryAutoUpdate = callable<[boolean], any>("set_library_auto_update");
+const getSyncIndicator = callable<[], any>("get_sync_indicator");
+const setSyncIndicatorRpc = callable<[boolean], any>("set_sync_indicator");
 
 // What a refresh actually did, for the completion toast. The backend already
 // phrases the counts ("12 added, 1 removed"); this only supplies the wording for
@@ -1485,6 +1488,9 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
   // Offline: downloaded games still launch, but a fetch from the server can't
   // succeed — so block + visually dim download on not-yet-downloaded tiles
   // rather than letting the user trigger a guaranteed failure.
+  // A save for this game on its way to RomM. Transient, and it takes the
+  // top-left corner from whatever normally holds it — see the badge below.
+  const syncing = useSaveActivityFor(game);
   const offline = useOffline();
   // An orphan blocks the same way: the server has no row to serve. This only
   // becomes reachable after its file is deleted (dl flips false while the entry
@@ -1817,10 +1823,32 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
             </div>
           </div>
         )}
+        {/* Save going up — top-left, and it takes that corner from the
+            downloaded dot, the region badge and the orphan badge for as long
+            as it lasts. It wins because it is the only one of the four that is
+            about to stop being true: the others state a standing fact and can
+            wait a few seconds to say it again.
+
+            Unlike its neighbours this does NOT fade out on focus. They step
+            aside so the action overlay reads cleanly; this is the answer to
+            "did my save go up?", and hiding it from the person looking
+            straight at the tile would defeat it. */}
+        {syncing && (
+          <div style={{
+            position: 'absolute', left: '7px', top: '7px', zIndex: 3,
+            display: 'inline-flex', alignItems: 'center', gap: '4px',
+            padding: '2px 6px', borderRadius: V2.radiusPill, fontSize: '10px', fontWeight: 600,
+            ...coverPill(iconDark),
+            transition: 'background 0.2s ease, border-color 0.2s ease',
+          }}>
+            <FaCloudUploadAlt size={9} />
+          </div>
+        )}
+
         {/* Downloaded status dot — top-left corner, opposite the platform
             icon so the two affordances don't collide. Hidden for multi-region
             games (the region badge replaces it). */}
-        {dl && !isMultiRegion && !game.is_orphan && (
+        {dl && !isMultiRegion && !game.is_orphan && !syncing && (
           <div style={{
             position: 'absolute', top: '7px', left: '7px', zIndex: 2,
             width: '10px', height: '10px', borderRadius: '50%',
@@ -1830,7 +1858,7 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
 
         {/* Region badge — globe icon + region count, top-left corner. Shown for
             multi-region games so the region picker is discoverable. */}
-        {isMultiRegion && (
+        {isMultiRegion && !syncing && (
           <div style={{
             position: 'absolute', left: '7px', top: '7px', zIndex: 2,
             display: 'inline-flex', alignItems: 'center', gap: '4px',
@@ -1856,7 +1884,7 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
 
             Cannot co-occur with the region badge: a removed game has no server
             rows left to have regions with. */}
-        {game.is_orphan && (
+        {game.is_orphan && !syncing && (
           <div style={{
             position: 'absolute', left: '7px', top: '7px', zIndex: 2,
             display: 'inline-flex', alignItems: 'center', gap: '5px',
@@ -1965,8 +1993,11 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
             position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%,-50%)',
             ...roundBtn(44, 'emphasized'), boxShadow: '0 2px 10px rgba(0,0,0,0.55)',
             // Stay visible while downloading so the fill ring is always shown,
-            // even if focus moves away mid-download.
-            opacity: (focused || downloading) ? (downloadBlocked ? 0.4 : 1) : 0,
+            // even if focus moves away mid-download. Same for a save going up:
+            // the corner chip is the unfocused tile's answer, but on the tile
+            // you are actually pointing at, the button is where the eye is —
+            // and a plain Play there says nothing about the upload.
+            opacity: (focused || downloading || syncing) ? (downloadBlocked ? 0.4 : 1) : 0,
             filter: downloadBlocked ? 'grayscale(1)' : 'none',
             transition: 'opacity 0.18s ease',
           }}>
@@ -1985,7 +2016,12 @@ const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef,
             ? (extracting ? <FaBoxOpen size={15} /> : <FaDownload size={15} />)
             : busy === 'launch'
               ? <FaSync size={16} style={{ animation: 'spin 1s linear infinite' }} />
-              : dl ? <FaPlay size={15} style={{ marginLeft: '2px' }} /> : <FaDownload size={15} />}
+              /* Ranked below launching: if you just pressed Play, what that
+                 press did outranks a background upload. The button still
+                 launches while it shows this — the glyph reports what is
+                 happening, it does not change what A does. */
+              : syncing ? <FaCloudUploadAlt size={15} />
+                : dl ? <FaPlay size={15} style={{ marginLeft: '2px' }} /> : <FaDownload size={15} />}
         </div>
         {/* Bottom row: Details (X) + Delete (Y, when downloaded) — glass buttons. */}
         <div className="romm-gt-actions" style={{
@@ -2092,6 +2128,7 @@ async function _colSyncTick() {
     const st = await getServiceStatus();
     _lastStatus = st ?? null;
     _connState = st?.connection ?? null;
+    _pushSaveActivity(st?.save_activity);
     _colSync.clear();
     for (const c of (st?.collections || [])) {
       _colSync.set(c.name, {
@@ -2135,6 +2172,102 @@ function useServiceStatus(): any {
   const [, force] = useState(0);
   useEffect(() => _subscribeStatus(() => force((n) => n + 1)), []);
   return _lastStatus;
+}
+
+// ── Live save-sync indicator ────────────────────────────────────────────────
+// Closing a game used to say nothing at all about the save on its way to RomM:
+// the only feedback was the completion toast, which arrives after the moment
+// you were worried about. `save_activity` rides the shared status poll above,
+// so this whole feature costs no poller of its own.
+//
+// Two states, and the first is the important one. A save that has just changed
+// waits out the engine's settle delay before a single byte moves, so an
+// indicator that lit up only for real HTTP would stay dark for most of the
+// window it exists for.
+type SaveActivity = {
+  active: boolean;
+  state: 'queued' | 'uploading' | null;
+  game: string | null;
+  rom_id: number | null;
+  games: number;
+};
+// Kept in its own tiny store rather than read off useServiceStatus, because a
+// library grid mounts one subscriber PER TILE: going through the full status
+// object would re-render every visible cover on every 1.5s poll, forever, to
+// deliver a value that changes a few times a day. This fires only when the
+// activity actually changes.
+let _saveActivity: SaveActivity | null = null;
+const _saveActivityListeners = new Set<() => void>();
+function _pushSaveActivity(a: any) {
+  const next: SaveActivity | null = a && a.active ? a as SaveActivity : null;
+  const same = (!next && !_saveActivity)
+    || (!!next && !!_saveActivity
+        && next.state === _saveActivity.state
+        && next.rom_id === _saveActivity.rom_id
+        && next.game === _saveActivity.game
+        && next.games === _saveActivity.games);
+  if (same) return;
+  _saveActivity = next;
+  _saveActivityListeners.forEach((l) => { try { l(); } catch { } });
+}
+function useSaveActivity(): SaveActivity | null {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const listener = () => force((n) => n + 1);
+    _saveActivityListeners.add(listener);
+    return () => { _saveActivityListeners.delete(listener); };
+  }, []);
+  // The store is filled by the shared status poll, which needs at least one
+  // subscriber to be running — the tiles that use this are always on a screen
+  // that has other status consumers, but a lone subscriber must still tick.
+  useEffect(() => _subscribeStatus(() => { }), []);
+  return _saveActivity;
+}
+
+// Is THIS game's save the one moving? The engine resolves the rom_id from the
+// save file it is uploading, so the answer is exact rather than a name match.
+//
+// Siblings count as the same tile. A multi-region game is ONE card standing for
+// several server rows, and the save came from whichever row was launched — with
+// a bare rom_id test, playing the USA copy of a game whose card is keyed to the
+// European one lights nothing at all.
+function useSaveActivityFor(game?: { rom_id: number; sibling_roms?: { rom_id: number }[] } | null): SaveActivity | null {
+  const a = useSaveActivity();
+  if (!a || a.rom_id == null || !game) return null;
+  if (a.rom_id === game.rom_id) return a;
+  return (game.sibling_roms || []).some((sib) => sib.rom_id === a.rom_id) ? a : null;
+}
+
+// Whether the live save-sync notification may appear. Cached module-side: it is
+// read from the background notification poll (which is not a component at all)
+// as well as from the Settings switch, and it changes only when the user flips
+// that switch. The listener set is what lets the flip take effect without a
+// reload.
+let _syncPillPref: boolean | null = null;
+const _syncPillListeners = new Set<() => void>();
+function _setSyncPillPref(on: boolean) {
+  _syncPillPref = on;
+  _syncPillListeners.forEach((l) => { try { l(); } catch { } });
+}
+function useSyncPillEnabled(): boolean {
+  const [, force] = useState(0);
+  useEffect(() => {
+    // Bump a counter rather than subscribing `force` directly: called bare it
+    // would set state to undefined every time, and React bails out of the
+    // second identical update — the switch would move once and then stick.
+    const listener = () => force((n) => n + 1);
+    _syncPillListeners.add(listener);
+    // Undefined until the first answer lands, and treated as ON meanwhile —
+    // suppressing it on the launch where it matters most would be the worse
+    // failure, and the round-trip beats any save to the finish anyway.
+    if (_syncPillPref === null) {
+      getSyncIndicator()
+        .then((r) => _setSyncPillPref(r?.enabled !== false))
+        .catch(() => _setSyncPillPref(true));
+    }
+    return () => { _syncPillListeners.delete(listener); };
+  }, []);
+  return _syncPillPref !== false;
 }
 
 // ── Emulator status ─────────────────────────────────────────────────────────
@@ -3428,7 +3561,7 @@ function UserMenuModal({ username, role, avatar, closeModal }:
           <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
           <UserMenuRow icon={<FaChartBar size={15} />} label="Stats" onSelect={() => go("/romm-sync-stats")} />
           <UserMenuRow icon={<FaPuzzlePiece size={15} />} label="Emulator Cores" onSelect={() => go("/romm-sync-cores")} />
-          <UserMenuRow icon={<FaMicrochip size={15} />} label="BIOS Files" onSelect={() => go("/romm-sync-bios")} />
+          <UserMenuRow icon={<FaMicrochip size={15} />} label="Firmware / BIOS" onSelect={() => go("/romm-sync-bios")} />
           <UserMenuRow icon={<FaCog size={15} />} label="Settings" onSelect={() => go("/romm-sync-settings")} />
           <UserMenuRow
             icon={<FaSync size={15} style={refreshing ? { animation: 'spin 1s linear infinite' } : undefined} />}
@@ -3814,7 +3947,7 @@ function CollectionActionsModal({ title, isCollection, isVirtual, isSynced, miss
               rather than navigating: the answer is three lines long, and the
               user is mid-browse in the grid underneath. */}
           {platformSlug && (
-            <UserMenuRow icon={<FaMicrochip size={14} />} label="BIOS files"
+            <UserMenuRow icon={<FaMicrochip size={14} />} label="Firmware / BIOS"
               onSelect={() => {
                 closeModal?.();
                 showModal(<BiosDetailModal slug={platformSlug} platformName={title} />);
@@ -3923,7 +4056,7 @@ function PlatformActionsModal({ label, slug, count, downloaded, resyncing, onSyn
           {/* BIOS is a property of the platform, so it belongs here for the same
               reason CollectionActionsModal only offers it on platforms. */}
           {slug && (
-            <UserMenuRow icon={<FaMicrochip size={15} />} label="BIOS files"
+            <UserMenuRow icon={<FaMicrochip size={15} />} label="Firmware / BIOS"
               onSelect={() => { closeModal?.(); showModal(<BiosDetailModal slug={slug} platformName={label} />); }} />
           )}
         </Focusable>
@@ -4155,6 +4288,16 @@ function V2Button({ children, onClick, variant = 'tonal', color, disabled }:
   );
 }
 
+// A percentage padded to three cells with U+2007 FIGURE SPACE, which in any
+// sane font is exactly one digit wide. Combined with `fontVariantNumeric:
+// tabular-nums` on the button, this makes "5%" and "100%" render at the SAME
+// width, so a counting progress label cannot resize the pill around it. A
+// pixel minWidth alone could not do this: it only sets a floor, and the label
+// still outgrew it at 100%.
+function padPct(n: number): string {
+  return String(n).padStart(3, '\u2007');
+}
+
 // GameActionButton — RomM's GameActionBtn vocabulary (the action ribbon in the
 // GameDetails header), distinct from V2Button's RBtn rounded-rect. Two shapes:
 //   • emphasized + label → white pill CTA (#fff / #111117), used by Play / the
@@ -4196,8 +4339,16 @@ function GameActionButton({ icon, label, onClick, variant = 'surface', accent, d
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
     height: '44px', borderRadius: V2.radiusPill, fontSize: '14px', fontWeight: 600,
     whiteSpace: 'nowrap', border: '1px solid transparent',
+    // Equal-width digits, so a percentage counting up does not reflow the
+    // label under itself. Proportional digits make "11%" narrower than "88%".
+    fontVariantNumeric: 'tabular-nums',
     cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.5 : 1,
     ...(labelled ? { padding: '0 24px' } : { width: '44px' }),
+    // A progress label grows by a whole digit at 10% and again at 100%, and the
+    // pill is sized by its content — so without a floor it visibly widens twice
+    // during a download, after the one-shot dlGrow pop has already settled.
+    // Sized for the longest label this button ever shows ("Downloading… 100%").
+    ...(labelled && hasProgress ? { minWidth: '208px' } : {}),
     transition: 'background 0.15s, color 0.15s, transform 0.15s, box-shadow 0.15s, border-color 0.15s',
     // Grow rightward from the left edge as the label widens — no overshoot.
     ...(pop ? { animation: 'dlGrow 0.4s ease', transformOrigin: 'left center' } : {}),
@@ -5204,6 +5355,63 @@ function LibraryFetchToastBody() {
   return box(line('Fetching from RomM…'));
 }
 
+// Live handle on the save-sync toast, plus when it went up. Same shape as the
+// library-fetch toast above, and for the same reason: a toast host is global,
+// so this reaches the user wherever they are — including the case this feature
+// exists for, where they have just closed a game and are not in Ludo at all.
+let _saveToast: { dismiss: () => void } | null = null;
+let _saveToastAt = 0;
+// A save that uploads inside a single poll would otherwise appear and vanish in
+// well under a second, reading as a glitch rather than as an answer. Hold it
+// this long from the moment it went up.
+const SAVE_TOAST_MIN_MS = 2600;
+// Leak guard, exactly like FETCH_TOAST_MAX_MS: a sync that wedges without ever
+// clearing must not leave a notification the user cannot get rid of.
+const SAVE_TOAST_MAX_MS = 10 * 60 * 1000;
+
+// Body of that toast, live — the same self-subscribing trick as
+// LibraryFetchToastBody, since neither toaster can update a toast in place. It
+// matters here because the activity changes KIND partway through: a save waits
+// out the settle delay before a byte moves, so the same notification has to be
+// able to go from waiting to uploading without being re-raised.
+function SaveSyncToastBody() {
+  const a = useSaveActivity();
+  const live = !a ? null
+    : a.games > 1
+      ? `${a.games} games`
+      : a.game
+        ? a.game
+        : a.state === 'queued' ? 'Waiting for the save to finish writing' : 'Uploading to RomM';
+  // The toast outlives the activity by up to SAVE_TOAST_MIN_MS, and its TITLE
+  // is snapshotted at push time and cannot follow. So hold the last real line
+  // rather than swapping in a completion message the title would contradict —
+  // the notification simply finishes saying what it was saying, and the
+  // separate completion toast reports the result.
+  const last = useRef<string>('Uploading to RomM');
+  if (live) last.current = live;
+  const text = live ?? last.current;
+  return (
+    <span style={{
+      display: 'block', maxWidth: '230px', whiteSpace: 'nowrap',
+      overflow: 'hidden', textOverflow: 'ellipsis',
+    }}>{text}</span>
+  );
+}
+
+// The save-sync toast's logo slot, live — and it has to be live for the same
+// reason the body does: the rom_id is not known at push time when the upload is
+// still settling, so a logo snapshotted then would be permanently blank.
+//
+// Same box art and same treatment the COMPLETION toast has always used, so the
+// pair reads as one event reported twice rather than two unrelated messages —
+// a generic cloud glyph followed by the game's cover looked like the second
+// toast was about something else.
+function SaveSyncToastLogo() {
+  const a = useSaveActivity();
+  if (a?.rom_id == null) return <FaCloudUploadAlt size={22} />;
+  return <ToastCover romId={a.rom_id} hasCover />;
+}
+
 // The toast's logo slot, live. `logo` is snapshotted at push time exactly like
 // every other toast option, so a static icon would freeze on whichever platform
 // happened to be current when the toast was raised. It is a ReactNode rendered
@@ -5295,6 +5503,49 @@ const checkForNotifications = async () => {
           try { _fetchToast.dismiss(); } catch { /* already gone */ }
           _fetchToast = null;
         }
+      }
+
+      // Save-sync toast — raised while a save is on its way up, dismissed when
+      // it lands. No sample delay before raising, unlike the fetch toast above:
+      // a save sync is over in seconds, and waiting to be sure it was worth
+      // narrating would mean narrating nothing at all. SAVE_TOAST_MIN_MS does
+      // that job from the other end instead.
+      //
+      // Feeds the module store as well, so the per-tile badges keep updating on
+      // this 2s poll even on a screen with no library subscriber running.
+      _pushSaveActivity(st?.save_activity);
+      if (_syncPillPref === null) {
+        // First read. Fired from here rather than a component so the preference
+        // is known even if the user never opens a page that asks for it.
+        _syncPillPref = true;
+        getSyncIndicator()
+          .then((r) => _setSyncPillPref(r?.enabled !== false))
+          .catch(() => { /* stays on */ });
+      }
+      const saving = st?.save_activity?.active && _syncPillPref !== false;
+      if (saving) {
+        if (!_saveToast) {
+          _saveToastAt = Date.now();
+          _saveToast = toaster.toast({
+            title: 'Uploading save',
+            body: <SaveSyncToastBody />,
+            logo: <SaveSyncToastLogo />,
+            duration: SAVE_TOAST_MAX_MS,
+            // Silent, like the fetch toast: this narrates work the user did not
+            // ask about. The completion toast keeps its chime, which is the one
+            // they actually need to hear from another room.
+            playSound: false,
+          });
+        }
+      } else if (_saveToast) {
+        const held = Date.now() - _saveToastAt;
+        const t = _saveToast;
+        _saveToast = null;
+        // Past the floor already: go now. Otherwise let it serve out the rest,
+        // with the body having fallen through to "Save uploaded" the moment the
+        // activity cleared — so the extra time reads as a result, not a stall.
+        if (held >= SAVE_TOAST_MIN_MS) { try { t.dismiss(); } catch { } }
+        else setTimeout(() => { try { t.dismiss(); } catch { } }, SAVE_TOAST_MIN_MS - held);
       }
 
       // First-library-load toast. Fires from here rather than a component
@@ -9524,7 +9775,7 @@ async function runLaunch(romId: number, gameName: string, disc: string | null,
         body: `${w.severity === 'required'
           ? `${w.core} will not boot without ` : `${label || gameName} may need `}`
           + `${miss.slice(0, 3).join(', ')}${miss.length > 3 ? '…' : ''}. `
-          + 'Open BIOS Files to download them.',
+          + 'Open Firmware / BIOS to download them.',
         duration: 10000,
         // The index, not this platform's panel: the toast is clicked at some
         // remove from the launch, often with RetroArch already up, and a modal
@@ -9544,7 +9795,11 @@ async function runLaunch(romId: number, gameName: string, disc: string | null,
           + `${got.slice(0, 3).join(', ')}${got.length > 3 ? '…' : ''}`,
       });
     }
-    else if (r?.success) toaster.toast({ title: 'Launching', body: label || gameName });
+    // No toast on a plain successful launch: the emulator takes over the
+    // screen a moment later, so the notification announces something the user
+    // is already watching happen. The BIOS branch above still fires, because
+    // that one is not about the launch -- it explains a longer-than-usual wait
+    // and files written to disk.
     else if (offerCoreInstall(r, () => void runLaunch(
       romId, gameName, disc, label, setBusy, onDone, siblingRomId))) {
       // The picker owns the outcome now — no toast.
@@ -9711,6 +9966,7 @@ function GameDetailPage() {
   // Nothing to launch into: Play dims rather than disappearing, and says why
   // when focused. Downloading stays available — building a library before you
   // own an emulator is legitimate.
+  const saveActivity = useSaveActivityFor(game);
   const emu = useEmulatorStatus();
   // Per-game, not global: a Switch ROM is playable on a machine with only Eden,
   // and unplayable on one with only RetroArch — no core can run it either way.
@@ -9734,7 +9990,12 @@ function GameDetailPage() {
       const res = await getGameDetail(rid);
       if (res?.success) {
         setDetail(res);
-        setIsDownloaded(!!res.is_downloaded);
+        // get_game_detail reports is_downloaded from the in-memory games index,
+        // which a just-finished download may not have reached yet (and which
+        // holds nothing at all for a rom folded into a parent). Treat a
+        // completed download in this session as the stronger evidence — it is
+        // only ever cleared by an actual delete, via libCacheSetDownloaded.
+        setIsDownloaded(!!res.is_downloaded || _dlSucceeded.has(rid));
         // Earned achievements are fetched separately so nothing blocks on the
         // extra /users/me round-trip; patch earned flags in once they arrive.
         if (res.ra_id && (res.achievements?.length)) {
@@ -9762,7 +10023,16 @@ function GameDetailPage() {
   // tile), refresh so the CTA flips Download → Play here too.
   const prevDownloading = useRef(false);
   useEffect(() => {
-    if (prevDownloading.current && !downloading) load();
+    if (prevDownloading.current && !downloading) {
+      // Flip the CTA on the registry alone, before load() answers. The reload
+      // is a round-trip to RomM and it can fail outright — a ROM download
+      // finishing has just been hammering the same connection, and a reset
+      // there returns success:false, which leaves the CTA saying Download for
+      // a game that is on disk. The registry cannot fail and is the reason the
+      // library tiles heal correctly today.
+      if (game && _dlSucceeded.has(game.rom_id)) setIsDownloaded(true);
+      load();
+    }
     prevDownloading.current = downloading;
   }, [downloading]);
 
@@ -9809,6 +10079,12 @@ function GameDetailPage() {
           onClick: () => openGameById(game.rom_id, detail?.name || game.name, "/romm-sync-library"),
         });
         setIsDownloaded(true);
+        // The same session registry the library tiles heal from. Without it
+        // this page is the only surface that does not know the download
+        // succeeded, so anything that re-reads state here — a remount with a
+        // stale `game` prop, or the reload below — silently flips the CTA back
+        // to Download while the library shows the game as present.
+        _dlSucceeded.add(game.rom_id);
         libCacheSetDownloaded(game.rom_id, true);
       } else {
         toaster.toast({ title: 'Download failed', body: res.message || 'Unknown error' });
@@ -10029,8 +10305,8 @@ function GameDetailPage() {
               <GameActionButton variant="emphasized" focusRef={ctaRef} disabled={!!busy || downloading} onClick={doDownload}
                 progress={downloading ? (dlPct ?? 0) : undefined}
                 label={downloading
-                  ? (extracting ? (dlPct != null ? `Extracting… ${dlPct}%` : 'Extracting…')
-                     : dlPct != null ? `Downloading… ${smoothPct}%` : 'Downloading…')
+                  ? (extracting ? (dlPct != null ? `Extracting… ${padPct(dlPct)}%` : 'Extracting…')
+                     : dlPct != null ? `Downloading… ${padPct(smoothPct)}%` : 'Downloading…')
                   : 'Download'}
                 icon={downloading
                   ? (extracting ? <FaBoxOpen size={15} />
@@ -10056,6 +10332,18 @@ function GameDetailPage() {
                 )}
                 <GameActionButton variant="surface" accent="danger" onClick={() => setConfirmDelete(true)}
                   icon={<FaTrash size={15} />} />
+                {/* Sits beside Play rather than replacing it: a save going up
+                    doesn't stop you launching again, and swapping the CTA out
+                    from under a waiting thumb would. */}
+                {saveActivity && (
+                  <span style={{
+                    display: 'inline-flex', alignItems: 'center', gap: '7px',
+                    fontSize: '12px', fontWeight: 600, color: V2.fgMuted,
+                  }}>
+                    <FaCloudUploadAlt size={13} style={{ color: V2.brandHover }} />
+                    Uploading save…
+                  </span>
+                )}
               </>
             ) : (
               <>
@@ -11303,7 +11591,7 @@ function BiosPage() {
       style={{ maxWidth: '760px', margin: '0 auto', padding: '20px 20px 0' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
         <GameActionButton icon={<FaChevronLeft size={16} />} onClick={() => libBack("/romm-sync-library")} />
-        <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>BIOS Files</div>
+        <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Firmware / BIOS</div>
       </div>
 
       <V2SettingsSection title={biosDir ? `Stored in ${biosDir}` : 'BIOS'}>
@@ -11756,6 +12044,11 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
   // rest; a bare "Installing…" with nothing moving is indistinguishable from
   // a hang, which is what this row used to be.
   const [progress, setProgress] = useState('');
+  // What is actually installed on THIS device, for the Switch panel only. The
+  // file rows above say what RomM holds and whether a file by that name is
+  // present; neither answers "which firmware am I running", which is the
+  // question someone opens this panel with after an emulator update.
+  const [fw, setFw] = useState<any>(null);
   useEffect(() => { const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60); return () => clearTimeout(t); }, []);
 
   const load = async () => {
@@ -11819,14 +12112,26 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
         if (!r?.success) toaster.toast({ title: 'BIOS', body: r?.message || 'Download failed' });
       }
       await load();
+      if (isSwitch) await loadFirmware();
       onChanged?.();
     } catch {
       toaster.toast({ title: isSwitch ? 'Switch firmware' : 'BIOS', body: 'Download failed' });
     } finally { setBusy(false); }
   };
 
+  const loadFirmware = async () => {
+    try { setFw(await switchFirmwareStatus()); } catch { /* leave the line off */ }
+  };
+  useEffect(() => { if (isSwitch) loadFirmware(); }, [isSwitch]);
+
   const files = row?.files || [];
   const missing = row?.missing_count || 0;
+  // installed_version is deliberately null when Eden's registered/ is empty,
+  // so an absent firmware never reads as a version number.
+  const fwLine = !isSwitch || !fw ? null
+    : fw.installed_version ? `Firmware: ${fw.installed_version}`
+    : fw.installed ? `Firmware: version unknown (${fw.installed} files)`
+    : 'Firmware: not installed';
   return (
     <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}>
       <Focusable noFocusRing style={{
@@ -11886,25 +12191,37 @@ function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
                   label={`${f.name}  ·  ${fmtBytes(f.size)}${f.superseded ? '  ·  superseded' : ''}`}
                   disabled onSelect={() => {}} />
               ))}
-              <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
-              {missing > 0 ? (
-                <UserMenuRow
-                  icon={busy
-                    ? <FaSync size={13} style={{ animation: 'spin 1s linear infinite' }} />
-                    : <FaDownload size={13} />}
-                  label={busy
-                    ? (isSwitch ? (progress || 'Installing…') : 'Downloading…')
-                    : isSwitch ? 'Install firmware into Eden'
-                    : `Download ${missing} missing file${missing === 1 ? '' : 's'}`}
-
-                  disabled={busy}
-                  onSelect={() => { if (!busy) fetchAll(); }} />
-              ) : (
+              {fwLine && (
+                <>
+                <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
                 <div style={{ padding: '8px 10px 12px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
-                  {files.some((f: any) => f.superseded)
-                    ? 'The current firmware and keys are installed. Older sets on the server are kept for reference.'
-                    : 'Everything RomM holds for this platform is in place.'}
+                  {/* One line, not two. The master-key generation belongs in
+                      the install prompt, where it is deciding something; here
+                      the only question is whether the set is complete, and
+                      "keys installed" is the whole answer. */}
+                  {fwLine}{fw?.keys_installed ? ' · Keys installed' : ''}
                 </div>
+                </>
+              )}
+              {/* Nothing missing means nothing to say: the ticks above
+                  already state it, and a paragraph restating them was the
+                  panel's largest element for its least informative case. The
+                  divider goes with the row it separates -- without one, it
+                  would hang under the last file with nothing below it. */}
+              {missing > 0 && (
+                <>
+                  <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
+                  <UserMenuRow
+                    icon={busy
+                      ? <FaSync size={13} style={{ animation: 'spin 1s linear infinite' }} />
+                      : <FaDownload size={13} />}
+                    label={busy
+                      ? (isSwitch ? (progress || 'Installing…') : 'Downloading…')
+                      : isSwitch ? 'Install firmware into Eden'
+                      : `Download ${missing} missing file${missing === 1 ? '' : 's'}`}
+                    disabled={busy}
+                    onSelect={() => { if (!busy) fetchAll(); }} />
+                </>
               )}
             </>
           )}
@@ -12270,6 +12587,42 @@ function SettingsPage() {
     }, d));
     return () => timers.forEach(clearTimeout);
   }, [confirmLogout]);
+  // Rebuild discards the cached library and refetches it from scratch. Armed
+  // before it fires, like Log out above: nothing on disk is destroyed, but it
+  // throws away the cache and costs a full walk of the server, so it must not
+  // happen on one stray press.
+  const [rebuildArmed, setRebuildArmed] = useState(false);
+  const [rebuilding, setRebuilding] = useState(false);
+  useEffect(() => {
+    if (!rebuildArmed) return;
+    const t = setTimeout(() => setRebuildArmed(false), 4000);
+    return () => clearTimeout(t);
+  }, [rebuildArmed]);
+  const doRebuild = async () => {
+    if (rebuilding) return;
+    if (!rebuildArmed) { setRebuildArmed(true); return; }
+    setRebuildArmed(false);
+    setRebuilding(true);
+    try {
+      const res = await rebuildLibrary();
+      if (res?.success) {
+        toaster.toast({
+          title: 'Rebuilding library',
+          body: 'Refetching everything from RomM. This can take a few minutes.',
+        });
+        _clearStale();
+        _broadcastLibRefresh();
+      } else if (res?.busy) {
+        toaster.toast({ title: 'Already refreshing', body: 'A library fetch is in progress.' });
+      } else {
+        toaster.toast({ title: 'Rebuild failed', body: res?.message ?? 'Unknown error' });
+      }
+    } catch (e: any) {
+      toaster.toast({ title: 'Rebuild failed', body: String(e?.message ?? e) });
+    } finally {
+      setRebuilding(false);
+    }
+  };
   const [serverInfo, setServerInfo] = useState<string>('');
   const [rdDetected, setRdDetected] = useState<boolean>(false);
   const [rdButton, setRdButton] = useState<boolean>(false);
@@ -12347,6 +12700,10 @@ function SettingsPage() {
       .then((v) => { _setResumeStatesPref(!!v); setResumeStates(!!v); })
       .catch(() => { /* leave the last known value */ });
   }, []);
+  // Saves: the live upload pill. No local mirror of the value — the pill's own
+  // cached pref IS the state, and writing to it re-renders this row and the
+  // pill together, so the switch and the thing it controls cannot disagree.
+  const syncPill = useSyncPillEnabled();
   const [autoUpdateLib, setAutoUpdateLib] = useState<boolean>(true);
   useEffect(() => {
     getLibraryAutoUpdate()
@@ -12369,6 +12726,16 @@ function SettingsPage() {
       })
       .catch(() => { /* the row keeps its explanatory subtitle */ });
   }, []);
+
+  const handleSyncPillToggle = async (enabled: boolean) => {
+    _setSyncPillPref(enabled);
+    try {
+      const r = await setSyncIndicatorRpc(enabled);
+      if (r && r.success === false) throw new Error(r.message || 'failed');
+    } catch {
+      _setSyncPillPref(!enabled);
+    }
+  };
 
   const handleAutoUpdateLibToggle = async (enabled: boolean) => {
     setAutoUpdateLib(enabled);
@@ -12844,12 +13211,32 @@ function SettingsPage() {
           right={<V2Switch checked={autoUpdateLib} />}
         />
         <V2SettingsRow
+          icon={rebuildArmed ? <FaCheck size={16} /> : <FaRedo size={16} />}
+          title={rebuilding ? 'Rebuilding…'
+            : rebuildArmed ? 'Press again to rebuild' : 'Rebuild library'}
+          subtitle={rebuildArmed
+            ? 'Ludo forgets its cached library and refetches everything from RomM. Nothing you have downloaded is deleted.'
+            : 'Refetch your whole library from RomM. Use this if what Ludo shows has drifted from what is on the server.'}
+          onClick={rebuilding ? undefined : doRebuild}
+          disabled={rebuilding}
+        />
+        <V2SettingsRow
           icon={<FaLayerGroup size={16} />}
           title="Platforms"
           subtitle={platformSummary
             || 'Choose which platforms Ludo syncs from RomM. Turning one off makes your library load faster; nothing already downloaded is removed.'}
           onClick={() => libNavigate("/romm-sync-platforms")}
           right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
+        />
+      </V2SettingsSection>
+
+      <V2SettingsSection title="Saves">
+        <V2SettingsRow
+          icon={<FaCloudUploadAlt size={16} />}
+          title="Show saves being uploaded"
+          subtitle="A small badge appears while a save is on its way to RomM, so closing a game isn't silent. Turn it off to keep the screen clear — you'll still be notified once the upload finishes."
+          onClick={() => handleSyncPillToggle(!syncPill)}
+          right={<V2Switch checked={syncPill} />}
         />
       </V2SettingsSection>
 

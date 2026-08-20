@@ -177,18 +177,50 @@ def _walk_for_titles(root, depth=0):
 def _newest_mtime(directory):
     """Latest mtime anywhere inside ``directory``, or None when it is empty.
 
-    The directory's own mtime is not enough: writing a file that already exists
-    leaves the parent's timestamp untouched, so a save edited in place would
-    look unchanged to the sync engine.
+    Files AND directories, including ``directory`` itself, because the two
+    answer different halves of "did this save change":
+
+      * A file's own mtime is what catches an edit in place. Rewriting a file
+        that already exists leaves its parent's timestamp untouched, so a
+        files-only scan is required for the common case.
+
+      * A directory's mtime is what catches a DELETION. Removing a file changes
+        no surviving file's timestamp — it bumps only the parent directory. A
+        files-only scan therefore reports the newest of what REMAINS, which
+        after deleting the most recent save slot is an older time than before:
+        the save appears to travel backwards. RomM then sees a client copy
+        older than its own and declines the upload, so the deletion never
+        propagates — and the next sync offers the deleted slot back as a
+        download. Observed exactly that way: a slot deleted at 20:48:47 left
+        this function reporting 13:56:58, and the session sync 14 seconds later
+        reported "0 up, 21 in-sync".
+
+    Taking the max of both is what makes a save's timestamp monotonic in the
+    way the sync protocol assumes. Content is compared by hash separately, so
+    a directory touched without any real change costs at most one no-op.
+
+    Still None for a save directory holding no files at all, which is how
+    find_eden_saves tells an empty save from a real one — a directory Eden
+    created on boot and never wrote to has an mtime like any other, so the
+    emptiness test cannot be folded into the timestamp.
     """
     newest = None
+    has_file = False
+    stamps = []
+    try:
+        stamps.append(directory.stat().st_mtime)
+    except OSError:
+        pass
     for path in directory.rglob('*'):
         try:
-            if not path.is_file():
-                continue
-            stamp = path.stat().st_mtime
+            if path.is_file():
+                has_file = True
+            stamps.append(path.stat().st_mtime)
         except OSError:
             continue
+    if not has_file:
+        return None
+    for stamp in stamps:
         if newest is None or stamp > newest:
             newest = stamp
     return newest
@@ -694,8 +726,28 @@ def eden_is_running():
                 comm = (entry / 'comm').read_text().strip().lower()
             except OSError:
                 continue
-            if comm.startswith('eden'):
-                return True
+            if not comm.startswith('eden'):
+                continue
+            # A ZOMBIE is not a running emulator. Ludo launches Eden with
+            # subprocess.Popen and does not wait on it, so when the player
+            # quits, the process stays in the table as an unreaped child of
+            # Ludo -- keeping /proc/<pid>/comm readable for as long as Ludo
+            # lives. Without this check, Eden "never closed": the save-sync
+            # boundary never fired, uploads stayed deferred, and the save
+            # appeared only after a Ludo restart reaped the zombie. Exactly
+            # what the log showed -- one "Eden launched" at 14:17 and no close,
+            # through two further launches.
+            try:
+                state = ''
+                for line in (entry / 'status').read_text().splitlines():
+                    if line.startswith('State:'):
+                        state = line.split()[1]
+                        break
+            except (OSError, IndexError):
+                state = ''
+            if state in ('Z', 'X'):
+                continue
+            return True
     except OSError as e:
         log.debug("could not scan /proc for Eden: %s", e)
     return False

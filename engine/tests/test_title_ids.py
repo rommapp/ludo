@@ -162,6 +162,34 @@ def main():
               index['0100152000022000'].name.startswith('Mario Kart 8 Deluxe [01001520'),
               True)
 
+        # The same contest, but with NEITHER name tagged -- the ordinary shape
+        # of a plainly-named dump. The filename cannot break this tie, so the
+        # rank has to come from the container, and without that the winner is
+        # whichever file rglob happened to yield first. When the update won,
+        # the save resolved to the patch's filename, matched no library tile,
+        # and was dropped in silence. This is the Metroid Dread failure.
+        untagged = Path(tmp) / 'untagged'
+        untagged.mkdir()
+        base_rom = untagged / 'Metroid Dread.xci'
+        patch_rom = untagged / 'Metroid Dread v327680.nsp'
+        for f in (base_rom, patch_rom):
+            f.write_bytes(b'')
+        kinds = {base_rom.name: 'base', patch_rom.name: 'update'}
+        real_id, real_content = T.title_id_from_rom, T.switch_content
+        T.title_id_from_rom = lambda path, **kw: '010093801237C000'
+        T.switch_content = lambda path, **kw: {'kind': kinds[Path(path).name]}
+        try:
+            # Both orders, so a pass cannot be an accident of directory order.
+            for order in ((base_rom, patch_rom), (patch_rom, base_rom)):
+                ranks = [T._content_rank(f) for f in order]
+                check(f'untagged rank: {order[0].name[:24]} first',
+                      ranks, [0 if kinds[f.name] == 'base' else 1 for f in order])
+            check('untagged base game still beats its update',
+                  T.index_roms([untagged])['010093801237C000'].name,
+                  'Metroid Dread.xci')
+        finally:
+            T.title_id_from_rom, T.switch_content = real_id, real_content
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

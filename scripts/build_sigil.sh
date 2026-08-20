@@ -68,9 +68,20 @@ if nm -D --undefined-only "$BUILD_DIR/libsigil.so" | grep -q sigil_; then
   exit 1
 fi
 
+# Install into the engine package, which is where a shipped build lives: both
+# the Decky zip and the desktop app carry romm_sync_engine wholesale, so a file
+# there reaches users without either build script changing. title_ids finds it
+# with no env var set. See engine/romm_sync_engine/bin/README.md.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BUNDLE_DIR="$REPO_ROOT/engine/romm_sync_engine/bin"
+if [ -d "$BUNDLE_DIR" ]; then
+  cp "$BUILD_DIR/libsigil.so" "$BUNDLE_DIR/libsigil.so"
+  echo "==> installed into $BUNDLE_DIR/libsigil.so"
+fi
+
 echo
 echo "built: $BUILD_DIR/libsigil.so"
 echo
-echo "use it with:"
+echo "Ludo picks this up automatically. To force a specific build instead:"
 echo "  export LUDO_SIGIL_LIB=$BUILD_DIR/libsigil.so"
 echo "  python3 scripts/switch_check.py"

@@ -75,6 +75,15 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
+        # Markers live under config_dir(), derived from HOME -- NOT from
+        # XDG_CACHE_HOME. Redirected HERE, before the first marker write,
+        # rather than further down beside the currency checks: a marker
+        # written above that point landed in the real ~/.config and left the
+        # user's install claiming a firmware version they never installed,
+        # which reads on the BIOS panel as the wrong number and, worse,
+        # invites a 324 MB re-download.
+        import os
+        os.environ['HOME'] = str(d / 'home')
         data = d / 'eden'
         (data / 'nand/system/Contents/registered').mkdir(parents=True)
 
@@ -261,13 +270,6 @@ master_key_source = ''' + b'c' * 32 + b'''
               pick(unversioned), 'Firmware_17.0.1.zip')
 
         # --- currency -------------------------------------------------
-        # Markers live under config_dir(), which is derived from HOME --
-        # NOT from XDG_CACHE_HOME. Overriding the wrong variable let earlier
-        # runs write into the user's real ~/.config, where a marker left by
-        # one run then made the next run's "nothing recorded yet" case pass
-        # a stale True.
-        import os
-        os.environ['HOME'] = str(d / 'home')
         entry = {'file_name': 'ProdKeys.NET-v22.5.0.zip',
                  'md5_hash': 'ABCD1234' * 4}
 

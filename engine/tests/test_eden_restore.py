@@ -126,6 +126,29 @@ def main():
               E.pack_save(again['path'], d / 'rt2.zip').read_bytes(),
               packed.read_bytes())
 
+        # --- uploads defer to Eden's exit too -------------------------
+        # The other direction of the same rule. A save packed while Eden is
+        # open is a partial snapshot of one the emulator still holds in
+        # memory, so the inventory must skip it and let the sync triggered by
+        # Eden's close send the finished article.
+        from romm_sync_engine import sync_core
+
+        m = object.__new__(sync_core.AutoSyncManager)
+        m.settings = type('S', (), {'get': lambda self, *a: ''})()
+        m.log = lambda *a, **k: None
+        called = []
+        real_running, real_find = E.eden_is_running, E.find_eden_saves
+        E.find_eden_saves = lambda **kw: called.append(1) or []
+        try:
+            E.eden_is_running = lambda: True
+            check('a live Eden yields no inventory entries',
+                  m._eden_inventory_entries(), [])
+            # Not merely empty -- the tree must not be walked at all, or a
+            # future change could reintroduce the race through the back door.
+            check('and its save tree is not even read', called, [])
+        finally:
+            E.eden_is_running, E.find_eden_saves = real_running, real_find
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

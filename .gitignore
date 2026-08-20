@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+# ...except the bundled Sigil build, which is a shipped artifact rather than a
+# local compilation product. Without this negation the blanket *.so above drops
+# it silently: the tree would look complete, every build would package a
+# library that is not there, and Switch identification would fall back to
+# reading filenames on every machine but the one that ran build_sigil.sh.
+!engine/romm_sync_engine/bin/*.so
 .Python
 build/AppDir/
 build/RomM-*.AppImage
@@ -102,5 +108,12 @@ node_modules/
 desktop/runtime/
 desktop/release/
 
-# Local libsigil build (scripts/build_sigil.sh)
+# Local libsigil build (scripts/build_sigil.sh). The build directory is scratch;
+# the copy the script installs into the engine package is a SHIPPED artifact and
+# is committed -- see the *.so negation at the top of this file.
 sigil-build/
+
+# Test-only virtualenv, built on demand by engine/tests/run.sh when no
+# interpreter on the machine has the engine dependencies. Not covered by the
+# .venv/ rule above -- that matches the exact name, not this suffixed one.
+engine/.venv-tests/

@@ -134,7 +134,17 @@ snapshot_file = CONFIG_DIR / 'library_snapshot.json'
 # snapshot has no flags on any row, and an incremental refresh only re-reads
 # rows RomM reports as changed — so without this bump the flags would trickle
 # in one game at a time, forever. Discarding the snapshot costs one full fetch.
-SNAPSHOT_SCHEMA = 2
+# 3: sibling grouping learned to rank Switch content, so a group's tile is now
+# the base game rather than whichever row the API happened to list first. Every
+# schema-2 snapshot was grouped under the old rule and can therefore hold an
+# update or a DLC where the base game belongs — "Mario Party Superstars
+# [01006FE013472800]" is a patch, and the base game it hid had no tile at all.
+# Re-grouping only happens when a platform is walked, and a platform is only
+# walked when its rom_count moves; a library that is merely mis-grouped keeps
+# its count forever, so nothing would ever heal it. Hence a bump rather than a
+# migration: the grouping cannot be redone from the persisted rows, because the
+# siblings it would need were folded away when the snapshot was written.
+SNAPSHOT_SCHEMA = 3
 
 # How long the last library fetch took, so a user can report it without having
 # to reproduce it while someone watches. Diagnosing the RomM fetch has meant
@@ -620,6 +630,18 @@ class Plugin:
     # be held against a server count; server-vs-server is the only comparison
     # that means anything, and it needs no arithmetic to correct for grouping.
     _library_platform_totals: dict = None
+
+    # {platform_id: newest ROM `updated_at`}, the companion to the counts above
+    # and the reason a re-added ROM no longer goes unnoticed. A count reports a
+    # net, so deleting a ROM and adding another to the same platform leaves it
+    # identical and the platform is never re-walked -- which is precisely what
+    # fixing a badly-matched ROM in RomM looks like from here. Any add or edit
+    # moves this timestamp; a pure delete does not, but a delete always moves
+    # the count, so the pair covers every change between them. Kept parallel to
+    # the counts rather than folded into them because the two are read on
+    # different paths and a probe that fails must leave the count comparison
+    # exactly as it was.
+    _library_platform_marks: dict = None
 
     # ISO 8601 fetched_at of the data currently in memory, sourced either from the
     # persisted snapshot (cold start) or the last live fetch. Drives the "library
@@ -1214,6 +1236,7 @@ class Plugin:
         self._snapshot_fetched_at = None
         self._library_server_total = None
         self._library_platform_totals = None
+        self._library_platform_marks = None
         self._last_full_fetch_time = None
         self._library_progress = None
         self._announce_library = None
@@ -1301,6 +1324,7 @@ class Plugin:
                 # rather than migrated — an old snapshot simply has no baselines
                 # and fetches once.
                 'platform_totals_v2': self._library_platform_totals or None,
+                'platform_marks': self._library_platform_marks or None,
                 'collections': self._romm_collections or [],
                 'virtual_collections': self._romm_virtual_collections or [],
                 'platform_slug_to_name': self._platform_slug_to_name or {},
@@ -1390,6 +1414,13 @@ class Plugin:
                         int(k): int(v) for k, v in totals.items()}
                 except (TypeError, ValueError):
                     logging.warning("Snapshot platform totals unusable; ignoring")
+            marks = data.get('platform_marks')
+            if isinstance(marks, dict) and marks:
+                try:
+                    self._library_platform_marks = {
+                        int(k): str(v) for k, v in marks.items()}
+                except (TypeError, ValueError):
+                    logging.warning("Snapshot platform marks unusable; ignoring")
             logging.info(f"Hydrated {len(self._available_games)} games from snapshot "
                          f"(fetched {self._snapshot_fetched_at})")
             return self._snapshot_fetched_at
@@ -2045,6 +2076,22 @@ class Plugin:
             logging.debug(f"_count_pending_saves failed: {e}")
         return 0
 
+    def _save_activity(self):
+        """What save-sync is doing right now — feeds the live sync indicator.
+
+        Rides get_service_status, which the frontend already polls, so the
+        indicator costs no poller of its own. Shape is fixed even on failure:
+        the UI reads .active unconditionally.
+        """
+        idle = {'active': False, 'state': None, 'game': None,
+                'rom_id': None, 'games': 0}
+        try:
+            if self._auto_sync and hasattr(self._auto_sync, 'save_activity'):
+                return self._auto_sync.save_activity() or idle
+        except Exception as e:
+            logging.debug(f"_save_activity failed: {e}")
+        return idle
+
     async def get_pending_uploads(self):
         """Itemized list of local saves/states waiting to upload on reconnect.
 
@@ -2131,6 +2178,7 @@ class Plugin:
                     'library_announcement':    self._announce_library,
                     'snapshot_fetched_at':     self._snapshot_fetched_at,
                     'pending_saves':           self._count_pending_saves(),
+                    'save_activity':           self._save_activity(),
                     'message':                 msg,
                     'details':                 details,
                     'collections':             [],
@@ -2209,6 +2257,7 @@ class Plugin:
                 'game_count':              game_count,
                 'snapshot_fetched_at':     self._snapshot_fetched_at,
                 'pending_saves':           self._count_pending_saves(),
+                'save_activity':           self._save_activity(),
                 'message':                 message,
                 'details':                 status,
                 'collections':             collections,
@@ -2358,6 +2407,64 @@ class Plugin:
             return {'success': True, 'started': True, 'previous_at': previous}
         except Exception as e:
             logging.error(f"time_cold_fetch error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def rebuild_library(self):
+        """Discard the cached library and refetch it from scratch.
+
+        The escape hatch for a library that has drifted out of step with the
+        server in a way no probe can see. Reconciliation is deliberately cheap —
+        it compares counts and newest-ROM timestamps rather than reading every
+        platform — and cheap comparisons have blind spots. When one bites, the
+        symptom is a tile that will not go away or a game that will not launch,
+        and until now the only cure was LUDO_DEBUG=1 and the cold-fetch
+        benchmark, which is not something a user can be asked to find.
+
+        Not gated on debug mode, unlike time_cold_fetch: this destroys a cache,
+        not data. The ROMs on disk, the saves and every setting are untouched —
+        what is thrown away is the record of what the server said, which the
+        server can always say again.
+
+        Returns immediately and refetches in the background; the fetch runs for
+        minutes on a large library, far longer than an RPC should block. The
+        caller watches the usual library progress.
+        """
+        try:
+            if not (self._romm_client and self._romm_client.authenticated):
+                return {'success': False, 'message': 'Not connected to RomM'}
+            if self._library_busy:
+                return {'success': False, 'busy': True,
+                        'message': 'A library refresh is already running'}
+
+            logging.info("rebuild_library RPC (user action): dropping the cache")
+            # The first-fetch toast is re-armed by _clear_library_cache, which is
+            # right after a logout and wrong here — the user has seen their
+            # library and is asking for it again, not meeting it for the first
+            # time.
+            announced = (self._settings.get('UI', 'library_announced', '')
+                         if self._settings else '')
+            self._clear_library_cache()
+            try:
+                if self._settings:
+                    self._settings.set('UI', 'library_announced', announced)
+            except Exception:
+                pass
+
+            def _run():
+                try:
+                    self._stop_sync()
+                    time.sleep(0.5)
+                    self._start_sync()
+                except Exception as e:
+                    logging.error(f"rebuild_library: {e}", exc_info=True)
+
+            threading.Thread(target=_run, daemon=True,
+                             name="ludo-library-rebuild").start()
+            _record_activity('sync', 'Library rebuild started', 'Library')
+            return {'success': True, 'started': True,
+                    'message': 'Rebuilding the library from RomM'}
+        except Exception as e:
+            logging.error(f"rebuild_library error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
     async def finish_onboarding(self):
@@ -2763,6 +2870,32 @@ class Plugin:
         except Exception:
             return True
 
+    def _sync_indicator(self) -> bool:
+        """Whether the live save-sync pill may appear.
+
+        Defaults ON: the pill exists because closing a game used to say
+        nothing at all about the save being pushed. But it is by nature an
+        overlay on top of whatever you were doing, so anyone who would rather
+        keep the screen clear can turn it off — the completion notification
+        still fires either way, which is the part you cannot miss and recover.
+        """
+        try:
+            return (self._settings.get('Sync', 'show_indicator', 'true') or 'true') != 'false'
+        except Exception:
+            return True
+
+    async def get_sync_indicator(self):
+        return {'success': True, 'enabled': self._sync_indicator()}
+
+    async def set_sync_indicator(self, enabled: bool):
+        try:
+            self._settings.set('Sync', 'show_indicator', 'true' if enabled else 'false')
+            logging.info(f"Save-sync indicator set to {bool(enabled)}")
+            return {'success': True, 'enabled': bool(enabled)}
+        except Exception as e:
+            logging.error(f"set_sync_indicator error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
     async def get_library_auto_update(self):
         return {'success': True, 'enabled': self._library_auto_update()}
 
@@ -2850,6 +2983,7 @@ class Plugin:
             if newly_off and self._library_platform_totals:
                 for pid, name in list(self._platform_ids_for(newly_off).items()):
                     self._library_platform_totals.pop(pid, None)
+                    (self._library_platform_marks or {}).pop(pid, None)
                     logging.info(f"Platform sync: dropped baseline for {name}")
 
             # The connect skip check compares the server's total against
@@ -5210,6 +5344,88 @@ class Plugin:
         return text in {str(platform.get(k) or '').strip().lower()
                         for k in ('id', 'slug', 'fs_slug')} - {''}
 
+    @staticmethod
+    def _platforms_needing_walk(considered, baselines, marks, fresh_marks,
+                                only_platform=None, force_platforms=None):
+        """Decide which platforms to re-walk. Returns (changed, marks_to_adopt).
+
+        Pure: it reads the four maps it is given and returns two lists, so the
+        rule can be tested without a server, a walk, or a plugin instance. That
+        matters more here than it looks — this is the function that decides
+        whether a library that has silently drifted ever gets noticed, and its
+        failure mode is doing nothing at all, which no assertion elsewhere in a
+        refresh would catch.
+
+        ``considered`` is [(pid, platform_row, count)]. The rules, in order:
+
+          * No baseline (never walked) → walk. Even at zero ROMs: the platform
+            may have appeared since, and adopting its count unread would hide
+            everything already in it.
+          * Count moved → walk. This is the cheap signal and it stays first.
+          * Explicitly demanded (``only_platform``/``force_platforms``) → walk.
+          * Count matched, but the newest ROM timestamp moved → walk. Counts
+            report a NET, so a delete plus an add of equal size is invisible to
+            them; this is the case that let a re-added ROM linger as a dead
+            entry for as long as nobody else touched the platform.
+          * Count matched, no mark known yet → adopt the mark, do not walk. The
+            alternative is re-walking every platform once the first time this
+            runs, which on a large library costs minutes to learn nothing.
+          * Count matched, mark unreadable → do nothing, adopt nothing. An
+            unanswered probe is not a match, and stamping it would make the
+            next comparison agree with a value never read.
+        """
+        changed = []
+        adopt = {}
+        for pid, platform, count in considered:
+            base = baselines.get(pid)
+            if (base is None or base != count or only_platform is not None
+                    or (force_platforms and pid in force_platforms)):
+                changed.append((pid, platform, count))
+                continue
+
+            mark = fresh_marks.get(pid)
+            if mark is None:
+                continue
+            known = marks.get(pid)
+            if known is None:
+                adopt[pid] = mark
+                continue
+            if known != mark:
+                logging.info(
+                    f"Reconcile: {platform.get('slug') or pid} kept its count "
+                    f"but its newest ROM moved ({known} → {mark})")
+                changed.append((pid, platform, count))
+        return changed, adopt
+
+    def _probe_platform_marks(self, platform_ids) -> dict:
+        """{platform_id: newest ROM updated_at} for the platforms named.
+
+        One small request each, run in parallel because they are independent
+        and a sequential pass over a fifteen-platform server would add seconds
+        to every reconcile for no reason. Platforms whose probe fails are
+        absent from the result rather than present with None — the caller must
+        be able to tell "unchanged" from "unanswered", and a key that is simply
+        missing cannot be mistaken for either.
+        """
+        client = self._romm_client
+        if not client or not platform_ids:
+            return {}
+        from concurrent.futures import ThreadPoolExecutor
+
+        def probe(pid):
+            try:
+                return pid, client.newest_rom_mark(pid)
+            except Exception as e:
+                logging.debug(f"Platform mark probe failed for {pid}: {e}")
+                return pid, None
+
+        out = {}
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for pid, mark in pool.map(probe, list(platform_ids)):
+                if mark is not None:
+                    out[pid] = mark
+        return out
+
     def _reconcile_platforms(self, only_platform=None, force_platforms=None) -> dict:
         """Bring the library back in step with the server, one platform at a time.
 
@@ -5261,6 +5477,7 @@ class Plugin:
             platforms = [p for p in platforms if p.get('id') not in off_ids]
             for pid in off_ids:
                 (self._library_platform_totals or {}).pop(pid, None)
+                (self._library_platform_marks or {}).pop(pid, None)
             if not platforms:
                 logging.info("Reconcile: every platform is turned off for sync")
                 stats['checked'] = 0
@@ -5281,25 +5498,35 @@ class Plugin:
             self._library_platform_totals = {
                 p['id']: (p.get('rom_count') or 0)
                 for p in platforms if p.get('id') is not None}
+            self._library_platform_marks = self._probe_platform_marks(
+                [p['id'] for p in platforms if p.get('id') is not None])
             logging.info(f"Reconcile: adopted baselines for "
                          f"{len(self._library_platform_totals)} platforms")
             stats['checked'] = len(platforms)
             return stats
 
-        changed = []
+        if self._library_platform_marks is None:
+            self._library_platform_marks = {}
+        marks = self._library_platform_marks
+
+        considered = []
         for p in platforms:
             pid = p.get('id')
             if pid is None or (only_platform is not None
                                and not self._platform_matches(p, only_platform)):
                 continue
-            count = p.get('rom_count') or 0
-            base = baselines.get(pid)
-            # A platform we have never walked (base is None) counts as changed
-            # even at zero ROMs — it may have appeared since, and adopting its
-            # count without reading it would hide everything already in it.
-            if (base is None or base != count or only_platform is not None
-                    or (force_platforms and pid in force_platforms)):
-                changed.append((pid, p, count))
+            considered.append((pid, p, p.get('rom_count') or 0))
+
+        # One probe per platform under consideration, before anything decides.
+        # The platforms the counts clear need it to answer whether they really
+        # are unchanged; the ones already known to have changed need it so the
+        # mark stamped after the walk describes what was actually walked.
+        fresh_marks = self._probe_platform_marks([pid for pid, _p, _c in considered])
+
+        changed, adopt = self._platforms_needing_walk(
+            considered, baselines, marks, fresh_marks,
+            only_platform=only_platform, force_platforms=force_platforms)
+        marks.update(adopt)
 
         stats['checked'] = len(platforms) if only_platform is None else len(changed)
         if not changed:
@@ -5369,6 +5596,11 @@ class Plugin:
                     touched_ids.add(rid)
 
             self._library_platform_totals[pid] = count
+            if pid in fresh_marks:
+                # Only a mark read on THIS pass is stamped. Carrying an older
+                # one forward would assert a state we did not verify, and the
+                # next comparison would match against it and skip a walk.
+                self._library_platform_marks[pid] = fresh_marks[pid]
             stats['walked'].append(name)
 
         self._library_progress = None
@@ -7122,6 +7354,104 @@ class Plugin:
             logging.error(f"switch_prereq_for_rom error: {e}", exc_info=True)
             return {'needed': False}
 
+    def _handle_switch_add_ons(self, rom_id, path, progress_callback=None):
+        """Install a downloaded Switch add-on, or fetch a base game's add-ons.
+
+        Runs on the download worker thread, after the file has landed. Both
+        halves are best-effort and never raise into the download: a game that
+        downloaded fine must not report failure because its optional patch did
+        not, and the file is on disk either way.
+        """
+        try:
+            sync = self._auto_sync
+            path = Path(path)
+            if not sync or path.suffix.lower() not in ('.nsp', '.xci'):
+                return
+
+            info = sync.switch_add_on_state(path.name)
+            if info and info.get('kind') in ('update', 'dlc'):
+                sync.install_switch_add_on(path)
+                return
+            if not info:
+                return
+
+            # A base game. Its add-ons are separate ROMs on the server, tied to
+            # it by title ID rather than by anything RomM models, so they are
+            # found by name -- see switch_add_ons_for_rom.
+            g = self._games_index().get(rom_id) or {}
+            add_ons = sync.switch_add_ons_for_rom(
+                g or {'id': rom_id, 'fs_name': path.name},
+                library=self._available_games)
+            # Siblings no name can classify. Fetched and read rather than
+            # guessed at: install_switch_add_on refuses a base game, so the
+            # worst outcome is a file that stays a ROM.
+            for extra in sync.switch_unresolved_siblings(g or {}):
+                if all((extra.get('id') != (a.get('rom_id') or a.get('id')))
+                       for a in add_ons):
+                    add_ons.append(extra)
+
+            for add_on in add_ons:
+                add_on_id = add_on.get('rom_id') or add_on.get('id')
+                # Library entries key this 'file_name'; folded sibling rows
+                # key it 'fs_name'. Both shapes reach here.
+                file_name = (add_on.get('file_name') or add_on.get('fs_name')
+                             or (add_on.get('romm_data') or {}).get('fs_name'))
+                if not (add_on_id and file_name):
+                    continue
+                target = path.parent / file_name
+                if not target.exists():
+                    logging.info(f"fetching Switch add-on {file_name} for rom {rom_id}")
+                    ok, msg = self._romm_client.download_rom(
+                        add_on_id, add_on.get('name') or file_name, target,
+                        progress_callback)
+                    if not ok:
+                        logging.warning(f"add-on download failed: {file_name}: {msg}")
+                        continue
+                sync.install_switch_add_on(target)
+        except Exception as e:
+            logging.error(f"Switch add-on handling failed for {path}: {e}",
+                          exc_info=True)
+
+    async def switch_add_ons(self, rom_id: int):
+        """Update and DLC state for a game, for the detail page.
+
+        Returns {'kind', 'installed_update', 'installed_dlc', 'available'}.
+        'kind' names what THIS rom is -- a base game, or an add-on to another --
+        because the same tile shape has to answer both, and an add-on's own
+        detail page should say what it patches rather than list itself.
+        """
+        try:
+            sync = self._auto_sync
+            g = self._games_index().get(rom_id) or {}
+            name = (g.get('file_name')
+                    or (g.get('romm_data') or {}).get('fs_name') or '')
+            if not sync or not name:
+                return {'kind': None}
+            info = sync.switch_add_on_state(name)
+            if not info:
+                return {'kind': None}
+            installed = sync.switch_add_ons_installed_for(name)
+            available = [] if info['kind'] != 'base' else [
+                {'rom_id': a.get('rom_id') or a.get('id'),
+                 'name': a.get('name'),
+                 'file_name': a.get('file_name'),
+                 'is_downloaded': bool(a.get('is_downloaded'))}
+                for a in sync.switch_add_ons_for_rom(
+                    g, library=self._available_games)]
+            return {
+                'kind': info['kind'],
+                'base_id': info['base_id'],
+                'title_id': info['title_id'],
+                'version': info.get('version'),
+                'installed': info.get('installed'),
+                'installed_update': installed['update'],
+                'installed_dlc': installed['dlc'],
+                'available': available,
+            }
+        except Exception as e:
+            logging.error(f"switch_add_ons error: {e}", exc_info=True)
+            return {'kind': None}
+
     async def download_game(self, rom_id: int):
         """Download a single ROM into the library (handles archive extraction)."""
         try:
@@ -7187,6 +7517,15 @@ class Plugin:
                     # grout-style: unpack a single-file .zip/.7z on arrival so
                     # disc cores get a real .cue/.m3u (no-op if disabled/plain ROM).
                     final = self._maybe_unzip_download(dest, rom_id) if ok else dest
+                    # Switch add-on content is the one thing here that is not
+                    # finished on arrival: Eden applies an update or DLC only
+                    # from its registered cache, so the file has to be installed
+                    # before it means anything. Downloading a BASE game also
+                    # pulls whatever patches and add-ons the library holds for
+                    # it -- the user asked for the game, and a game whose patch
+                    # sits undownloaded beside it is not the game they meant.
+                    if ok:
+                        self._handle_switch_add_ons(rom_id, final, _on_progress)
                     # `g` was resolved before the download started, which can be
                     # minutes ago — long enough for the 5-minute library refresh
                     # to have replaced _available_games. Re-resolve now, or a rom

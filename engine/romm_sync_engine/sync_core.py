@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
-from . import emulator_saves, title_ids
+from . import emulator_saves, switch_content, title_ids
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -29,6 +29,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import queue
 from collections import defaultdict, deque, OrderedDict
+from contextlib import contextmanager
 
 # Recent-activity feed (Decky Settings UI). Optional so the desktop app —
 # which shares this module without py_modules/activity_log — degrades to no-op.
@@ -69,6 +70,12 @@ _DISPLAY_DUMP_RE = re.compile(r'^(!|[abhoftp]\d{0,2}[a-z]?)$', re.I)
 # Groups worth keeping even inside a TOSEC tag run — they tell saves apart.
 _DISPLAY_KEEP_RE = re.compile(r'^(disc|disk|side|part|tape)\b', re.I)
 _DISPLAY_REV_RE = re.compile(r'^(rev|v|version|beta|proto|demo|disc|disk)\b', re.I)
+# RomM's own Switch naming: "Mario Kart 8 Deluxe [0100152000022000][v0] (6.77 GB)".
+# The title ID and the size are the two groups that made a save notification
+# read as a filename rather than a game -- "[v0]" was already stripped, which
+# left the worst two behind. Neither can collide with a real title.
+_DISPLAY_TITLE_ID_RE = re.compile(r'^01[0-9a-f]{14}$', re.I)
+_DISPLAY_SIZE_RE = re.compile(r'^[\d.]+\s*(b|[kmgt]i?b)$', re.I)
 
 
 def _is_display_noise(group):
@@ -92,6 +99,10 @@ def _is_display_noise(group):
         if _DISPLAY_YEAR_RE.match(part):        # TOSEC dump year
             continue
         if _DISPLAY_DUMP_RE.match(part):        # [!], [b2], [h1C]
+            continue
+        if _DISPLAY_TITLE_ID_RE.match(part):    # [0100152000022000]
+            continue
+        if _DISPLAY_SIZE_RE.match(part):        # (6.77 GB)
             continue
         return False
     return True
@@ -332,6 +343,25 @@ def _flush_game_toast(rom_id):
         _toast_title(entry['counts']), display_game_name(entry['name']),
         rom_id=entry['rom_id'], has_cover=entry['has_cover'],
     )
+
+
+def flush_pending_game_toasts():
+    """Fire every coalesced toast now, cancelling its timer.
+
+    The coalescing timers are daemon threads, deliberately, so they can never
+    hold up a plugin shutdown -- but that means a shutdown inside the coalesce
+    window drops the announcement entirely. That is the worst possible moment
+    to lose one: the last thing a session does is upload the save the player
+    just made, and the user is often quitting seconds later. Called on stop so
+    the message survives.
+    """
+    with _pending_toasts_lock:
+        rom_ids = list(_pending_toasts)
+    for rom_id in rom_ids:
+        try:
+            _flush_game_toast(rom_id)
+        except Exception as e:
+            logging.debug(f"could not flush the pending toast for {rom_id}: {e}")
 
 
 def queue_game_sync_toast(rom_id, name, has_cover=False, saves_up=0,
@@ -3326,6 +3356,33 @@ class RomMClient:
                 else group_roms
             )
 
+            # Switch groups are ordered by what the content IS before anything
+            # else looks at them. A base game, its patch and its DLC are all
+            # plain .nsp files with one entry each, so every test below --
+            # folder ROM, is_main_sibling, file count -- is blind to the
+            # difference, and the group falls through to candidates[0]: the
+            # order the API happened to return. That is how a library ends up
+            # showing the Booster Course Pass where Mario Kart 8 should be, and
+            # it is the tile for the whole group, so the base game has no tile
+            # at all.
+            #
+            # The IDs settle it without reading a single file: an add-on's title
+            # ID is its base's give or take the low twelve bits, and the low
+            # three hex digits say which of the three it is (see
+            # title_ids.switch_kind). Ties and non-Switch groups keep the
+            # existing order exactly.
+            switch_rank = {'base': 0, 'update': 1, 'dlc': 2}
+            if any(title_ids.switch_content_from_name(
+                    r.get('fs_name') or r.get('name') or '') for r in candidates):
+                def _switch_key(rom):
+                    info = title_ids.switch_content_from_name(
+                        rom.get('fs_name') or rom.get('name') or '')
+                    # Unidentifiable rows sort with the base games rather than
+                    # last: a group whose base is untagged is still a group
+                    # whose add-ons must not win it.
+                    return switch_rank.get((info or {}).get('kind'), 0)
+                candidates = sorted(candidates, key=_switch_key)
+
             for rom in candidates:
                 fs_extension = rom.get('fs_extension', '')
                 is_main = rom.get('rom_user', {}).get('is_main_sibling', False)
@@ -3738,6 +3795,51 @@ class RomMClient:
             return response.json().get('total')
         except Exception as e:
             print(f"❌ Platform count probe error: {e}")
+            return None
+
+    def newest_rom_mark(self, platform_id):
+        """The newest `updated_at` among a platform's ROMs, or None.
+
+        The companion to count_platform_roms, and the answer to what a count
+        alone cannot see. Counts report a NET: delete a ROM and add another to
+        the same platform and rom_count is unchanged, so a library that has
+        genuinely moved reads as untouched and is never re-walked. That is not
+        a corner case -- it is what deleting a badly-matched ROM and re-adding
+        it with fixed metadata looks like from here, which is an ordinary thing
+        to do to a RomM library.
+
+        A timestamp catches exactly what the count misses. Any add or edit
+        moves it; a pure delete does not, but a delete always moves the count.
+        Together the two cover every change a walk would find. It cannot go
+        backwards on its own, so a server that answers this at all answers it
+        monotonically.
+
+        One row, ordered server-side -- the same shape and cost as the count
+        probe beside it. Returns None when the server cannot answer, and the
+        caller must read that as "no information" rather than "unchanged":
+        stamping a mark we failed to read would make the next comparison a
+        false match.
+        """
+        if not self.ensure_authenticated():
+            return None
+        try:
+            response = self.session.get(
+                urljoin(self.base_url, '/api/roms'),
+                params={'limit': 1, 'offset': 0, 'fields': 'id,updated_at',
+                        'order_by': 'updated_at', 'order_dir': 'desc',
+                        'platform_id': platform_id, 'platform_ids': platform_id},
+                timeout=15)
+            if response.status_code != 200:
+                return None
+            items = response.json().get('items') or []
+            if not items:
+                # An empty platform has no newest row. Distinct from a failed
+                # probe: '' is a value that compares equal to itself, so an
+                # empty platform that stays empty reads as unchanged.
+                return ''
+            return items[0].get('updated_at') or None
+        except Exception as e:
+            logging.debug(f"Platform mark probe error: {e}")
             return None
 
     def _fetch_pages_parallel(self, total_items, page_size, pages_needed, progress_callback,
@@ -8046,6 +8148,28 @@ class RetroArchInterface:
                 print(error_msg)
                 return False, error_msg
 
+            # Reap the child once it exits. Two reasons, both real:
+            #
+            #  * An unwaited child becomes a zombie that lives as long as Ludo
+            #    does, and /proc still lists its name -- so every "is the
+            #    emulator running?" check answers yes forever. That is what
+            #    stopped Eden's save-sync boundary from ever firing.
+            #  * stdout/stderr are pipes nobody drains. An emulator chatty
+            #    enough to fill the ~64KB buffer would block on its own write
+            #    and hang mid-session. Eden logs to a file so it never hit
+            #    this, but the trap was armed for any emulator that does not.
+            #
+            # communicate() solves both, and in a daemon thread it costs
+            # nothing while the game runs.
+            def _reap(proc):
+                try:
+                    proc.communicate()
+                except Exception as exc:
+                    logging.debug(f"reaping the emulator process failed: {exc}")
+
+            threading.Thread(target=_reap, args=(result,), daemon=True,
+                             name="romm-emulator-reaper").start()
+
             if standalone:
                 return True, f"Launched {rom_path.name} in {standalone['name']}"
             return True, f"Launched {rom_path.name} with {core_name} core"
@@ -10270,6 +10394,14 @@ class AutoSyncManager:
         self._uploads_inflight_lock = threading.Lock()
         # Coalesces concurrent session syncs (connect vs RetroArch-close triggers).
         self._session_sync_lock = threading.Lock()
+        # Uploads genuinely in flight, as [(rom_id, path)] — pushed by the
+        # upload sites themselves. See save_activity.
+        self._activity_uploads = []
+        self._activity_lock = threading.Lock()
+        # save path -> rom_id, memoized against the games list — see
+        # rom_id_for_save. Shared by the inventory build and the live indicator.
+        self._rom_match_cache = {}
+        self._rom_match_games = None
         
         # Game session tracking
         self.current_game = None
@@ -10505,6 +10637,159 @@ class AutoSyncManager:
             logging.debug(f"count_pending_saves failed: {e}")
             return 0
 
+    def _activity_begin(self, rom_id, path):
+        """Mark a real upload as started — see save_activity for why this is
+        pushed from the upload sites rather than inferred."""
+        with self._activity_lock:
+            self._activity_uploads.append((rom_id, str(path)))
+
+    def _activity_end(self, rom_id, path):
+        with self._activity_lock:
+            try:
+                self._activity_uploads.remove((rom_id, str(path)))
+            except ValueError:
+                pass
+
+    @contextmanager
+    def _activity_upload(self, rom_id, path):
+        self._activity_begin(rom_id, path)
+        try:
+            yield
+        finally:
+            self._activity_end(rom_id, path)
+
+    def save_activity(self):
+        """What save-sync is doing RIGHT NOW, for the UI's live indicator.
+
+        Two sources, both of which mean a file is genuinely going up:
+
+          _activity_uploads   an upload_save call in flight   -> 'uploading'
+          upload_debounce     a changed file still settling   -> 'queued'
+
+        Explicitly NOT sourced from _session_sync_lock, which was the obvious
+        proxy and the wrong one. That lock is held by every session sync,
+        including the one that runs on connect and the one after a play session
+        where nothing changed. Watching it made the UI announce "Uploading
+        save" for a negotiate that came back "0 up, 21 in-sync" — a claim about
+        the user's data that was simply untrue, and worse than showing nothing.
+
+        The queued half gets the same treatment: a save file being rewritten is
+        not the same as a save file that DIFFERS from what the server already
+        has, and RetroArch touches saves that are byte-identical to the last
+        upload. So the fingerprint is checked here, the same test
+        list_pending_saves uses, before anything is reported as pending.
+
+        Deliberately NOT latched past the end of the upload. A small save goes
+        up in about 200ms (measured: 1,542 bytes, 197ms) against a 2s UI poll,
+        so a short upload is usually never sampled and shows nothing — which is
+        the right outcome. There is no wait to narrate, and the completion
+        notification already covers it. The indicator is for the uploads long
+        enough that silence would be worrying.
+
+        Returns {'active', 'state', 'game', 'rom_id', 'games'}. Best-effort:
+        a status readout is never worth raising on the status path.
+        """
+        idle = {'active': False, 'state': None, 'game': None,
+                'rom_id': None, 'games': 0}
+        try:
+            with self._activity_lock:
+                uploads = list(self._activity_uploads)
+
+            if uploads:
+                rom_ids = {r for r, _ in uploads if r is not None}
+                rom_id, path = uploads[0]
+                return {
+                    'active': True, 'state': 'uploading',
+                    'game': self._activity_name(rom_id, path),
+                    'rom_id': rom_id,
+                    'games': len(rom_ids) or 1,
+                }
+
+            queued = [p for p in list(self.upload_debounce.keys())
+                      if self._activity_pending(p)]
+            if not queued:
+                return idle
+            rom_id = self.rom_id_for_save(queued[0])
+            return {
+                'active': True, 'state': 'queued',
+                'game': self._activity_name(rom_id, queued[0]),
+                'rom_id': rom_id,
+                'games': len({self._game_key_for_save(p) for p in queued}),
+            }
+        except Exception as e:
+            logging.debug(f"save_activity failed: {e}")
+            return idle
+
+    def _activity_pending(self, path):
+        """Does this queued file actually differ from what we last uploaded?"""
+        try:
+            st = Path(path).stat()
+            return self.last_uploaded.get(str(path)) != (st.st_size, st.st_mtime)
+        except Exception:
+            # Gone, or unreadable. Not something to announce either way.
+            return False
+
+    def _activity_name(self, rom_id, path):
+        """What to call this upload on screen.
+
+        The library's display name when we have a rom_id, because the filename
+        is not always a name: an Eden save is called "010093801237C000", a
+        title ID, and "Uploading save — 010093801237C000" tells the user
+        nothing about which game just closed.
+        """
+        if rom_id is not None:
+            try:
+                for game in (self.get_games() or []):
+                    if game.get('rom_id') == rom_id:
+                        name = game.get('name')
+                        if name:
+                            return name
+            except Exception:
+                pass
+        try:
+            return self._game_key_for_save(path)
+        except Exception:
+            return None
+
+    def rom_id_for_save(self, path):
+        """rom_id for a save file — find_rom_id_for_save_file, memoized.
+
+        The matcher itself is authoritative and untouched: six tiers, from the
+        launch alias through GameCube header IDs to region variants and the
+        containing folder. What was wrong was calling it once PER SAVE on every
+        sync. It walks the whole library applying regexes per game, so a
+        21-save inventory against a 16,541-game library re-derived roughly
+        350,000 name comparisons — measured at 2.3s of the ~3s a player waits
+        after closing a game, to reproduce a mapping that had not changed.
+
+        Cached against the games list by IDENTITY, holding a reference to it.
+        A refreshed library is a new list object, which drops the whole cache;
+        keeping the reference is what makes that test sound, since comparing
+        id() alone can be fooled by a freed list's address being reused.
+
+        Negative results are cached too — "no match" costs a full six-tier walk
+        to reach and is the common answer for a save whose ROM was never
+        downloaded here.
+        """
+        games = self.get_games() or []
+        if self._rom_match_games is not games:
+            self._rom_match_games = games
+            self._rom_match_cache = {}
+        key = str(path)
+        if key in self._rom_match_cache:
+            return self._rom_match_cache[key]
+        try:
+            rom_id = self.find_rom_id_for_save_file(Path(path))
+        except Exception:
+            rom_id = None
+        # Bounded. Normally one entry per save on disk, but the activity
+        # readout feeds it from filesystem events, so it must not grow without
+        # limit on a machine that churns save paths.
+        if len(self._rom_match_cache) > 512:
+            self._rom_match_cache = {}
+        self._rom_match_cache[key] = rom_id
+        return rom_id
+
     def start_auto_sync(self):
         """Start all auto-sync components"""
         if self.enabled:
@@ -10574,6 +10859,25 @@ class AutoSyncManager:
         if self.upload_worker and self.upload_worker.is_alive():
             self.upload_worker.join(timeout=2)
         
+        # Let an in-flight session sync finish before the process goes away.
+        # The sync thread is a daemon, so a teardown mid-cycle kills it between
+        # the upload and the bookkeeping that ANNOUNCES the upload -- observed
+        # exactly: save uploaded and accepted at 14:35:46.796, auto-sync
+        # stopped at 14:35:46.832, and no activity row or toast for it. The
+        # save was safely on the server and the user had every reason to
+        # believe it had not been. Bounded so a wedged sync cannot hang
+        # shutdown; the upload itself is already durable either way.
+        try:
+            if self._session_sync_lock.acquire(timeout=8):
+                self._session_sync_lock.release()
+            else:
+                logging.debug("a session save-sync was still running at "
+                              "shutdown; its toast may be lost")
+        except Exception as e:
+            logging.debug(f"waiting for the session sync failed: {e}")
+        # Then say what happened, before there is nothing left to say it with.
+        flush_pending_game_toasts()
+
         self.log("⏹️ Auto-sync stopped")
     
     def start_file_monitoring(self):
@@ -10676,6 +10980,10 @@ class AutoSyncManager:
             last_content = None
             last_mtime = 0
             retroarch_was_running = False
+            # Seeded False so that an Eden already open when monitoring starts
+            # still produces a close transition, rather than being mistaken for
+            # a state we have already handled.
+            eden_was_running = False
             last_network_state = False  # Local variable, not self._last_network_state
             startup_grace_period = True
             network_retry_count = 0
@@ -10704,6 +11012,21 @@ class AutoSyncManager:
                             # RetroArch has flushed them on exit.
                             self.trigger_session_save_sync("RetroArch closed")
                         retroarch_was_running = retroarch_running
+
+                    # The same session boundary for Eden. Without this, a
+                    # Switch save only reached the server whenever the next
+                    # unrelated sync happened to run -- observed as a save
+                    # sitting on disk from 11:56 and not uploading until 14:05,
+                    # on the next app start. Closing the emulator is the moment
+                    # the save is both final and worth confirming to the user.
+                    eden_running = emulator_saves.eden_is_running()
+                    if eden_running != eden_was_running:
+                        if eden_running:
+                            self.log("🎮 Eden launched")
+                        else:
+                            self.log("🎮 Eden closed")
+                            self.trigger_session_save_sync("Eden closed")
+                        eden_was_running = eden_running
 
                     # 3. PRIORITY: Network state detection (content loaded/unloaded)
                     if network_responding != last_network_state:
@@ -11326,10 +11649,11 @@ class AutoSyncManager:
             device_id = self.settings.get('Device', 'device_id', '')
             if not device_id:
                 device_id = None
-            result = self.romm_client.upload_save_with_thumbnail(
-                rom_id, save_type, file_path, thumbnail_path, emulator, device_id,
-                slot=slot, autocleanup=autocleanup, autocleanup_limit=autocleanup_limit
-            )
+            with self._activity_upload(rom_id, file_path):
+                result = self.romm_client.upload_save_with_thumbnail(
+                    rom_id, save_type, file_path, thumbnail_path, emulator, device_id,
+                    slot=slot, autocleanup=autocleanup, autocleanup_limit=autocleanup_limit
+                )
 
             if result == 'offline':
                 # No network — leave the file pending (don't record a synced
@@ -11373,9 +11697,14 @@ class AutoSyncManager:
                 except Exception:
                     pass
                 _kind_label = save_type.rstrip('s').capitalize()
-                _title = (f"{_kind_label} uploaded — {_gname}" if _gname
-                          else f"{_kind_label} uploaded")
-                _record_activity('save', _title, file_path.name)
+                _title = (f"{_kind_label} uploaded — {display_game_name(_gname)}"
+                          if _gname else f"{_kind_label} uploaded")
+                # The game, not the file. A save's filename is RetroArch's
+                # spelling of the content at best and a bare title ID at worst
+                # ("010093801237C000.srm"), neither of which names the game the
+                # player just put down.
+                _record_activity('save', _title,
+                                 display_game_name(_gname) or file_path.name)
                 # The ONE announcement for this upload: queue_game_sync_toast
                 # picks the surface (RetroArch's OSD while a game is up, a Ludo
                 # toast otherwise). This used to fire a bare "State uploaded" to
@@ -11411,18 +11740,19 @@ class AutoSyncManager:
         choice = self._resolve_save_conflict(op, entry['_path'],
                                              entry.get('updated_at'))
         if choice == 'local':
-            if self.romm_client.upload_save(
-                rom_id, 'saves', entry['_path'], emulator=entry.get('emulator'),
-                device_id=device_id, slot=slot, overwrite=True,
-                autocleanup=entry.get('_autocleanup', False),
-                autocleanup_limit=entry.get('_autocleanup_limit'),
-                session_id=session_id,
-            ) is True:
-                summary['uploaded'] += 1
-                summary['_per_game'][rom_id]['up'] += 1
-                return self._record_synced(entry['_path'])
-            summary['errors'] += 1
-            return False
+            with self._activity_upload(rom_id, entry['_path']):
+                if self.romm_client.upload_save(
+                    rom_id, 'saves', entry['_path'], emulator=entry.get('emulator'),
+                    device_id=device_id, slot=slot, overwrite=True,
+                    autocleanup=entry.get('_autocleanup', False),
+                    autocleanup_limit=entry.get('_autocleanup_limit'),
+                    session_id=session_id,
+                ) is True:
+                    summary['uploaded'] += 1
+                    summary['_per_game'][rom_id]['up'] += 1
+                    return self._record_synced(entry['_path'])
+                summary['errors'] += 1
+                return False
         if choice == 'server':
             try:
                 src = Path(entry['_path'])
@@ -11927,9 +12257,12 @@ class AutoSyncManager:
         import datetime as _dt
 
         inventory = []
+        _t0 = time.monotonic()
         # The emulator may have created its save tree since sync started.
         self.refresh_save_dirs()
         save_files = self.retroarch.get_save_files() or {}
+        logging.debug("[AUTO-SYNC] ⏱️ inventory: save-file walk %.2fs",
+                      time.monotonic() - _t0)
         # Under content sorting the save's folder is the GAME, not an emulator,
         # so the label below has to come from the ROM instead — see _emulator_label.
         content_sorted = self.retroarch.get_save_subdir_mode('saves') == 'content'
@@ -11943,7 +12276,7 @@ class AutoSyncManager:
                 logging.debug(f"could not map platforms for the inventory: {e}")
         for entry in save_files.get('saves', []):
             path = Path(entry['path'])
-            rom_id = self.find_rom_id_for_save_file(path)
+            rom_id = self.rom_id_for_save(path)
             if not rom_id:
                 # Unmatched local save — server can't pair it; skip rather than
                 # uploading against a guessed ROM.
@@ -12046,6 +12379,20 @@ class AutoSyncManager:
         stays read-only — nothing in this method writes into Eden's tree.
         """
         entries = []
+        # Eden flushes a Switch save when the game exits, not continuously, so
+        # anything on disk mid-session is a partial picture of a save the
+        # emulator still holds in memory. Packing it would upload a stale
+        # snapshot and race the flush, and the "uploaded" toast would be
+        # claiming something that is not yet true. Wait for the close instead:
+        # start_retroarch_monitoring triggers a session sync on Eden's exit, so
+        # the deferral costs seconds, not a cycle. Restore already refuses on
+        # the same condition (unpack_save), so both directions now agree that a
+        # live Eden owns its save tree.
+        if emulator_saves.eden_is_running():
+            logging.debug("Eden is running; deferring its saves to the sync "
+                          "triggered when it closes")
+            return entries
+
         # [Emulators] is optional, and ConfigParser's fallback= does not cover a
         # missing SECTION — it still raises. Read it on its own so that a config
         # without the section leaves the override empty instead of being caught
@@ -12055,11 +12402,18 @@ class AutoSyncManager:
         except Exception:
             override = ''
 
+        # Timed separately from the pack loop below. The session sync a player
+        # sits through on close is ~2.8s, and the phase timers narrowed almost
+        # all of it to this method — discovery walks Eden's NAND, packing zips
+        # and hashes every matched save. Which of the two owns the time decides
+        # what is worth caching, so measure them apart rather than together.
+        _t0 = time.monotonic()
         try:
             saves = emulator_saves.find_eden_saves(extra_data_dir=override or None)
         except Exception as e:
             logging.debug(f"Eden save discovery failed: {e}")
             return entries
+        _t1 = time.monotonic()
 
         if not saves:
             return entries
@@ -12097,6 +12451,9 @@ class AutoSyncManager:
                 '_autocleanup': True,
                 '_autocleanup_limit': 10,
             })
+        logging.debug("[AUTO-SYNC] ⏱️ eden inventory: discovery %.2fs, "
+                      "pack+hash %.2fs (%d saves, %d matched)",
+                      _t1 - _t0, time.monotonic() - _t1, len(saves), len(entries))
         return entries
 
     _NO_KEYS_MESSAGE = (
@@ -12193,11 +12550,20 @@ class AutoSyncManager:
         server_version = emulator_saves.firmware_version_from_name(
             entry.get('file_name'))
         installed_version = emulator_saves.installed_firmware_version()
+        # The marker is history; registered/ is the present tense. Deleting
+        # Eden's data folder (or just its registered/ directory) leaves our
+        # marker behind in Ludo's own cache, and reporting "22.5.0 installed"
+        # for a NAND with no NCAs in it would be a claim about a directory
+        # that no longer exists. firmware_is_current already refuses on the
+        # same count guard; this makes the label agree with it.
+        if not status.get('count'):
+            installed_version = None
         if emulator_saves.firmware_is_current(entry):
             return {'available': False, 'file_name': entry.get('file_name'),
                     'installed': status.get('count', 0), 'keys_ok': keys_ok,
                     'version': server_version,
                     'installed_version': installed_version,
+                    'keys_installed': keys is not None,
                     'master_key': (keys or {}).get('master_key')}
         return {'available': True,
                 'file_name': entry.get('file_name'),
@@ -12206,6 +12572,10 @@ class AutoSyncManager:
                 'keys_ok': keys_ok,
                 'version': server_version,
                 'installed_version': installed_version,
+                # Whether prod.keys is on THIS disk -- distinct from keys_ok
+                # above, which also counts a keys entry sitting on the server
+                # that nothing has installed yet.
+                'keys_installed': keys is not None,
                 # Shown, not enforced: which firmware needs which generation
                 # is a table that goes stale with every Nintendo release, and
                 # guessing it wrong would block an install that would work.
@@ -12319,6 +12689,184 @@ class AutoSyncManager:
                  f"({result['skipped']} already present)")
         return {'status': 'installed', **result}
 
+    # ── Switch updates and DLC ──────────────────────────────────────────
+    #
+    # A patch or add-on is not a ROM and does not behave like one. Eden reads
+    # add-on content only out of its own registered cache, so a downloaded
+    # update NSP sitting in the library folder does nothing at all until it is
+    # installed -- which is the opposite of every other platform here, where
+    # having the file IS having the content. That asymmetry is why these are
+    # separate methods rather than a branch inside the download path.
+
+    def switch_add_on_state(self, rom_name):
+        """What a ROM's filename says it is, for the download UI, or None.
+
+        Returns the title_ids.switch_content_from_name shape plus 'installed'
+        and 'installed_version'. Filename-derived, deliberately: this answers a
+        question about a game the user has not downloaded yet, so the file is
+        not here to read.
+        """
+        info = title_ids.switch_content_from_name(rom_name)
+        if not info or not info.get('kind'):
+            return None
+        info['installed_version'] = switch_content.installed_version(
+            info['title_id'])
+        info['installed'] = info['installed_version'] is not None or bool(
+            switch_content.read_manifest().get(info['title_id']))
+        return info
+
+    def switch_unresolved_siblings(self, rom):
+        """Switch siblings of ``rom`` that no filename can classify.
+
+        The last resort, and only reachable for a ROM on the Switch platform.
+        A dump named plainly -- "Metroid Dread.xci" beside "Metroid Dread
+        v327680.nsp" -- carries no title ID and no version anywhere in either
+        name, so nothing short of the CNMT inside the container says which is
+        the game and which is the patch. Sigil reads exactly that, but only
+        from a file, and a sibling still on the server is not one.
+
+        So the only way to classify these is to fetch them and look. What makes
+        that acceptable rather than reckless is the shape of the mistake: RomM
+        has already asserted the two are one game, switch_content.install
+        refuses to write a base game into NAND, and a sibling that turns out to
+        be an ordinary regional variant simply stays in the library folder as
+        the ROM it is. The cost of being wrong is bandwidth, not a broken
+        install.
+
+        Returns [] for anything that is not a Switch ROM, and for siblings a
+        name CAN classify -- those go through switch_add_ons_for_rom, which
+        does not have to download anything to be sure.
+        """
+        slug = (rom.get('platform_slug')
+                or (rom.get('romm_data') or {}).get('platform_slug') or '')
+        if str(slug).lower() != 'switch':
+            return []
+
+        out = []
+        for sibling in (rom.get('_sibling_files') or []):
+            if not isinstance(sibling, dict) or sibling.get('id') is None:
+                continue
+            name = (sibling.get('fs_name') or sibling.get('file_name')
+                    or sibling.get('fs_name_no_ext') or '')
+            if not name:
+                continue
+            if title_ids.switch_content_from_name(name):
+                continue  # the name settles it; no need to spend a download
+            if Path(name).suffix.lower() not in ('.nsp', '.xci'):
+                continue  # not a container this can install from anyway
+            out.append(sibling)
+        return out
+
+    def switch_add_ons_for_rom(self, rom, library=None):
+        """Server ROMs holding updates or DLC for ``rom``, newest patch first.
+
+        Grouping happens on filenames, which is what makes it usable at the
+        moment it is needed: the user presses download on a base game, and the
+        add-ons are still on the server, so their containers cannot be read.
+        Their names carry the title ID, and an add-on's ID and its base's are
+        the same number give or take the low twelve bits -- see
+        base_switch_title_id.
+
+        Only the newest update is returned; every DLC is. Installing two
+        versions of one patch is not additive, it is ambiguous (see
+        switch_content), while add-ons are independent titles that coexist.
+        """
+        base_info = title_ids.switch_content_from_name(
+            rom.get('fs_name') or rom.get('file_name') or rom.get('name') or '')
+        base_id = (base_info or {}).get('base_id')
+
+        candidates = list(library if library is not None else (self.available_games or []))
+        # A game's add-ons are usually not library entries at all. RomM reports
+        # a base game and its patch as siblings, and sibling grouping folds the
+        # patch INTO the base's entry -- which is what puts one tile on screen
+        # instead of three, and also what hides the patch from a scan of the
+        # library. The folded rows carry their own fs_name, so they group here
+        # exactly like top-level entries.
+        for sibling in (rom.get('_sibling_files') or rom.get('sibling_roms') or []):
+            if isinstance(sibling, dict) and sibling.get('id') is not None:
+                candidates.append(sibling)
+        def _name_of(entry):
+            return (entry.get('fs_name') or entry.get('file_name')
+                    or entry.get('fs_name_no_ext') or entry.get('name') or '')
+
+        if not base_id:
+            # The game itself names no title, but its add-ons may. A dump is
+            # routinely a bare "Super Mario Party.xci" sitting beside a fully
+            # tagged "Super Mario Party [010036B0034E4000][v0].nsp", and reading
+            # only the row the user pressed throws away the one name in the
+            # group that identifies it. RomM has already asserted these are one
+            # game by making them siblings, so any base ID found among them is
+            # this group's.
+            found = {info['base_id'] for info in (
+                title_ids.switch_content_from_name(_name_of(c)) or {}
+                for c in candidates) if info.get('base_id')}
+            if len(found) != 1:
+                # None, or a candidate pool spanning two games. Neither is
+                # something to guess at: the add-ons of the wrong title would
+                # install just as willingly as the right ones.
+                return []
+            base_id = found.pop()
+
+        groups = title_ids.group_switch_content(candidates, key=_name_of)
+        bucket = groups.get(base_id)
+        if not bucket:
+            return []
+        out = bucket['update'][:1] + bucket['dlc']
+        # The base game itself groups here too; it is the thing being
+        # downloaded, not an add-on to it.
+        rom_id = rom.get('id') or rom.get('rom_id')
+        return [g for g in out if (g.get('id') or g.get('rom_id')) != rom_id]
+
+    def install_switch_add_on(self, local_path, progress=None):
+        """Install a downloaded update or DLC into Eden. Returns its result dict.
+
+        Safe to call on any freshly downloaded file: anything that is not an
+        installable Switch add-on comes back as a status the caller can ignore,
+        so the download path does not have to know what a Switch container is.
+
+        prod.keys is passed when Eden has it. Without it the kind and version
+        come from the filename, which is enough to install correctly but not
+        enough to be sure the file is what it is named -- switch_content
+        records which of the two answered.
+        """
+        try:
+            prod_keys = emulator_saves.find_prod_keys(
+                (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip() or None)
+        except Exception:
+            prod_keys = None
+        try:
+            result = switch_content.install(local_path, prod_keys=prod_keys,
+                                            progress=progress)
+        except Exception as e:
+            logging.error(f"Switch add-on install failed for {local_path}: {e}",
+                          exc_info=True)
+            return {'status': 'failed', 'error': str(e)}
+
+        status = result.get('status')
+        name = Path(local_path).name
+        if status == 'ok':
+            kind = 'Update' if result['kind'] == 'update' else 'DLC'
+            self.log(f"✅ {kind} installed for {result['base_id']} ({name})")
+        elif status == 'current':
+            logging.debug(f"{name} is already installed")
+        elif status == 'no-emulator':
+            self.log(f"ℹ️ {name} is Switch add-on content, but Eden is not "
+                     f"installed here — it stays in the library folder")
+        elif status == 'compressed':
+            self.log(f"⚠️ {name} is compressed (.nsz/.xcz) and cannot be "
+                     f"installed; a decompressed .nsp/.xci is needed")
+        elif status == 'unreadable':
+            self.log(f"⚠️ Could not read {name} as a Switch container: "
+                     f"{result.get('error')}")
+        return result
+
+    def switch_add_ons_installed_for(self, rom_name):
+        """{'update', 'dlc'} installed for the game named by ``rom_name``."""
+        info = title_ids.switch_content_from_name(rom_name)
+        if not info or not info.get('base_id'):
+            return {'update': None, 'dlc': []}
+        return switch_content.installed_for_base(info['base_id'])
+
     def flush_after_reconnect(self):
         """Flush local save changes accumulated while offline. Called when the
         retry loop detects an offline→online transition (RomMClient.authenticated
@@ -12382,14 +12930,30 @@ class AutoSyncManager:
             try:
                 if reason:
                     self.log(f"🔄 Save-sync session ({reason})")
+                # Phase timings. Closing a game and waiting for the save to
+                # land is the slowest thing this code does that a user actually
+                # sits through — a measured Eden close spent 2.32s between the
+                # trigger and the first byte, of which the upload itself was
+                # 197ms. The trigger fires ~1ms after the emulator exits, so
+                # the cost is prep, not latency in noticing; these lines say
+                # WHICH prep, so it can be attacked with a number rather than
+                # a guess.
+                _t0 = time.monotonic()
                 # Before anything reads the disk: the emulator may have created
                 # (or moved) its save tree since this manager started.
                 self.refresh_save_dirs()
+                _t1 = time.monotonic()
                 # Push any states that drifted (e.g. changed while offline)
                 # BEFORE the negotiate baseline, so they actually reach the
                 # server instead of being marked synced in place.
                 self.flush_pending_states()
+                _t2 = time.monotonic()
                 self.run_negotiated_save_sync(trigger=reason)
+                _t3 = time.monotonic()
+                logging.info(
+                    "[AUTO-SYNC] ⏱️ session sync %.2fs "
+                    "(dirs %.2fs, states %.2fs, negotiate+ops %.2fs)",
+                    _t3 - _t0, _t1 - _t0, _t2 - _t1, _t3 - _t2)
             except Exception as e:
                 self.log(f"❌ Session save-sync failed: {e}")
             finally:
@@ -12474,33 +13038,38 @@ class AutoSyncManager:
                         self.log(f"⚠️ Save-sync: no local file for upload op rom={rom_id} slot={slot!r}")
                         summary['errors'] += 1
                         continue
-                    ok = self.romm_client.upload_save(
-                        rom_id, 'saves', entry['_path'],
-                        emulator=entry.get('emulator'), device_id=device_id,
-                        slot=slot, autocleanup=entry.get('_autocleanup', False),
-                        autocleanup_limit=entry.get('_autocleanup_limit'),
-                        session_id=session_id,
-                    )
-                    if ok is True:
-                        summary['uploaded'] += 1
-                        _bump(rom_id, 'up')
-                        if self._record_synced(entry['_path']):
-                            _fp_dirty = True
-                    elif ok == 'conflict':
-                        # The server rejected a "clean" upload with 409 — a
-                        # version diverged underneath us. Resolve like any
-                        # conflict (Smart prefer-newer by default): re-push local
-                        # with overwrite when local wins, else pull the server
-                        # copy. Without this the save would silently never sync.
-                        if self._handle_upload_conflict(op, entry, rom_id, slot,
-                                                        device_id, session_id,
-                                                        saves_dir, summary):
-                            _fp_dirty = True
+                    # The whole branch, including the 409 retry: the indicator
+                    # should stay lit across a conflict resolution rather than
+                    # blink off between the two requests.
+                    with self._activity_upload(rom_id, entry['_path']):
+                        ok = self.romm_client.upload_save(
+                            rom_id, 'saves', entry['_path'],
+                            emulator=entry.get('emulator'), device_id=device_id,
+                            slot=slot, autocleanup=entry.get('_autocleanup', False),
+                            autocleanup_limit=entry.get('_autocleanup_limit'),
+                            session_id=session_id,
+                        )
+                        if ok is True:
+                            summary['uploaded'] += 1
+                            _bump(rom_id, 'up')
+                            if self._record_synced(entry['_path']):
+                                _fp_dirty = True
+                        elif ok == 'conflict':
+                            # The server rejected a "clean" upload with 409 — a
+                            # version diverged underneath us. Resolve like any
+                            # conflict (Smart prefer-newer by default): re-push
+                            # local with overwrite when local wins, else pull the
+                            # server copy. Without this the save would silently
+                            # never sync.
+                            if self._handle_upload_conflict(op, entry, rom_id, slot,
+                                                            device_id, session_id,
+                                                            saves_dir, summary):
+                                _fp_dirty = True
+                            else:
+                                _errored_paths.add(str(entry['_path']))
                         else:
+                            summary['errors'] += 1
                             _errored_paths.add(str(entry['_path']))
-                    else:
-                        summary['errors'] += 1
-                        _errored_paths.add(str(entry['_path']))
 
                 elif action == 'download':
                     target = self._resolve_download_target(op, saves_dir)
@@ -12539,20 +13108,23 @@ class AutoSyncManager:
                     else:
                         choice = 'skip'
                     if choice == 'local':
-                        if entry and self.romm_client.upload_save(
-                            rom_id, 'saves', entry['_path'], emulator=entry.get('emulator'),
-                            device_id=device_id, slot=slot, overwrite=True,
-                            autocleanup=entry.get('_autocleanup', False),
-                            autocleanup_limit=entry.get('_autocleanup_limit'),
-                            session_id=session_id,
-                        ) is True:
-                            summary['uploaded'] += 1
-                            _bump(rom_id, 'up')
-                            if self._record_synced(entry['_path']):
-                                _fp_dirty = True
-                        else:
+                        if not entry:
                             summary['errors'] += 1
-                            if entry:
+                            continue
+                        with self._activity_upload(rom_id, entry['_path']):
+                            if self.romm_client.upload_save(
+                                rom_id, 'saves', entry['_path'], emulator=entry.get('emulator'),
+                                device_id=device_id, slot=slot, overwrite=True,
+                                autocleanup=entry.get('_autocleanup', False),
+                                autocleanup_limit=entry.get('_autocleanup_limit'),
+                                session_id=session_id,
+                            ) is True:
+                                summary['uploaded'] += 1
+                                _bump(rom_id, 'up')
+                                if self._record_synced(entry['_path']):
+                                    _fp_dirty = True
+                            else:
+                                summary['errors'] += 1
                                 _errored_paths.add(str(entry['_path']))
                     elif choice == 'server':
                         # Back up local before overwriting it — whatever chose
@@ -12637,7 +13209,9 @@ class AutoSyncManager:
                 if parts:
                     g = games.get(rid) or {}
                     name = g.get('name') or f'ROM {rid}'
-                    _record_activity('save', f"Save sync — {name}", ', '.join(parts))
+                    _record_activity('save',
+                                     f"Save sync — {display_game_name(name)}",
+                                     ', '.join(parts))
                     # Toast it as well. Saves used to get nothing on screen, only
                     # this feed row — so a save uploaded (or, worse, one pulled
                     # DOWN over the local file) happened silently. Merged with
@@ -13693,6 +14267,24 @@ class AutoSyncManager:
                     original_filename = latest_save.get('file_name', '')
                     romm_emulator = latest_save.get('emulator') or 'unknown'
 
+                    # Everything below this point is RetroArch's world: a save
+                    # root, per-core subdirectories, and a filename converted to
+                    # RetroArch's spelling. A standalone emulator's save obeys
+                    # none of it -- Eden's is a packed DIRECTORY keyed by title
+                    # ID, belonging in Eden's own tree. Run through here it was
+                    # written to saves/switch/<title-id>.srm: Eden never saw it,
+                    # so the restore silently did nothing, and the file watcher
+                    # then found a stray .srm and uploaded it under its own
+                    # name -- which is why the toast said "010093801237C000"
+                    # instead of "Metroid Dread". _restore_standalone_save is
+                    # the path that knows how to unpack these, and the
+                    # negotiated sync routes them there. Same reasoning as
+                    # _resolve_download_target, which already returns None here.
+                    if self._is_standalone_emulator(romm_emulator):
+                        self.log(f"  ⏭️ {romm_emulator} save handled by the "
+                                 f"standalone restore path, not RetroArch's")
+                        continue
+
                     # Compute local path to check if file exists before skipping
                     final_path = None
                     emulator_save_dir = None
@@ -14623,6 +15215,11 @@ class CollectionSyncManager:
 
             if success:
                 self.log(f"  ✅ Downloaded {rom.get('name')}")
+                # A Switch update or DLC is inert until it is in Eden's
+                # registered cache, so arriving is not the end of the job the
+                # way it is for every other file here. No-op for anything else.
+                if local_path.suffix.lower() in ('.nsp', '.xci'):
+                    self.install_switch_add_on(local_path)
                 downloaded_count += rom_file_count
                 sync_done += 1
 

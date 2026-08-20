@@ -179,6 +179,22 @@ class _Sigil:
         override = os.environ.get('LUDO_SIGIL_LIB')
         if override:
             candidates.append(override)
+        # The copy shipped inside this package, which is what makes Sigil
+        # present for a user who never builds anything. It sits here rather
+        # than in a sibling bin/ because this directory is the one both builds
+        # already carry: the Decky zip vendors romm_sync_engine wholesale and
+        # the desktop app imports the engine from the tree. See bin/README.md.
+        here = Path(__file__).resolve().parent
+        candidates.append(str(here / 'bin' / 'libsigil.so'))
+        # A local build, for developing against a newer Sigil than the bundled
+        # one, and the conventional manual install location. Both lose to
+        # LUDO_SIGIL_LIB and win over the bundle, so a build in the tree is
+        # picked up without having to move or delete anything.
+        candidates += [
+            str(here.parents[1] / 'sigil-build' / 'libsigil.so'),
+            str(Path.home() / '.local' / 'lib' / 'libsigil.so'),
+        ]
+        # Last: whatever the dynamic loader already knows about.
         candidates += ['libsigil.so', 'libsigil.dylib', 'sigil.dll']
         for name in candidates:
             try:
@@ -557,13 +573,200 @@ def index_roms(directories, extensions=None, prod_keys=None):
             # several ROMs can claim the same entry. The base game wins: it is
             # the title the save belongs to, and attributing a save to a DLC
             # entry would sync it against the wrong ROM. Ties keep the first.
-            rank = 0 if switch_kind(_raw_switch_tag(path)) in (None, 'base') else 1
+            rank = _content_rank(path, prod_keys=prod_keys)
             if title_id not in index or rank < ranks[title_id]:
                 index[title_id] = path
                 ranks[title_id] = rank
     return index
 
 
+def _content_rank(path, prod_keys=None):
+    """0 when a ROM is a base game, 1 when it is an update or DLC.
+
+    The filename tag is consulted first because it costs nothing. When the name
+    carries no tag -- the ordinary case for a plainly-named dump -- ask the
+    container itself, because a base game and its update normalise to the SAME
+    base title ID and so compete for one index entry. With both on disk and
+    neither tagged, the tie was previously broken by directory order, and the
+    update could win: the save then resolved to the patch's filename, matched
+    no library tile, and was silently dropped. Observed with Metroid Dread,
+    whose save never uploaded for exactly this reason.
+
+    Only Switch containers are opened, so this costs nothing for the rest of a
+    library.
+    """
+    kind = switch_kind(_raw_switch_tag(path))
+    if kind:
+        return 0 if kind == 'base' else 1
+    if Path(path).suffix.lower() not in _SWITCH_CONTAINERS:
+        return 0
+    try:
+        info = switch_content(path, prod_keys=prod_keys)
+    except Exception as e:
+        log.debug("could not read the content type of %s: %s", path, e)
+        return 0
+    return 1 if (info or {}).get('kind') in ('update', 'dlc') else 0
+
+
 def _raw_switch_tag(path):
     """The un-normalised Switch ID in a ROM's filename, for ranking."""
     return raw_switch_tag_in_name(Path(path).name)
+
+
+# ── Switch add-on content ────────────────────────────────────────────────────
+#
+# Everything above answers "which game owns this save", and deliberately
+# flattens an update or an add-on onto the base title to do it. Installing
+# add-on content needs the opposite: the distinction that was flattened, plus
+# the version, so a newer patch can replace an older one.
+#
+# Eden applies an update or DLC only out of its own registered cache -- a patch
+# NSP sitting beside the base ROM is inert -- and it refuses a base game there
+# outright (registered_cache.cpp returns ErrorBaseInstall when the CNMT title
+# is its own base at version 0). So the kind is not a label, it is the gate
+# deciding whether a file may be installed at all, and getting it wrong is the
+# difference between a working patch and a NAND full of content Eden ignores.
+#
+# The authority for both fields is the CNMT, which lives inside an encrypted
+# NCA. That is precisely what Sigil reads and what the PFS0 installer in
+# switch_content.py cannot: the installer needs no keys because it only copies
+# members out of a container, and the price of that is that it cannot tell what
+# it is copying. The two halves are complementary, the same way the two title-ID
+# backends above are.
+
+# sigil_switch_content_type, from include/sigil.h. UNKNOWN (0) is absent on
+# purpose: it means the CNMT was not read, and the ID is then the only evidence.
+_SIGIL_CONTENT_KINDS = {1: 'base', 2: 'update', 3: 'dlc'}
+
+# "[v131072]" as scene-named dumps tag a patch. The value is Nintendo's packed
+# version integer, which is meaningful only in comparison to another one --
+# never rendered for a human, who would read "131072" as noise.
+_SWITCH_VERSION_RE = re.compile(r'[\[\(]v(\d{1,10})[\]\)]', re.IGNORECASE)
+
+_SWITCH_CONTAINERS = {'.nsp', '.xci'}
+# Compressed rewrites of the two containers. Identifiable by name, but the
+# installer cannot open them -- see switch_content.py, which declines them
+# rather than half-installing one.
+_SWITCH_COMPRESSED = {'.nsz', '.xcz'}
+
+
+def switch_version_from_name(name):
+    """The packed title version tagged in a filename, or None."""
+    match = _SWITCH_VERSION_RE.search(str(name))
+    return int(match.group(1)) if match else None
+
+
+def switch_content(path, prod_keys=None):
+    """What Switch content ``path`` holds, or None if it is not a container.
+
+    Returns a dict of:
+
+      ``title_id``  the content's own ID -- an update's "…800", not its base
+      ``base_id``   the base application the content belongs to
+      ``kind``      'base', 'update' or 'dlc'
+      ``version``   packed title version, or None when nothing states it
+      ``source``    'cnmt' when Sigil decrypted the metadata, 'filename' when
+                    the answer came from the name alone
+      ``compressed``  True for .nsz/.xcz, which identify but cannot install
+
+    ``source`` is the caller's confidence signal and the reason it is returned
+    rather than logged. A filename-derived answer is a community convention:
+    good enough to group a library by game, too weak to justify writing into
+    Eden's NAND on the strength of it.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+    compressed = suffix in _SWITCH_COMPRESSED
+    if suffix not in _SWITCH_CONTAINERS and not compressed:
+        return None
+
+    result = None if compressed else _Sigil.get().extract(path, prod_keys=prod_keys)
+    if result and result.platform == _SIGIL_PLATFORM_SWITCH:
+        found = result.title_id.decode('ascii', 'replace').strip()
+        kind = _SIGIL_CONTENT_KINDS.get(result.switch_content_type)
+        base = base_switch_title_id(found)
+        if base:
+            # A read CNMT settles the kind; a filename-scanned result leaves
+            # switch_content_type at UNKNOWN, and then the ID's own numbering
+            # is the better evidence than nothing.
+            from_cnmt = (result.source != _SIGIL_SOURCE_FILENAME
+                         and result.switch_content_type != 0)
+            return {
+                'title_id': found.upper(),
+                'base_id': base,
+                'kind': kind or switch_kind(found),
+                'version': (result.title_version if from_cnmt
+                            else switch_version_from_name(path.name)),
+                'source': 'cnmt' if from_cnmt else 'filename',
+                'compressed': compressed,
+            }
+
+    tag = raw_switch_tag_in_name(path.name)
+    if not tag:
+        return None
+    return {
+        'title_id': tag.upper(),
+        'base_id': base_switch_title_id(tag),
+        'kind': switch_kind(tag),
+        'version': switch_version_from_name(path.name),
+        'source': 'filename',
+        'compressed': compressed,
+    }
+
+
+def switch_content_from_name(name):
+    """switch_content's answer for a name alone, without the file.
+
+    The server knows a ROM's filename before anything is downloaded, so this
+    is what lets the library group a game with its updates and add-ons while
+    every one of them is still on the server. It cannot reach the CNMT, so the
+    result is always ``source='filename'``.
+    """
+    name = str(name)
+    tag = raw_switch_tag_in_name(name)
+    if not tag:
+        return None
+    return {
+        'title_id': tag.upper(),
+        'base_id': base_switch_title_id(tag),
+        'kind': switch_kind(tag),
+        'version': switch_version_from_name(name),
+        'source': 'filename',
+        'compressed': Path(name).suffix.lower() in _SWITCH_COMPRESSED,
+    }
+
+
+def group_switch_content(items, key=None):
+    """Group Switch items by the base game they belong to.
+
+    ``items`` is any iterable of things carrying a name; ``key`` extracts that
+    name (default: the item itself). Returns
+    {base_id: {'base': [...], 'update': [...], 'dlc': [...]}} holding the
+    original items, with the update list ordered newest version first so the
+    one to install is the head.
+
+    Anything that names no Switch title is dropped rather than bucketed under
+    a guess -- a library is mostly not Switch content, and a wrong grouping is
+    worse than an absent one.
+    """
+    groups = {}
+    for item in items:
+        name = key(item) if key else item
+        info = switch_content_from_name(name)
+        if not info or not info['base_id'] or not info['kind']:
+            continue
+        bucket = groups.setdefault(
+            info['base_id'], {'base': [], 'update': [], 'dlc': []})
+        bucket[info['kind']].append((info, item))
+
+    out = {}
+    for base_id, bucket in groups.items():
+        # Untagged versions sort last: an update that states its version is
+        # the one we can reason about, and preferring it keeps a bare
+        # "[UPD]" file from shadowing a known-newer patch.
+        bucket['update'].sort(key=lambda pair: (pair[0]['version'] is not None,
+                                                pair[0]['version'] or 0),
+                              reverse=True)
+        out[base_id] = {kind: [item for _info, item in pairs]
+                        for kind, pairs in bucket.items()}
+    return out

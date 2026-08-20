@@ -23,3 +23,11 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["romm_sync_engine*"]
+
+# The bundled Sigil build is not a Python file, so nothing includes it by
+# default -- and the desktop AppImage installs this package with pip rather
+# than importing the tree. Without this the library is present in git, present
+# in the Decky zip, and silently absent from the AppImage, where the only
+# symptom is Switch identification quietly falling back to reading filenames.
+[tool.setuptools.package-data]
+romm_sync_engine = ["bin/*.so", "bin/README.md"]
