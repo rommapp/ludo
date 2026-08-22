@@ -3707,6 +3707,16 @@ class RomMClient:
                     # platform overwrites it.
                     if self.last_fetch_incomplete:
                         any_incomplete = True
+                        # argosy parity: the platform is abandoned for this
+                        # pass — the walk above already stopped at its first
+                        # failed page — and whatever landed is kept. The
+                        # incomplete flag keeps the checkpoint alive and the
+                        # server count uncached, so the next sync resumes
+                        # this platform from the pages that survived instead
+                        # of starting it over.
+                        print(f"⏭️  {name}: abandoned for this sync "
+                              f"({len(games)} of {count} games landed) — "
+                              f"resumes on the next sync")
 
                     # Prove the filter actually applied, once, on the first
                     # platform that returns anything. A server that recognises
@@ -3924,26 +3934,36 @@ class RomMClient:
         final_games = []
         pages_out = {}   # page_num -> rows, so assembly order is page order
         
+        # Set the moment a page fails for good. Workers check it before
+        # making a request, the collector cancels everything still queued:
+        # after one failure the walk stops issuing pages entirely.
+        stop_event = threading.Event()
+
         def fetch_single_page(page_num):
             offset = (page_num - 1) * page_size
             if offset >= total_items:
                 return page_num, [], True
+
+            if stop_event.is_set():
+                # A page ahead of the failure reached the worker before the
+                # cancel below did. No request was made for this page; the
+                # None keeps it out of the failed list, where it would read
+                # as a server-side loss rather than a walk we chose to end.
+                return page_num, [], None
             
-            # Concurrency inflates each request's latency roughly in proportion
-            # to the worker count (measured: one 500-row page alone 2.9s, four
-            # issued together ~8s each), so the read budget has to cover a big
-            # page on a slow server under contention. A flat 60s covered 500 rows
-            # on a fast instance and nothing else — a 15k library on a modest box
-            # was logging 23s per page already. Connect stays short: an
-            # unreachable server should still fail fast.
-            #
-            # The read budget is deliberately generous rather than tight. Giving
-            # up early does not save the server any work: RomM builds the whole
-            # response before sending, so hanging up leaves the query running to
-            # completion with nobody to receive it (it shows up in the access log
-            # as a 499) and buys us nothing but a retry. Waiting is strictly
-            # cheaper for both ends than timing out.
-            timeout = (10, 120 + page_size // 5)
+            # Argosy parity, deliberately flat: argosy-launcher gives every
+            # /api/roms call a 60s read budget (only /content downloads get
+            # more), and its sync is the behavior this walk now mirrors — a
+            # page that cannot land inside that window abandons the platform
+            # for this pass instead of marching on. The old size-scaled
+            # budget (120 + page_size/5) assumed waiting was always cheaper
+            # than hanging up, but the caller only waits for OUR socket:
+            # RomM keeps building the response either way, so a longer
+            # timeout just delays the moment we issue the next request into
+            # a server still burning the abandoned one. 60s matches the
+            # client that provably syncs these servers. Connect stays short:
+            # an unreachable server should still fail fast.
+            timeout = (10, 60)
 
             if resumed_pages and offset in resumed_pages:
                 # Already fetched by a run that was interrupted. Not re-requested
@@ -3998,24 +4018,26 @@ class RomMClient:
                             'order_dir': 'asc',
                             # RomM 4.9.0: file expansion is opt-in (with_files default False).
                             'with_files': 'true',
-                            # /api/roms computes four things per request — the
-                            # page, the count, char_index, rom_id_index — plus
-                            # filter_values, and all four extras default on. We
-                            # read only `items` (the total comes from the probe
-                            # in _fetch_all_games_chunked), so every page was
-                            # paying for three whole-library scans it discarded.
-                            # Measured on a 3,083-ROM instance: 5.26s -> 4.92s
-                            # per 1000-row page, 60KB less payload. Small there,
-                            # but the extras scale with LIBRARY size while the
-                            # page doesn't, and they are recomputed per page —
-                            # rom_id_index alone is 18KB of ids at 3k, so ~290KB
-                            # on every one of the ~50 pages of a 50k library.
-                            # Note with_total alone is not enough: rom_id_index
-                            # carries the count, so `total` comes back anyway
-                            # unless it is disabled too. Older servers ignore
-                            # unknown params, so this stays safe pre-5.1.1.
-                            'with_total': 'false',
-                            'with_rom_id_index': 'false',
+                            # Index-slice pagination, deliberately. RomM serves
+                            # /api/roms two ways: with `with_rom_id_index` left
+                            # on, it builds the result set's ordered id list
+                            # once per request and serves each page by slicing
+                            # it and fetching 100 rows by primary key — page
+                            # cost independent of depth. With it off, the page
+                            # comes from ORDER BY + OFFSET, and the database
+                            # walks past everything before the page: measured
+                            # on a 17k-ROM platform, 2.0s/page at the top of
+                            # the walk climbing to 2.8s by offset 17k, while
+                            # the index path stayed flat at 2.1s end to end.
+                            # argosy-launcher rides the index path by default
+                            # for the same reason. The price is receiving the
+                            # id list on every page (~90KB at 17k ROMs, parsed
+                            # and discarded here) and `total` riding along
+                            # with it — so with_total is left on too rather
+                            # than paying to suppress something the index
+                            # carries regardless. Pre-5.1.1 servers ignore
+                            # both flags and always computed the index anyway,
+                            # so dropping the opt-outs changes nothing there.
                             'with_char_index': 'false',
                             'with_filter_values': 'false',
                             'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
@@ -4105,9 +4127,29 @@ class RomMClient:
                               for page in range(1, pages_needed + 1)}
 
             for future in concurrent.futures.as_completed(future_to_page):
-                page_num, page_roms, ok = future.result()
+                try:
+                    page_num, page_roms, ok = future.result()
+                except concurrent.futures.CancelledError:
+                    # Drained after the stop below; its request was never made.
+                    continue
+                if ok is None:
+                    # Stopped before its request was made (see fetch_single_page).
+                    continue
                 if not ok:
                     failed_pages.append(page_num)
+                    # Stop the walk. Continuing to the next offset after a
+                    # failed page was the old behavior, and it is how one
+                    # slow page became many: every abandoned request leaves
+                    # its query running server-side, so each page we request
+                    # next lands on a server still doing the work we gave up
+                    # waiting for — the pileup an operator reads as parallel
+                    # load. argosy-launcher abandons the platform at the
+                    # first failure; this is the same retreat, expressed as
+                    # "no new pages after a failure". The platform resumes
+                    # from its checkpoint on the next sync.
+                    stop_event.set()
+                    for pending in future_to_page:
+                        pending.cancel()
 
                 # Held by page number, then concatenated in page order below.
                 # Assembling in completion order instead made the result depend
@@ -4162,6 +4204,10 @@ class RomMClient:
 
         for page_num in sorted(pages_out):
             final_games.extend(pages_out[page_num])
+        # pages_out holds one entry per page that actually ran (success or
+        # failure); anything else in pages_needed was never requested. Read
+        # before the clear below empties it.
+        pages_attempted = len(pages_out)
         pages_out.clear()
 
         # Read by callers that cache or compare against the server's count: a
@@ -4170,8 +4216,10 @@ class RomMClient:
         self.last_fetch_incomplete = bool(failed_pages)
         if failed_pages:
             print(f"⚠️ Fetch INCOMPLETE: {len(failed_pages)} of {pages_needed} pages "
-                  f"failed (pages {sorted(failed_pages)}) — "
-                  f"{len(final_games):,} games returned, which is not the whole library")
+                  f"failed (pages {sorted(failed_pages)}), "
+                  f"{pages_needed - pages_attempted} not attempted after the walk "
+                  f"stopped — {len(final_games):,} games returned, which is not "
+                  f"the whole library")
         else:
             print(f"✓ Fetch complete: {len(final_games):,} games loaded with optimized memory usage")
 
