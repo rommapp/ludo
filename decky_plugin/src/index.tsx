@@ -533,15 +533,26 @@ function fmtReleaseDate(ts: number | null | undefined): string {
 // focused/first cover is painted behind everything, heavily blurred and dimmed,
 // with a bg-coloured gradient scrim on top (recipe lifted verbatim from RomM's
 // frontend/src/v2/styles/global.css: blur(28px) brightness(0.45), scale 1.08).
+// The fallback asset is fetched once per session and shared: each V2Bg mount
+// used to issue its own getImage round-trip, so opening any page while the
+// backend was busy (a library walk, say) painted plain black until the loop
+// got around to answering — a visible black → background → content sequence.
+let _v2BgFallback: string | null | undefined;
 function V2Bg({ uri }: { uri: string | null }) {
   // RomM's BackgroundArt falls back to /assets/auth_background.svg when no cover
   // is set (platform/collection index pages). Fetch it once as the default.
-  const [fallback, setFallback] = useState<string | null>(null);
+  const [fallback, setFallback] = useState<string | null>(
+    _v2BgFallback !== undefined ? _v2BgFallback : null);
   useEffect(() => {
+    if (_v2BgFallback !== undefined) return;
     let alive = true;
     (async () => {
-      try { const r = await getImage('/assets/auth_background.svg'); if (alive) setFallback(r?.data_uri || null); }
-      catch { /* ignore */ }
+      try {
+        const r = await getImage('/assets/auth_background.svg');
+        const uri = r?.data_uri || null;
+        _v2BgFallback = uri;
+        if (alive) setFallback(uri);
+      } catch { /* ignore */ }
     })();
     return () => { alive = false; };
   }, []);
@@ -12800,6 +12811,25 @@ function FoldersSection() {
   );
 }
 
+// Settings' shape — whether the RetroDECK and Steam sections exist, and the
+// toggle states inside them. These are stable facts about the machine (was
+// RetroDECK installed, does the desktop shell have Steam integration) that
+// only change when the machine changes, so the last answer is remembered
+// across opens and launches. Without it, every visit held the page's body
+// hidden for the round-trips that re-confirm what the last visit established —
+// worst during a library walk, when those reads queue behind the fetch.
+interface SettingsShape { rd: boolean; rdButton: boolean; tileAvailable: boolean; tileInstalled: boolean; }
+let _settingsShape: SettingsShape | null = (() => {
+  try {
+    const s = localStorage.getItem('romm:settingsShape');
+    return s ? JSON.parse(s) : null;
+  } catch { return null; }
+})();
+function _writeSettingsShape(s: SettingsShape) {
+  _settingsShape = s;
+  try { localStorage.setItem('romm:settingsShape', JSON.stringify(s)); } catch { /* ignore */ }
+}
+
 function SettingsPage() {
   const [loggingEnabled, setLoggingEnabled] = useState<boolean>(true);
   const [debugMode, setDebugMode] = useState<boolean>(false);
@@ -12857,15 +12887,17 @@ function SettingsPage() {
     }
   };
   const [serverInfo, setServerInfo] = useState<string>('');
-  const [rdDetected, setRdDetected] = useState<boolean>(false);
-  const [rdButton, setRdButton] = useState<boolean>(false);
+  const [rdDetected, setRdDetected] = useState<boolean>(!!_settingsShape?.rd);
+  const [rdButton, setRdButton] = useState<boolean>(!!_settingsShape?.rdButton);
 
   // Desktop-only: the Ludo tile in Steam's library. Unlike the Deck plugin —
   // which owns its tile through SteamClient's live API — the desktop shell has
   // no SteamClient and the backend edits shortcuts.vdf, so the tile only shows
   // up after Steam restarts. `tileNote` carries that hint to the row subtitle.
   const [tileState, setTileState] = useState<{ available: boolean; installed: boolean }>(
-    { available: false, installed: false });
+    _settingsShape
+      ? { available: _settingsShape.tileAvailable, installed: _settingsShape.tileInstalled }
+      : { available: false, installed: false });
   const [tileBusy, setTileBusy] = useState<boolean>(false);
   const [tileNote, setTileNote] = useState<string>('');
 
@@ -12887,8 +12919,11 @@ function SettingsPage() {
   // RetroDECK and Steam sections sit above everything else and only exist on
   // some machines, so painting before we know pushes the rest of the page down
   // a step at a time as each reply arrives. Hold the body for one round-trip
-  // instead and it arrives whole. See `shapeTimer` below for the escape hatch.
-  const [shapeReady, setShapeReady] = useState<boolean>(false);
+  // instead and it arrives whole — but the remembered shape from the last
+  // visit (`_settingsShape`) already answers the question, so repeat visits
+  // paint whole on frame one and the live reads only reconcile drift (e.g.
+  // RetroDECK uninstalled since). See `shapeTimer` below for the escape hatch.
+  const [shapeReady, setShapeReady] = useState<boolean>(!!_settingsShape);
 
   useEffect(() => {
     // The "Ludo" tile is mandatory and auto-created at plugin load. Reconcile
@@ -12900,11 +12935,16 @@ function SettingsPage() {
 
     // Never let a wedged IPC hide the whole page — show what we have and let
     // the stragglers fill in, which is the old behaviour but only as a fallback.
-    const shapeTimer = setTimeout(() => setShapeReady(true), 1500);
+    // 600ms, not the old 1500: the reads it waits for are cheap when idle, so
+    // the timer really only covers a busy backend (mid-library-walk), and
+    // holding a finished background for 1.5s was worse than a section
+    // occasionally arriving a beat later.
+    const shapeTimer = setTimeout(() => setShapeReady(true), 600);
 
     // These reads are independent of each other, so run them together rather
     // than awaiting in a chain; the page's first paint costs one round-trip,
-    // not five.
+    // not five. Each returns the shape fact it learned (null when it failed)
+    // so this visit's answers can be remembered for the next one.
     const config = (async () => {
       const cfg = await getConfig();
       const url = cfg?.url || '';
@@ -12918,16 +12958,41 @@ function SettingsPage() {
           setServerInfo(name && url ? `${name} · ${url}` : (name || url || ''));
         })
         .catch(() => setServerInfo(url));
+      return !!cfg?.retrodeck_detected;
     })();
-    const rdBtn = (async () => { setRdButton(await getRetrodeckButtonEnabled()); })();
+    const rdBtn = (async () => {
+      const on = !!(await getRetrodeckButtonEnabled());
+      setRdButton(on);
+      return on;
+    })();
     const tile = (async () => {
-      if (!(window as any).__rommDesktop) return;
+      if (!(window as any).__rommDesktop) return null;
       const st = await getSteamTileStatus();
-      setTileState({ available: !!st?.available, installed: !!st?.installed });
+      const t = { available: !!st?.available, installed: !!st?.installed };
+      setTileState(t);
+      return t;
     })();
 
-    Promise.all([config, rdBtn, tile].map((p) => p.catch(() => { /* ignore */ })))
-      .then(() => { clearTimeout(shapeTimer); setShapeReady(true); });
+    Promise.all([config, rdBtn, tile].map((p) => p.catch(() => null)))
+      .then((res) => {
+        // Positions restored by hand: .map() over the three promises flattens
+        // them into one union, which tells TypeScript `rd` might be the tile
+        // object and `t` a boolean.
+        const [rd, btn, t] = res as [boolean | null, boolean | null,
+          { available: boolean; installed: boolean } | null];
+        clearTimeout(shapeTimer);
+        setShapeReady(true);
+        // Remember what this visit learned — but a FAILED read must not
+        // clobber a fact an earlier visit established.
+        const prev = _settingsShape
+          || { rd: false, rdButton: false, tileAvailable: false, tileInstalled: false };
+        _writeSettingsShape({
+          rd: rd ?? prev.rd,
+          rdButton: btn ?? prev.rdButton,
+          tileAvailable: t ? t.available : prev.tileAvailable,
+          tileInstalled: t ? t.installed : prev.tileInstalled,
+        });
+      });
     return () => clearTimeout(shapeTimer);
   }, []);
 

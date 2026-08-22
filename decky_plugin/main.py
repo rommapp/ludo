@@ -3633,6 +3633,9 @@ class Plugin:
 
             self._stop_sync()
             time.sleep(0.5)
+            # Fresh credentials may be a different account: drop the cached
+            # /api/users/me answer so the next read reflects whoever connects.
+            self._invalidate_account_user_cache()
             self._start_sync()
             _record_activity('account', 'Signed in', url.strip().rstrip('/'))
             return {'success': True}
@@ -3735,6 +3738,60 @@ class Plugin:
             logging.error(f"test_connection error: {e}", exc_info=True)
             return {'success': False, 'message': f'Connection error: {str(e)[:150]}'}
 
+    # /api/users/me as last seen: {'user': <payload>, 'at': unix seconds}. The
+    # account name feeds the Settings account row and the top-bar pill; it
+    # changes rarely, but reading it live on every call put a network
+    # round-trip (10s timeout, against a server that is often mid-library-walk
+    # when Settings gets opened) on the caller's critical path — and, before
+    # get_account_username learned to_thread, on the event loop every other
+    # RPC shares. A fresh entry is served as-is; a stale one is served
+    # immediately and re-validated in the background. Cleared wherever the
+    # signed-in account can change.
+    _account_user_cache = None
+    _account_user_refreshing = False
+    _ACCOUNT_USER_TTL = 300.0
+
+    def _account_user_payload(self, user):
+        """The stable part of get_account_username's answer, cacheable.
+        None when the fetch produced nothing worth caching."""
+        if not user:
+            return None
+        return {
+            'username': user.get('username') or user.get('display_name') or '',
+            'role': user.get('role') or '',
+            'avatar_path': user.get('avatar_path') or '',
+            'updated_at': user.get('updated_at') or '',
+        }
+
+    def _store_account_user(self, user):
+        payload = self._account_user_payload(user)
+        if payload:
+            self._account_user_cache = {'user': payload, 'at': time.time()}
+        return payload
+
+    async def _refresh_account_user_cache(self):
+        """Background revalidation for a stale cache entry. A failure just
+        leaves the old entry in place: RomM being unreachable says nothing
+        about who is signed in."""
+        # Single-flag guard, no lock: everything up to the first await runs
+        # atomically on the one event loop these coroutines share.
+        if self._account_user_refreshing:
+            return
+        self._account_user_refreshing = True
+        try:
+            client = self._romm_client
+            if client is None or not getattr(client, 'authenticated', False):
+                return
+            self._store_account_user(
+                await asyncio.to_thread(client.get_current_user))
+        except Exception:
+            pass
+        finally:
+            self._account_user_refreshing = False
+
+    def _invalidate_account_user_cache(self):
+        self._account_user_cache = None
+
     async def get_account_username(self):
         """Return the human-readable RomM account name for the connected user,
         fetched live from /api/users/me. Used by the in-app Settings page so it
@@ -3746,22 +3803,33 @@ class Plugin:
         unconditional {'username': ''} made the caller read that as signed out
         — it painted "Guest"/"G" and threw away the cached identity, which is
         what made the *next* launch slow too. Only connected:True licenses the
-        caller to treat an empty username as a real signed-out state."""
+        caller to treat an empty username as a real signed-out state.
+
+        The live fetch runs off the event loop (to_thread, like get_avatar
+        below): it used to run inline, so one /api/users/me round-trip against
+        a busy server froze every other RPC behind it — opening Settings
+        mid-library-walk stalled the whole page on this one call. A cached
+        answer — warmed by the top-bar pill at startup, re-validated in the
+        background once older than _ACCOUNT_USER_TTL — returns without any
+        network at all."""
+        client = self._romm_client
+        if client is None or not getattr(client, 'authenticated', False):
+            # _connect_blocked means auto-connect is off or credentials are
+            # missing: nobody is coming, so this genuinely is signed out.
+            return {'username': '', 'connected': bool(self._connect_blocked)}
+        cached = self._account_user_cache
+        if cached:
+            if time.time() - cached['at'] >= self._ACCOUNT_USER_TTL:
+                asyncio.create_task(self._refresh_account_user_cache())
+            return {**cached['user'], 'connected': True}
         try:
-            client = self._romm_client
-            if client is None or not getattr(client, 'authenticated', False):
-                # _connect_blocked means auto-connect is off or credentials are
-                # missing: nobody is coming, so this genuinely is signed out.
-                return {'username': '', 'connected': bool(self._connect_blocked)}
-            user = client.get_current_user() or {}
-            name = user.get('username') or user.get('display_name') or ''
-            return {
-                'username': name,
-                'role': user.get('role') or '',
-                'avatar_path': user.get('avatar_path') or '',
-                'updated_at': user.get('updated_at') or '',
-                'connected': True,
-            }
+            user = await asyncio.to_thread(client.get_current_user)
+            payload = self._store_account_user(user)
+            if payload:
+                return {**payload, 'connected': True}
+            # Server unreachable / erroring with nothing cached: "can't answer
+            # yet", not signed out — the caller keeps its cached identity.
+            return {'username': '', 'connected': False}
         except Exception as e:
             logging.error(f"get_account_username error: {e}")
             return {'username': '', 'connected': False}
@@ -4622,6 +4690,9 @@ class Plugin:
 
             self._romm_client = None
             self._clear_library_cache()
+            # The cached /api/users/me answer describes the account that was
+            # just signed out — it must not outlive the credentials.
+            self._invalidate_account_user_cache()
 
             ds = load_decky_settings()
             ds['needs_onboarding'] = True
@@ -4752,6 +4823,9 @@ class Plugin:
             # route for password auth; pairing was the odd one out.
             self._stop_sync()
             await asyncio.sleep(0.5)
+            # A paired token can be a different account than the one the
+            # cached /api/users/me answer describes.
+            self._invalidate_account_user_cache()
             # Connect, but stop short of the library walk: the wizard's next
             # steps include the platform switches, and fetching everything now
             # would finish (or be minutes into) exactly the work those switches
