@@ -6945,6 +6945,32 @@ function GroupGridSkeleton() {
   );
 }
 
+// And for a group's games page: the real grid geometry (3:4 covers + title
+// lines) greyed out. A first open of a collection — the fetch pulls its whole
+// ROM list before anything paints — used to show a line of text, which the
+// home and index pages had already moved past.
+function GamesGridSkeleton() {
+  return (
+    <div style={{ opacity: 0, animation: 'rommSkelIn 0.5s ease 0.15s forwards' }} aria-busy="true">
+      <style>{`
+        @keyframes rommShimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+        @keyframes rommSkelIn { from { opacity: 0; } to { opacity: 1; } }
+      `}</style>
+      <div style={{
+        display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(132px, 1fr))',
+        gap: '18px 16px', padding: '16px 16px 0',
+      }}>
+        {Array.from({ length: 18 }).map((_, i) => (
+          <div key={i}>
+            <Shimmer style={{ width: '100%', aspectRatio: '3 / 4', borderRadius: V2.radiusArt }} />
+            <Shimmer style={{ width: `${55 + ((i * 41) % 40)}%`, height: '9px', marginTop: '8px', borderRadius: '4px' }} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // Home dashboard — faithful to RomM v2 Home.vue: horizontal CardRows
 // (Continue playing / Recently added / Platforms / Collections).
 // Home banner for the two emulator states that change what the app can do:
@@ -8974,7 +9000,7 @@ function LibraryGamesPage() {
       </div>
 
       {loading ? (
-        <div style={{ padding: '16px', color: V2.fgMuted, fontSize: '13px' }}>Loading games…</div>
+        <GamesGridSkeleton />
       ) : games.length === 0 ? (
         <div style={{ padding: '16px', color: V2.fgMuted, fontSize: '13px' }}>No games in this group.</div>
       ) : (
@@ -12882,11 +12908,16 @@ function SettingsPage() {
     const config = (async () => {
       const cfg = await getConfig();
       const url = cfg?.url || '';
-      // Prefer the live RomM account name; never show the stored credential/token.
-      let name = '';
-      try { name = (await getAccountUsername())?.username || ''; } catch { /* ignore */ }
-      setServerInfo(name && url ? `${name} · ${url}` : (name || url || ''));
       setRdDetected(!!cfg?.retrodeck_detected);
+      // The account name only feeds the Account section's subtitle — and the
+      // backend serves it from cache — so its round-trip must not hold the
+      // page's first paint alongside the shape reads. It lands when it lands.
+      getAccountUsername()
+        .then((r) => {
+          const name = r?.username || '';
+          setServerInfo(name && url ? `${name} · ${url}` : (name || url || ''));
+        })
+        .catch(() => setServerInfo(url));
     })();
     const rdBtn = (async () => { setRdButton(await getRetrodeckButtonEnabled()); })();
     const tile = (async () => {
