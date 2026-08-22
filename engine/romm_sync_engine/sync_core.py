@@ -12550,20 +12550,32 @@ class AutoSyncManager:
         # Under content sorting the save's folder is the GAME, not an emulator,
         # so the label below has to come from the ROM instead — see _emulator_label.
         content_sorted = self.retroarch.get_save_subdir_mode('saves') == 'content'
+        # Built for the emulator label under content sorting AND for the
+        # standalone-platform skip below, so the walk happens either way.
         slugs = {}
-        if content_sorted:
-            try:
-                slugs = {g.get('rom_id'): (g.get('platform_slug')
-                                           or (g.get('romm_data') or {}).get('platform_slug'))
-                         for g in (self.get_games() or [])}
-            except Exception as e:
-                logging.debug(f"could not map platforms for the inventory: {e}")
+        try:
+            slugs = {g.get('rom_id'): (g.get('platform_slug')
+                                       or (g.get('romm_data') or {}).get('platform_slug'))
+                     for g in (self.get_games() or [])}
+        except Exception as e:
+            logging.debug(f"could not map platforms for the inventory: {e}")
         for entry in save_files.get('saves', []):
             path = Path(entry['path'])
             rom_id = self.rom_id_for_save(path)
             if not rom_id:
                 # Unmatched local save — server can't pair it; skip rather than
                 # uploading against a guessed ROM.
+                continue
+
+            # A save for a ROM on a standalone-only platform (Switch -> Eden)
+            # is never a RetroArch save: no core runs it, so any .srm here is
+            # debris from a mislabelled download. Left in, it collides with
+            # Eden's packed entry on (rom_id, slot) — the server pairs on that
+            # alone — and the dedupe below can keep the .srm over the real
+            # save, uploading it as the device's Switch save.
+            if standalone_emulator_for_platform(slugs.get(rom_id)):
+                logging.debug(f"skipping RetroArch-side save for standalone "
+                              f"platform rom={rom_id}: {path.name}")
                 continue
 
             slot, _autocleanup, _limit = RomMClient.get_slot_info(path)
@@ -13694,6 +13706,19 @@ class AutoSyncManager:
                 device_id=device_id, session_id=session_id):
             return False
 
+        # A save this client once mislabelled ('switch' instead of 'eden') was
+        # stored as a bare .srm, and it can sit as a slot's newest server row.
+        # It is not an Eden pack and never will be — say so instead of letting
+        # unpack_save's generic error fuzz the diagnosis every sync.
+        import zipfile
+        if not zipfile.is_zipfile(staged):
+            self.log(f"⚠️ Save-sync: server save {file_name!r} for {title_id} is a "
+                     f"bare .srm, not an Eden save pack — likely a stray upload from "
+                     f"a mislabelled sync. Delete it in RomM so the real save can "
+                     f"become the slot's latest.")
+            staged.unlink(missing_ok=True)
+            return False
+
         try:
             override = (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip()
         except Exception:
@@ -13754,6 +13779,21 @@ class AutoSyncManager:
         leaving the emulator without the save and the failure invisible.
         """
         if self._is_standalone_emulator(op.get('emulator')):
+            return None
+        # The op's emulator is the SERVER save's label, which a buggy or
+        # foreign upload can set to anything ('switch' instead of 'eden'). The
+        # ROM's platform is the stable truth: a standalone-only platform's
+        # save belongs in that emulator's tree, never the RetroArch root —
+        # writing it there is what seeds the stray .srm the inventory now
+        # refuses to sync.
+        try:
+            slug = next(
+                (g.get('platform_slug') or (g.get('romm_data') or {}).get('platform_slug')
+                 for g in (self.get_games() or [])
+                 if g.get('rom_id') == op.get('rom_id')), None)
+        except Exception:
+            slug = None
+        if standalone_emulator_for_platform(slug):
             return None
         target_dir = Path(saves_dir)
         emulator = op.get('emulator')
