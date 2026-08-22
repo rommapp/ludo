@@ -12820,40 +12820,40 @@ function SettingsPage() {
     }, d));
     return () => timers.forEach(clearTimeout);
   }, [confirmLogout]);
-  // Rebuild discards the cached library and refetches it from scratch. Armed
-  // before it fires, like Log out above: nothing on disk is destroyed, but it
-  // throws away the cache and costs a full walk of the server, so it must not
+  // Refetch throws away the cached library and reads everything from the
+  // server again. Armed before it fires, like Log out above: nothing on disk
+  // is destroyed, but it costs a full walk of the server, so it must not
   // happen on one stray press.
-  const [rebuildArmed, setRebuildArmed] = useState(false);
-  const [rebuilding, setRebuilding] = useState(false);
+  const [refetchArmed, setRefetchArmed] = useState(false);
+  const [refetching, setRefetching] = useState(false);
   useEffect(() => {
-    if (!rebuildArmed) return;
-    const t = setTimeout(() => setRebuildArmed(false), 4000);
+    if (!refetchArmed) return;
+    const t = setTimeout(() => setRefetchArmed(false), 4000);
     return () => clearTimeout(t);
-  }, [rebuildArmed]);
-  const doRebuild = async () => {
-    if (rebuilding) return;
-    if (!rebuildArmed) { setRebuildArmed(true); return; }
-    setRebuildArmed(false);
-    setRebuilding(true);
+  }, [refetchArmed]);
+  const doRefetch = async () => {
+    if (refetching) return;
+    if (!refetchArmed) { setRefetchArmed(true); return; }
+    setRefetchArmed(false);
+    setRefetching(true);
     try {
       const res = await rebuildLibrary();
       if (res?.success) {
         toaster.toast({
-          title: 'Rebuilding library',
-          body: 'Refetching everything from RomM. This can take a few minutes.',
+          title: 'Refetching library',
+          body: 'Reading everything from RomM again. This can take a few minutes.',
         });
         _clearStale();
         _broadcastLibRefresh();
       } else if (res?.busy) {
         toaster.toast({ title: 'Already refreshing', body: 'A library fetch is in progress.' });
       } else {
-        toaster.toast({ title: 'Rebuild failed', body: res?.message ?? 'Unknown error' });
+        toaster.toast({ title: 'Refetch failed', body: res?.message ?? 'Unknown error' });
       }
     } catch (e: any) {
-      toaster.toast({ title: 'Rebuild failed', body: String(e?.message ?? e) });
+      toaster.toast({ title: 'Refetch failed', body: String(e?.message ?? e) });
     } finally {
-      setRebuilding(false);
+      setRefetching(false);
     }
   };
   const [serverInfo, setServerInfo] = useState<string>('');
@@ -13463,38 +13463,52 @@ function SettingsPage() {
         transition: 'opacity 140ms ease-out',
       }}>
       <V2SettingsSection title="Library">
-        <V2SettingsRow
-          icon={<FaSync size={16} />}
-          title="Update your library automatically"
-          subtitle="When RomM has changed, Ludo re-reads only the platforms that changed and tells you what it found. Turn this off to be asked first — you'll still see a notice when your library is out of date, with a button to update it."
-          onClick={() => handleAutoUpdateLibToggle(!autoUpdateLib)}
-          right={<V2Switch checked={autoUpdateLib} />}
-        />
-        <V2SettingsRow
-          icon={<FaBolt size={16} />}
-          title="Show smart collections"
-          subtitle="RomM's filter-based collections appear alongside your other collections, marked with a lightning bolt. Turn this off if you have more of them than you browse."
-          onClick={() => handleShowSmartToggle(!showSmart)}
-          right={<V2Switch checked={showSmart} />}
-        />
-        <V2SettingsRow
-          icon={rebuildArmed ? <FaCheck size={16} /> : <FaRedo size={16} />}
-          title={rebuilding ? 'Rebuilding…'
-            : rebuildArmed ? 'Press again to rebuild' : 'Rebuild library'}
-          subtitle={rebuildArmed
-            ? 'Ludo forgets its cached library and refetches everything from RomM. Nothing you have downloaded is deleted.'
-            : 'Refetch your whole library from RomM. Use this if what Ludo shows has drifted from what is on the server.'}
-          onClick={rebuilding ? undefined : doRebuild}
-          disabled={rebuilding}
-        />
-        <V2SettingsRow
-          icon={<FaLayerGroup size={16} />}
-          title="Platforms"
-          subtitle={platformSummary
-            || 'Choose which platforms Ludo syncs from RomM. Turning one off makes your library load faster; nothing already downloaded is removed.'}
-          onClick={() => libNavigate("/romm-sync-platforms")}
-          right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
-        />
+        {/* One card, not one per option — same shape as Emulator & folders:
+            these are all answers to "what does my library contain", and they
+            read as a block. The rows are fixed (no conditional ones), so
+            first/divider/last are stated outright instead of computed. */}
+        <div style={{
+          display: 'flex', flexDirection: 'column',
+          borderRadius: V2.radiusCard, background: V2.surface,
+          border: `1px solid ${V2.border}`, overflow: 'hidden',
+        }}>
+          <V2CardRow
+            first
+            icon={<FaSync size={16} />}
+            title="Update your library automatically"
+            subtitle="When RomM has changed, Ludo re-reads only the platforms that changed and tells you what it found. Turn this off to be asked first — you'll still see a notice when your library is out of date, with a button to update it."
+            onClick={() => handleAutoUpdateLibToggle(!autoUpdateLib)}
+            right={<V2Switch checked={autoUpdateLib} />}
+          />
+          <V2CardRow
+            divider
+            icon={<FaBolt size={16} />}
+            title="Show smart collections"
+            subtitle="RomM's filter-based collections appear alongside your other collections, marked with a lightning bolt. Turn this off if you have more of them than you browse."
+            onClick={() => handleShowSmartToggle(!showSmart)}
+            right={<V2Switch checked={showSmart} />}
+          />
+          <V2CardRow
+            divider
+            icon={refetchArmed ? <FaCheck size={16} /> : <FaRedo size={16} />}
+            title={refetching ? 'Refetching…'
+              : refetchArmed ? 'Press again to refetch' : 'Refetch Library'}
+            subtitle={refetchArmed
+              ? 'Ludo forgets its cached library and refetches everything from RomM. Nothing you have downloaded is deleted.'
+              : 'Refetch your whole library from RomM. Use this if what Ludo shows has drifted from what is on the server.'}
+            onClick={refetching ? undefined : doRefetch}
+          />
+          <V2CardRow
+            divider
+            last
+            icon={<FaLayerGroup size={16} />}
+            title="Platforms"
+            subtitle={platformSummary
+              || 'Choose which platforms Ludo syncs from RomM. Turning one off makes your library load faster; nothing already downloaded is removed.'}
+            onClick={() => libNavigate("/romm-sync-platforms")}
+            right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
+          />
+        </div>
       </V2SettingsSection>
 
       <V2SettingsSection title="Saves">
