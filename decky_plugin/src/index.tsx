@@ -12830,9 +12830,22 @@ function _writeSettingsShape(s: SettingsShape) {
   try { localStorage.setItem('romm:settingsShape', JSON.stringify(s)); } catch { /* ignore */ }
 }
 
+// Last-known values for the toggles that would otherwise paint from an
+// optimistic default. The page renders on frame one now, so a toggle stored as
+// OFF visibly animated ON → OFF on every visit while its read was in flight.
+// Seeded from here; the live read (and every successful toggle) reconciles it.
+let _settingsToggles: Record<string, boolean> = (() => {
+  try { return JSON.parse(localStorage.getItem('romm:settingsToggles') || '{}'); }
+  catch { return {}; }
+})();
+function _rememberSettingsToggle(key: string, v: boolean) {
+  _settingsToggles[key] = v;
+  try { localStorage.setItem('romm:settingsToggles', JSON.stringify(_settingsToggles)); } catch { /* ignore */ }
+}
+
 function SettingsPage() {
-  const [loggingEnabled, setLoggingEnabled] = useState<boolean>(true);
-  const [debugMode, setDebugMode] = useState<boolean>(false);
+  const [loggingEnabled, setLoggingEnabled] = useState<boolean>(_settingsToggles.logging ?? true);
+  const [debugMode, setDebugMode] = useState<boolean>(_settingsToggles.debug ?? false);
   const [loading, setLoading] = useState<boolean>(true);
   const [confirmLogout, setConfirmLogout] = useState<boolean>(false);
   const [loggingOut, setLoggingOut] = useState<boolean>(false);
@@ -13007,16 +13020,24 @@ function SettingsPage() {
   // cached pref IS the state, and writing to it re-renders this row and the
   // pill together, so the switch and the thing it controls cannot disagree.
   const syncPill = useSyncPillEnabled();
-  const [autoUpdateLib, setAutoUpdateLib] = useState<boolean>(true);
+  const [autoUpdateLib, setAutoUpdateLib] = useState<boolean>(_settingsToggles.autoUpdateLib ?? true);
   useEffect(() => {
     getLibraryAutoUpdate()
-      .then((r) => setAutoUpdateLib(r?.enabled !== false))
+      .then((r) => {
+        const v = r?.enabled !== false;
+        setAutoUpdateLib(v);
+        _rememberSettingsToggle('autoUpdateLib', v);
+      })
       .catch(() => { /* keep the default */ });
   }, []);
-  const [showVirtual, setShowVirtual] = useState<boolean>(true);
+  const [showVirtual, setShowVirtual] = useState<boolean>(_settingsToggles.showVirtual ?? true);
   useEffect(() => {
     getVirtualCollectionsVisible()
-      .then((r) => setShowVirtual(r?.enabled !== false))
+      .then((r) => {
+        const v = r?.enabled !== false;
+        setShowVirtual(v);
+        _rememberSettingsToggle('showVirtual', v);
+      })
       .catch(() => { /* keep the default */ });
   }, []);
   // Row subtitle for Platforms — only set once something is actually switched
@@ -13051,6 +13072,7 @@ function SettingsPage() {
     try {
       const r = await setLibraryAutoUpdate(enabled);
       if (r && r.success === false) throw new Error(r.message || 'failed');
+      _rememberSettingsToggle('autoUpdateLib', enabled);
       // Turning it back on doesn't retro-apply anything by itself, but a
       // pending "your library changed" offer is now redundant with the next
       // connect — leave it standing rather than guess; the banner clears
@@ -13065,6 +13087,7 @@ function SettingsPage() {
     try {
       const r = await setVirtualCollectionsVisibleRpc(enabled);
       if (r && r.success === false) throw new Error(r.message || 'failed');
+      _rememberSettingsToggle('showVirtual', enabled);
       // Drop the cached collections index so the next visit re-fetches groups
       // from the now-changed setting; a stale cache would keep showing (or
       // hiding) the Virtual section until something else refreshed it.
@@ -13150,9 +13173,14 @@ function SettingsPage() {
       try {
         const enabled = await getLoggingEnabled();
         setLoggingEnabled(enabled);
+        _rememberSettingsToggle('logging', enabled);
         // Defaults false, so a failed read hides the developer rows rather
         // than showing a cache-wiping button to an ordinary user.
-        try { setDebugMode(await isDebugMode()); } catch { /* stays hidden */ }
+        try {
+          const dbg = await isDebugMode();
+          setDebugMode(dbg);
+          _rememberSettingsToggle('debug', dbg);
+        } catch { /* stays hidden */ }
       } catch (error) {
         console.error('Failed to load logging preference:', error);
       } finally {
@@ -13424,6 +13452,7 @@ function SettingsPage() {
     setLoggingEnabled(enabled);
     try {
       await updateLoggingEnabled(enabled);
+      _rememberSettingsToggle('logging', enabled);
     } catch (error) {
       console.error('Failed to set logging preference:', error);
       setLoggingEnabled(!enabled);
