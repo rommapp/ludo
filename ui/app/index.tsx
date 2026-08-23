@@ -121,6 +121,9 @@ import {
 } from "./rpc";
 import { MdVerified } from "react-icons/md";
 import { V2, fmtBytes, fmtReleaseDate, fmtAgo, formatEta, formatSpeed } from "./theme";
+import { LibGroup, LibGame } from "./types";
+import { _lsAvail, _LS_REOPEN_HOME } from "./storage";
+import { _libRefreshListeners, _broadcastLibRefresh, _downloadedListeners } from "./events";
 
 
 // "2m 29s", not "149.3s" — this number gets read aloud in bug reports, and
@@ -355,13 +358,6 @@ function roundBtn(size: number, variant: 'glass' | 'emphasized' | 'danger'): any
   return { ...base, background: 'rgba(0,0,0,0.55)', border: '1px solid rgba(255,255,255,0.12)', color: 'rgba(255,255,255,0.95)' };
 }
 
-interface LibGroup {
-  key: string; label: string; count: number; downloaded: number | null;
-  kind?: 'favorite' | 'smart' | 'virtual' | 'collection'; covers?: string[];
-  slug?: string | null; fs_slug?: string | null;
-  synced?: boolean; virtual?: boolean;
-}
-interface LibGame { rom_id: number; name: string; platform: string | null; is_downloaded: boolean; has_cover: boolean; screenshot?: string | null; platform_slug?: string | null; is_multi_disc?: boolean; disc_count?: number; sibling_roms?: { rom_id: number; name: string }[]; region_count?: number; is_orphan?: boolean; regions?: string[]; languages?: string[]; }
 
 // Region/language code -> flag emoji, ported from RomM's
 // frontend/src/utils/index.ts (regionToEmoji / languageToEmoji). RomM accepts
@@ -4884,14 +4880,10 @@ function playSteamSound(name: string) {
 // content instead of popping in after an async fetch.
 const _libGamesCache = new Map<string, LibGame[]>();
 
-// Broadcast target for "the backend re-fetched from RomM, re-pull whatever's
-// on screen now" (fired after a manual Refresh from the account menu). The
-// Home/Groups panels stay mounted across tab switches (see below) and their
-// silent-refresh effects don't re-run just because a modal closed on top of
-// them, so without this a same-tab refresh would sit invisible until the
-// user actually switched tabs.
-const _libRefreshListeners = new Set<() => void>();
-function _broadcastLibRefresh() { _libRefreshListeners.forEach((l) => { try { l(); } catch { } }); }
+// The downloader announces; the cache is what acts on it. See events.ts for
+// why this is a subscription rather than a call from the other direction.
+_downloadedListeners.add((romId, downloaded) => libCacheSetDownloaded(romId, downloaded));
+
 
 // Home tab data cache — survives tab-switch remounts so returning to Home paints
 // instantly (then refreshes silently) instead of flashing "Loading…".
@@ -4908,10 +4900,7 @@ let _homeCache: {
 // silently refreshes in the background.
 const _LS_LIB_PREFIX = 'romm:libcache:v1:';
 const _LS_HOME_KEY = 'romm:homecache:v1';
-// Set right before a self-update reload; consumed once on startup to reopen home.
-const _LS_REOPEN_HOME = 'romm:reopen-home';
 const _LS_TTL_MS = 1000 * 60 * 60 * 24; // 24h; lists rarely churn, dots refresh on fetch
-const _lsAvail = (() => { try { return typeof localStorage !== 'undefined'; } catch { return false; } })();
 
 function _persistLibGroup(key: string, list: LibGame[]) {
   if (!_lsAvail) return;
