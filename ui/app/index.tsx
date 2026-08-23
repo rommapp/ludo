@@ -44,9 +44,7 @@ import {
   getBiosInventory,
   getCheckOnStartup,
   getConfig,
-  getCoreMappings,
   getDownloadProgress,
-  getDownloadableCores,
   getEmulatorStatus,
   getFetchBenchmark,
   getGameDetail,
@@ -59,7 +57,6 @@ import {
   getLocalSiblings,
   getLoggingEnabled,
   getPlatformSync,
-  getPluginStats,
   getPluginVersion,
   getRaEarned,
   getRecentActivity,
@@ -126,21 +123,21 @@ import { setPreDownloadHook } from "./downloads";
 import { V2_FOCUS_STYLE, V2Focus, v2Page } from "./focus";
 import { NavId, LibView, navExitPlugin, libNavigate, libBack, RouteGuard } from "./nav";
 import { setLibViewHooks, pushLibView } from "./nav";
+import { StatsPage } from "./pages/stats";
+import { DownloadsPage } from "./pages/downloads";
+import { CoresPage } from "./pages/cores";
 import {
   _subscribeStatus,
   refreshStatusNow,
   useCollectionSync,
   useOffline,
   useServiceStatus,
-  usePendingUploads,
   useDownloadGlimpse, SaveActivity, _pushSaveActivity, useSaveActivity} from "./status";
 import {
   useEtaFromPct,
   ProgressRing,
   PlatformIcon,
   UserMenuRow,
-  DownloadStatusRow,
-  CollectionSyncStatusRow,
   Bumper,
   V2Button,
   GameActionButton,
@@ -150,9 +147,9 @@ import {
   V2SettingsSection,
   V2SettingsRow,
   V2Switch,
-  V2StatsSectionBox,
   V2Segment,
-  UpdateActionBtn, DownloadRowCover, _gameLabel, useRowHighlight} from "./kit";
+  UpdateActionBtn, _gameLabel, useRowHighlight,
+} from "./kit";
 import {
   _forceGamepadFocus,
   _gpFocusEl,
@@ -173,8 +170,6 @@ import {
   _batchJobs,
   useBatchJob,
   runCollectionBatch,
-  useActiveDownloads,
-  useQueuedDownloads,
   useIsDownloading,
   useDownloadProgress,
 } from "./downloads";
@@ -235,7 +230,7 @@ function _refreshSummary(res: any): string {
 // exactly backwards. The desktop shim publishes its legend height as
 // --shim-legend-h; on the Deck the variable is absent and the fallback is
 // Steam's own fixed legend, measured at 42px on-device.
-const MODAL_SCRIM_INSET = '0 0 var(--shim-legend-h, 42px) 0';
+export const MODAL_SCRIM_INSET = '0 0 var(--shim-legend-h, 42px) 0';
 
 // RomM GameActionBtn round buttons: glassy scrim with blur (default), or the
 // "emphasized" white look used by Play. Circular; size in px.
@@ -1294,7 +1289,7 @@ type EmuStandalone = {
   // Lowercase tokens matched against a game's platform name and slug.
   platforms: string[];
 };
-type EmuStatus = {
+export type EmuStatus = {
   installed: boolean;
   kind: 'retrodeck' | 'flatpak' | 'snap' | 'native' | 'none';
   executable: string | null;
@@ -1327,7 +1322,7 @@ function publishEmulatorStatus(s: EmuStatus | null) {
   [..._emuSubs].forEach((f) => f());
 }
 
-async function loadEmulatorStatus(refresh = false): Promise<EmuStatus | null> {
+export async function loadEmulatorStatus(refresh = false): Promise<EmuStatus | null> {
   // Coalesce: several components mount at once on a cold start and would
   // otherwise each pay for the (filesystem-probing) detection.
   if (!refresh && _emuInflight) return _emuInflight;
@@ -1381,7 +1376,7 @@ function cannotLaunch(status: EmuStatus | null,
   return !status.installed;
 }
 
-function useEmulatorStatus(): EmuStatus | null {
+export function useEmulatorStatus(): EmuStatus | null {
   const [, force] = useState(0);
   useEffect(() => {
     const f = () => force((n) => n + 1);
@@ -1515,7 +1510,7 @@ function _pollInstall() {
   }, 1000);
 }
 
-async function startEmulatorInstall() {
+export async function startEmulatorInstall() {
   _publishInstall({ active: true, phase: 'Starting…', pct: null, detail: '', error: null, bytesDone: null, bytesTotal: null });
   try {
     const r = await installEmulator();
@@ -1535,14 +1530,14 @@ async function startEmulatorInstall() {
 // couldn't be read — better to say nothing than to quote a made-up total.
 // flatpak reports SI sizes, so divide by 1000, not 1024, to match what it and
 // Flathub show for the same app.
-function installSize(s: EmuInstall): string {
+export function installSize(s: EmuInstall): string {
   if (!s.bytesTotal) return '';
   const mb = (n: number) => `${Math.round(n / 1e6)} MB`;
   return s.bytesDone == null ? mb(s.bytesTotal)
     : `${mb(s.bytesDone)} of ${mb(s.bytesTotal)}`;
 }
 
-function useEmulatorInstall(): EmuInstall {
+export function useEmulatorInstall(): EmuInstall {
   const [, force] = useState(0);
   useEffect(() => {
     const f = () => force((n) => n + 1);
@@ -3714,7 +3709,7 @@ function libCacheFindGame(romId: number): LibGame | null {
 // GameDetailPage fetches its own detail from the backend, so a stub is enough
 // to render — the cached LibGame is preferred only because it paints the name,
 // platform and downloaded state on the first frame instead of after the fetch.
-function openGameById(romId: number, name: string, origin: string) {
+export function openGameById(romId: number, name: string, origin: string) {
   const cached = libCacheFindGame(romId);
   _libGameHolder = cached || {
     rom_id: romId, name, platform: null,
@@ -8924,729 +8919,14 @@ function RecentActivitySection() {
 // doubles as the row divider). Scope is plugin-local (this device).
 
 
-// SummaryStatsSection card: leading icon + big tabular number + uppercase label.
-function V2StatCard({ icon, value, label }: { icon: any; value: string; label: string }) {
-  return (
-    <div style={{
-      display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '4px',
-      padding: '16px', background: V2.surface, border: `1px solid ${V2.border}`,
-      borderRadius: V2.radiusLg, color: V2.fgMuted,
-    }}>
-      <div style={{ color: V2.brandHover }}>{icon}</div>
-      <div style={{
-        fontSize: '28px', fontWeight: 800, lineHeight: 1.1, color: V2.fg,
-        fontVariantNumeric: 'tabular-nums',
-      }}>{value}</div>
-      <div style={{
-        fontSize: '11px', fontWeight: 600, letterSpacing: '0.08em',
-        textTransform: 'uppercase', color: V2.fgMuted,
-      }}>{label}</div>
-    </div>
-  );
-}
 
-type PlatStat = { slug: string; fs_slug?: string; name: string; rom_count: number; downloaded: number; fs_size_bytes: number };
 
-// PlatformsStatsSection row: icon · name + meta · size + pct · progress bar
-// (spans full width, doubles as the divider; hidden on the last row).
-function PlatformStatRow({ p, total }: { p: PlatStat; total: number }) {
-  const pct = total > 0 ? (p.fs_size_bytes / total) * 100 : 0;
-  // Same system as the achievements list: a shared .romm-row (CSS drives the
-  // focus/hover highlight via :focus-within) plus an empty onActivate so the
-  // row registers as a gamepad nav target. No JS focus state or inline border —
-  // that's what left a stray border on blur.
-  return (
-    <Focusable noFocusRing onActivate={() => { }} className="romm-row" style={{
-      display: 'grid', gridTemplateColumns: 'auto 1fr auto', columnGap: '14px', rowGap: '12px',
-      alignItems: 'center', padding: '12px 14px', borderRadius: V2.radiusMd,
-    }}>
-      <div style={{
-        flexShrink: 0, width: '32px', height: '32px',
-        display: 'flex', alignItems: 'center', justifyContent: 'center', color: V2.fg2,
-      }}><PlatformIcon slug={p.slug} fsSlug={p.fs_slug} size={32} /></div>
-      <div style={{ minWidth: 0 }}>
-        <div style={{ fontSize: '14px', fontWeight: 600, color: V2.fg }}>{p.name}</div>
-        <div style={{
-          marginTop: '4px', display: 'flex', flexWrap: 'wrap', alignItems: 'center',
-          gap: '6px', fontSize: '12px', color: V2.fgMuted,
-        }}>
-          <span style={{ fontWeight: 500, color: V2.fg2 }}>{p.rom_count} game{p.rom_count === 1 ? '' : 's'}</span>
-          <span style={{ color: V2.fgFaint }}>·</span>
-          <span style={{
-            display: 'inline-flex', alignItems: 'center', gap: '4px', padding: '1px 6px',
-            borderRadius: V2.radiusSm, background: V2.surface, border: `1px solid ${V2.border}`,
-            fontSize: '11px', fontWeight: 500, color: V2.fg2,
-          }}>{p.downloaded} downloaded</span>
-        </div>
-      </div>
-      <div style={{ textAlign: 'right', flexShrink: 0 }}>
-        <div style={{ fontSize: '13px', fontWeight: 700, color: V2.brand, fontVariantNumeric: 'tabular-nums' }}>
-          {fmtBytes(p.fs_size_bytes) || '0 B'}
-        </div>
-        <div style={{ fontSize: '11px', color: V2.fgFaint }}>{pct.toFixed(1)}%</div>
-      </div>
-      <div style={{ gridColumn: '1 / -1', height: '3px', borderRadius: '2px', background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
-        <div style={{ height: '100%', width: `${pct}%`, background: V2.brand }} />
-      </div>
-    </Focusable>
-  );
-}
 
-function StatsPage() {
-  const [stats, setStats] = useState<any | null>(null);
-  const [query, setQuery] = useState('');
-  const [sort, setSort] = useState<'name' | 'size' | 'count'>('size');
-  // Without an explicit mount focus, gamepad focus never enters the page, so
-  // nothing (search, sort, the rows) can be reached and it can't scroll. Focus a
-  // concrete child (the search field) — focusing the container itself doesn't
-  // descend to a child here — and let spatial navigation handle the rest.
-  const searchRef = useRef<any>(null);
-  useEffect(() => {
-    (async () => {
-      try { setStats(await getPluginStats()); } catch { setStats({}); }
-    })();
-  }, []);
-  useEffect(() => {
-    if (stats == null) return;
-    const t = setTimeout(() => { try { if (searchRef.current) _forceGamepadFocus(searchRef.current); } catch { } }, 80);
-    return () => clearTimeout(t);
-  }, [stats]);
 
-  const s = stats || {};
-  const cards = [
-    { icon: <FaGamepad size={22} />, value: (s.platforms ?? 0).toLocaleString(), label: 'Platforms' },
-    { icon: <FaLayerGroup size={22} />, value: (s.games_total ?? 0).toLocaleString(), label: 'Library games' },
-    { icon: <FaDownload size={22} />, value: (s.games_downloaded ?? 0).toLocaleString(), label: 'Downloaded' },
-    { icon: <FaHome size={22} />, value: fmtBytes(s.size_on_disk) || '0 B', label: 'Size on disk' },
-    { icon: <FaBookmark size={22} />, value: (s.collections_total ?? 0).toLocaleString(), label: 'Collections' },
-    { icon: <FaCheckCircle size={22} />, value: (s.collections_synced ?? 0).toLocaleString(), label: 'Synced' },
-  ];
 
-  const plats: PlatStat[] = (s.platforms_breakdown || []);
-  const total = Number(s.size_on_disk || 0);
-  const q = query.trim().toLowerCase();
-  const filtered = plats
-    .filter((p) => !q || p.name.toLowerCase().includes(q) || p.slug.toLowerCase().includes(q))
-    .sort((a, b) =>
-      sort === 'name' ? a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-        : sort === 'count' ? b.rom_count - a.rom_count
-          : b.fs_size_bytes - a.fs_size_bytes);
 
-  const sortItems: { id: 'name' | 'size' | 'count'; label: string }[] = [
-    { id: 'name', label: 'Name' }, { id: 'size', label: 'Size' }, { id: 'count', label: 'Games' },
-  ];
 
-  return v2Page(
-    <Focusable noFocusRing
-      onCancelButton={() => libBack("/romm-sync-library")}
-      style={{ maxWidth: '760px', margin: '0 auto', padding: '20px 20px 80px' }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
-        <GameActionButton icon={<FaChevronLeft size={16} />} onClick={() => libBack("/romm-sync-library")} />
-        <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Stats</div>
-      </div>
 
-      {/* Section stack */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
-        {/* Summary */}
-        <V2StatsSectionBox title="Summary" icon={<FaInfoCircle size={14} />}>
-          <div style={{
-            display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '12px', padding: '16px',
-          }}>
-            {cards.map((c) => <V2StatCard key={c.label} {...c} />)}
-          </div>
-        </V2StatsSectionBox>
-
-        {/* Platforms breakdown — flush, no card chrome (matches RomM). */}
-        <section style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-          <Focusable noFocusRing flow-children="horizontal" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <div style={{ flex: '0 1 360px', minWidth: 0 }}>
-              <V2SearchField ref={searchRef} value={query} onChange={setQuery} />
-            </div>
-            {/* Same segmented pill control as the update channel / setup switch. */}
-            <div style={{ marginLeft: 'auto' }}>
-              <V2Segment options={sortItems} value={sort} onChange={(v) => setSort(v as any)} />
-            </div>
-          </Focusable>
-
-          <Focusable noFocusRing flow-children="vertical" style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            {filtered.length === 0 ? (
-              <div style={{
-                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
-                padding: '24px', color: V2.fgMuted, fontSize: '13px',
-              }}>
-                <FaBoxOpen size={22} /><span>{q ? 'No matching platforms' : 'No platforms'}</span>
-              </div>
-            ) : filtered.map((p) => (
-              <PlatformStatRow key={p.slug} p={p} total={total} />
-            ))}
-          </Focusable>
-        </section>
-      </div>
-    </Focusable>,
-  );
-}
-
-// Downloads page: every in-flight download (per-game registry + backend
-// collection auto-sync passes) with live progress, plus recently completed
-// downloads from the backend activity log. Opened from the account menu.
-// One "Recently completed" row. Focusable and openable when the activity entry
-// carries a rom_id — A jumps to that game's detail page. Entries without one
-// (failures, and anything logged before rom_id was recorded) render as inert
-// text rather than as a focus target that does nothing when pressed.
-function CompletedDownloadRow({ event, first }: {
-  event: { kind: string; title: string; detail: string; timestamp: number; rom_id?: number };
-  first: boolean;
-}) {
-  const { active, highlightHandlers } = useRowHighlight();
-  const name = _gameLabel(event.detail || event.title);
-  const romId = event.rom_id;
-  const open = romId != null
-    ? () => openGameById(romId, name, "/romm-sync-downloads")
-    : undefined;
-  return (
-    <Focusable noFocusRing
-      // `focusable` isn't in @decky/ui's prop types but is honoured at runtime —
-      // same cast the tiles use to drop out of gamepad nav.
-      {...({ focusable: !!open } as any)}
-      onActivate={open}
-      onClick={open}
-      {...highlightHandlers}
-      style={{
-        display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 14px',
-        borderTop: first ? 'none' : `1px solid ${V2.border}`,
-        background: active && open ? V2.surfaceHover : 'transparent',
-        // Inset ring rather than a border: these rows share one card, and a
-        // real border would break its outline (same reasoning as V2CardRow).
-        boxShadow: active && open ? `inset 0 0 0 2px ${V2.brand}` : 'none',
-        cursor: open ? 'pointer' : 'default',
-        transition: 'background 0.15s, box-shadow 0.15s',
-      }}>
-      {romId != null
-        ? <DownloadRowCover romId={romId} />
-        : <div style={{ flexShrink: 0, color: V2.success, display: 'flex' }}><FaCheckCircle size={13} /></div>}
-      <div style={{
-        flex: '1 1 auto', minWidth: 0, fontSize: '12.5px', fontWeight: 600, color: V2.fg,
-        display: 'flex', alignItems: 'center', gap: '7px',
-      }}>
-        {romId != null && <FaCheckCircle size={12} style={{ flexShrink: 0, color: V2.success }} />}
-        <span style={{ minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</span>
-      </div>
-      <div style={{ flexShrink: 0, fontSize: '10.5px', color: V2.fgMuted, whiteSpace: 'nowrap' }}>
-        {fmtAgo(event.timestamp)}
-      </div>
-      {open && (
-        <div style={{
-          flexShrink: 0, display: 'flex', color: active ? V2.fg2 : V2.fgMuted,
-          opacity: active ? 1 : 0.5, transition: 'opacity 0.15s, color 0.15s',
-        }}><FaChevronRight size={11} /></div>
-      )}
-    </Focusable>
-  );
-}
-
-function DownloadsPage() {
-  const activeDls = useActiveDownloads();
-  const queued = useQueuedDownloads();
-  const status = useServiceStatus();
-  const pendingCount = status?.pending_saves || 0;
-  const pendingUploads = usePendingUploads(pendingCount);
-  const offline = !!status?.unreachable_reason;
-  const syncingCols = ((status?.collections || []) as any[]).filter((c) => c.sync_state === 'syncing');
-  const activeCount = activeDls.length + syncingCols.length;
-
-  const [recent, setRecent] = useState<Array<{ kind: string, title: string, detail: string, timestamp: number, rom_id?: number }>>([]);
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      try {
-        const res = await getRecentActivity(10);
-        if (alive && res?.events) setRecent(res.events.filter((e) => e.kind === 'download'));
-      } catch { /* transient */ }
-    };
-    load();
-    const iv = setInterval(load, 5000);
-    return () => { alive = false; clearInterval(iv); };
-  }, []);
-
-  // Same mount-focus dance as StatsPage: internally pushed views get no focus
-  // pass from Steam, so drop gamepad focus on the first focusable element.
-  const hostRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const t = setTimeout(() => {
-      try {
-        const first = hostRef.current?.querySelector('[tabindex]') as HTMLElement | null;
-        if (first) _forceGamepadFocus(first);
-      } catch { /* ignore */ }
-    }, 100);
-    return () => clearTimeout(t);
-  }, []);
-
-  return v2Page(
-    <Focusable noFocusRing
-      onCancelButton={() => libBack("/romm-sync-library")}
-      style={{ maxWidth: '760px', margin: '0 auto', padding: '20px 20px 80px' }}>
-      <div ref={hostRef} style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
-        <GameActionButton icon={<FaChevronLeft size={16} />} onClick={() => libBack("/romm-sync-library")} />
-        <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Downloads</div>
-      </div>
-
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
-        <V2StatsSectionBox title={`Active${activeCount ? ` (${activeCount})` : ''}`} icon={<FaDownload size={14} />}>
-          {activeCount === 0 ? (
-            <div style={{
-              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
-              padding: '24px', color: V2.fgMuted, fontSize: '13px',
-            }}>
-              <FaBoxOpen size={20} /><span>No active downloads</span>
-            </div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column' }}>
-              {syncingCols.map((c, i) => (
-                <div key={`col-${c.name}`} style={{ borderTop: i > 0 ? `1px solid ${V2.border}` : 'none' }}>
-                  <CollectionSyncStatusRow col={c} />
-                </div>
-              ))}
-              {activeDls.map((d, i) => (
-                <div key={d.romId} style={{ borderTop: (i > 0 || syncingCols.length > 0) ? `1px solid ${V2.border}` : 'none' }}>
-                  <DownloadStatusRow romId={d.romId} name={d.name} />
-                </div>
-              ))}
-            </div>
-          )}
-        </V2StatsSectionBox>
-
-        {queued.length > 0 && (
-          <V2StatsSectionBox title={`Queued (${queued.length})`} icon={<FaRegClock size={14} />}>
-            {queued.slice(0, 12).map((q, i) => (
-              <div key={q.romId} style={{
-                display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 14px',
-                borderTop: i > 0 ? `1px solid ${V2.border}` : 'none',
-              }}>
-                <DownloadRowCover romId={q.romId} />
-                <div style={{
-                  flex: '1 1 auto', minWidth: 0, fontSize: '12.5px', fontWeight: 500, color: V2.fg2,
-                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                }}>{_gameLabel(q.name)}</div>
-                <div style={{ flexShrink: 0, fontSize: '10.5px', color: V2.fgMuted }}>Waiting</div>
-              </div>
-            ))}
-            {queued.length > 12 && (
-              <div style={{
-                padding: '9px 14px', fontSize: '11.5px', color: V2.fgMuted,
-                borderTop: `1px solid ${V2.border}`,
-              }}>and {queued.length - 12} more…</div>
-            )}
-          </V2StatsSectionBox>
-        )}
-
-        {pendingUploads.length > 0 && (
-          <V2StatsSectionBox
-            title={`Waiting to upload (${pendingUploads.length})`}
-            icon={<FaCloudUploadAlt size={14} />}>
-            <div style={{
-              padding: '9px 14px', fontSize: '11.5px', color: V2.fgMuted,
-              borderBottom: `1px solid ${V2.border}`,
-            }}>
-              {offline
-                ? 'These saves will sync automatically when you’re back online.'
-                : 'These local changes will sync on the next pass.'}
-            </div>
-            {pendingUploads.slice(0, 12).map((p, i) => {
-              const slots = p.files.length;
-              return (
-                <div key={`${p.game}-${p.type}`} style={{
-                  display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 14px',
-                  borderTop: i > 0 ? `1px solid ${V2.border}` : 'none',
-                }}>
-                  <div style={{ flexShrink: 0, color: V2.fgMuted, display: 'flex' }}>
-                    <FaCloudUploadAlt size={13} />
-                  </div>
-                  <div style={{ flex: '1 1 auto', minWidth: 0 }}>
-                    <div style={{
-                      fontSize: '12.5px', fontWeight: 600, color: V2.fg,
-                      whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                    }}>{p.game}</div>
-                    <div style={{ fontSize: '10.5px', color: V2.fgMuted, marginTop: '1px' }}>
-                      {p.type === 'states' ? 'Save state' : 'Save'}
-                      {slots > 1 ? ` · ${slots} files` : ''}
-                      {p.emulator ? ` · ${p.emulator}` : ''}
-                    </div>
-                  </div>
-                  <div style={{ flexShrink: 0, fontSize: '10.5px', color: V2.fgMuted }}>Waiting</div>
-                </div>
-              );
-            })}
-            {pendingUploads.length > 12 && (
-              <div style={{
-                padding: '9px 14px', fontSize: '11.5px', color: V2.fgMuted,
-                borderTop: `1px solid ${V2.border}`,
-              }}>and {pendingUploads.length - 12} more…</div>
-            )}
-          </V2StatsSectionBox>
-        )}
-
-        <V2StatsSectionBox title="Recently completed" icon={<FaHistory size={14} />}>
-          {recent.length === 0 ? (
-            <div style={{ padding: '14px 16px', fontSize: '12px', color: V2.fgMuted }}>
-              Nothing yet — finished downloads will show up here.
-            </div>
-          ) : recent.map((e, i) => (
-            <CompletedDownloadRow key={`${e.timestamp}-${i}`} event={e} first={i === 0} />
-          ))}
-        </V2StatsSectionBox>
-      </div>
-    </Focusable>,
-  );
-}
-
-// Glassy core picker (RomM v2 chrome, like the account/collection menus).
-// Lists "Auto" + every installed core, with RetroDECK's choices surfaced first
-// and the current selection check-marked. closeModal is injected by showModal.
-function CorePickerModal({ row, availableCores, canDownload, noDownloadReason, noDownloadKind, onPick, onDownload, closeModal }: {
-  row: any; availableCores: string[]; canDownload: boolean;
-  noDownloadReason?: string; noDownloadKind?: string;
-  onPick: (core: string) => void;
-  onDownload: (core: string) => void; closeModal?: () => void;
-}) {
-  const panelRef = useRef<HTMLDivElement>(null);
-  const [query, setQuery] = useState('');
-  // Cores the buildbot can supply for this platform that aren't installed. The
-  // full buildbot catalogue (~200 cores) is only pulled in once you search, so
-  // opening the picker stays a local, offline-safe operation.
-  const [catalogue, setCatalogue] = useState<string[] | null>(null);
-  const rdSet = new Set<string>(row?.retrodeck_choices || []);
-  // Installed cores that can actually run this platform (RetroDECK's choices
-  // plus our own map). Only these are offered — pinning mupen64plus to Game Boy
-  // Advance just produces a launch that fails. The rest of the core folder is
-  // still reachable behind "show all" for cores we don't know about.
-  const relevant: string[] = (row?.platform_cores
-    || (row?.retrodeck_choices || []).filter((c: string) => availableCores.includes(c)));
-  const relevantSet = new Set<string>(relevant);
-  const [showAll, setShowAll] = useState(false);
-  useEffect(() => { const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60); return () => clearTimeout(t); }, []);
-
-  const q = query.trim().toLowerCase();
-  const match = (c: string) => !q || c.toLowerCase().includes(q);
-  // RetroDECK's choices first (in its priority order), then (if expanded) the rest.
-  const rdOrdered = relevant.filter((c: string) => match(c));
-  // Filtering searches the whole installed set even when collapsed, so you can
-  // find any core by typing without toggling "show all" first.
-  const others = (showAll || q) ? availableCores.filter((c) => !relevantSet.has(c) && match(c)) : [];
-  const current = row?.override || '';
-
-  const pick = (core: string) => { closeModal?.(); onPick(core); };
-  const grab = (core: string) => { closeModal?.(); onDownload(core); };
-
-  // Suggested downloads for this platform, plus — once you type — anything else
-  // in the catalogue. Both filtered against what's already installed.
-  // Nothing downloadable on a RetroDECK install (it bundles its own cores in a
-  // read-only tree) — the whole section, catalogue fetch included, stays off.
-  const suggested: string[] = canDownload ? (row?.download_candidates || []).filter(match) : [];
-  const catalogueHits = (canDownload && q && catalogue)
-    ? catalogue.filter((c) => !availableCores.includes(c) && !suggested.includes(c) && match(c)).slice(0, 40)
-    : [];
-  useEffect(() => {
-    if (!canDownload || !q || catalogue !== null) return;
-    getDownloadableCores(false)
-      .then((r: any) => setCatalogue(r?.success ? (r.cores || []).map((c: any) => c.name) : []))
-      .catch(() => setCatalogue([]));
-  }, [canDownload, q, catalogue]);
-
-  const coreRow = (core: string) => (
-    <UserMenuRow key={core}
-      icon={current === core ? <FaCheck size={13} /> : <FaPuzzlePiece size={13} />}
-      label={core + (row?.retrodeck_default === core ? '  · RetroDECK default' : (rdSet.has(core) ? '  · RetroDECK' : ''))}
-      onSelect={() => pick(core)} />
-  );
-
-  const downloadRow = (core: string) => (
-    <UserMenuRow key={`dl-${core}`}
-      icon={<FaDownload size={13} />}
-      label={`${core}  ·  download`}
-      onSelect={() => grab(core)} />
-  );
-
-  return (
-    <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}>
-      <Focusable noFocusRing style={{
-        position: 'fixed', inset: MODAL_SCRIM_INSET, display: 'flex', alignItems: 'center', justifyContent: 'center',
-        background: 'rgba(7,7,15,0.45)', WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
-      }}>
-        <style>{`${V2_FOCUS_STYLE}
-          @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }`}</style>
-        <div onClick={() => closeModal?.()} style={{ position: 'absolute', inset: 0 }} />
-        <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
-          position: 'relative', width: '340px', maxWidth: '92vw', boxSizing: 'border-box',
-          fontFamily: V2.font, color: V2.fg, padding: '8px',
-          display: 'flex', flexDirection: 'column',
-          background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
-          WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
-          border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
-          boxShadow: '0 16px 48px rgba(0,0,0,0.55)', maxHeight: '82vh', overflowY: 'auto',
-          animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
-        }}>
-          <div style={{
-            fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em',
-            color: V2.fgMuted, padding: '6px 8px 10px',
-          }}>Core · {row?.platform_name || ''}</div>
-          <div style={{ padding: '0 4px 8px' }}>
-            <V2SearchField value={query} onChange={setQuery} />
-          </div>
-          <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
-          {/* Auto reverts to RetroDECK's choice / our guess. */}
-          {match('auto') && (
-            <UserMenuRow
-              icon={!current ? <FaCheck size={13} /> : <FaUndo size={13} />}
-              label={`Auto${row?.retrodeck_default ? `  ·  ${row.retrodeck_default}` : (row?.resolved_core ? `  ·  ${row.resolved_core}` : '')}`}
-              onSelect={() => pick('')} />
-          )}
-          {rdOrdered.length > 0 && <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />}
-          {rdOrdered.map(coreRow)}
-          {/* No installed core runs this platform — say so instead of leaving a
-              bare "Auto" that resolves to nothing. */}
-          {relevant.length === 0 && !q && (
-            <>
-              <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
-              <div style={{ padding: '8px 10px', fontSize: '11.5px', color: V2.fgMuted, lineHeight: 1.45 }}>
-                {suggested.length > 0
-                  ? 'No installed core runs this platform — download one below.'
-                  /* Nothing to offer: either Ludo can't install cores here at all
-                     (RetroDECK, unsupported arch, read-only cores dir) or the
-                     buildbot has none for this platform. Both end the same way —
-                     RetroArch's own Online Updater is the way out, so say so
-                     instead of leaving a dead end. */
-                  /* RetroDECK's core set is fixed and read-only inside the
-                     flatpak, so its Online Updater can't write there either —
-                     pointing at it would just be a second dead end. */
-                  : noDownloadKind === 'retrodeck'
-                    ? 'No installed core runs this platform. RetroDECK ships a fixed core set that neither Ludo nor its own updater can add to, so there is nothing to install here — this platform needs a separate RetroArch to run.'
-                    : !canDownload
-                    ? `No installed core runs this platform, and Ludo can't install one${noDownloadReason ? ` — ${noDownloadReason}` : ''}. Add a core from RetroArch itself (Main Menu ▸ Online Updater ▸ Core Downloader), then come back and pin it here.`
-                    : 'No installed core runs this platform, and the libretro buildbot has none to offer for it. Check RetroArch\'s own Core Downloader (Main Menu ▸ Online Updater) — if it isn\'t there either, this platform has no libretro core.'}
-              </div>
-            </>
-          )}
-          {/* Escape hatch to the rest of the core folder, for cores our map
-              doesn't know about. Off by default so a core meant for another
-              system can't be pinned here by accident. */}
-          <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
-          <UserMenuRow
-            icon={<FaLayerGroup size={13} />}
-            label={showAll ? 'Show only cores for this platform' : 'Show all installed cores'}
-            onSelect={() => setShowAll((v) => !v)} />
-          {others.length > 0 && (
-            <>
-              <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
-              <div style={{
-                fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em',
-                color: V2.fgMuted, padding: '6px 8px 4px',
-              }}>Other installed cores · not for this platform</div>
-            </>
-          )}
-          {others.map(coreRow)}
-          {/* Not installed, but the libretro buildbot has it — same source
-              RetroArch's own Online Updater uses. */}
-          {(suggested.length > 0 || catalogueHits.length > 0) && (
-            <>
-              <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
-              <div style={{
-                fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em',
-                color: V2.fgMuted, padding: '6px 8px 4px',
-              }}>Available to download</div>
-            </>
-          )}
-          {suggested.map(downloadRow)}
-          {catalogueHits.map(downloadRow)}
-        </Focusable>
-      </Focusable>
-    </ModalRoot>
-  );
-}
-
-// Emulator Cores page: one row per library platform showing how its launch
-// core resolves (user override > RetroDECK/ES-DE > built-in guess). A on a row
-// opens the picker; the trailing badge shows the resolved core + its source.
-// The Emulator page with nothing to configure: no RetroArch, no RetroDECK, so
-// per-platform cores are meaningless until one exists. Offer the install
-// instead of an empty list.
-function NoEmulatorSection({ status }: { status: EmuStatus }) {
-  const install = useEmulatorInstall();
-  // Can't install from here — Windows, no flatpak, running as root. The row
-  // becomes an explanation rather than a button that could only fail.
-  const canInstall = status.install.available;
-  return (
-    <V2SettingsSection title="Emulator">
-      <V2SettingsRow icon={<FaGamepad size={16} />}
-        title={install.active ? 'Installing RetroArch…' : 'No emulator installed'}
-        subtitle={install.active
-          ? [install.phase || 'Installing', install.pct != null ? `${install.pct}%` : '',
-             installSize(install)].filter(Boolean).join(' · ')
-            || 'This takes a few minutes.'
-          : install.error
-            ? install.error
-            : canInstall
-              ? 'Ludo needs RetroArch or RetroDECK to launch games.'
-              : `Ludo needs RetroArch or RetroDECK to launch games. ${status.install.reason || 'Install one, then re-check.'}`}
-        onClick={install.active || !canInstall ? undefined : startEmulatorInstall}
-        right={install.active
-          ? <FaSync size={15} style={{ animation: 'spin 1s linear infinite', color: V2.fgMuted }} />
-          : canInstall
-            ? <span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Install</span>
-            : null} />
-      {/* Only worth suggesting where a flatpak install is actually possible —
-          the reasons canInstall is false here are Windows, no flatpak, or root. */}
-      {canInstall && <V2SettingsRow icon={<FaInfoCircle size={15} />}
-        title="Prefer RetroDECK?"
-        subtitle="Install net.retrodeck.retrodeck from Flathub yourself."
-        right={<span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Re-check</span>}
-        onClick={() => loadEmulatorStatus(true)} />}
-      {/* Without the RetroDECK row there is nothing to re-detect with, and
-          installing outside Ludo is exactly what needs a re-check. */}
-      {!canInstall && <V2SettingsRow icon={<FaSync size={15} />}
-        title="Re-check"
-        subtitle="Look for an emulator again."
-        onClick={() => loadEmulatorStatus(true)} />}
-    </V2SettingsSection>
-  );
-}
-
-function CoresPage() {
-  const [rows, setRows] = useState<any[]>([]);
-  const [cores, setCores] = useState<string[]>([]);
-  const [loading, setLoading] = useState(true);
-  // Whether this RetroArch can gain cores at all, and why not when it can't
-  // (RetroDECK bundles them read-only; unsupported CPU; no writable dir).
-  const [canDownload, setCanDownload] = useState(false);
-  const [noDownloadReason, setNoDownloadReason] = useState('');
-  // Which of those cases it is ('retrodeck', 'no_builds', …) — the picker words
-  // its advice per case rather than pattern-matching the reason text.
-  const [noDownloadKind, setNoDownloadKind] = useState('');
-
-  const emu = useEmulatorStatus();
-
-  const load = async () => {
-    try {
-      const r = await getCoreMappings();
-      if (r?.success) {
-        setRows(r.mappings || []);
-        setCores(r.available_cores || []);
-        setCanDownload(!!r.can_download_cores);
-        setNoDownloadReason(r.download_unavailable_reason || '');
-        setNoDownloadKind(r.download_unavailable_kind || '');
-      }
-    } catch { /* ignore */ }
-    finally { setLoading(false); }
-  };
-  useEffect(() => { load(); }, []);
-  // An install finishing while this page is open turns every row from
-  // unresolvable to resolvable — re-read instead of stranding the empty state.
-  const wasInstalled = useRef<boolean | null>(null);
-  useEffect(() => {
-    if (emu == null) return;
-    if (wasInstalled.current != null && wasInstalled.current !== emu.installed) load();
-    wasInstalled.current = emu.installed;
-  }, [emu?.installed]);
-
-  const apply = async (slug: string, core: string) => {
-    try {
-      const r = await setCoreOverride(slug, core);
-      if (r?.success && r.mapping) {
-        setRows((prev) => prev.map((x) => x.slug === slug ? { ...r.mapping } : x));
-      }
-    } catch { toaster.toast({ title: 'Core override', body: 'Could not save change' }); }
-  };
-
-  // Fetch a core, then pin it for this platform — picking a core you just
-  // downloaded and NOT using it is never what was meant.
-  const [busy, setBusy] = useState<string | null>(null);
-  const install = async (row: any, core: string) => {
-    setBusy(row.slug);
-    toaster.toast({ title: 'Emulator core', body: `Downloading ${core}…` });
-    try {
-      const r = await downloadCore(core);
-      if (r?.success) {
-        toaster.toast({ title: 'Emulator core', body: `${core} installed` });
-        await apply(row.slug, core);
-        await load();   // the installed-core list grew
-      } else {
-        toaster.toast({ title: 'Emulator core', body: r?.message || `Could not download ${core}` });
-      }
-    } catch {
-      toaster.toast({ title: 'Emulator core', body: `Could not download ${core}` });
-    } finally { setBusy(null); }
-  };
-
-  const openPicker = (row: any) =>
-    showModal(<CorePickerModal row={row} availableCores={cores} canDownload={canDownload}
-      noDownloadReason={noDownloadReason} noDownloadKind={noDownloadKind}
-      onPick={(c) => apply(row.slug, c)}
-      onDownload={(c) => install(row, c)} />);
-
-  const badge = (row: any) => {
-    const labelFor: Record<string, string> = { override: 'pinned', retrodeck: 'RetroDECK', guess: 'auto', none: '—' };
-    const color = row.source === 'override' ? V2.brandHover : (row.source === 'none' ? V2.danger : V2.fgMuted);
-    return (
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <span style={{ fontSize: '13px', fontWeight: 600, color: row.resolved_core ? V2.fg : V2.danger }}>
-          {row.resolved_core || 'no core'}
-        </span>
-        <span style={{
-          fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
-          color, border: `1px solid ${color}`, borderRadius: V2.radiusChip, padding: '1px 6px',
-        }}>{labelFor[row.source] || row.source}</span>
-        <FaChevronRight size={12} style={{ color: V2.fgFaint }} />
-      </div>
-    );
-  };
-
-  return v2Page(
-    <Focusable noFocusRing
-      onCancelButton={() => libBack("/romm-sync-library")}
-      style={{ maxWidth: '760px', margin: '0 auto', padding: '20px 20px 0' }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
-        <GameActionButton icon={<FaChevronLeft size={16} />} onClick={() => libBack("/romm-sync-library")} />
-        <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Emulator Cores</div>
-      </div>
-
-      {/* Stale folders used to be warned about here; they now live in
-          Settings ▸ Folders, beside the folders themselves. */}
-
-      {/* Nothing installed: the per-platform list would be a wall of "no core"
-          rows that can't be resolved, so it collapses to the install prompt. */}
-      {emu && !emu.installed ? <NoEmulatorSection status={emu} /> : (
-      <V2SettingsSection title="Per-platform core">
-        {loading ? (
-          <V2SettingsRow icon={<FaPuzzlePiece size={16} />} title="Loading cores…" />
-        ) : rows.length === 0 ? (
-          <V2SettingsRow icon={<FaPuzzlePiece size={16} />}
-            title="No platforms detected yet"
-            subtitle="Open the Game Browser once to load your library." />
-        ) : rows.map((row) => (
-          <V2SettingsRow key={row.slug}
-            bareIcon
-            icon={<PlatformIcon slug={row.slug} size={28} />}
-            title={row.platform_name}
-            subtitle={busy === row.slug
-              ? 'Downloading core…'
-              : row.source === 'none'
-                ? ((row.download_candidates || []).length
-                  ? `No core installed — A to download ${row.download_candidates[0]}`
-                  : noDownloadReason
-                    ? `No core installed — ${noDownloadReason}`
-                    : 'No core installed — A to pick one')
-                : row.source === 'override'
-                  ? 'Pinned by you — A to change or reset to auto'
-                  : 'Auto-resolved — A to pin a specific core'}
-            onClick={() => openPicker(row)}
-            right={badge(row)} />
-        ))}
-      </V2SettingsSection>
-      )}
-    </Focusable>
-  );
-}
 
 // BiosPage — what RomM holds as firmware per platform, versus what's actually in
 // RetroArch's system dir, with a button to close the gap.
