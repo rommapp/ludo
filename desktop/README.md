@@ -4,8 +4,9 @@ A generic build of the sync app (Linux + Windows), for people running RetroArch
 **without** a Steam Deck / Decky. It shares the backend and UI with the Decky
 plugin:
 
-- **UI** — `ui/app/`, consumed byte-identically and reached through `@ludo/app`.
-  It imports its shell through `@ludo/host`, which a Vite alias points at
+- **UI** — `ui/app/`, consumed byte-identically and reached through `@ludo/app`
+  (whose entry is `index.tsx`, now just the route table). It imports its shell
+  through `@ludo/host`, which a Vite alias points at
   `src/host/` (this shell's adapter) instead of forking the UI. The Decky build
   points both specifiers at its own side; the contract the adapters satisfy is
   `ui/host/contract.ts`.
@@ -42,7 +43,8 @@ plugin:
   itself (loudly) if Playwright or the build is missing.
 
   This exists because `ui/app/` is code both shells render and that nothing
-  else covered. Its failure mode is not a crash: a reply whose shape drifted,
+  else covered — and it was written while that code was still one 15k-line
+  file, as the net for splitting it up. Its failure mode is not a crash: a reply whose shape drifted,
   or an asset that stopped being packaged, shows up as a page that renders a
   header and nothing else. A build and a typecheck both pass through that
   happily; this does not. It earned its keep immediately — the click-through
