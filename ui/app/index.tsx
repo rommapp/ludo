@@ -120,6 +120,7 @@ import {
   updateLoggingEnabled,
 } from "./rpc";
 import { MdVerified } from "react-icons/md";
+import { V2, fmtBytes, fmtReleaseDate, fmtAgo, formatEta, formatSpeed } from "./theme";
 
 
 // "2m 29s", not "149.3s" — this number gets read aloud in bug reports, and
@@ -331,41 +332,6 @@ function awaitCover(key: string, fetcher: () => Promise<{ success?: boolean; dat
   return p;
 }
 
-// ---------------------------------------------------------------------------
-// RomM v2 visual language (from rommapp/romm frontend/src/v2/styles/tokens.css).
-// The Game Browser renders custom divs styled with these tokens instead of the
-// Steam/Decky chrome; Focusable is used only for gamepad navigation.
-// ---------------------------------------------------------------------------
-const V2 = {
-  bg: '#07070f',
-  surface: 'rgba(255,255,255,0.07)',
-  surfaceHover: 'rgba(255,255,255,0.12)',
-  border: 'rgba(255,255,255,0.07)',
-  borderStrong: 'rgba(255,255,255,0.15)',
-  fg: '#ffffff',
-  fg2: 'rgba(255,255,255,0.75)',
-  fgMuted: 'rgba(255,255,255,0.45)',
-  fgFaint: 'rgba(255,255,255,0.25)',
-  bgElevated: 'rgba(255,255,255,0.045)',
-  brand: '#8b74e8',
-  brandHover: '#a18fff',
-  brandPressed: '#6043c8',
-  success: '#4ade80',
-  warning: '#fbbf24',
-  danger: '#ff5050',
-  igdb: '#6366f1',
-  ra: '#ef4444',
-  coverPlaceholder: '#1a1a2e',
-  radiusArt: '8px',
-  radiusSm: '4px',
-  radiusMd: '8px',
-  radiusChip: '6px',
-  radiusLg: '10px',
-  radiusCard: '14px',
-  radiusPill: '100px',
-  elev2: '0 8px 24px rgba(0,0,0,.45)',
-  font: '"Motiva Sans","Segoe UI",system-ui,-apple-system,sans-serif',
-};
 
 // Full-screen modal scrims stop short of the button legend at the bottom of the
 // screen, so the hints for the modal's own buttons stay readable while it is
@@ -485,28 +451,7 @@ function languageToEmoji(language: string): string {
   return LANGUAGE_EMOJI[(language || '').toLowerCase()] || language;
 }
 
-function fmtBytes(n: number | null | undefined): string {
-  if (!n || isNaN(n as any)) return '';
-  let v = Number(n);
-  for (const u of ['B', 'KB', 'MB', 'GB']) {
-    if (v < 1024) return u === 'B' ? `${v.toFixed(0)} ${u}` : `${v.toFixed(1)} ${u}`;
-    v /= 1024;
-  }
-  return `${v.toFixed(1)} TB`;
-}
 
-// Full release date "02 Jan 2024" — RomM GameHeader meta uses the localized
-// day/short-month/year form rather than just the year.
-function fmtReleaseDate(ts: number | null | undefined): string {
-  if (!ts) return '';
-  try {
-    // RomM stores first_release_date as a Unix timestamp in milliseconds and
-    // formats it directly (new Date(ms)); match that exactly.
-    const d = new Date(Number(ts));
-    if (isNaN(d.getTime())) return '';
-    return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' });
-  } catch { return ''; }
-}
 
 // Blurred full-bleed background art — the defining RomM v2 surface. The
 // focused/first cover is painted behind everything, heavily blurred and dimmed,
@@ -1148,14 +1093,6 @@ function useEtaFromPct(pct: number, active: boolean): number {
   return eta;
 }
 
-// "1m 23s" / "45s" — compact ETA from a seconds count (0 / unknown → '').
-const formatEta = (secs: number): string => {
-  if (!secs || secs <= 0 || !isFinite(secs)) return '';
-  const s = Math.round(secs);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  return `${m}m ${s % 60}s`;
-};
 
 // Circular progress ring drawn around a centered glyph (used on the cover's
 // download button). `pct` null renders an empty track.
@@ -5144,11 +5081,6 @@ const _UPD_CACHE_MS = 5 * 60 * 1000;
 // reads as an action that ran rather than a flicker (see runUpdateCheck).
 const MIN_CHECK_MS = 900;
 
-const formatSpeed = (bytesPerSec: number): string => {
-  if (bytesPerSec >= 1024 * 1024) return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
-  if (bytesPerSec >= 1024) return `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
-  return `${bytesPerSec.toFixed(0)} B/s`;
-};
 
 // Background notification polling — drains events the backend emits at the exact
 // moment a sync/removal happens. No state diffing, no transition inference: the
@@ -10638,16 +10570,6 @@ const ACTIVITY_ICONS: Record<string, any> = {
   account: FaUser, error: FaExclamationTriangle,
 };
 
-function fmtAgo(ts: number): string {
-  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
-  if (s < 60) return 'just now';
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m} min ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  return d === 1 ? 'yesterday' : `${d} days ago`;
-}
 
 function RecentActivitySection() {
   const [events, setEvents] = useState<Array<{ kind: string, title: string, detail: string, timestamp: number }>>([]);
