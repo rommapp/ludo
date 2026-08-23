@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
-import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel } from "../kit";
+import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel, V2CardRow} from "../kit";
 import { V2, fmtAgo } from "../theme";
 import { FaBookmark, FaBug, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaInfoCircle, FaLayerGroup, FaPlay, FaRedo, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
 import { Focusable, Navigation, host, toaster } from "@ludo/host";
@@ -9,19 +9,12 @@ import { _broadcastLibRefresh } from "../events";
 import { _LS_REOPEN_HOME, _lsAvail} from "../storage";
 import { libBack, libNavigate } from "../nav";
 import { V2Focus, v2Page } from "../focus";
-import {
-  V2CardRow,
-  _setSyncPillPref,
-  _syncPillListeners,
-  syncPillPref,
-  _setResumeStatesPref,
-  _resumeStatesPref,
-} from "../index";
 import { FoldersSection } from "./setup";
-import { _groupsCache, clearBrowseCaches, persistGroupsCache } from "../libcache";
+import { _groupsCache, clearBrowseCaches, persistGroupsCache, _setSyncPillPref, _syncPillListeners, syncPillPref} from "../libcache";
 import { clearIdentityCache } from "../topbar";
 import { _clearStale } from "../status";
 import { resetAnnouncementShown } from "../notifications";
+import { _resumeStatesPref, _setResumeStatesPref } from "../tiles";
 // Settings: the account, the folders, updates, and what the app is allowed to do.
 //
 // Most of it is capability-gated rather than shell-gated — the Steam-tile row

@@ -91,3 +91,31 @@ export function letterJump(dir: 1 | -1): boolean {
 
 /** Flash a letter in the overlay, if a grid is showing one. */
 export function scrubGlimpse(letter: string) { _scrubGlimpse?.(letter); }
+
+// Entering a grid/row container from above or below should land on the tile in
+// the SAME COLUMN you came from, not the container's remembered last-active
+// child (Steam's default "preferred child" made UP/DOWN between rows snap back
+// to wherever you were last in that row — verified on-device by live-patching
+// nav nodes). 2 = NavEntryPositionPreferences.MAINTAIN_X (@decky/ui declares
+// the enum but doesn't export it at runtime). Spread as any: not in decky's
+// FocusableProps typing, but Steam's Focusable forwards it into m_Properties.
+export const NAV_MAINTAIN_X = { navEntryPreferPosition: 2 } as any;
+
+export let _scrubFocusTs = 0;
+
+export let _scrubStreak = 0;
+
+// The letter glimpse is for flying VERTICALLY through the alphabetized grid, so
+// only a sustained run of fast ROW-TO-ROW moves should raise it. Browsing
+// horizontally within a row must never trigger it — on a wide desktop row that's
+// a long run of quick focus moves, which is exactly what popped the overlay
+// unbidden. The shim records the axis of the last directional move on
+// window.__rommNavH; a horizontal move resets the streak. On the Deck (Steam's
+// native nav) the flag is undefined, so behaviour there is unchanged.
+export function _tileFocusScrub(_el: any, label: string) {
+  if ((window as any).__rommNavH) { _scrubStreak = 0; return; }
+  const now = Date.now();
+  _scrubStreak = now - _scrubFocusTs < 200 ? _scrubStreak + 1 : 1;
+  _scrubFocusTs = now;
+  if (_scrubStreak >= 5) { try { scrubGlimpse(_scrubLetterOf(label)); } catch { /* ignore */ } }
+}

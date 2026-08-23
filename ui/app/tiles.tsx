@@ -2,28 +2,14 @@ import { memo, useEffect, useRef, useState } from "react";
 import { LibGame, LibGroup } from "./types";
 import { _dlSucceeded, _setDlActive, awaitDownload, runCollectionBatch, useDownloadProgress, useIsDownloading } from "./downloads";
 import { V2, roundBtn} from "./theme";
-import {
-  LocalDisc,
-  ToastCover,
-  openDiscPicker,
-  openGameById,
-  useSaveActivityFor,
-  _tileElsByRomId,
-  _tileFocusScrub,
-  libCacheDelete,
-  MODAL_SCRIM_INSET,
-  PickerModal,
-  libCacheDrop,
-  NAV_MAINTAIN_X,
-} from "./index";
-import { useCollectionSync, useOffline } from "./status";
-import { deleteCollectionRoms, deleteGame, downloadGame, getLibraryGames, getLocalDiscs, getLocalSiblings, resyncPlatform, toggleCollectionSync } from "./rpc";
+import { useCollectionSync, useOffline, useSaveActivityFor} from "./status";
+import { deleteCollectionRoms, deleteGame, downloadGame, getLibraryGames, getLocalDiscs, getLocalSiblings, resyncPlatform, toggleCollectionSync, getStateThumbnails} from "./rpc";
 import { Focusable, GamepadButton, Menu, MenuItem, showContextMenu, showModal, toaster, ModalRoot} from "@ludo/host";
 import { maybePromptSwitchFirmware } from "./firmware";
-import { _libGamesCache, libCacheSetDownloaded, _focusedPlatform, _setFocusedPlatform} from "./libcache";
+import { _libGamesCache, libCacheSetDownloaded, _focusedPlatform, _setFocusedPlatform, libCacheDelete, libCacheDrop, openGameById} from "./libcache";
 import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImage } from "./media";
-import { PlatformIcon, ProgressRing, UserMenuRow} from "./kit";
+import { PlatformIcon, ProgressRing, UserMenuRow, MODAL_SCRIM_INSET, PickerModal, ToastCover} from "./kit";
 import { FaBookmark, FaBoxOpen, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
 import { _broadcastLibRefresh } from "./events";
 import { MdFlashOn } from "react-icons/md";
@@ -31,6 +17,8 @@ import { _forceGamepadFocus } from "./shell";
 import { BiosDetailModal } from "./pages/bios";
 import { launchGameSmart, offerCoreInstall, cannotLaunch, runLaunch} from "./launch";
 import { _emuStatus, standaloneFor } from "./emulator";
+import { _lsAvail } from "./storage";
+import { NAV_MAINTAIN_X, _tileFocusScrub } from "./scrub";
 // The things a grid is made of.
 //
 // A tile is not just a cover: it carries the download state, the focus
@@ -1386,5 +1374,138 @@ export function CardRow({ icon, title, count, children }:
         </div>
       </div>
     </section>
+  );
+}
+
+// Live game tiles by rom_id, and the rom_id of the last game launched. Coming
+// back from a session, restoring focus to the FIRST tile lost the user's place
+// — on a long list the game they just played could be scrolled far off screen.
+// Aiming at the tile they launched keeps the selection where they left it.
+// A plain Map (not WeakMap): the value IS the key's only strong ref here, and
+// entries are removed on unmount.
+export const _tileElsByRomId = new Map<number, any>();
+
+// Last known value of the resume-from-state preference. Persisted, because the
+// Home row has to decide how to draw itself on the FIRST frame: read from the
+// backend it arrives a round-trip late, and the row visibly re-lays-itself out
+// from box art to state screenshots every time Home opens.
+export const _LS_RESUME_PREF = 'romm:resumestates:v1';
+
+export let _resumeStatesPref = (() => {
+  try { return _lsAvail && localStorage.getItem(_LS_RESUME_PREF) === '1'; }
+  catch { return false; }
+})();
+
+export function _setResumeStatesPref(v: boolean) {
+  _resumeStatesPref = v;
+  try { if (_lsAvail) localStorage.setItem(_LS_RESUME_PREF, v ? '1' : '0'); } catch { }
+}
+
+// Save-state screenshots for the Continue playing row, rom_id → data URI (null
+// = this game has no state picture). Module-level so returning to Home repaints
+// from memory instead of re-asking, and shared by every mount of the row.
+export const _stateThumbs = new Map<number, string | null>();
+
+export let _stateThumbsInflight: Promise<void> | null = null;
+
+// Fetches every missing thumbnail in ONE backend call. Per-tile calls turned a
+// 15-card row into 15 websocket round-trips, each of which could fall through
+// to its own RomM request; batched, the backend overlaps the misses on a thread
+// pool and answers once. Resolves when the map has been filled.
+// A play session creates or replaces save states, and "this game has no state"
+// is cached as null just as firmly as a picture — so after playing, the row
+// would keep showing box art until the next app start. Drop the lot; the row's
+// own effect refetches, and a Continue-playing-sized batch is one call.
+export const _stateThumbListeners = new Set<() => void>();
+
+export function invalidateStateThumbs() {
+  _stateThumbs.clear();
+  // Clearing alone isn't enough: the row refetches from an effect keyed on the
+  // games it shows, and after a session those are usually the same games.
+  _stateThumbListeners.forEach((l) => { try { l(); } catch { } });
+}
+
+export async function loadStateThumbs(romIds: number[], force = false): Promise<void> {
+  const missing = romIds.filter((id) => !_stateThumbs.has(id));
+  if (!missing.length) return;
+  if (_stateThumbsInflight) await _stateThumbsInflight;
+  const still = romIds.filter((id) => !_stateThumbs.has(id));
+  if (!still.length) return;
+  _stateThumbsInflight = (async () => {
+    try {
+      const r = await getStateThumbnails(still, force);
+      const thumbs = r?.thumbs || {};
+      // Absent keys are recorded as null too: the backend answered, and without
+      // this the next visit would ask again for the same nothing.
+      for (const id of still) _stateThumbs.set(id, thumbs[String(id)] ?? null);
+    } catch {
+      // Leave them unset so the next visit retries rather than caching a
+      // failure as "no state".
+    } finally {
+      _stateThumbsInflight = null;
+    }
+  })();
+  await _stateThumbsInflight;
+}
+
+// ── Multi-disc helpers (shared by the cover tile, the Play button and the
+// Files tab) ────────────────────────────────────────────────────────────────
+export type LocalDisc = { name: string; path: string; is_m3u: boolean; is_region?: boolean };
+
+// Friendly label for a disc file: keep the "(Disc N)" tail when present, else
+// fall back to the bare filename (sans extension).
+export function discDisplayLabel(fname: string): string {
+  const base = fname.replace(/\.[^.]+$/, '');
+  const m = base.match(/\(dis[ck]\s*\d+[^)]*\)/i);
+  return m ? m[0].replace(/[()]/g, '') : base;
+}
+
+// Friendly label for a regional variant file: surface the "(Region)" tag
+// (e.g. "(Italy)", "(USA, Europe)") that RomM/No-Intro dumps carry, else the
+// bare filename (sans extension).
+export function regionDisplayLabel(fname: string): string {
+  const base = fname.replace(/\.[^.]+$/, '');
+  const m = base.match(/\(([^)]+)\)\s*$/);
+  return m ? m[1] : base;
+}
+
+// Picker listing the bootable discs (V2 modal). The first item launches the
+// .m3u playlist (in-game disc swap) when present, else disc 1. `last` is the
+// remembered disc (what a plain Play resumes) and is checkmarked. Choosing the
+// playlist persists the .m3u name so a later plain Play resumes the playlist.
+export function openDiscPicker(romId: number, gameName: string, discs: LocalDisc[],
+  last?: string, setBusy?: (b: any) => void, onLaunched?: () => void) {
+  // A regional multi-file ROM has no playlist — every entry is a standalone
+  // region. Present it as a region picker (no "all discs" default).
+  const isRegion = discs.length > 0 && discs.every((d) => d.is_region);
+  if (isRegion) {
+    // Default to the remembered region, else the first one.
+    const activeName = (last && discs.some((d) => d.name === last)) ? last : discs[0]?.name;
+    showModal(
+      <PickerModal title="Select region" items={discs.map((d) => ({
+        key: d.name, label: regionDisplayLabel(d.name), active: d.name === activeName,
+        onSelect: () => runLaunch(romId, gameName, d.name, regionDisplayLabel(d.name), setBusy, onLaunched),
+      }))} />
+    );
+    return;
+  }
+  const m3u = discs.find((d) => d.is_m3u);
+  const pickable = discs.filter((d) => !d.is_m3u);
+  // The playlist is the active default when it is the remembered choice, or when
+  // nothing is remembered yet (the implicit first-launch default).
+  const m3uActive = !!m3u && (last === m3u.name || !last);
+  showModal(
+    <PickerModal title="Select disc" items={[
+      {
+        key: '__all__', label: m3u ? 'Play (all discs, in-game swap)' : 'Play (disc 1)',
+        active: m3uActive,
+        onSelect: () => runLaunch(romId, gameName, m3u ? m3u.name : null,
+          m3u ? 'All discs' : undefined, setBusy, onLaunched),
+      },
+      ...pickable.map((d) => ({
+        key: d.name, label: discDisplayLabel(d.name), active: last === d.name,
+        onSelect: () => runLaunch(romId, gameName, d.name, discDisplayLabel(d.name), setBusy, onLaunched),
+      })),
+    ]} />
   );
 }

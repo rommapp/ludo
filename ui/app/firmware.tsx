@@ -2,11 +2,10 @@ import { getSwitchFirmwareProgress, installSwitchFirmware, switchPrereqForRom } 
 import { Focusable, ModalRoot, showModal, toaster, GamepadButton} from "@ludo/host";
 import { useEffect, useRef } from "react";
 import { _forceGamepadFocus } from "./shell";
-import { MODAL_SCRIM_INSET } from "./index";
 import { V2_FOCUS_STYLE } from "./focus";
 import { V2 } from "./theme";
 import { FaExclamationTriangle, FaMicrochip } from "react-icons/fa";
-import { V2Button } from "./kit";
+import { V2Button, MODAL_SCRIM_INSET} from "./kit";
 // Switch firmware and keys, which a Switch rom needs on the device before it
 // will boot at all.
 //

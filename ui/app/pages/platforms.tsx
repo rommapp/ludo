@@ -1,8 +1,7 @@
-import { ScrollFade } from "../index";
 import { v2Page } from "../focus";
 import { Focusable } from "@ludo/host";
 import { libBack } from "../nav";
-import { GameActionButton, V2SettingsSection } from "../kit";
+import { GameActionButton, V2SettingsSection, ScrollFade} from "../kit";
 import { FaChevronLeft } from "react-icons/fa";
 import { V2 } from "../theme";
 import { PlatformSyncList, usePlatformSync } from "../emulator";

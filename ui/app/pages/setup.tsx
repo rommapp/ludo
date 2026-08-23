@@ -1,11 +1,10 @@
-import { MODAL_SCRIM_INSET, V2CardRow, ScrollFade } from "../index";
 import { cloneElement, useEffect, useRef, useState } from "react";
 import { finishOnboarding, getConfig, getRommLogo, getSteamTileStatus, pairDevice, repairEmulatorPaths, saveConfig, setDeviceNameRpc, setLibraryPaths, setSteamTile, testRommConnection } from "../rpc";
 import { FileSelectionType, Focusable, Navigation, host, openFilePicker, showModal, toaster, ModalRoot, GamepadButton} from "@ludo/host";
 import { V2 } from "../theme";
 import { FaBoxOpen, FaCheck, FaCheckCircle, FaChevronLeft, FaChevronRight, FaDownload, FaExternalLinkAlt, FaGamepad, FaPlay, FaPuzzlePiece, FaSave, FaSync, FaTimes, FaUndo} from "react-icons/fa";
 import { libNavigate } from "../nav";
-import { Bumper, GameActionButton, PairCodeField, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, V2TextField, UserMenuRow} from "../kit";
+import { Bumper, GameActionButton, PairCodeField, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, V2TextField, UserMenuRow, MODAL_SCRIM_INSET, ScrollFade, V2CardRow} from "../kit";
 import { _forceGamepadFocus, playSteamSound, useAutoFocus } from "../shell";
 import { V2Bg } from "../media";
 import { V2_FOCUS_STYLE } from "../focus";

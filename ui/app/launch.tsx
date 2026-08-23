@@ -2,14 +2,14 @@ import { host, showModal, toaster, Focusable, GamepadButton, ModalRoot} from "@l
 import { libNavigate } from "./nav";
 import { libCacheSetDownloaded } from "./libcache";
 import { launchGame, prepareSteamLaunch, downloadCore, getSyncEpoch, setCoreOverride} from "./rpc";
-import { MODAL_SCRIM_INSET, invalidateStateThumbs } from "./index";
 import { useRef, useState } from "react";
 import { V2_FOCUS_STYLE } from "./focus";
 import { V2 } from "./theme";
 import { FaChevronRight, FaCog, FaPlay, FaPuzzlePiece, FaDownload, FaSync, FaTimes} from "react-icons/fa";
-import { UserMenuRow } from "./kit";
+import { UserMenuRow, MODAL_SCRIM_INSET} from "./kit";
 import { _broadcastLibRefresh } from "./events";
 import { EmuStatus, loadEmulatorStatus, standaloneFor } from "./emulator";
+import { invalidateStateThumbs } from "./tiles";
 // Starting a game, and the one thing that differs between the two shells.
 //
 // On the Deck the emulator must run as a child of a Steam-tracked game or the

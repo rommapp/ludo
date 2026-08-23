@@ -5,26 +5,17 @@ import { useEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
 import { deleteGame, downloadGame, getGameDetail, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns} from "../rpc";
 import { _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
-import {
-  MODAL_SCRIM_INSET,
-  openGameById,
-  SectionHeading,
-  discDisplayLabel,
-  LocalDisc,
-  ToastCover,
-  openDiscPicker,
-  useRommImage,
-  useSaveActivityFor,
-} from "../index";
-import { Bumper, GameActionButton, PlatformIcon, V2Button, V2SettingsRow } from "../kit";
+import { Bumper, GameActionButton, PlatformIcon, V2Button, V2SettingsRow, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage} from "../kit";
 import { _dlSucceeded, _setDlActive, awaitDownload, useDownloadProgress, useIsDownloading, downloadOne} from "../downloads";
 import { maybePromptSwitchFirmware } from "../firmware";
 import { libBack, libNavigate } from "../nav";
 import { GameCover } from "../media";
 import { MdVerified } from "react-icons/md";
-import { getLibGameHolder, getLibGameOrigin, libCacheSetDownloaded} from "../libcache";
+import { getLibGameHolder, getLibGameOrigin, libCacheSetDownloaded, openGameById} from "../libcache";
 import { cannotLaunch, runLaunch } from "../launch";
 import { standaloneFor, useEmulatorStatus } from "../emulator";
+import { LocalDisc, discDisplayLabel, openDiscPicker } from "../tiles";
+import { useSaveActivityFor } from "../status";
 // One game, in full: the hero art, the actions, and the four metadata tabs.
 //
 // The tabs are where most of this lives — overview, files, save data,

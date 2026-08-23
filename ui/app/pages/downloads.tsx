@@ -9,7 +9,7 @@ import { libBack } from "../nav";
 import { CollectionSyncStatusRow, DownloadRowCover, DownloadStatusRow, GameActionButton, V2StatsSectionBox, _gameLabel, useRowHighlight} from "../kit";
 import { FaBoxOpen, FaChevronLeft, FaCloudUploadAlt, FaDownload, FaHistory, FaRegClock, FaCheckCircle, FaChevronRight} from "react-icons/fa";
 import { V2, fmtAgo} from "../theme";
-import { openGameById } from "../index";
+import { openGameById } from "../libcache";
 // The Downloads page: what is transferring now, what is queued behind it.
 //
 // It owns none of that state — downloads.ts does, because the same transfer is

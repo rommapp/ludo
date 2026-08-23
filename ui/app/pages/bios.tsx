@@ -3,10 +3,9 @@ import { downloadBios, getBiosInventory, getSwitchAddonMode, setSwitchAddonMode,
 import { Focusable, ModalRoot, showModal, toaster } from "@ludo/host";
 import { V2_FOCUS_STYLE, v2Page } from "../focus";
 import { libBack } from "../nav";
-import { GameActionButton, PlatformIcon, UserMenuRow, V2Segment, V2SettingsRow, V2SettingsSection } from "../kit";
+import { GameActionButton, PlatformIcon, UserMenuRow, V2Segment, V2SettingsRow, V2SettingsSection, MODAL_SCRIM_INSET} from "../kit";
 import { FaCheckCircle, FaChevronLeft, FaDownload, FaHistory, FaMicrochip, FaSync, FaTimesCircle, FaChevronRight} from "react-icons/fa";
 import { _forceGamepadFocus } from "../shell";
-import { MODAL_SCRIM_INSET } from "../index";
 import { V2, fmtBytes } from "../theme";
 import { SwitchFirmwareConfirm, fmtFirmwareProgress, installSwitchFirmwareWatched, switchInstallSummary } from "../firmware";
 // BIOS files: which platforms need one, and which of those are satisfied.

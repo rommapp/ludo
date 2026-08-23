@@ -1,28 +1,17 @@
 import { LibGame, LibGroup } from "../types";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { deleteCollectionRoms, getConfig, getDownloadProgress, getHomeData, getLibraryGames, getLibraryGroups, getResumeStateEnabled, getServiceStatus, repairEmulatorPaths, searchGames, toggleCollectionSync, checkLibraryStale, refreshFromRomm} from "../rpc";
-import { CardRow, CollectionTile, GameTile, PlatformTile } from "../tiles";
+import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _setResumeStatesPref, _stateThumbListeners, _stateThumbs, _tileElsByRomId, loadStateThumbs} from "../tiles";
 import { _autoFocusFirstRef, _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
-import { Bumper, GameActionButton, V2SearchField, useEtaFromPct } from "../kit";
+import { Bumper, GameActionButton, V2SearchField, useEtaFromPct, Shimmer} from "../kit";
 import { V2, formatEta, formatSpeed } from "../theme";
 import { Focusable, GamepadButton, Navigation, host, showModal, toaster } from "@ludo/host";
-import {
-  NAV_MAINTAIN_X,
-  _resumeStatesPref,
-  _setResumeStatesPref,
-  _tileElsByRomId,
-  libCacheDelete,
-  Shimmer,
-  _stateThumbListeners,
-  loadStateThumbs,
-  _stateThumbs,
-} from "../index";
 import { FaBookmark, FaCheck, FaChevronRight, FaDownload, FaEllipsisH, FaExclamationTriangle, FaGamepad, FaLayerGroup, FaPlay, FaRegClock, FaSync } from "react-icons/fa";
 import { LibView, NavId, libBack, libNavigate, navExitPlugin, pushLibView, setLibViewHooks } from "../nav";
-import { _groupsCache, _libGamesCache, getHomeCache, getLibGroupHolder, getLibGroupsHolder, getLibLastTab, libCacheSet, libCacheSetDownloaded, persistGroupsCache, persistHomeCache, setHomeCache, setLibGameHolder, setLibGameOrigin, setLibGroupHolder, setLibGroupsHolder, setLibLastTab, _focusedPlatformSubs, _focusedPlatform} from "../libcache";
+import { _groupsCache, _libGamesCache, getHomeCache, getLibGroupHolder, getLibGroupsHolder, getLibLastTab, libCacheSet, libCacheSetDownloaded, persistGroupsCache, persistHomeCache, setHomeCache, setLibGameHolder, setLibGameOrigin, setLibGroupHolder, setLibGroupsHolder, setLibLastTab, _focusedPlatformSubs, _focusedPlatform, libCacheDelete} from "../libcache";
 import { useOffline, useServiceStatus, StaleInfo, _STALE_CHECK_MS, _STALE_RANK, _setStale, _staleInfo, _staleSubs, _clearStale, lastStaleCheck, markStaleChecked} from "../status";
 import { _broadcastLibRefresh, _libRefreshListeners } from "../events";
-import { ScrubOverlay, letterJump, setLetterJump, setScrubGlimpse, _scrubLetterOf, _scrubTargetIdx} from "../scrub";
+import { ScrubOverlay, letterJump, setLetterJump, setScrubGlimpse, _scrubLetterOf, _scrubTargetIdx, NAV_MAINTAIN_X} from "../scrub";
 import { GameDetailPage } from "./game";
 import { SettingsPage } from "./settings";
 import { StatsPage } from "./stats";

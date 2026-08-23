@@ -11,10 +11,14 @@
 // library before the server answers — or instead of it, when offline.
 
 import { _lsAvail } from "./storage";
+import { _LS_PLATICON, _platIconCache } from "./media";
 import { _downloadedListeners, _broadcastLibRefresh} from "./events";
 import type { LibGroup, LibGame } from "./types";
 import type { NavId } from "./nav";
 import { _dlSucceeded } from "./downloads";
+import { pushLibView } from "./nav";
+import { Navigation } from "@ludo/host";
+import { _clearStale } from "./status";
 
 // Module-level holders pass the selection between Game Browser routes without
 // re-fetching (same pattern as _historyGameHolder).
@@ -172,3 +176,120 @@ export function _setFocusedPlatform(p: typeof _focusedPlatform) {
   _focusedPlatform = p;
   _focusedPlatformSubs.forEach((fn) => { try { fn(p); } catch { /* ignore */ } });
 }
+
+export function libCacheDelete(key: string) { _libGamesCache.delete(key); _dropLibGroup(key); }
+
+// Remove a game from every cached group. Called when the server has confirmed
+// the ROM is gone — the backend has already dropped it from the library, but
+// the cached lists (its platform, any collections, Home) would keep serving the
+// tile until the next full refetch, which is exactly the phantom this exists to
+// clear. Mirrors libCacheSetDownloaded's fan-out rather than invalidating
+// everything, so nothing else has to be re-fetched.
+export function libCacheDrop(romId: number) {
+  _dlSucceeded.delete(romId);
+  for (const [key, list] of _libGamesCache) {
+    if (!list.some((g) => g.rom_id === romId)) continue;
+    libCacheSet(key, list.filter((g) => g.rom_id !== romId));
+  }
+  _broadcastLibRefresh();
+}
+
+// Find a cached LibGame by rom id, across every group it might sit in. Used to
+// open a game from somewhere that only knows an id (the Downloads page's
+// completed list). Returns null when nothing is cached — see openGameById for
+// what happens then.
+export function libCacheFindGame(romId: number): LibGame | null {
+  for (const [, list] of _libGamesCache) {
+    const g = list.find((x) => x.rom_id === romId);
+    if (g) return g;
+  }
+  // Home's rows aren't in _libGamesCache, and a just-downloaded game is very
+  // likely sitting in one of them.
+  for (const list of [getHomeCache()?.downloaded, getHomeCache()?.recent, getHomeCache()?.continuePlaying]) {
+    const g = list?.find((x) => x.rom_id === romId);
+    if (g) return g;
+  }
+  return null;
+}
+
+// Open the game detail page knowing only a rom id (and, at best, a name).
+// GameDetailPage fetches its own detail from the backend, so a stub is enough
+// to render — the cached LibGame is preferred only because it paints the name,
+// platform and downloaded state on the first frame instead of after the fetch.
+export function openGameById(romId: number, name: string, origin: string) {
+  const cached = libCacheFindGame(romId);
+  setLibGameHolder(cached || {
+    rom_id: romId, name, platform: null,
+    is_downloaded: true, has_cover: true,
+  });
+  setLibGameOrigin(origin);
+  if (!pushLibView('game')) Navigation.Navigate(`/romm-sync-game/${romId}`);
+}
+
+// Whether the live save-sync notification may appear. Cached module-side: it is
+// read from the background notification poll (which is not a component at all)
+// as well as from the Settings switch, and it changes only when the user flips
+// that switch. The listener set is what lets the flip take effect without a
+// reload.
+export let _syncPillPref: boolean | null = null;
+
+/** The sync-pill preference, or null until it has been read from storage. */
+export function syncPillPref(): boolean | null { return _syncPillPref; }
+
+export const _syncPillListeners = new Set<() => void>();
+
+export function _setSyncPillPref(on: boolean) {
+  _syncPillPref = on;
+  _syncPillListeners.forEach((l) => { try { l(); } catch { } });
+}
+
+/**
+ * "The library just changed underneath you" — retire the staleness banner and
+ * tell every mounted view to refetch.
+ *
+ * Exported because the Deck's Quick Access panel can refresh the library too,
+ * from outside the app's own screens. It calls this rather than reaching for
+ * _clearStale and _broadcastLibRefresh itself, which keeps what a refresh
+ * *means* on this side of the seam and the plugin's import surface at two
+ * names.
+ */
+export function notifyLibraryRefreshed() {
+  _clearStale();
+  _broadcastLibRefresh();
+}
+
+// Hydrate both caches once at module load from any non-expired localStorage data.
+(function _hydrateBrowseCaches() {
+  if (!_lsAvail) return;
+  const now = Date.now();
+  try {
+    const stale: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(_LS_LIB_PREFIX)) continue;
+      try {
+        const o = JSON.parse(localStorage.getItem(k) || 'null');
+        if (o && Array.isArray(o.v) && (now - (o.t || 0)) < _LS_TTL_MS)
+          _libGamesCache.set(k.slice(_LS_LIB_PREFIX.length), o.v);
+        else stale.push(k);
+      } catch { stale.push(k); }
+    }
+    stale.forEach((k) => { try { localStorage.removeItem(k); } catch { } });
+  } catch { }
+  try {
+    const o = JSON.parse(localStorage.getItem(_LS_HOME_KEY) || 'null');
+    if (o && o.v && (now - (o.t || 0)) < _LS_TTL_MS) setHomeCache(o.v);
+    else if (o) localStorage.removeItem(_LS_HOME_KEY);
+  } catch { }
+  try {
+    const o = JSON.parse(localStorage.getItem(_LS_GROUPS_KEY) || 'null');
+    if (o && o.v && (now - (o.t || 0)) < _LS_TTL_MS)
+      for (const k of Object.keys(o.v)) _groupsCache[k] = o.v[k];
+    else if (o) localStorage.removeItem(_LS_GROUPS_KEY);
+  } catch { }
+  try {
+    const o = JSON.parse(localStorage.getItem(_LS_PLATICON) || 'null');
+    if (o && typeof o === 'object')
+      for (const k of Object.keys(o)) _platIconCache.set(k, o[k]);
+  } catch { }
+})();

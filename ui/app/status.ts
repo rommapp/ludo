@@ -295,3 +295,17 @@ export function _setStale(s: StaleInfo | null) {
 // the interval — a manual refresh resolves it just as the banner's own button
 // does, and one left on screen after the fact reads as a failure.
 export function _clearStale() { _setStale(null); markStaleChecked(); }
+
+// Is THIS game's save the one moving? The engine resolves the rom_id from the
+// save file it is uploading, so the answer is exact rather than a name match.
+//
+// Siblings count as the same tile. A multi-region game is ONE card standing for
+// several server rows, and the save came from whichever row was launched — with
+// a bare rom_id test, playing the USA copy of a game whose card is keyed to the
+// European one lights nothing at all.
+export function useSaveActivityFor(game?: { rom_id: number; sibling_roms?: { rom_id: number }[] } | null): SaveActivity | null {
+  const a = useSaveActivity();
+  if (!a || a.rom_id == null || !game) return null;
+  if (a.rom_id === game.rom_id) return a;
+  return (game.sibling_roms || []).some((sib) => sib.rom_id === a.rom_id) ? a : null;
+}

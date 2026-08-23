@@ -8,13 +8,13 @@
 // re-deriving what a focusable thing has to do.
 
 import { useState, useEffect, useRef, forwardRef, type Ref, ChangeEvent} from "react";
-import { Focusable, TextField } from "@ludo/host";
+import { Focusable, TextField, GamepadButton, ModalRoot} from "@ludo/host";
 import { V2, fmtBytes, formatEta, formatSpeed } from "./theme";
-import { V2Focus } from "./focus";
+import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { _forceGamepadFocus, _summonVirtualKeyboard, _dismissVirtualKeyboard } from "./shell";
 import { useDownloadProgress } from "./downloads";
 import { _platIconCache, _platIconCacheSet, qGetImage, awaitCover, peekCover, qGetGameCover} from "./media";
-import { FaBoxOpen, FaGamepad, FaSearch, FaTimesCircle } from "react-icons/fa";
+import { FaBoxOpen, FaGamepad, FaSearch, FaTimesCircle, FaCheck} from "react-icons/fa";
 // Box art for a Downloads-page row, so each entry is recognisable at a glance
 // rather than being a name in a list. Same cache/queue path as the tiles, so a
 // game whose grid cover was already painted renders on the first frame. The
@@ -968,4 +968,252 @@ export function UpdateActionBtn({ label, icon, onClick, disabled, primary, progr
       </div>
     </Focusable>
   );
+}
+
+// Full-screen modal scrims stop short of the button legend at the bottom of the
+// screen, so the hints for the modal's own buttons stay readable while it is
+// open — dimming and blurring the one bar that says which button does what is
+// exactly backwards. The desktop shim publishes its legend height as
+// --shim-legend-h; on the Deck the variable is absent and the fallback is
+// Steam's own fixed legend, measured at 42px on-device.
+export const MODAL_SCRIM_INSET = '0 0 var(--shim-legend-h, 42px) 0';
+
+// Box art for a toast's logo slot, so a "Downloaded" notification shows the
+// game rather than just naming it. The cover is nearly always already in
+// `_coverCache` — the tile the user pressed painted it — so this renders on the
+// first frame; a cache miss loads in behind nothing rather than reserving an
+// empty box, and a rom with no art renders nothing at all, which lets the host
+// fall back to its own icon instead of showing a grey rectangle.
+export function ToastCover({ romId, hasCover }: { romId: number; hasCover: boolean }) {
+  const ck = `cover:${romId}:false`;
+  const [uri, setUri] = useState<string | null>(peekCover(ck) ?? null);
+  useEffect(() => {
+    if (!hasCover || peekCover(ck) !== undefined) return;
+    let alive = true;
+    awaitCover(ck, () => qGetGameCover(romId, false))
+      .then((u) => { if (alive) setUri(u); })
+      .catch(() => { /* no art, no logo */ });
+    return () => { alive = false; };
+  }, [romId]);
+  if (!uri) return null;
+  return (
+    <img src={uri} style={{
+      // Box art is the fastest way to recognise which game a toast is about,
+      // and at 32px it read as an icon rather than a cover. Height-capped as
+      // well as width-set: the toast is only so tall, and a 3:4 portrait is the
+      // dimension that runs out first.
+      width: '56px', maxHeight: '76px', aspectRatio: '3 / 4',
+      objectFit: 'cover', display: 'block',
+      borderRadius: V2.radiusSm, border: '1px solid rgba(255,255,255,0.12)',
+    }} />
+  );
+}
+
+// Uppercase eyebrow heading for an overview section (RomM
+// .overview-tab__section-heading).
+export function SectionHeading({ icon, children }: { icon?: any; children: any }) {
+  return (
+    <div style={{
+      display: 'inline-flex', alignItems: 'center', gap: '6px', margin: 0,
+      fontSize: '11px', fontWeight: 700, letterSpacing: '0.1em',
+      textTransform: 'uppercase', color: V2.fgFaint,
+    }}>
+      {icon}{children}
+    </div>
+  );
+}
+
+// Placeholder block with a slow left-to-right sheen — the shared building brick
+// for every "we don't know this yet" shape.
+export function Shimmer({ style }: { style?: any }) {
+  return (
+    <div style={{
+      background: V2.bgElevated, borderRadius: V2.radiusSm, overflow: 'hidden',
+      position: 'relative', ...style,
+    }}>
+      <div style={{
+        position: 'absolute', inset: 0,
+        background: 'linear-gradient(100deg, transparent 20%, rgba(255,255,255,0.055) 50%, transparent 80%)',
+        animation: 'rommShimmer 1.4s ease-in-out infinite',
+      }} />
+    </div>
+  );
+}
+
+// The same row, but flat: no card of its own, so several can live inside ONE
+// surface separated by hairlines (see FoldersSection). Highlight is drawn inset
+// instead of as a border, which keeps the card's outline unbroken.
+export function V2CardRow({ icon, title, subtitle, onClick, right, danger, divider, first, last }:
+  { icon?: any; title: any; subtitle?: any; onClick?: () => void; right?: any;
+    danger?: boolean; divider?: boolean; first?: boolean; last?: boolean }) {
+  const { active, highlightHandlers } = useRowHighlight();
+  const interactive = !!onClick;
+  const accent = danger ? V2.danger : V2.brand;
+  // The highlight ring has to follow the CARD's corners, not its own: a row in
+  // the middle is square, but the top and bottom rows sit in the card's rounded
+  // ends. One pixel less than the card radius, because the card's 1px border
+  // sits outside this ring.
+  const end = `calc(${V2.radiusCard} - 1px)`;
+  return (
+    <Focusable noFocusRing
+      onActivate={interactive ? onClick : undefined}
+      onClick={interactive ? onClick : undefined}
+      {...highlightHandlers}
+      style={{
+        display: 'flex', alignItems: 'center', gap: '14px', padding: '13px 14px',
+        borderTopLeftRadius: first ? end : 0,
+        borderTopRightRadius: first ? end : 0,
+        borderBottomLeftRadius: last ? end : 0,
+        borderBottomRightRadius: last ? end : 0,
+        borderTop: divider ? `1px solid ${V2.border}` : 'none',
+        background: active && interactive ? V2.surfaceHover : 'transparent',
+        boxShadow: active && interactive ? `inset 0 0 0 2px ${accent}` : 'none',
+        cursor: interactive ? 'pointer' : 'default',
+        transition: 'background 0.15s, box-shadow 0.15s',
+      }}>
+      {icon && (
+        <div style={{
+          flexShrink: 0, width: '32px', height: '32px', borderRadius: V2.radiusMd,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: danger ? 'rgba(255,80,80,0.12)' : V2.bgElevated,
+          color: danger ? V2.danger : V2.brandHover,
+        }}>{icon}</div>
+      )}
+      <div style={{ flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: '2px' }}>
+        <div style={{ fontSize: '14px', fontWeight: 600, color: danger ? V2.danger : V2.fg }}>{title}</div>
+        {subtitle && <div style={{ fontSize: '12px', color: V2.fgMuted, lineHeight: 1.35 }}>{subtitle}</div>}
+      </div>
+      {right != null && <div style={{ flexShrink: 0 }}>{right}</div>}
+    </Focusable>
+  );
+}
+
+// The toggle list itself, shared by Settings ▸ Platforms and the setup wizard's
+// optional Platforms step — the two must never drift, because they are the same
+// decision made at two different moments.
+// A bounded scroll box whose edges fade out only while there is more content
+// past them. The fade IS the affordance: a hard-cut edge mid-row reads as a
+// layout bug, and on a controller there is no scrollbar to say otherwise —
+// nothing else on screen tells you the list continues. Both edges are computed
+// independently so the top fade appears only once you have actually scrolled,
+// rather than veiling the first row from the start.
+export function ScrollFade({ maxHeight, refresh, children, style }: {
+  maxHeight: string;
+  // Bump when the content's height can have changed without a scroll (rows
+  // arriving, a subtitle growing on toggle) — there is no scroll event for that.
+  refresh?: any;
+  children: any;
+  style?: any;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [edges, setEdges] = useState({ top: false, bottom: false });
+
+  const measure = () => {
+    const el = ref.current;
+    if (!el) return;
+    // 2px slack: fractional scroll offsets (dpad scrollIntoView lands on
+    // sub-pixel positions) would otherwise leave a fade stuck on at the end.
+    const top = el.scrollTop > 2;
+    const bottom = el.scrollTop + el.clientHeight < el.scrollHeight - 2;
+    setEdges((p) => (p.top === top && p.bottom === bottom ? p : { top, bottom }));
+  };
+
+  useEffect(() => { measure(); }, [refresh, maxHeight]);
+
+  const F = '30px';
+  const mask = edges.top && edges.bottom
+    ? `linear-gradient(to bottom, transparent 0, #000 ${F}, #000 calc(100% - ${F}), transparent 100%)`
+    : edges.top
+      ? `linear-gradient(to bottom, transparent 0, #000 ${F})`
+      : edges.bottom
+        ? `linear-gradient(to bottom, #000 calc(100% - ${F}), transparent 100%)`
+        : undefined;
+
+  return (
+    <div ref={ref} onScroll={measure}
+      style={{
+        maxHeight, overflowY: 'auto', overflowX: 'hidden',
+        WebkitMaskImage: mask, maskImage: mask,
+        // Both properties, or the mask is applied per-box and each row fades
+        // against its own edges instead of the container's.
+        WebkitMaskSize: '100% 100%', maskSize: '100% 100%',
+        ...style,
+      }}>
+      {children}
+    </div>
+  );
+}
+
+// V2 glass picker — the disc/region selector in the app's own modal language
+// (same chrome as CollectionActionsModal / UserMenuModal) instead of Steam's
+// native context menu. Rows reuse UserMenuRow; the remembered/default entry
+// carries a check in the icon slot.
+export function PickerModal({ title, items, closeModal }: {
+  title: string;
+  items: { key: string | number; label: string; active?: boolean; onSelect: () => void }[];
+  closeModal?: () => void;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60); return () => clearTimeout(t); }, []);
+  return (
+    <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}
+      className="romm-modal-collapse" modalClassName="romm-modal-collapse">
+      <Focusable noFocusRing className="romm-ui"
+        onCancelButton={() => closeModal?.()}
+        onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
+        style={{
+          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(7,7,15,0.45)',
+          WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
+        }}>
+        <style>{`
+          ${V2_FOCUS_STYLE}
+          .romm-modal-collapse, .romm-modal-collapse > div {
+            background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important;
+          }
+          @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }
+        `}</style>
+        <div onClick={() => closeModal?.()} style={{ position: 'absolute', inset: 0 }} />
+        <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
+          position: 'relative', width: '340px', maxWidth: '90vw', boxSizing: 'border-box',
+          fontFamily: V2.font, color: V2.fg, padding: '8px',
+          display: 'flex', flexDirection: 'column',
+          background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
+          WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
+          border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
+          boxShadow: '0 16px 48px rgba(0,0,0,0.55)',
+          maxHeight: '82vh', overflowY: 'auto',
+          animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
+        }}>
+          <div style={{
+            fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em',
+            color: V2.fgMuted, padding: '6px 8px 10px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+          }}>{title}</div>
+          <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
+          {items.map((it) => (
+            <UserMenuRow key={it.key}
+              icon={it.active ? <FaCheck size={14} style={{ color: V2.brand }} /> : null}
+              label={it.label}
+              onSelect={() => { closeModal?.(); it.onSelect(); }} />
+          ))}
+        </Focusable>
+      </Focusable>
+    </ModalRoot>
+  );
+}
+
+// Fetch an auth-gated RomM resource path as a base64 data URI (backend proxy).
+export function useRommImage(path: string | null): string | null {
+  const [uri, setUri] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    if (!path) { setUri(null); return; }
+    (async () => {
+      try { const r = await qGetImage(path); if (alive) setUri(r?.data_uri || null); }
+      catch { if (alive) setUri(null); }
+    })();
+    return () => { alive = false; };
+  }, [path]);
+  return uri;
 }
