@@ -13,6 +13,14 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "allowJs": false,
+    // Kept in step with decky_plugin/tsconfig.json. Both projects compile the
+    // same ui/ sources, so a rule enforced by only one of them is a rule the
+    // other build discovers late — these four were decky-only, and what they
+    // caught in ui/app/ went unseen here for that reason.
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitThis": true,
     "baseUrl": ".",
     // Mirrors the aliases in vite.config.ts. tsc does not read those, so
     // without these it resolves bare imports by walking up from the shared UI,
