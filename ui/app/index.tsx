@@ -24,7 +24,6 @@ import {
   FaHome,
   FaSearch,
   FaTimes,
-  FaTimesCircle,
   FaDownload,
   FaPlay,
   FaInfoCircle,
@@ -46,7 +45,6 @@ import {
   FaChevronDown,
   FaChartBar,
   FaExclamationTriangle,
-  FaHistory,
   FaPowerOff,
   FaCloudUploadAlt,
   FaMicrochip,
@@ -61,14 +59,12 @@ import {
   checkLibraryStale,
   deleteCollectionRoms,
   deleteGame,
-  downloadBios,
   downloadCore,
   downloadGame,
   drainNotifications,
   emulatorInstallState,
   getAccountUsername,
   getAvatar,
-  getBiosInventory,
   getCheckOnStartup,
   getConfig,
   getDownloadProgress,
@@ -90,13 +86,10 @@ import {
   getServiceStatus,
   getStateThumbnails,
   getSwitchAddOns,
-  getSwitchAddonMode,
-  getSwitchFirmwareProgress,
   getSyncEpoch,
   getSyncIndicator,
   getUpdateChannel,
   installEmulator,
-  installSwitchFirmware,
   launchGame,
   notifyNetworkState,
   prepareSteamLaunch,
@@ -107,9 +100,6 @@ import {
   searchGames,
   setCoreOverride,
   setPlatformSync,
-  setSwitchAddonMode,
-  switchFirmwareStatus,
-  switchPrereqForRom,
   toggleCollectionSync,
 } from "./rpc";
 import { MdVerified } from "react-icons/md";
@@ -128,6 +118,9 @@ import { CoresPage } from "./pages/cores";
 import { ConfigPage } from "./pages/config";
 import { SetupWizard } from "./pages/setup";
 import { SettingsPage } from "./pages/settings";
+import { BiosPage, BiosDetailModal} from "./pages/bios";
+import { PlatformsPage } from "./pages/platforms";
+import { maybePromptSwitchFirmware } from "./firmware";
 import {
   _subscribeStatus,
   refreshStatusNow,
@@ -144,10 +137,10 @@ import {
   V2Button,
   GameActionButton,
   V2SearchField,
-  V2SettingsSection,
   V2SettingsRow,
   V2Switch,
-  V2Segment, _gameLabel, useRowHighlight,
+  _gameLabel,
+  useRowHighlight,
 } from "./kit";
 import {
   _forceGamepadFocus,
@@ -378,100 +371,14 @@ function ToastCover({ romId, hasCover }: { romId: number; hasCover: boolean }) {
 }
 
 
-// Starts the detached install and polls it to completion, reporting progress
-// as it goes. Returns the final state, so callers still read as "await the
-// install" while the RPC socket stays free the whole time.
-async function installSwitchFirmwareWatched(
-  onTick?: (p: { phase: string; have: number; total: number; bps: number }) => void,
-): Promise<any> {
-  const start = await installSwitchFirmware();
-  if (!start?.success) return start;
-  // Poll a little under a second: the backend recomputes speed on roughly
-  // that cadence, so asking faster returns the same numbers.
-  for (;;) {
-    await new Promise((r) => setTimeout(r, 700));
-    let p: any;
-    try { p = await getSwitchFirmwareProgress(); } catch { continue; }
-    if (!p) continue;
-    onTick?.({ phase: p.phase || '', have: p.have || 0, total: p.total || 0, bps: p.bps || 0 });
-    if (!p.active) return p;
-  }
-}
 
-// Human-readable transfer line: "142 / 325 MB · 8.4 MB/s". Speed is omitted
-// until the backend has a sample worth showing rather than printing 0 MB/s.
-function fmtFirmwareProgress(p: { phase: string; have: number; total: number; bps: number }): string {
-  if (p.phase === 'installing') return 'Unpacking…';
-  if (!p.total) return 'Starting…';
-  const mb = (n: number) => (n / 1048576).toFixed(0);
-  const speed = p.bps > 0 ? `  ·  ${(p.bps / 1048576).toFixed(1)} MB/s` : '';
-  return `${mb(p.have)} / ${mb(p.total)} MB${speed}`;
-}
 
-// What actually happened, in the terms someone cares about. "229 file(s)" is
-// an implementation detail of how a firmware set is packaged -- what a person
-// installed is "the firmware", and separately "the keys".
-function switchInstallSummary(r: any): string {
-  const status = r?.status;
-  if (status === 'no-emulator') return 'Eden isn’t installed on this device';
-  if (status === 'no-firmware') return 'No Switch firmware on the server';
-  // Firmware landed but nothing can decrypt it: the fix is an upload, not a
-  // retry, so say which.
-  if (status === 'no-keys') return 'Firmware installed, but prod.keys is missing — upload it to the Switch platform on RomM';
-  if (status === 'installed') {
-    const parts: string[] = [];
-    if (r.installed) parts.push('Firmware');
-    if (r.keys) parts.push('keys');
-    return parts.length ? `${parts.join(' and ')} installed` : 'Installed';
-  }
-  if (status === 'up-to-date') return 'Firmware and keys are already installed';
-  return r?.message || 'Install failed';
-}
 // The Switch firmware prompt is a modal, so it belongs to the page tree, not to
 // the download registry — which is why downloads.ts asks for it to be installed
 // rather than calling it. Registered once, at module load.
 setPreDownloadHook(maybePromptSwitchFirmware);
 
 
-// Getting a Switch game is the moment the firmware actually matters, so the
-// prompt belongs here rather than only on the BIOS page, which someone may
-// never open. Deliberately not a gate: declining installs no firmware and the
-// game still downloads, because a ROM on disk with no firmware is a recoverable
-// state and blocking the download would not make it less so.
-//
-// Once per session. The check is cheap, but a modal in front of every download
-// is not something anyone wants twice.
-let _switchPromptDone = false;
-async function maybePromptSwitchFirmware(romId: number): Promise<void> {
-  if (_switchPromptDone) return;
-  try {
-    const info = await switchPrereqForRom(romId);
-    if (!info?.needed) return;
-    _switchPromptDone = true;
-    // Keys missing but no firmware to fetch: nothing to confirm, so say it
-    // and move on rather than opening a modal whose only button is Cancel.
-    if (!info.available) {
-      toaster.toast({
-        title: 'Switch firmware',
-        body: 'prod.keys is missing — Switch games won’t boot until it’s uploaded to RomM',
-      });
-      return;
-    }
-    const mb = info.size ? `${(info.size / 1048576).toFixed(0)} MB` : 'a large download';
-    const ok = await new Promise<boolean>((resolve) => {
-      showModal(
-        <SwitchFirmwareConfirm
-          fileName={info.file_name} size={mb} reason={info.reason}
-          keysOk={info.keys_ok} version={info.version}
-          installedVersion={info.installed_version}
-          onAnswer={resolve} />
-      );
-    });
-    if (!ok) return;
-    const r = await installSwitchFirmwareWatched();
-    toaster.toast({ title: 'Switch firmware', body: switchInstallSummary(r) });
-  } catch { /* never let this stop a download */ }
-}
 
 
 
@@ -8255,97 +8162,6 @@ export function V2CardRow({ icon, title, subtitle, onClick, right, danger, divid
 
 
 
-// BiosPage — what RomM holds as firmware per platform, versus what's actually in
-// RetroArch's system dir, with a button to close the gap.
-//
-// The server is the source of truth for *which* files a platform wants, not the
-// core's libretro .info: the core Ludo resolves is not necessarily the core that
-// ends up running the game (the user can switch cores inside RetroArch), so a
-// check keyed on the resolved core stays silent for pcsx_rearmed while every PSX
-// BIOS is missing. The .info only decides how loudly to say it — 'required'
-// means that core won't boot at all, 'optional' means it has an HLE fallback.
-function BiosPage() {
-  const [rows, setRows] = useState<any[]>([]);
-  const [biosDir, setBiosDir] = useState('');
-  const [connected, setConnected] = useState(true);
-  const [loading, setLoading] = useState(true);
-  // The server couldn't be asked (typically busy serving a library fetch) —
-  // NOT the same as it holding no firmware, which is what this page used to
-  // claim in that case.
-  const [unavailable, setUnavailable] = useState(false);
-  const [libraryLoading, setLibraryLoading] = useState(false);
-
-  const load = async (refresh = false) => {
-    try {
-      const r = await getBiosInventory(refresh);
-      if (r?.success) {
-        setRows(r.platforms || []);
-        setBiosDir(r.bios_dir || '');
-        setConnected(!!r.connected);
-        setUnavailable(!!r.unavailable);
-        setLibraryLoading(!!r.library_loading);
-      }
-    } catch { /* ignore */ }
-    finally { setLoading(false); }
-  };
-  useEffect(() => { load(); }, []);
-
-  // Come back on our own while the server is busy, so the page fills in when
-  // the fetch eases off instead of parking on an error the user has to poke.
-  useEffect(() => {
-    if (!unavailable) return;
-    const t = setTimeout(() => load(true), 5000);
-    return () => clearTimeout(t);
-  }, [unavailable, rows]);
-
-  const openDetail = (row: any) =>
-    showModal(<BiosDetailModal slug={row.slug} platformName={row.platform_name || row.name}
-      seed={row} onChanged={load} />);
-
-  return v2Page(
-    <Focusable noFocusRing
-      onCancelButton={() => libBack("/romm-sync-library")}
-      style={{ maxWidth: '760px', margin: '0 auto', padding: '20px 20px 0' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
-        <GameActionButton icon={<FaChevronLeft size={16} />} onClick={() => libBack("/romm-sync-library")} />
-        <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Firmware / BIOS</div>
-      </div>
-
-      <V2SettingsSection title={biosDir ? `Stored in ${biosDir}` : 'BIOS'}>
-        {loading ? (
-          <V2SettingsRow icon={<FaMicrochip size={16} />} title="Checking BIOS files…" />
-        ) : !connected ? (
-          <V2SettingsRow icon={<FaMicrochip size={16} />}
-            title="Not connected to RomM"
-            subtitle="Connect to RomM to see its firmware." />
-        ) : unavailable ? (
-          <V2SettingsRow icon={<FaMicrochip size={16} />}
-            title={libraryLoading ? 'Waiting for your library to finish loading…'
-              : 'Couldn’t read firmware from RomM'}
-            subtitle={libraryLoading
-              ? 'Your server is busy sending the library. Retrying…'
-              : 'Your server didn’t answer. Retrying…'} />
-        ) : rows.length === 0 ? (
-          <V2SettingsRow icon={<FaMicrochip size={16} />}
-            title="No firmware on the server"
-            subtitle="Upload BIOS files to a platform in RomM." />
-        ) : rows.map((row) => (
-          <V2SettingsRow key={row.slug}
-            bareIcon
-            icon={<PlatformIcon slug={row.slug} size={28} />}
-            title={row.platform_name || row.name}
-            subtitle={row.missing_label
-              ? `${row.missing_label} missing — A to review`
-              : row.missing_count === 0
-                ? `${(row.files || []).length} file${(row.files || []).length === 1 ? '' : 's'} in place`
-                : `${(row.files || []).length} file${(row.files || []).length === 1 ? '' : 's'} — A to review`}
-            onClick={() => openDetail(row)}
-            right={biosChip(row, true)} />
-        ))}
-      </V2SettingsSection>
-    </Focusable>
-  );
-}
 
 // ─── Per-platform sync ───────────────────────────────────────────────────────
 // Which platforms Ludo reads from RomM at all. The backend stores the DISABLED
@@ -8558,465 +8374,10 @@ export function PlatformSyncList({ sync }: { sync: ReturnType<typeof usePlatform
   );
 }
 
-// PlatformsPage — Settings ▸ Platforms. The header counts what the switches add
-// up to, because the number that makes someone want to turn a platform off is
-// how many games it costs, not how many platforms there are.
-function PlatformsPage() {
-  const sync = usePlatformSync();
-  const { rows, enabledCount, enabledRoms, totalRoms, loading } = sync;
-  const summary = loading || !rows.length
-    ? 'Platforms'
-    : `${enabledCount} of ${rows.length} syncing · ${enabledRoms.toLocaleString()} of ${totalRoms.toLocaleString()} games`;
-  return v2Page(
-    <Focusable noFocusRing
-      onCancelButton={() => libBack("/romm-sync-settings")}
-      style={{ maxWidth: '760px', margin: '0 auto', padding: '20px 20px 0' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
-        <GameActionButton icon={<FaChevronLeft size={16} />} onClick={() => libBack("/romm-sync-settings")} />
-        <div style={{ fontSize: '24px', fontWeight: 800, letterSpacing: '-0.01em' }}>Platforms</div>
-      </div>
-
-      {/* Same bounded-with-fades treatment as the wizard's platform step. The
-          page would happily scroll the whole list, but then the header and the
-          "nothing is deleted" note scroll away with it — and on a 30-platform
-          server the note is the thing a hesitant user scrolls back up looking
-          for. Capping the list keeps both in view and puts the scrolling where
-          the content actually is. */}
-      <V2SettingsSection title={summary}>
-        <ScrollFade maxHeight="calc(100vh - 300px)"
-          refresh={`${rows.length}:${sync.off.size}`}
-          style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '2px' }}>
-          <PlatformSyncList sync={sync} />
-        </ScrollFade>
-      </V2SettingsSection>
-
-      <div style={{
-        fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45,
-        padding: '0 4px 24px',
-      }}>
-        Turning a platform off stops Ludo reading it from RomM, so your library
-        loads faster and stays smaller. Nothing is deleted — games you already
-        downloaded stay on this device and stay playable. Turn it back on and
-        Ludo fetches that platform again.
-      </div>
-    </Focusable>
-  );
-}
-
-// Per-platform status pill: green once every file the server holds is on disk,
-// red when the resolved core cannot boot without what's missing, amber when it
-// has an HLE fallback and will merely run worse. Shared by the index row and
-// the detail panel so the two never disagree.
-function biosChip(row: any, chevron?: boolean) {
-  const ok = row.missing_count === 0;
-  const color = ok ? V2.success : (row.severity === 'required' ? V2.danger : V2.warning);
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-      <span style={{
-        fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
-        color, border: `1px solid ${color}`, borderRadius: V2.radiusChip, padding: '1px 6px',
-      }}>{ok ? 'complete'
-            // Switch names what is missing instead of counting files: the
-            // platform has exactly two things worth having, and "2 missing"
-            // is a number you must open the panel to decode.
-            : row.missing_label ? `${row.missing_label} missing`
-            : `${row.missing_count} missing`}</span>
-      {chevron && <FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
-    </div>
-  );
-}
-
-// Confirmation for the one transfer big enough to deserve one: ~340 MB into
-// another application's system tree. Wears the same chrome as the other
-// modals here (scrim, blurred card, V2 tokens, V2Button) rather than raw
-// dialog furniture -- and is built from ModalRoot/Focusable/DialogButton
-// because @decky/ui's ConfirmModal is exported by neither @decky/ui 4.7.2 nor
-// the desktop shim, so importing it would break both builds.
-// No `installed` count and no `masterKey` here any more. The count was printed
-// as "replacing 238 installed file(s)", a number nobody can judge, and the
-// master-key generation says how far prod.keys can decrypt WITHOUT proving it
-// covers this firmware — so it could not settle the question being asked. The
-// keysOk warning below is the keys fact that changes what you'd do. Both are
-// still on the backend payload; this component just stopped rendering them.
-function SwitchFirmwareConfirm({ fileName, size, reason, keysOk,
-                                 version, installedVersion, onAnswer, closeModal }: {
-  fileName: string; size: string; reason?: string;
-  keysOk?: boolean;
-  version?: string | null; installedVersion?: string | null;
-  onAnswer: (ok: boolean) => void; closeModal?: () => void;
-}) {
-  // Answer exactly once. Every dismissal route lands here, and a modal that
-  // closes without resolving leaves the caller awaiting a promise forever.
-  const answered = useRef(false);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const answer = (ok: boolean) => {
-    if (answered.current) return;
-    answered.current = true;
-    onAnswer(ok);
-    closeModal?.();
-  };
-  useEffect(() => {
-    const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60);
-    return () => clearTimeout(t);
-  }, []);
-  return (
-    <ModalRoot bHideCloseIcon onCancel={() => answer(false)} onEscKeypress={() => answer(false)}
-      className="romm-modal-collapse" modalClassName="romm-modal-collapse">
-      <Focusable noFocusRing className="romm-ui"
-        onCancelButton={() => answer(false)}
-        onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) answer(false); }}
-        style={{
-          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          background: 'rgba(7,7,15,0.45)',
-          WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
-        }}>
-        <style>{`
-          ${V2_FOCUS_STYLE}
-          .romm-modal-collapse, .romm-modal-collapse > div {
-            background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important;
-          }
-          @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }
-        `}</style>
-        {/* Click-away cancels, like every other modal here. */}
-        <div onClick={() => answer(false)} style={{ position: 'absolute', inset: 0 }} />
-        <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
-          position: 'relative', width: '420px', maxWidth: '90vw', boxSizing: 'border-box',
-          fontFamily: V2.font, color: V2.fg, padding: '20px',
-          display: 'flex', flexDirection: 'column',
-          background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
-          WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
-          border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
-          boxShadow: '0 16px 48px rgba(0,0,0,0.55)',
-          maxHeight: '82vh', overflowY: 'auto',
-          animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
-            <FaMicrochip size={16} style={{ color: V2.brand, flexShrink: 0 }} />
-            {/* The version belongs in the question, since it is the thing
-                being decided. Falls back to the generic title only when no
-                filename anywhere carried a version to name. */}
-            <div style={{ fontSize: '16px', fontWeight: 700, color: V2.fg }}>
-              {version ? `Install firmware ${version}?` : 'Install Switch firmware?'}
-            </div>
-          </div>
-          <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.5, marginBottom: '4px' }}>
-            {/* One line, and it answers only "what happens to what I have".
-                The version being installed is in the title above, so this says
-                what it replaces — the fact the decision turns on.
-
-                It used to report the installed FILE COUNT ("replacing 238
-                installed file(s)"), which is not something anyone can act on:
-                nobody knows whether 238 is the right number, and the version
-                they are running is the thing they would actually recognise.
-                The count is still there in the panel for anyone who wants it. */}
-            {reason === 'missing'
-              ? 'Eden has no firmware installed.'
-              : installedVersion
-                ? `Replaces ${installedVersion}, installed now.`
-                // A firmware set is installed but nothing named a version for
-                // it — an older marker, or an archive named without one. Say
-                // that it gets replaced and stop, rather than reach for the
-                // file count to have a number to print.
-                : 'Replaces the firmware installed now.'}
-          </div>
-          <div style={{ fontSize: '13px', color: V2.fgMuted, lineHeight: 1.5, marginBottom: '18px' }}>
-            {/* The filename appears only when the title could not name a
-                version — then it is the one identifier there is. Alongside
-                "Install firmware 20.5.0?" it just restates that, in a worse
-                format. */}
-            {!version && fileName ? `${fileName} · ` : ''}{size} · goes into Eden’s system directory
-          </div>
-          {/* Said BEFORE the download, not after it. Firmware without keys
-              installs perfectly and then boots nothing, and the only useful
-              moment to mention that is while the transfer is still a
-              choice. Not a block: installing now and adding keys later is a
-              legitimate order to do this in. */}
-          {keysOk === false && (
-            <div style={{
-              display: 'flex', gap: '8px', alignItems: 'flex-start',
-              background: 'rgba(251,191,36,0.10)',
-              border: `1px solid rgba(251,191,36,0.35)`,
-              borderRadius: V2.radiusMd, padding: '10px 12px', marginBottom: '18px',
-            }}>
-              <FaExclamationTriangle size={13} style={{ color: V2.warning, flexShrink: 0, marginTop: '2px' }} />
-              <div style={{ fontSize: '12px', color: V2.fg2, lineHeight: 1.45 }}>
-                No prod.keys found here or on RomM. Eden can’t decrypt firmware
-                without it, so games still won’t boot until you upload prod.keys
-                to the Switch platform.
-              </div>
-            </div>
-          )}
-          <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-            <V2Button variant="text" onClick={() => answer(false)}>Cancel</V2Button>
-            <V2Button variant="primary" onClick={() => answer(true)}>Install</V2Button>
-          </div>
-        </Focusable>
-      </Focusable>
-    </ModalRoot>
-  );
-}
 
 
-// One platform's firmware, as a panel rather than a page — the same shape as
-// CorePickerModal, which is the other "settle one platform's emulation detail"
-// surface. Opened from a BiosPage row or straight from a platform's actions
-// menu, where the grid underneath is the context the user wants back.
-//
-// `seed` paints immediately when the caller already has the row; without one
-// (the actions-menu path) the panel fetches the inventory itself.
-function BiosDetailModal({ slug, platformName, seed, onChanged, closeModal }: {
-  slug: string; platformName?: string; seed?: any;
-  onChanged?: () => void; closeModal?: () => void;
-}) {
-  const panelRef = useRef<HTMLDivElement>(null);
-  const [row, setRow] = useState<any>(seed || null);
-  const [loading, setLoading] = useState(!seed);
-  const [busy, setBusy] = useState(false);
-  // Live transfer line while the detached firmware install runs. Empty at
-  // rest; a bare "Installing…" with nothing moving is indistinguishable from
-  // a hang, which is what this row used to be.
-  const [progress, setProgress] = useState('');
-  // What is actually installed on THIS device, for the Switch panel only. The
-  // file rows above say what RomM holds and whether a file by that name is
-  // present; neither answers "which firmware am I running", which is the
-  // question someone opens this panel with after an emulator update.
-  const [fw, setFw] = useState<any>(null);
-  // Where Switch updates and DLC go. Eden 0.2.0-rc1 reads them from a folder;
-  // older Eden only applies what is installed into NAND. The panel is the one
-  // place that already knows this platform is Switch, so the choice lives here
-  // rather than in a global settings list where it would mean nothing.
-  const [addOn, setAddOn] = useState<any>(null);
-  const [addOnBusy, setAddOnBusy] = useState(false);
-  useEffect(() => { const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60); return () => clearTimeout(t); }, []);
 
-  const load = async () => {
-    try {
-      const r = await getBiosInventory(false);
-      if (r?.success) setRow((r.platforms || []).find((p: any) => p.slug === slug) || null);
-    } catch { /* ignore */ }
-    finally { setLoading(false); }
-  };
-  useEffect(() => { if (!seed) load(); }, []);
 
-  // Stays open through the download: the panel is the only thing confirming it
-  // worked, and closing on activate would take the answer away with it.
-  // Switch firmware is not a BIOS file. It is a ~324 MB archive of NCAs that
-  // belongs in Eden's NAND tree, and download_bios would drop it in RetroArch's
-  // system directory where Eden never looks — so this platform routes to its
-  // own installer. Everything else keeps the original path unchanged.
-  const isSwitch = slug === 'switch' || /nintendo\s*switch/i.test(
-    row?.platform_name || row?.name || platformName || '');
-
-  const fetchAll = async () => {
-    setBusy(true);
-    try {
-      if (isSwitch) {
-        // Prompt first. ~340 MB into another application's system tree is not
-        // something to start on a single button press without saying so --
-        // and when nothing has changed, this answers without transferring
-        // anything at all. Keys are deliberately NOT gated behind this: they
-        // are ~14 KB, Eden cannot start a game without them, and they sync
-        // with an ordinary Switch pass.
-        const avail = await switchFirmwareStatus();
-        if (avail && avail.available === false && avail.file_name) {
-          toaster.toast({ title: 'Switch firmware', body: 'Already up to date' });
-          return;
-        }
-        if (avail?.available) {
-          const mb = avail.size ? `${(avail.size / 1048576).toFixed(0)} MB` : 'a large download';
-          const ok = await new Promise<boolean>((resolve) => {
-            showModal(
-              <SwitchFirmwareConfirm
-                fileName={avail.file_name}
-                size={mb}
-                reason={avail.reason}
-                keysOk={avail.keys_ok}
-                version={avail.version}
-                installedVersion={avail.installed_version}
-                onAnswer={resolve}
-              />
-            );
-          });
-          if (!ok) return;
-        }
-        const r = await installSwitchFirmwareWatched(
-          (tick) => setProgress(fmtFirmwareProgress(tick)));
-        setProgress('');
-        toaster.toast({ title: 'Switch firmware', body: switchInstallSummary(r) });
-      } else {
-        const r = await downloadBios(slug, '');
-        if (!r?.success) toaster.toast({ title: 'BIOS', body: r?.message || 'Download failed' });
-      }
-      await load();
-      if (isSwitch) await loadFirmware();
-      onChanged?.();
-    } catch {
-      toaster.toast({ title: isSwitch ? 'Switch firmware' : 'BIOS', body: 'Download failed' });
-    } finally { setBusy(false); }
-  };
-
-  const loadFirmware = async () => {
-    try { setFw(await switchFirmwareStatus()); } catch { /* leave the line off */ }
-  };
-  useEffect(() => { if (isSwitch) loadFirmware(); }, [isSwitch]);
-
-  const loadAddOnMode = async () => {
-    try { setAddOn(await getSwitchAddonMode()); } catch { /* ignore */ }
-  };
-  useEffect(() => { if (isSwitch) loadAddOnMode(); }, [isSwitch]);
-  const changeAddOnMode = async (mode: string) => {
-    if (addOnBusy || mode === addOn?.mode) return;
-    setAddOnBusy(true);
-    // Optimistic, then replaced by what the backend reports: switching to the
-    // folder mode also tries to register it with Eden, and whether THAT
-    // worked is the part worth waiting to show.
-    setAddOn((a: any) => ({ ...a, mode }));
-    try { setAddOn(await setSwitchAddonMode(mode)); }
-    catch { await loadAddOnMode(); }
-    finally { setAddOnBusy(false); }
-  };
-
-  const files = row?.files || [];
-  const missing = row?.missing_count || 0;
-  // installed_version is deliberately null when Eden's registered/ is empty,
-  // so an absent firmware never reads as a version number.
-  const fwLine = !isSwitch || !fw ? null
-    : fw.installed_version ? `Firmware: ${fw.installed_version}`
-    : fw.installed ? `Firmware: version unknown (${fw.installed} files)`
-    : 'Firmware: not installed';
-  return (
-    <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}>
-      <Focusable noFocusRing style={{
-        position: 'fixed', inset: MODAL_SCRIM_INSET, display: 'flex', alignItems: 'center', justifyContent: 'center',
-        background: 'rgba(7,7,15,0.45)', WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
-      }}>
-        <style>{`${V2_FOCUS_STYLE}
-          @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }`}</style>
-        <div onClick={() => closeModal?.()} style={{ position: 'absolute', inset: 0 }} />
-        <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
-          position: 'relative', width: '340px', maxWidth: '92vw', boxSizing: 'border-box',
-          fontFamily: V2.font, color: V2.fg, padding: '8px',
-          display: 'flex', flexDirection: 'column',
-          background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
-          WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
-          border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
-          boxShadow: '0 16px 48px rgba(0,0,0,0.55)', maxHeight: '82vh', overflowY: 'auto',
-          animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
-        }}>
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: '8px',
-            padding: '6px 8px 10px',
-          }}>
-            <div style={{
-              flex: '1 1 auto', minWidth: 0,
-              fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em',
-              color: V2.fgMuted, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-            }}>BIOS · {row?.platform_name || row?.name || platformName || ''}</div>
-            {row && biosChip(row)}
-          </div>
-          <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
-
-          {loading ? (
-            <UserMenuRow icon={<FaMicrochip size={13} />} label="Checking…" disabled onSelect={() => {}} />
-          ) : !row ? (
-            <div style={{ padding: '10px 10px 14px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
-              RomM holds no firmware for this platform. Upload it under the
-              platform’s Firmware tab and it will show up here.
-            </div>
-          ) : (
-            <>
-              {/* Exact filenames, because RetroArch matches BIOS on the name:
-                  knowing it wants scph5501.bin specifically is the difference
-                  between a fix and a guess. */}
-              {/* A superseded firmware set is neither present nor missing:
-                  a device holds exactly one, so an older upload sitting
-                  beside the current one is history, not a gap. Shown greyed
-                  with its own label rather than a red cross that would never
-                  clear no matter how much is installed. */}
-              {files.map((f: any) => (
-                <UserMenuRow key={f.name}
-                  icon={f.superseded
-                    ? <FaHistory size={13} style={{ color: V2.fgFaint }} />
-                    : f.present
-                      ? <FaCheckCircle size={13} style={{ color: V2.success }} />
-                      : <FaTimesCircle size={13} style={{ color: row.severity === 'required' ? V2.danger : V2.warning }} />}
-                  label={`${f.name}  ·  ${fmtBytes(f.size)}${f.superseded ? '  ·  superseded' : ''}`}
-                  disabled onSelect={() => {}} />
-              ))}
-              {fwLine && (
-                <>
-                <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
-                <div style={{ padding: '8px 10px 12px', fontSize: '12px', color: V2.fgMuted, lineHeight: 1.45 }}>
-                  {/* One line, not two. The master-key generation belongs in
-                      the install prompt, where it is deciding something; here
-                      the only question is whether the set is complete, and
-                      "keys installed" is the whole answer. */}
-                  {fwLine}{fw?.keys_installed ? ' · Keys installed' : ''}
-                </div>
-                {/* Updates & DLC placement. Two modes, and the difference is
-                    not cosmetic: the folder keeps one file per add-on where
-                    the user (and RetroDECK) can see it, while NAND explodes it
-                    into anonymous NCAs. The folder needs Eden 0.2.0-rc1 and it
-                    needs Eden to know the path — an unregistered folder is the
-                    silent failure this block exists to make loud. */}
-                <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '4px 10px 12px' }}>
-                  <div style={{ fontSize: '12px', color: V2.fg2 }}>Updates &amp; DLC</div>
-                  {/* The pill sizes to its labels. In a column flex parent it
-                      would otherwise stretch edge to edge, which reads as a
-                      progress bar rather than a two-way choice. */}
-                  <div style={{ display: 'flex' }}>
-                    <V2Segment
-                      options={[{ id: 'extcontent', label: 'Folder' },
-                                { id: 'nand', label: 'Install to NAND' }]}
-                      value={addOn?.mode || 'extcontent'}
-                      disabled={addOnBusy}
-                      onChange={changeAddOnMode} />
-                  </div>
-                  <div style={{ fontSize: '11.5px', color: V2.fgMuted, lineHeight: 1.45 }}>
-                    {addOn?.mode === 'nand'
-                      ? 'Add-ons are installed into Eden’s NAND. Works on any Eden version, and stores each add-on twice.'
-                      : addOn?.eden_registered
-                      ? `Eden reads add-ons from ${addOn?.folder || 'the library folder'} — one copy, nothing in NAND.`
-                      : !addOn?.folder
-                      ? 'Add-ons will go in a folder Eden reads. Download a Switch game first, so there is a folder to put them in.'
-                      : !addOn?.eden_configured
-                      ? 'Add-ons go in a folder Eden reads. Run Eden once so it writes its config — Ludo will point it at the folder by itself after that.'
-                      : addOn?.eden_running
-                      ? 'Eden is open, and it rewrites its config when it closes — so Ludo will point it at the folder once Eden has quit. Nothing for you to do.'
-                      : 'Ludo could not write Eden’s config. Add the folder yourself under Settings → General → External Content. Needs Eden 0.2.0-rc1 or newer.'}
-                  </div>
-                </div>
-                </>
-              )}
-              {/* Nothing missing means nothing to say: the ticks above
-                  already state it, and a paragraph restating them was the
-                  panel's largest element for its least informative case. The
-                  divider goes with the row it separates -- without one, it
-                  would hang under the last file with nothing below it. */}
-              {missing > 0 && (
-                <>
-                  <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
-                  <UserMenuRow
-                    icon={busy
-                      ? <FaSync size={13} style={{ animation: 'spin 1s linear infinite' }} />
-                      : <FaDownload size={13} />}
-                    label={busy
-                      ? (isSwitch ? (progress || 'Installing…') : 'Downloading…')
-                      : isSwitch ? 'Install firmware into Eden'
-                      : `Download ${missing} missing file${missing === 1 ? '' : 's'}`}
-                    disabled={busy}
-                    onSelect={() => { if (!busy) fetchAll(); }} />
-                </>
-              )}
-            </>
-          )}
-        </Focusable>
-      </Focusable>
-    </ModalRoot>
-  );
-}
 
 
 
