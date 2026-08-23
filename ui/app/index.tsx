@@ -14,7 +14,6 @@ import {
   showContextMenu,
   Menu,
   MenuItem,
-  callable,
   toaster,
   routerHook,
   openFilePicker,
@@ -24,14 +23,104 @@ import {
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, forwardRef, memo, cloneElement, type Ref, type ChangeEvent } from "react";
 import { FaSync, FaTrash, FaCog, FaGithub, FaBug, FaUndo, FaCopy, FaGamepad, FaBookmark, FaHome, FaSearch, FaTimes, FaTimesCircle, FaDownload, FaPlay, FaInfoCircle, FaRegClock, FaLayerGroup, FaChevronLeft, FaChevronRight, FaCheckCircle, FaUsers, FaExternalLinkAlt, FaPuzzlePiece, FaBoxOpen, FaClone, FaRedo, FaClock, FaCheck, FaEllipsisH, FaGlobe, FaChevronDown, FaChartBar, FaSave, FaUser, FaExclamationTriangle, FaHistory, FaPowerOff, FaCloudUploadAlt, FaMicrochip, FaStopwatch, FaUnlink, FaFolder, FaLink } from "react-icons/fa";
 import { MdFlashOn } from "react-icons/md";
+import {
+  ackLibraryAnnouncement,
+  applyAppImageUpdate,
+  cancelQrPairing,
+  checkForUpdate,
+  checkLibraryStale,
+  clearCoverCache,
+  clearRecentActivity,
+  deleteCollectionRoms,
+  deleteGame,
+  downloadBios,
+  downloadCore,
+  downloadGame,
+  downloadUpdate,
+  drainNotifications,
+  emulatorInstallState,
+  finishOnboarding,
+  getAccountUsername,
+  getAvatar,
+  getBiosInventory,
+  getCheckOnStartup,
+  getConfig,
+  getCoreMappings,
+  getDownloadProgress,
+  getDownloadableCores,
+  getEmulatorStatus,
+  getFetchBenchmark,
+  getGameCover,
+  getGameDetail,
+  getHomeData,
+  getImage,
+  getLibraryAutoUpdate,
+  getLibraryGames,
+  getLibraryGroups,
+  getLocalDiscs,
+  getLocalSiblings,
+  getLoggingEnabled,
+  getPendingUploads,
+  getPlatformSync,
+  getPluginStats,
+  getPluginVersion,
+  getRaEarned,
+  getRecentActivity,
+  getResumeStateEnabled,
+  getRetrodeckButtonEnabled,
+  getRetrodeckLogo,
+  getRommLogo,
+  getSaveHistory,
+  getSaveScreenshot,
+  getServiceStatus,
+  getStateThumbnails,
+  getSteamTileStatus,
+  getSwitchAddOns,
+  getSwitchAddonMode,
+  getSwitchFirmwareProgress,
+  getSyncEpoch,
+  getSyncIndicator,
+  getUpdateChannel,
+  getVirtualCollectionsVisible,
+  installEmulator,
+  installSwitchFirmware,
+  isDebugMode,
+  launchGame,
+  logout,
+  notifyNetworkState,
+  pairDevice,
+  pollQrPairing,
+  prepareSteamLaunch,
+  rebuildLibrary,
+  refreshFromRomm,
+  repairEmulatorPaths,
+  restoreSaveVersion,
+  resyncPlatform,
+  saveConfig,
+  searchGames,
+  setCheckOnStartup,
+  setCoreOverride,
+  setDeviceNameRpc,
+  setLibraryAutoUpdate,
+  setLibraryPaths,
+  setPlatformSync,
+  setResumeStateEnabled,
+  setRetrodeckButtonEnabled,
+  setSteamTile,
+  setSwitchAddonMode,
+  setSyncIndicatorRpc,
+  setUpdateChannel,
+  setVirtualCollectionsVisibleRpc,
+  startQrPairing,
+  switchFirmwareStatus,
+  switchPrereqForRom,
+  testRommConnection,
+  timeColdFetch,
+  toggleCollectionSync,
+  updateLoggingEnabled,
+} from "./rpc";
 import { MdVerified } from "react-icons/md";
 
-// Call backend methods
-const getServiceStatus = callable<[], any>("get_service_status");
-const timeColdFetch = callable<[], any>("time_cold_fetch");
-// LUDO_DEBUG=1 in the plugin's environment. Gates developer-only Settings rows.
-const isDebugMode = callable<[], boolean>("is_debug_mode");
-const getFetchBenchmark = callable<[], any>("get_fetch_benchmark");
 
 // "2m 29s", not "149.3s" — this number gets read aloud in bug reports, and
 // minutes are how people describe a fetch. Sub-minute keeps one decimal,
@@ -47,23 +136,6 @@ function fmtFetchDuration(seconds: number | null | undefined): string {
   // readable but "5m 1s" never silently becomes "5m".
   return s ? `${m}m ${s}s` : `${m}m`;
 }
-const ackLibraryAnnouncement = callable<[], any>("ack_library_announcement");
-const notifyNetworkState = callable<[boolean], any>("notify_network_state");
-// rom_id/has_cover are set on events about one specific game (save/state
-// uploads) and absent on collection-wide ones.
-const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number, rom_id?: number | null, has_cover?: boolean }> }>("drain_notifications");
-const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
-const rebuildLibrary = callable<[], any>("rebuild_library");
-// Re-reads one platform and reconciles that slice. Takes a slug (what the
-// platform groups are keyed by) or a numeric id.
-const resyncPlatform = callable<[string], any>("resync_platform");
-const checkLibraryStale = callable<[], any>("check_library_stale");
-const getLibraryAutoUpdate = callable<[], any>("get_library_auto_update");
-const setLibraryAutoUpdate = callable<[boolean], any>("set_library_auto_update");
-const getVirtualCollectionsVisible = callable<[], any>("get_virtual_collections_visible");
-const setVirtualCollectionsVisibleRpc = callable<[boolean], any>("set_virtual_collections_visible");
-const getSyncIndicator = callable<[], any>("get_sync_indicator");
-const setSyncIndicatorRpc = callable<[boolean], any>("set_sync_indicator");
 
 // What a refresh actually did, for the completion toast. The backend already
 // phrases the counts ("12 added, 1 removed"); this only supplies the wording for
@@ -78,99 +150,6 @@ function _refreshSummary(res: any): string {
   if (r && (r.added || r.removed || r.updated)) return res.message || 'Library updated.';
   return 'No changes — your library matches RomM.';
 }
-// `rom_id` is present only on entries that name a single rom (downloads), and
-// only on entries written since it was added — older persisted logs lack it.
-const getRecentActivity = callable<[number], { events: Array<{ kind: string, title: string, detail: string, timestamp: number, rom_id?: number }> }>("get_recent_activity");
-const clearRecentActivity = callable<[], any>("clear_recent_activity");
-const getLoggingEnabled = callable<[], boolean>("get_logging_enabled");
-const updateLoggingEnabled = callable<[boolean], boolean>("set_logging_enabled");
-const getRetrodeckButtonEnabled = callable<[], boolean>("get_retrodeck_button_enabled");
-const setRetrodeckButtonEnabled = callable<[boolean], boolean>("set_retrodeck_button_enabled");
-const getRetrodeckLogo = callable<[], any>("get_retrodeck_logo");
-const getSteamTileStatus = callable<[], any>("get_steam_tile_status");
-const setSteamTile = callable<[boolean, string, string, string], any>("set_steam_tile");
-const getCoreMappings = callable<[], any>("get_core_mappings");
-const setCoreOverride = callable<[string, string], any>("set_core_override");
-const downloadCore = callable<[string], any>("download_core");
-const getEmulatorStatus = callable<[boolean?], any>("get_emulator_status");
-const repairEmulatorPaths = callable<[string[]?], any>("repair_emulator_paths");
-const installEmulator = callable<[], any>("install_emulator");
-const emulatorInstallState = callable<[], any>("emulator_install_state");
-// Folder-only setter — save_config is the wizard's, and rewrites credentials.
-const setLibraryPaths = callable<[string?, string?, string?, string?], any>("set_library_paths");
-const getDownloadableCores = callable<[boolean], any>("get_downloadable_cores");
-const getConfig = callable<[], any>("get_config");
-const logout = callable<[boolean], any>("logout");
-const getAccountUsername = callable<[], any>("get_account_username");
-const getAvatar = callable<[], any>("get_avatar");
-const getPluginStats = callable<[], any>("get_plugin_stats");
-const saveConfig = callable<[string, string, string, string, string, string, string], any>("save_config");
-const testRommConnection = callable<[string, string, string], any>("test_connection");
-const pairDevice = callable<[string, string], any>("pair_device");
-// QR pairing (RomM's device-auth flow). start returns the code + QR matrix,
-// poll is driven from the frontend so backing out of the step stops it.
-const startQrPairing = callable<[string], any>("start_qr_pairing");
-const pollQrPairing = callable<[], any>("poll_qr_pairing");
-const cancelQrPairing = callable<[], any>("cancel_qr_pairing");
-// Releases the library fetch that pairing deferred, so the walk starts against
-// the platform switches the wizard just collected rather than ahead of them.
-const finishOnboarding = callable<[], any>("finish_onboarding");
-const setDeviceNameRpc = callable<[string], any>("set_device_name");
-const getSaveHistory = callable<[number], any>("get_save_history");
-const getPendingUploads = callable<[], any>("get_pending_uploads");
-const getSaveScreenshot = callable<[number, number, string], any>("get_save_screenshot");
-const restoreSaveVersion = callable<[number, number, string, boolean], any>("restore_save_version");
-// Game Browser
-const getLibraryGroups = callable<[string], any>("get_library_groups");
-const getLibraryGames = callable<[string, string], any>("get_library_games");
-const getGameCover = callable<[number, boolean], any>("get_game_cover");
-const getImage = callable<[string], any>("get_image");
-const clearCoverCache = callable<[], any>("clear_cover_cache");
-const searchGames = callable<[string], any>("search_games");
-const getGameDetail = callable<[number], any>("get_game_detail");
-const getRaEarned = callable<[number], any>("get_ra_earned");
-const downloadGame = callable<[number], any>("download_game");
-const getSwitchAddOns = callable<[number], any>("switch_add_ons");
-const getSwitchAddonMode = callable<[], any>("get_switch_addon_mode");
-const setSwitchAddonMode = callable<[string], any>("set_switch_addon_mode");
-const toggleCollectionSync = callable<[string, boolean], any>("toggle_collection_sync");
-const deleteCollectionRoms = callable<[string, string], any>("delete_collection_roms");
-const getDownloadProgress = callable<[number], any>("get_download_progress");
-const deleteGame = callable<[number], any>("delete_game");
-const launchGame = callable<[number, (string | null)?, (number | null)?, (boolean)?], any>("launch_game");
-// Steam Deck session-host launch: resolves argv + writes a launch-spec; the tile
-// is then RunGame'd so the emulator is a child of a Steam-tracked game (overlay).
-const prepareSteamLaunch = callable<[number, (string | null)?, (number | null)?, (boolean)?], any>("prepare_steam_launch");
-// Continue playing: resume from the newest save state (opt-in) and the state's
-// own screenshot, used as that row's art.
-const getResumeStateEnabled = callable<[], boolean>("get_resume_state_enabled");
-const setResumeStateEnabled = callable<[boolean], boolean>("set_resume_state_enabled");
-const getStateThumbnails = callable<[number[], (boolean)?], any>("get_state_thumbnails");
-// BIOS inventory: what RomM holds per platform vs. what's in RetroArch's system
-// dir. Distinct from get_bios_status, which reports background download progress.
-const getBiosInventory = callable<[(boolean)?], any>("get_bios_inventory");
-const downloadBios = callable<[string, (string)?], any>("download_bios");
-// Switch firmware is an Eden-tree install, not a BIOS-directory drop, so it has
-// its own call rather than riding download_bios. See install_switch_firmware.
-const installSwitchFirmware = callable<[], any>("install_switch_firmware");
-// Asked before the download, so the prompt can name the size. Firmware is the
-// one transfer here big enough that starting it unasked would be rude.
-const switchFirmwareStatus = callable<[], any>("switch_firmware_status");
-// Asked before downloading a ROM: is this a Switch game whose firmware or keys
-// need attention? {needed:false} for everything else, and no transfer either way.
-const switchPrereqForRom = callable<[number], any>("switch_prereq_for_rom");
-// The install runs detached (a ~340 MB transfer cannot occupy Decky's single
-// RPC socket), so its progress is polled rather than awaited.
-const getSwitchFirmwareProgress = callable<[], any>("get_switch_firmware_progress");
-// Per-platform sync switches. get_ returns every platform with its rom_count and
-// whether it's on; set_ takes the whole disabled set, so it's idempotent.
-const getPlatformSync = callable<[], any>("get_platform_sync");
-const setPlatformSync = callable<[string[]], any>("set_platform_sync");
-const getLocalDiscs = callable<[number], any>("get_local_discs");
-const getLocalSiblings = callable<[number], any>("get_local_siblings");
-const getHomeData = callable<[], any>("get_home_data");
-const getSyncEpoch = callable<[], any>("get_sync_epoch");
-const getRommLogo = callable<[], any>("get_romm_logo");
 
 // Shared image-fetch queue. The home page mounts dozens of tiles at once, each
 // of which needs a base64 cover / screenshot / platform-icon over RPC. Firing
@@ -5157,17 +5136,6 @@ function clearBrowseCaches() {
   } catch { }
 })();
 
-// Auto-update
-const getPluginVersion = callable<[], string>("get_plugin_version");
-const getUpdateChannel = callable<[], string>("get_update_channel");
-const setUpdateChannel = callable<[string], string>("set_update_channel");
-const checkForUpdate = callable<[string], any>("check_for_update");
-const downloadUpdate = callable<[string], any>("download_update");
-// Desktop-only: swaps the running AppImage. No-ops on Decky, which
-// updates through the loader instead.
-const applyAppImageUpdate = callable<[string], any>("apply_appimage_update");
-const getCheckOnStartup = callable<[], boolean>("get_check_on_startup");
-const setCheckOnStartup = callable<[boolean], boolean>("set_check_on_startup");
 // Session cache for update checks: the section auto-checks on open, and this
 // keeps reopening Settings from burning GitHub's anonymous rate limit (60/hr).
 let _updCheckCache: { t: number; channel: string; info: any } | null = null;
