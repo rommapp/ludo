@@ -13,9 +13,7 @@ import {
   discDisplayLabel,
   LocalDisc,
   ToastCover,
-  cannotLaunch,
   openDiscPicker,
-  runLaunch,
   standaloneFor,
   useRommImage,
   useSaveActivityFor,
@@ -27,6 +25,7 @@ import { libBack, libNavigate } from "../nav";
 import { GameCover } from "../media";
 import { MdVerified } from "react-icons/md";
 import { getLibGameHolder, getLibGameOrigin, libCacheSetDownloaded} from "../libcache";
+import { cannotLaunch, runLaunch } from "../launch";
 // One game, in full: the hero art, the actions, and the four metadata tabs.
 //
 // The tabs are where most of this lives — overview, files, save data,

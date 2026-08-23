@@ -93,3 +93,17 @@ export const formatSpeed = (bytesPerSec: number): string => {
   if (bytesPerSec >= 1024) return `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
   return `${bytesPerSec.toFixed(0)} B/s`;
 };
+
+// RomM GameActionBtn round buttons: glassy scrim with blur (default), or the
+// "emphasized" white look used by Play. Circular; size in px.
+export function roundBtn(size: number, variant: 'glass' | 'emphasized' | 'danger'): any {
+  const base: any = {
+    width: `${size}px`, height: `${size}px`, borderRadius: '50%',
+    display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+    backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)',
+    transition: 'background 0.15s, color 0.15s, border-color 0.15s',
+  };
+  if (variant === 'emphasized') return { ...base, background: '#ffffff', border: '1px solid #ffffff', color: '#111117' };
+  if (variant === 'danger') return { ...base, background: 'rgba(0,0,0,0.55)', border: '1px solid rgba(255,80,80,0.55)', color: V2.danger };
+  return { ...base, background: 'rgba(0,0,0,0.55)', border: '1px solid rgba(255,255,255,0.12)', color: 'rgba(255,255,255,0.95)' };
+}
