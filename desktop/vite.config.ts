@@ -12,9 +12,11 @@ export default defineConfig({
   resolve: {
     alias: [
       { find: "@ludo/host", replacement: resolve(__dirname, "src/host/index.ts") },
-      // decky_plugin/src/index.tsx lives outside this root and there is no
-      // node_modules next to it, so Node resolution walks past desktop/ and
-      // never finds react/react-icons. Pin them to ours.
+      { find: "@ludo/app", replacement: resolve(__dirname, "../ui/app/index.tsx") },
+      // ui/app/index.tsx lives outside this root and there is no node_modules
+      // next to it, so Node resolution walks past desktop/ and never finds
+      // react/react-icons. Pin them to ours. (decky_plugin/rollup.config.js
+      // pins react-icons for the mirror-image reason.)
       { find: /^react$/, replacement: resolve(__dirname, "node_modules/react") },
       { find: /^react-dom$/, replacement: resolve(__dirname, "node_modules/react-dom") },
       { find: /^react\/jsx-runtime$/, replacement: resolve(__dirname, "node_modules/react/jsx-runtime") },

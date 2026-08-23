@@ -33,7 +33,6 @@ export {
 // Decky's IPC, toaster, router and file picker are already the shape Ludo wants.
 export {
   callable,
-  definePlugin,
   toaster,
   routerHook,
   openFilePicker,

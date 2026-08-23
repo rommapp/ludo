@@ -1,15 +1,26 @@
 # Ludo — desktop client
 
 A generic build of the sync app (Linux + Windows), for people running RetroArch
-**without** a Steam Deck / Decky. It reuses the Decky plugin's engine and UI
-unchanged:
+**without** a Steam Deck / Decky. It shares the backend and UI with the Decky
+plugin:
 
-- **UI** — `decky_plugin/src/index.tsx`, consumed byte-identically. A Vite alias
-  points `@decky/ui` and `@decky/api` at `src/shim/*` (web implementations of
-  the Decky primitives) instead of forking the 9k-line file.
+- **UI** — `ui/app/`, consumed byte-identically and reached through `@ludo/app`.
+  It imports its shell through `@ludo/host`, which a Vite alias points at
+  `src/host/` (this shell's adapter) instead of forking the UI. The Decky build
+  points both specifiers at its own side; the contract the adapters satisfy is
+  `ui/host/contract.ts`.
+- **Host capabilities** — the UI never asks which shell it is in. It asks what
+  the shell can do (`host.capabilities.selfUpdate`, `.exit`, `.shortcutTile`,
+  `.toastPlacement`) and calls through `host.app`, `host.keyboard`,
+  `host.launcher` and `host.focus`.
+- **Launcher** — `host.launcher` is the Steam library tile and overlay-session
+  machinery. There is none out here, so `available` is false and the tile
+  methods no-op; a game launches directly instead. Steam integration on a PC is
+  a different mechanism: the backend writes `shortcuts.vdf`
+  (`capabilities.shortcutTile`).
 - **Backend** — `ludo_app.backend.LudoBackend` (in `app/`), on top of the shared
   `romm_sync_engine` package. Both shells construct the same class; neither
-  imports the other. Decky's `callable` IPC is replaced by HTTP here: the shim's
+  imports the other. Decky's `callable` IPC is replaced by HTTP here: this shell's
   `callable` POSTs to `/api/<method>` and `backend/server.py` dispatches to
   `backend.<method>(*args)`.
 - **Host profile** — the few facts that differ between shells (version, which
@@ -18,7 +29,7 @@ unchanged:
 
 ```
 browser (webview)  ──POST /api/get_status──▶  backend/server.py ──▶ LudoBackend.get_status()
-   shim callable    ◀──── {"result": …} ────                     (sync_core, watchdog)
+   host callable    ◀──── {"result": …} ────                     (sync_core, watchdog)
 ```
 
 ## Run it (dev)

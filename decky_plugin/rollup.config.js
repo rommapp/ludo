@@ -16,6 +16,16 @@ export default deckyPlugin({
         alias({
             entries: [
                 { find: "@ludo/host", replacement: resolve(import.meta.dirname, "src/host/index.ts") },
+
+                // The UI lives in ui/app/, reached through the src/app dev
+                // symlink. Rollup resolves that to its real path, so bare
+                // imports from inside it are looked up by walking UP FROM
+                // ui/app — which never reaches decky_plugin/node_modules, and
+                // react-icons then falls through as an unresolved external:
+                // the plugin builds clean and ships with no icons. Pin them.
+                // (desktop/vite.config.ts pins the same packages, for the
+                // mirror-image reason.)
+                { find: /^react-icons\//, replacement: resolve(import.meta.dirname, "node_modules/react-icons") + "/" },
             ],
         }),
     ],

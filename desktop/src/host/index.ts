@@ -32,7 +32,6 @@ export {
 // ── Services ────────────────────────────────────────────────────────────────
 export {
   callable,
-  definePlugin,
   toaster,
   routerHook,
   openFilePicker,

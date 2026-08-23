@@ -14,28 +14,6 @@ export { routerHook } from "./router";
 import { callable } from "./rpc";
 export { callable };
 
-// ── Plugin entry ────────────────────────────────────────────────────────────
-// Still here because the shared UI is still a Decky plugin factory. It stops
-// being needed once the app entry is split out of the QAM panel.
-
-export type PluginDescriptor = {
-  name?: string;
-  title?: any;
-  content?: any;
-  icon?: any;
-  onDismount?: () => void;
-  alwaysRender?: boolean;
-};
-
-/**
- * Decky calls the factory once at load and keeps the descriptor. Same here —
- * running it at import time is what registers the plugin's routes, so the
- * router has them before first render.
- */
-export function definePlugin(factory: () => PluginDescriptor): PluginDescriptor {
-  return factory();
-}
-
 // ── Toasts ──────────────────────────────────────────────────────────────────
 
 export const toaster = {

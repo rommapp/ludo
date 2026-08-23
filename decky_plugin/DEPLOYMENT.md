@@ -8,7 +8,9 @@
 ## Overview
 
 The plugin has two components:
-- **Frontend** — TypeScript/React in `src/index.tsx`, compiled to `dist/index.js` via rollup
+- **Frontend** — Ludo's UI in `ui/app/index.tsx` (reached through the `src/app` dev
+  symlink), compiled to `dist/index.js` via rollup. `src/index.tsx` is only the Decky
+  entry point: `startApp()` plus the Quick Access panel this plugin alone can render.
 - **Backend** — `py_modules/ludo_app/` (the shared `LudoBackend`) on top of
   `py_modules/romm_sync_engine/`. `main.py` is only Decky's entry point: it does the
   Deck-specific bootstrap, describes this deployment as a `HostProfile`, and subclasses
@@ -38,7 +40,7 @@ After editing source, copy only what changed, then reload the plugin from the De
 cd /path/to/ludo
 DEST=~/homebrew/plugins/ludo
 
-# Frontend change (src/index.tsx):
+# Frontend change (ui/app/index.tsx):
 (cd decky_plugin && pnpm run build) && cp decky_plugin/dist/index.js decky_plugin/dist/index.js.map "$DEST/dist/"
 
 # Backend change (app/ludo_app/*.py — the shared backend):
@@ -134,9 +136,17 @@ every stable user when it's forgotten.
 The recipe above is still the right way to build a zip for **loose deploy, testing, or
 handoff** — just don't attach the result to a GitHub release yourself.
 
-**Why `cp -rL`?** `py_modules/sync_core.py` and `py_modules/bios_manager.py` are symlinks in
-the dev tree. The `-L` flag dereferences all symlinks so real file content goes into the zip.
-Without it, the zip contains broken symlinks and the plugin fails to load.
+**Why `cp -rL`?** `py_modules/ludo_app` and `py_modules/romm_sync_engine` are symlinks in
+the dev tree, pointing at `app/` and `engine/`. The `-L` flag dereferences all symlinks so
+real file content goes into the zip. Without it, the zip contains broken symlinks and the
+plugin fails to load.
+
+The frontend has two dev symlinks of its own — `src/app` → `ui/app` and
+`src/host/contract.ts` → `ui/host/contract.ts` — but those are resolved by rollup at build
+time and never reach the zip. They carry a different hazard: rollup resolves `src/app` to its
+real path, so a bare import from inside `ui/app/` never reaches `decky_plugin/node_modules`
+and falls through as an unresolved external. The build still reports success. See `ui/README.md`;
+`rollup.config.js` pins `react-icons` for exactly this reason.
 
 **Why `pnpm run package` and not `pnpm run build`?** `package` runs the build then a
 `postpackage` hook that re-creates the `py_modules/sync_core.py` symlink, so the working tree

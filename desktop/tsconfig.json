@@ -20,11 +20,12 @@
     // errors cascading from an unresolved `react`. Keep the two lists in step.
     "paths": {
       "@ludo/host": ["src/host/index.ts"],
+      "@ludo/app": ["../ui/app/index.tsx"],
       "react": ["node_modules/@types/react"],
       "react-dom": ["node_modules/@types/react-dom"],
       "react/jsx-runtime": ["node_modules/@types/react/jsx-runtime"],
       "react-icons/*": ["node_modules/react-icons/*"]
     }
   },
-  "include": ["src", "vite.config.ts", "../decky_plugin/src"]
+  "include": ["src", "vite.config.ts", "../ui"]
 }

@@ -9,21 +9,16 @@ import { Navigation, matchRoute, useRoutePath, useRouteRegistry } from "./host/r
 import { startSound } from "./host/sound";
 import "./host/host.css";
 
-// Importing the plugin runs its definePlugin factory, which registers every
-// route. Must happen before first render so the router already has them. This
-// is a side-effect import — we deliberately do NOT use the returned plugin
-// object (see below).
-//
-// NOTE: this is decky_plugin/src/index.tsx. It asks for its shell through the
-// `@ludo/host` specifier, which vite.config.ts points at this shell's adapter
-// (src/host/); the Decky build points the same specifier at its own. Both
-// satisfy ui/host/contract.ts.
-import "../../decky_plugin/src/index";
+// Ludo itself: ui/app/index.tsx, shared byte-identically with the Decky build.
+// It asks for its shell through the `@ludo/host` specifier, which
+// vite.config.ts points at this shell's adapter (src/host/); the Decky build
+// points the same specifier at its own. Both satisfy ui/host/contract.ts.
+import { startApp } from "@ludo/app";
 
-// Where the desktop app lands. The Decky Quick Access panel (plugin.content) is
-// a Deck-only surface — sized for the 240px sidebar and reached via SteamOS —
-// so the desktop app never renders it. The library browser is the real
-// full-window home; the setup wizard is where an unconfigured install begins.
+// Where the desktop app lands. The library browser is the real full-window
+// home; the setup wizard is where an unconfigured install begins. (There is no
+// counterpart to the Deck's Quick Access panel to fall back on — that surface
+// belongs to the plugin now, and this shell never sees it.)
 const LIBRARY_ROUTE = "/romm-sync-library";
 const SETUP_ROUTE = "/romm-sync-setup";
 
@@ -33,9 +28,14 @@ const getConfig = callable<[], { configured?: boolean }>("get_config");
 // load — it polls via requestAnimationFrame and no-ops until a pad reports in.
 startGamepad();
 
-// Deck UI sounds. Imported before the plugin (below) so __ludoSoundBase is set
-// by the time index.tsx's own playSteamSound resolves a URL.
+// Deck UI sounds. Started before startApp() below so __ludoSoundBase is set by
+// the time the app's own playSteamSound resolves a URL.
 startSound();
+
+// Register Ludo's routes and start its backend watches. Must happen before the
+// first render so the router already has them. Nothing tears this down: the app
+// lives as long as the window does, unlike a plugin Decky can unload.
+startApp();
 
 function App() {
   useRouteRegistry(); // re-render when routes are added or removed
