@@ -4,7 +4,6 @@ import {
   PanelSectionRow,
   TextField,
   Navigation,
-  Router,
   staticClasses,
   DialogButton,
   Focusable,
@@ -126,6 +125,8 @@ import { _libRefreshListeners, _broadcastLibRefresh, _downloadedListeners } from
 import { _LS_PLATICON, _coverInflight } from "./media";
 import { setPreDownloadHook } from "./downloads";
 import { V2_FOCUS_STYLE, V2Focus, v2Page } from "./focus";
+import { NavId, LibView, navExitPlugin, libNavigate, libBack, RouteGuard } from "./nav";
+import { setLibViewHooks, pushLibView } from "./nav";
 import {
   _forceGamepadFocus,
   _gpFocusEl,
@@ -2226,7 +2227,6 @@ function NavLaunchButton({ iconSrc, label, onActivate }:
   );
 }
 
-type NavId = 'home' | 'platforms' | 'collections' | 'search';
 
 // Remembered account identity (username / role / avatar data URI), mirrored to
 // localStorage the same way the browse caches are. The identity is the same on
@@ -4228,103 +4228,7 @@ let _libGameOrigin: string = "/romm-sync-library";
 // returns to that tab (platforms/collections) instead of resetting to 'home'.
 let _libLastTab: NavId = 'home';
 
-// ── History-aware back navigation ────────────────────────────────────────────
-// Navigation.Navigate always PUSHES a history entry. Backing out of our pages
-// by pushing the origin route filled the router history with /romm-sync-*
-// entries, so after leaving the plugin, B in Steam's OWN library popped that
-// polluted stack and dragged the user back into the plugin (endless loop).
-// The fix is to genuinely POP our entries. The Gamepad UI's react-router
-// history is undocumented but reachable; everything is feature-detected with
-// the old push as fallback.
-const _gpHistory = (): any => {
-  try { return (Router as any)?.WindowStore?.GamepadUIMainWindowInstance?.m_history; }
-  catch { return undefined; }
-};
-// Timestamp of the last pop WE initiated. RouteGuard uses it to tell "the user
-// backed out of a plugin page" (expected — render normally) apart from "Steam's
-// own back walked into a plugin history entry" (unexpected — keep popping).
-let _expectedPopAt = 0;
-// Pop one history entry: react-router v5 history has goBack(), the newer
-// history lib has back(); Steam's native NavigateBack as a last resort.
-function _histBack(h: any): boolean {
-  try {
-    if (typeof h?.goBack === 'function') { h.goBack(); return true; }
-    if (typeof h?.back === 'function') { h.back(); return true; }
-  } catch { /* ignore */ }
-  try { Navigation.NavigateBack(); return true; } catch { /* ignore */ }
-  return false;
-}
-// Back out of a plugin page by genuinely POPPING the router history (pushing
-// the origin route instead is what polluted the history and made Steam's own
-// B walk back into the plugin). The entry below is the page that pushed us —
-// a plugin page or, for e.g. Settings opened from the QAM, the Steam page the
-// user was on; both are correct destinations.
-function navBack(fallback: string) {
-  _expectedPopAt = Date.now();
-  if (!_histBack(_gpHistory())) {
-    try { Navigation.Navigate(fallback); } catch { /* ignore */ }
-  }
-}
-// B at the library root: leave the plugin with an UNEXPECTED pop — if the
-// entry below is another plugin page (e.g. stale entries left by an earlier
-// visit or a pre-update build), its RouteGuard keeps the cascade going until
-// a real Steam page is on top.
-function navExitPlugin() {
-  _expectedPopAt = 0;
-  _histBack(_gpHistory());
-}
 
-// ── In-library view switching (route-level keep-alive) ───────────────────────
-// Steam's router unmounts a route's entire tree on navigation, so every trip
-// into a platform grid / game detail / settings used to rebuild the four
-// keep-alive tab panels on the way back (~100–200ms of long tasks plus a
-// cover re-decode burst). Instead of leaving /romm-sync-library at all, the
-// inner pages now mount as views INSIDE that route (LibraryRootPage) while
-// the tabs tree stays mounted hidden underneath — same display:none trick
-// that made tab switching instant, extended one level up.
-// These module hooks are only set while LibraryRootPage is mounted; when they
-// are null (e.g. Settings opened from the QAM as a real route) callers fall
-// back to genuine navigation, preserving the old behavior.
-type LibView = 'grid' | 'game' | 'settings' | 'stats' | 'cores' | 'bios' | 'downloads';
-let _libPushView: ((v: LibView) => void) | null = null;
-let _libPopView: (() => void) | null = null;
-const _libViewForRoute: Record<string, LibView> = {
-  '/romm-sync-settings': 'settings',
-  '/romm-sync-stats': 'stats',
-  '/romm-sync-cores': 'cores',
-  '/romm-sync-bios': 'bios',
-  '/romm-sync-downloads': 'downloads',
-};
-// Open a plugin page: as an in-library view when the library route hosts us,
-// as a real route otherwise (QAM entry points, stale fallbacks).
-function libNavigate(route: string) {
-  const v = _libViewForRoute[route];
-  if (v && _libPushView) { _libPushView(v); return; }
-  try { Navigation.Navigate(route); } catch { /* ignore */ }
-}
-// Back out of a plugin page: pop the in-library view stack when hosted,
-// otherwise genuinely pop the router history.
-function libBack(fallback: string) {
-  if (_libPopView) { _libPopView(); return; }
-  navBack(fallback);
-}
-// Wraps every plugin route. A plugin page entered via a history POP we did not
-// initiate means Steam's back navigation surfaced one of our history entries
-// (possibly stale, from before a plugin update) — immediately pop again, so B
-// cascades through plugin entries and always lands on a real Steam page. All
-// intentional entries into the plugin arrive via PUSH and render normally.
-function RouteGuard({ children }: { children: any }) {
-  useEffect(() => {
-    try {
-      const h = _gpHistory();
-      if (h?.action === 'POP') {
-        if (Date.now() - _expectedPopAt < 1500) _expectedPopAt = 0;
-        else _histBack(h);
-      }
-    } catch { /* ignore */ }
-  }, []);
-  return children;
-}
 
 // Per-group games cache (key: `${mode}:${groupKey}`) so paging to an already
 // prefetched neighbour shows its covers instantly — the grid slides in with real
@@ -4424,8 +4328,7 @@ function openGameById(romId: number, name: string, origin: string) {
     is_downloaded: true, has_cover: true,
   };
   _libGameOrigin = origin;
-  if (_libPushView) _libPushView('game');
-  else Navigation.Navigate(`/romm-sync-game/${romId}`);
+  if (!pushLibView('game')) Navigation.Navigate(`/romm-sync-game/${romId}`);
 }
 
 // Open a platform/collection grid from outside the library (a toast click).
@@ -4436,8 +4339,7 @@ function openGroupPage(mode: string, group: LibGroup, siblings?: LibGroup[]) {
   _libGroupHolder = { mode, group };
   if (siblings?.length) _libGroupsHolder = { mode, groups: siblings };
   else if (_libGroupsHolder?.mode !== mode) _libGroupsHolder = { mode, groups: [group] };
-  if (_libPushView) _libPushView('grid');
-  else Navigation.Navigate(`/romm-sync-library/${encodeURIComponent(group.key)}`);
+  if (!pushLibView('grid')) Navigation.Navigate(`/romm-sync-library/${encodeURIComponent(group.key)}`);
 }
 
 function persistHomeCache() {
@@ -7077,9 +6979,11 @@ function LibraryRootPage() {
   const [stack, setStack] = useState<LibView[]>([]);
   const viewRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    _libPushView = (v) => setStack((s) => [...s, v]);
-    _libPopView = () => setStack((s) => s.slice(0, -1));
-    return () => { _libPushView = null; _libPopView = null; };
+    setLibViewHooks(
+      (v) => setStack((s) => [...s, v]),
+      () => setStack((s) => s.slice(0, -1)),
+    );
+    return () => setLibViewHooks(null, null);
   }, []);
 
   // Logged-out guard: after a logout the credentials are cleared, but the tile
@@ -7187,16 +7091,14 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   const openGroupFrom = (m: string, g: LibGroup, gs: LibGroup[]) => {
     _libGroupHolder = { mode: m, group: g };
     _libGroupsHolder = { mode: m, groups: gs };
-    if (_libPushView) _libPushView('grid');
-    else Navigation.Navigate(`/romm-sync-library/${encodeURIComponent(g.key)}`);
+    if (!pushLibView('grid')) Navigation.Navigate(`/romm-sync-library/${encodeURIComponent(g.key)}`);
   };
 
   const openGame = (g: LibGame) => {
     _libGameHolder = g;
     // Opened from the home/search/index grid → back returns to the library root.
     _libGameOrigin = "/romm-sync-library";
-    if (_libPushView) _libPushView('game');
-    else Navigation.Navigate(`/romm-sync-game/${g.rom_id}`);
+    if (!pushLibView('game')) Navigation.Navigate(`/romm-sync-game/${g.rom_id}`);
   };
 
   const onTab = (id: NavId) => { _libLastTab = id; setActive(id); };
@@ -7559,8 +7461,7 @@ function LibraryGamesPage() {
     _libGameHolder = g;
     // Return to THIS collection/platform's games page when backing out.
     _libGameOrigin = group ? `/romm-sync-library/${encodeURIComponent(group.key)}` : "/romm-sync-library";
-    if (_libPushView) _libPushView('game');
-    else Navigation.Navigate(`/romm-sync-game/${g.rom_id}`);
+    if (!pushLibView('game')) Navigation.Navigate(`/romm-sync-game/${g.rom_id}`);
   };
   const openGameImplRef = useRef(openGameImpl);
   openGameImplRef.current = openGameImpl;
