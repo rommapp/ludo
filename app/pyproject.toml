@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ludo-app"
+version = "0.1.0"
+description = "Ludo's shell-independent backend: the RPC surface both frontends serve"
+requires-python = ">=3.11"
+authors = [{ name = 'Hector Eduardo "Covin" Silveri' }]
+dependencies = ["romm-sync-engine"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.setuptools.packages.find]
+include = ["ludo_app*"]
+
+# The artwork backend.py serves and paints onto Steam shortcuts. It is package
+# data, not a frontend's: both shells read it through this package, and
+# backend.py locates it relative to its own __file__.
+[tool.setuptools.package-data]
+ludo_app = ["assets/*"]

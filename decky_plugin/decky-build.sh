@@ -51,14 +51,20 @@ cp "${SCRIPT_DIR}/LICENSE"                 "${TMP_DIR}/${PLUGIN_NAME}/"
 cp "${SCRIPT_DIR}/main.py"                 "${TMP_DIR}/${PLUGIN_NAME}/"
 cp "${SCRIPT_DIR}/dist/index.js"           "${TMP_DIR}/${PLUGIN_NAME}/dist/"
 cp "${SCRIPT_DIR}/dist/index.js.map"       "${TMP_DIR}/${PLUGIN_NAME}/dist/"
-# Copy all py_modules (sync_core + bundled dependencies like requests, watchdog)
-# -L dereferences the romm_sync_engine dev symlink, vendoring the shared
-# engine into the zip (the Deck has no pip install step).
+# Copy all py_modules (the ludo_app backend, the romm_sync_engine sync core, and
+# bundled dependencies like requests and watchdog). -L dereferences the
+# ludo_app and romm_sync_engine dev symlinks, vendoring both into the zip — the
+# Deck has no pip install step, so main.py finds them on sys.path instead.
 cp -rL "${SCRIPT_DIR}/py_modules/"* "${TMP_DIR}/${PLUGIN_NAME}/py_modules/"
 # Remove unnecessary files
 rm -rf "${TMP_DIR}/${PLUGIN_NAME}/py_modules/__pycache__" "${TMP_DIR}/${PLUGIN_NAME}/py_modules/bin" "${TMP_DIR}/${PLUGIN_NAME}/py_modules/"*.dist-info \
-    "${TMP_DIR}/${PLUGIN_NAME}/py_modules/romm_sync_engine/__pycache__"
-cp "${SCRIPT_DIR}/assets/logo.png"         "${TMP_DIR}/${PLUGIN_NAME}/assets/"
+    "${TMP_DIR}/${PLUGIN_NAME}/py_modules/romm_sync_engine/__pycache__" \
+    "${TMP_DIR}/${PLUGIN_NAME}/py_modules/ludo_app/__pycache__"
+# The artwork is package data of ludo_app now, so the `cp -rL py_modules/*`
+# above already vendored it at py_modules/ludo_app/assets/ — which is where
+# backend.py looks. This copy is only for the plugin-root logo Decky Loader
+# shows in its plugin list.
+cp "${SCRIPT_DIR}/py_modules/ludo_app/assets/logo.png" "${TMP_DIR}/${PLUGIN_NAME}/assets/"
 
 rm -f "$OUT_ZIP"
 (cd "$TMP_DIR" && zip -r "$OUT_ZIP" "${PLUGIN_NAME}/")

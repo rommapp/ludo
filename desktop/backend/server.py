@@ -3,15 +3,17 @@
 
 The desktop app has no Decky, so the React bundle (served here as static files)
 can't reach the Python engine through Decky's `callable` IPC. This server is the
-bridge the @decky/api shim's `callable` targets: it imports the plugin's Plugin
-class UNMODIFIED and dispatches POST /api/<method> onto its coroutine methods.
+bridge the host adapter's `callable` targets: it constructs a LudoBackend — the
+same class the Decky plugin runs — and dispatches POST /api/<method> onto its
+coroutine methods.
 
   browser  --POST /api/get_status {args:[...]}-->  this server
                                                       -> await plugin.get_status(*args)
                                                    <-- {"result": ...}
 
-The engine (sync_core, watchdog, the RomM client) is the same code the plugin
-runs. Only the transport differs: HTTP here, Decky IPC there.
+The engine (sync_core, watchdog, the RomM client) and the backend above it are
+the same code the plugin runs. Only the transport differs: HTTP here, Decky IPC
+there.
 """
 import asyncio
 import inspect
@@ -26,51 +28,27 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-# ── Import the plugin engine ────────────────────────────────────────────────
+# ── The backend ─────────────────────────────────────────────────────────────
 #
-# The vendored decky_plugin/py_modules ships Deck-only binary builds (PIL etc.
-# compiled for cpython-311). main.py prepends py_modules to sys.path at import
-# time, so those would shadow our environment's working builds. Pre-importing
-# the good copies caches them in sys.modules, and the late path insertion then
-# resolves them from cache. The engine itself is pure Python and
-# imports from the installed romm_sync_engine package.
-for _dep in ("PIL.Image", "requests", "watchdog", "psutil"):
-    try:
-        __import__(_dep)
-    except Exception:
-        pass  # surfaced later if a method actually needs it
+# `ludo_app` is a package both shells install; nothing here reaches into
+# decky_plugin/. The three facts that differ between the shells are passed in
+# as a HostProfile rather than patched onto module globals.
+import ludo_app.backend  # noqa: E402
+from ludo_app.backend import LudoBackend  # noqa: E402
+from ludo_app.host import HostProfile, read_package_version  # noqa: E402
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-PLUGIN_DIR = REPO_ROOT / "decky_plugin"
-
-# The engine is a real package now (pip install -e engine/); only the plugin
-# itself still needs a path entry so `import main` resolves.
-sys.path.insert(0, str(PLUGIN_DIR))
-
-# Decky injected these; supply equivalents so main.py's module-level reads work.
-os.environ.setdefault("DECKY_PLUGIN_RUNTIME_DIR",
-                      str(Path.home() / ".config" / "ludo"))
-if not os.environ.get("DECKY_PLUGIN_VERSION"):
-    try:
-        pkg = json.loads((PLUGIN_DIR / "package.json").read_text())
-        os.environ["DECKY_PLUGIN_VERSION"] = pkg.get("version", "0.0.0")
-    except Exception:
-        pass
-
-import main as plugin_module  # noqa: E402  (path setup must precede this)
+DESKTOP_DIR = Path(__file__).resolve().parents[1]
 
 # Both frontends share one GitHub release and differ only in which asset they
 # want: Decky Loader unpacks a zip, the desktop swaps a single AppImage file.
-plugin_module.set_asset_suffix("-x86_64.AppImage")
-
-# Version comes from desktop/package.json, not the plugin's, so update
+# The version comes from desktop/package.json, not the plugin's, so update
 # comparisons use the number this build actually ships as.
-try:
-    _dpkg = json.loads((Path(__file__).resolve().parents[1] / "package.json").read_text())
-    if _dpkg.get("version"):
-        plugin_module.PLUGIN_VERSION = _dpkg["version"]
-except Exception:
-    pass
+DESKTOP_HOST = HostProfile(
+    version=read_package_version(DESKTOP_DIR / "package.json"),
+    asset_suffix="-x86_64.AppImage",
+    download_dir=Path.home() / ".config" / "ludo" / "updates",
+    name="desktop",
+)
 
 STATIC_ROOT = Path(__file__).resolve().parent.parent / "dist"
 
@@ -171,7 +149,7 @@ class Engine:
 
     def __init__(self):
         self.loop = asyncio.new_event_loop()
-        self.plugin = plugin_module.Plugin()
+        self.plugin = LudoBackend(host=DESKTOP_HOST)
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run, name="engine-loop",
                                          daemon=True)
@@ -236,7 +214,10 @@ def shim_list_dir(path: str, include_files: bool = False) -> dict:
     return {"path": str(p), "parent": parent, "entries": entries}
 
 
-ASSETS_DIR = (PLUGIN_DIR / "assets").resolve()
+# The artwork is package data of ludo_app, so it is wherever the package was
+# installed — not at a path relative to this file, and no longer anywhere near
+# decky_plugin/.
+ASSETS_DIR = (Path(ludo_app.backend.__file__).parent / "assets").resolve()
 _ASSET_URI_CACHE: dict = {}
 
 

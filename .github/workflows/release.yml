@@ -1,8 +1,9 @@
 name: Release
 
 # One release carries both artifacts. They are named by the suffixes the
-# in-app updater selects on (UPDATE_ASSET_SUFFIX in decky_plugin/main.py,
-# artifactName in desktop/package.json), so the names are a contract, not
+# in-app updater selects on (each shell's HostProfile.asset_suffix — see
+# decky_plugin/main.py and desktop/backend/server.py — plus artifactName in
+# desktop/package.json), so the names are a contract, not
 # cosmetics — the verify job below enforces that.
 on:
   push:
@@ -139,11 +140,11 @@ jobs:
           # Import the real module rather than a copy of its logic, so this
           # exercises the code the app actually ships.
           pip install --quiet ./engine
+          pip install --quiet --no-deps ./app
           VERSION='${{ needs.version.outputs.version }}' python - <<'PY'
-          import os, sys, logging
+          import os, logging
           logging.basicConfig(level=logging.INFO)
-          sys.path.insert(0, 'decky_plugin')
-          import main
+          from ludo_app import backend
 
           # A prerelease is only visible on the beta channel — the stable
           # channel filters prereleases out, which is correct behaviour and
@@ -154,12 +155,12 @@ jobs:
 
           failures = []
           for suffix in ('-decky.zip', '-x86_64.AppImage'):
-              rel = main.select_release(channel, suffix)
+              rel = backend.select_release(channel, suffix)
               if not rel:
                   failures.append(suffix)
                   print(f'FAIL {suffix}: updater cannot resolve a release')
                   continue
-              asset = main._release_asset(rel, suffix)
+              asset = backend._release_asset(rel, suffix)
               print(f'OK   {suffix} -> {rel["tag_name"]} / {asset["name"]}')
               if rel['tag_name'].lstrip('v') != version:
                   failures.append(f'{suffix} (resolved {rel["tag_name"]}, expected v{version})')

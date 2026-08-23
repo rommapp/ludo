@@ -9,7 +9,10 @@
 
 The plugin has two components:
 - **Frontend** — TypeScript/React in `src/index.tsx`, compiled to `dist/index.js` via rollup
-- **Backend** — `main.py` + `py_modules/sync_core.py` (Python, runs inside Decky Loader)
+- **Backend** — `py_modules/ludo_app/` (the shared `LudoBackend`) on top of
+  `py_modules/romm_sync_engine/`. `main.py` is only Decky's entry point: it does the
+  Deck-specific bootstrap, describes this deployment as a `HostProfile`, and subclasses
+  `LudoBackend` as `Plugin` because that is the name Decky Loader looks for.
 
 `py_modules/sync_core.py` is a **dev symlink** to `../../src/sync_core.py`. It is resolved to a
 real file during packaging. Never commit the resolved copy — the symlink is intentional.
@@ -38,7 +41,10 @@ DEST=~/homebrew/plugins/ludo
 # Frontend change (src/index.tsx):
 (cd decky_plugin && pnpm run build) && cp decky_plugin/dist/index.js decky_plugin/dist/index.js.map "$DEST/dist/"
 
-# Backend change (main.py):
+# Backend change (app/ludo_app/*.py — the shared backend):
+cp app/ludo_app/*.py "$DEST/py_modules/ludo_app/"
+
+# Decky entry point change (main.py — rare; bootstrap and HostProfile only):
 cp decky_plugin/main.py "$DEST/main.py"
 
 # Shared sync logic (src/sync_core.py) — DEST has a real copy, not a symlink:
@@ -46,7 +52,8 @@ cp src/sync_core.py "$DEST/py_modules/sync_core.py"
 ```
 
 Notes:
-- A **full plugin reload** is required for `main.py` / `sync_core.py` changes (Python is only
+- A **full plugin reload** is required for any Python change (`ludo_app/`, `main.py`,
+  `sync_core.py`) — Python is only
   imported at load). Frontend (`dist/index.js`) also needs a reload to re-evaluate.
 - Backend Python logs land in `~/homebrew/logs/ludo/<timestamp>.log`. Frontend
   `console.*`/toasts do **not**; bridge them to the backend with a temporary `debug_log`
@@ -86,7 +93,10 @@ mkdir -p "${TMP_DIR}/${PLUGIN_NAME}/dist" "${TMP_DIR}/${PLUGIN_NAME}/assets" "${
 cp "${PLUGIN_DIR}/plugin.json" "${PLUGIN_DIR}/package.json" "${PLUGIN_DIR}/LICENSE" "${PLUGIN_DIR}/main.py" "${TMP_DIR}/${PLUGIN_NAME}/"
 cp "${PLUGIN_DIR}/dist/index.js" "${PLUGIN_DIR}/dist/index.js.map" "${TMP_DIR}/${PLUGIN_NAME}/dist/"
 cp -rL "${PLUGIN_DIR}/py_modules" "${TMP_DIR}/${PLUGIN_NAME}/"
-cp "${PLUGIN_DIR}"/assets/logo.png "${PLUGIN_DIR}"/assets/romm-isotipo.svg "${PLUGIN_DIR}"/assets/romm-logotipo.svg "${PLUGIN_DIR}"/assets/auth_background.svg "${PLUGIN_DIR}"/assets/retrodeck.svg "${PLUGIN_DIR}"/assets/romm-*.png "${TMP_DIR}/${PLUGIN_NAME}/assets/"
+# The artwork is package data of ludo_app, so the `cp -rL py_modules` above
+# already placed it at py_modules/ludo_app/assets/ — where the backend reads
+# it. Only the plugin-list icon is copied to the plugin root.
+cp "${PLUGIN_DIR}/py_modules/ludo_app/assets/logo.png" "${TMP_DIR}/${PLUGIN_NAME}/assets/"
 cp "${PLUGIN_DIR}/bin/7zz" "${TMP_DIR}/${PLUGIN_NAME}/bin/" && chmod +x "${TMP_DIR}/${PLUGIN_NAME}/bin/7zz"
 cp "${PLUGIN_DIR}/bin/romm-session-host" "${TMP_DIR}/${PLUGIN_NAME}/bin/" && chmod +x "${TMP_DIR}/${PLUGIN_NAME}/bin/romm-session-host"  # Steam session-host: the RomM tile's exe; execs the picked emulator as a Steam-tracked child so the overlay works on Deck Gaming Mode
 (cd "$TMP_DIR" && zip -rq "$OUT_ZIP" "${PLUGIN_NAME}/")
@@ -143,7 +153,8 @@ Decky Loader's installer validates all of these. **Any missing file causes silen
 | `plugin.json` | YES | Plugin metadata — see rules below |
 | `package.json` | YES | Decky Loader validator requires it |
 | `LICENSE` | YES | Decky Loader validator requires it |
-| `main.py` | YES | Python backend entrypoint |
+| `main.py` | YES | Decky entry point: bootstrap + the `Plugin` subclass |
+| `py_modules/ludo_app/` | YES | The backend itself (symlink in dev — must be real files in zip) |
 | `dist/index.js` | YES | Compiled frontend |
 | `dist/index.js.map` | YES | Source map |
 | `py_modules/sync_core.py` | YES | Sync daemon logic (symlink in dev — must be real file in zip) |
@@ -154,7 +165,7 @@ Decky Loader's installer validates all of these. **Any missing file causes silen
 | `py_modules/pillow.libs/` | YES | Bundled shared libs for Pillow C extensions |
 | `py_modules/qrcode/` | YES | Bundled dependency (QR encoding for device pairing) |
 | `py_modules/urllib3/`, `certifi/`, `charset_normalizer/`, `idna/` | YES | Transitive deps of requests |
-| `assets/logo.png` | NO | Plugin icon (also Steam library-tile artwork via `get_plugin_logo`) |
+| `assets/logo.png` | NO | Plugin icon shown in Decky's plugin list (the copy the backend serves is `py_modules/ludo_app/assets/logo.png`) |
 | `assets/romm-isotipo.svg` | NO | RomM brand mark shown on the setup-wizard welcome; served pre-connection by `get_romm_logo` (bundled because RomM server assets need auth) |
 | `assets/romm-{grid,hero,logo,header,icon}.png` | NO | RomM-branded Steam library artwork for the optional 'RomM' launcher tile (Steam asset types 0/1/2/3/4). Served by `get_romm_artwork`, painted via `SetCustomArtworkForApp`. Regenerate with `scripts/gen_romm_artwork.py` (needs cairosvg; dev-only). |
 | `bin/7zz` | NO | Static 7-Zip (x64) for `.7z` extraction — SteamOS has no system 7z. `sync_core._find_7z()` resolves `<plugin>/bin/7zz`. Must be `chmod +x`. Without it: `.7z` console ROMs still load via RetroArch, `.7z` PC games won't auto-extract. |

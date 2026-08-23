@@ -63,8 +63,12 @@ echo "==> Installing backend dependencies"
 "$PY" -m pip install --quiet --upgrade pip
 "$PY" -m pip install --quiet --no-compile -r "$DESKTOP_DIR/backend/requirements.txt"
 
-echo "==> Installing romm-sync-engine (non-editable: the AppImage must be self-contained)"
+echo "==> Installing romm-sync-engine and ludo-app (non-editable: the AppImage must be self-contained)"
 "$PY" -m pip install --quiet --no-compile "$REPO_ROOT/engine"
+# --no-deps: ludo-app declares romm-sync-engine, which isn't on PyPI. It was
+# installed from the local checkout on the line above, so resolving deps here
+# would only send pip looking for it in the wrong place.
+"$PY" -m pip install --quiet --no-compile --no-deps "$REPO_ROOT/app"
 
 # ── 2b. Trim the interpreter ─────────────────────────────────────────────────
 # A standalone CPython ships a full development install. The app only ever
@@ -120,13 +124,9 @@ if [ ! -f "$DESKTOP_DIR/dist/index.html" ]; then
 fi
 cp -r "$DESKTOP_DIR/dist" "$SRC_DIR/desktop/dist"
 
-# The plugin supplies the Plugin class the backend drives. py_modules is
-# deliberately NOT copied: those are Deck-only cpython-311 binary builds that
-# would shadow the interpreter's own working copies.
-cp "$REPO_ROOT/decky_plugin/main.py"      "$SRC_DIR/decky_plugin/"
-cp "$REPO_ROOT/decky_plugin/package.json" "$SRC_DIR/decky_plugin/"
-cp "$REPO_ROOT/decky_plugin/plugin.json"  "$SRC_DIR/decky_plugin/"
-cp -r "$REPO_ROOT/decky_plugin/assets"    "$SRC_DIR/decky_plugin/"
+# Nothing is staged out of decky_plugin/ any more. The backend is pip-installed
+# above (ludo_app), and the artwork server.py serves from ASSETS_DIR now ships
+# as that package's own data, so it arrives with the install.
 
 # ── 4. Verify before packaging ───────────────────────────────────────────────
 # Import the backend exactly as the packaged app will, so a missing dependency
@@ -137,15 +137,18 @@ import sys
 sys.path.insert(0, '.')
 import server
 from romm_sync_engine import paths, sync_core
-assert server.plugin_module.asset_suffix() == '-x86_64.AppImage', 'wrong update asset'
+import ludo_app.backend
+assert server.DESKTOP_HOST.asset_suffix == '-x86_64.AppImage', 'wrong update asset'
+assert server.DESKTOP_HOST.version != '0.0.0', 'desktop version did not resolve'
 # qr_matrix swallows a missing qrcode and returns None, which would ship as a
 # pairing screen with no QR on it rather than a crash. py_modules (where the
 # Deck gets qrcode) is deliberately not bundled here, so prove the interpreter
 # has its own copy while we can still fail the build.
 assert sync_core.qr_matrix('https://example.com/pair/device?user_code=TEST1234'), \\
     'qrcode missing from the bundled runtime — QR pairing would ship broken'
-print('    backend imports OK, suffix =', server.plugin_module.asset_suffix())
+print('    backend imports OK, host =', server.DESKTOP_HOST)
 print('    engine  =', paths.__file__)
+print('    app     =', ludo_app.backend.__file__)
 print('    qr encoder OK')
 " )
 

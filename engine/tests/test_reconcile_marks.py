@@ -8,14 +8,14 @@ leaves rom_count identical, so the count comparison alone sees an unchanged
 platform and the dead entry survives every refresh.
 
 Only the decision is exercised. _platforms_needing_walk is pure by design, so
-this needs no server, no walk and no plugin instance.
+this needs no server, no walk and no backend instance.
 """
 
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'decky_plugin'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'app'))
 
 FAILURES = []
 
@@ -33,17 +33,17 @@ def check(name, got, want):
 
 
 def load_rule():
-    """Import the decision without importing the whole Decky plugin.
+    """Import the decision without importing the whole backend.
 
-    main.py pulls in the plugin runtime at import time, which is not present
-    off a Deck. The rule is a self-contained staticmethod, so it is read out of
-    the source and compiled on its own.
+    backend.py pulls in the engine at import time, which needs dependencies that
+    are not present everywhere. The rule is a self-contained staticmethod, so it
+    is read out of the source and compiled on its own.
     """
     import ast
     import textwrap
 
     source = (Path(__file__).resolve().parents[2]
-              / 'decky_plugin' / 'main.py').read_text()
+              / 'app' / 'ludo_app' / 'backend.py').read_text()
     tree = ast.parse(source)
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == '_platforms_needing_walk':
@@ -53,7 +53,7 @@ def load_rule():
             namespace = {'logging': __import__('logging')}
             exec(compile(module, '<rule>', 'exec'), namespace)
             return namespace['_platforms_needing_walk']
-    raise AssertionError("_platforms_needing_walk not found in main.py")
+    raise AssertionError("_platforms_needing_walk not found in backend.py")
 
 
 def main():
