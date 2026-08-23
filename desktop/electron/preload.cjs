@@ -4,7 +4,7 @@
 // WebKitGTK's W3C Gamepad API mangles Xbox-compatible pads over Bluetooth (d-pad
 // and triggers collapse onto stick axes). Chromium's Gamepad API does NOT have
 // that bug, so here we poll navigator.getGamepads() directly and drive the same
-// `window.__rommGamepad` API that src/shim/gamepad.ts installs — no native
+// `window.__rommGamepad` API that src/host/gamepad.ts installs — no native
 // module. If Chromium's mapping ever proves unreliable on some pad, this is the
 // single place to swap in a node-hid/XInput fallback.
 //
@@ -34,7 +34,7 @@ const { ipcRenderer } = require("electron");
 
 // Which pads are PHYSICALLY attached, which navigator.getGamepads() refuses to
 // say until one is pressed. The footer legend needs the answer on frame one, so
-// src/shim/gamepad.ts calls this at startup. Returns null on platforms that
+// src/host/gamepad.ts calls this at startup. Returns null on platforms that
 // can't answer — "unknown", never "no pad".
 //
 // The scan itself lives in the MAIN process (electron/native-pads.cjs) and is

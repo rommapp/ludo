@@ -10,6 +10,7 @@
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/*.test.mjs",
+    "test:render": "node --test tests/routes.render.test.mjs",
     "preview": "vite preview",
     "electron": "npm run build && node electron/launch.cjs",
     "electron:dev": "node electron/launch.cjs --dev",
@@ -28,6 +29,7 @@
     "@vitejs/plugin-react": "^4.3.1",
     "electron": "^33.4.11",
     "electron-builder": "^25.1.8",
+    "playwright": "^1.62.1",
     "typescript": "^5.6.2",
     "vite": "^5.4.0"
   },

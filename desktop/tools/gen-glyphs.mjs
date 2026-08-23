@@ -1,4 +1,4 @@
-// Regenerates src/shim/glyphs.tsx from a Kenney "Input Prompts" download.
+// Regenerates src/host/glyphs.tsx from a Kenney "Input Prompts" download.
 //
 //   node tools/gen-glyphs.mjs ~/Downloads/kenney_input-prompts_1.5
 //
@@ -22,7 +22,7 @@ if (!PACK) {
   process.exit(1);
 }
 
-const OUT = resolve(dirname(fileURLToPath(import.meta.url)), "../src/shim/glyphs.tsx");
+const OUT = resolve(dirname(fileURLToPath(import.meta.url)), "../src/host/glyphs.tsx");
 
 // glyph name -> "<pack subdir>/Vector/<file>.svg"
 //

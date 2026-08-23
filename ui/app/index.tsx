@@ -4955,7 +4955,12 @@ function playSteamSound(name: string) {
     }
     const a = base.cloneNode(true) as HTMLAudioElement;
     a.volume = 1;
-    void a.play?.();
+    // play() REJECTS when the source won't load, and the try/catch around this
+    // only sees synchronous throws — so on any machine whose shell serves no
+    // Steam sounds (a PC with no Steam install; the backend logs "silent" and
+    // 404s), every navigation press left an unhandled rejection in the console.
+    // Swallow it here: a missing sound is the expected case, not an error.
+    void a.play?.()?.catch(() => { });
   } catch { /* no audio → silent, never fatal */ }
 }
 // Per-group games cache (key: `${mode}:${groupKey}`) so paging to an already

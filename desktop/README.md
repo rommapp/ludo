@@ -27,6 +27,28 @@ plugin:
   release asset the updater pulls, where downloads land) are passed in as a
   `HostProfile`; see `DESKTOP_HOST` in `backend/server.py`.
 
+`npm test` runs both suites in `tests/`:
+
+- **`host-shell.test.mjs`** — the seam. Exercises both shells' adapters in one
+  process against `ui/host/contract.ts`.
+- **`routes.render.test.mjs`** — the other side of that seam. Mounts the built
+  bundle in headless Chromium and walks every route `startApp()` registers,
+  asserting each one draws real content with a silent console. `support/`
+  holds the fake backend: `fixtures.mjs` answers every RPC with a
+  correctly-shaped reply, in an empty profile and a populated one.
+
+  Run it alone with `npm run test:render`. It needs `npm run build` first —
+  it deliberately drives `dist/`, because `dist/` is what ships — and it skips
+  itself (loudly) if Playwright or the build is missing.
+
+  This exists because `ui/app/` is code both shells render and that nothing
+  else covered. Its failure mode is not a crash: a reply whose shape drifted,
+  or an asset that stopped being packaged, shows up as a page that renders a
+  header and nothing else. A build and a typecheck both pass through that
+  happily; this does not. It earned its keep immediately — the click-through
+  walk surfaced an unhandled promise rejection on every navigation press on any
+  machine with no Steam sounds installed.
+
 ```
 browser (webview)  ──POST /api/get_status──▶  backend/server.py ──▶ LudoBackend.get_status()
    host callable    ◀──── {"result": …} ────                     (sync_core, watchdog)
@@ -122,7 +144,7 @@ What the shell reproduces from `app.py`:
   `navigator.getGamepads()` and drives the same `window.__rommGamepad` API the UI
   installs. No native module: the GTK build's `libmanette` bridge existed only to
   work around a WebKitGTK Bluetooth-pad bug that Chromium doesn't share. The
-  "standard" mapping matches what `src/shim/gamepad.ts` expects (see the mapping
+  "standard" mapping matches what `src/host/gamepad.ts` expects (see the mapping
   table in `preload.cjs`). If some pad ever misbehaves, `preload.cjs` is the one
   place to add a `node-hid`/XInput fallback.
 
@@ -145,10 +167,10 @@ missing either asset.
 
 ## Button-hint legend
 
-`src/shim/footer.tsx` rebuilds the Deck's bottom hint bar. Its glyph art comes
+`src/host/footer.tsx` rebuilds the Deck's bottom hint bar. Its glyph art comes
 from Kenney's [Input Prompts](https://kenney.nl/assets/input-prompts) pack
 (**CC0** — commercial use fine, attribution not required), inlined as SVG into
-`src/shim/glyphs.tsx`. That file is **generated and committed**; regenerate with:
+`src/host/glyphs.tsx`. That file is **generated and committed**; regenerate with:
 
 ```bash
 node tools/gen-glyphs.mjs ~/Downloads/kenney_input-prompts_1.5
@@ -196,7 +218,7 @@ doesn't fire until a press, the latter often not at all on unplug), so
 actual change.
 
 The keyboard/mouse set advertises only bindings that exist, so `Focusable`
-(`src/shim/ui.tsx`) gained desktop equivalents for the pad's non-primary face
+(`src/host/kit.tsx`) gained desktop equivalents for the pad's non-primary face
 buttons — without them the legend would name actions no keyboard could reach:
 
 | Action | Pad | Keyboard / mouse |

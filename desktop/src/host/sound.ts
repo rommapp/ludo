@@ -32,7 +32,11 @@ export function playUiSound(name: string, volume = 1) {
     }
     const a = base.cloneNode(true) as HTMLAudioElement;
     a.volume = volume;
-    void a.play?.();
+    // play() REJECTS when the source won't load, and this try/catch only sees
+    // synchronous throws — so on a machine with no Steam install (the backend
+    // 404s /sounds/ and logs "silent") every press left an unhandled rejection
+    // in the console. A missing sound is the expected case, not an error.
+    void a.play?.()?.catch(() => { });
   } catch { /* no audio → silent */ }
 }
 
