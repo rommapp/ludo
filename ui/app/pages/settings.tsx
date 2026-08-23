@@ -15,13 +15,13 @@ import {
   _syncPillListeners,
   _syncPillPref,
   _setResumeStatesPref,
-  clearIdentityCache,
   _resumeStatesPref,
   resetAnnouncementShown,
   _clearStale,
 } from "../index";
 import { FoldersSection } from "./setup";
 import { _groupsCache, clearBrowseCaches, persistGroupsCache } from "../libcache";
+import { clearIdentityCache } from "../topbar";
 // Settings: the account, the folders, updates, and what the app is allowed to do.
 //
 // Most of it is capability-gated rather than shell-gated — the Steam-tile row
