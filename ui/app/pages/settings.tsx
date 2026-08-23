@@ -9,8 +9,19 @@ import { _broadcastLibRefresh } from "../events";
 import { _LS_REOPEN_HOME, _lsAvail} from "../storage";
 import { libBack, libNavigate } from "../nav";
 import { V2Focus, v2Page } from "../focus";
-import { V2CardRow, _setSyncPillPref, _syncPillListeners, _syncPillPref, _setResumeStatesPref, clearIdentityCache, persistGroupsCache, _libGamesCache, _resumeStatesPref, clearBrowseCaches, resetAnnouncementShown, _clearStale, _groupsCache} from "../index";
+import {
+  V2CardRow,
+  _setSyncPillPref,
+  _syncPillListeners,
+  _syncPillPref,
+  _setResumeStatesPref,
+  clearIdentityCache,
+  _resumeStatesPref,
+  resetAnnouncementShown,
+  _clearStale,
+} from "../index";
 import { FoldersSection } from "./setup";
+import { _groupsCache, clearBrowseCaches, persistGroupsCache } from "../libcache";
 // Settings: the account, the folders, updates, and what the app is allowed to do.
 //
 // Most of it is capability-gated rather than shell-gated — the Steam-tile row
