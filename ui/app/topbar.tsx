@@ -3,10 +3,10 @@ import { Focusable, GamepadButton, ModalRoot, host, showModal, toaster } from "@
 import { V2 } from "./theme";
 import { FaBookmark, FaChartBar, FaCheck, FaChevronDown, FaCog, FaDownload, FaExternalLinkAlt, FaGamepad, FaHome, FaMicrochip, FaPlay, FaPowerOff, FaPuzzlePiece, FaRegClock, FaSearch, FaSync, FaTrash } from "react-icons/fa";
 import { getAccountUsername, getAvatar, getImage, getRetrodeckButtonEnabled, getRetrodeckLogo, refreshFromRomm } from "./rpc";
-import { MODAL_SCRIM_INSET, _clearStale } from "./index";
+import { MODAL_SCRIM_INSET } from "./index";
 import { NavId, libNavigate } from "./nav";
 import { Bumper, ProgressRing, UserMenuRow } from "./kit";
-import { useDownloadGlimpse } from "./status";
+import { useDownloadGlimpse, _clearStale} from "./status";
 import { _forceGamepadFocus } from "./shell";
 import { _broadcastLibRefresh } from "./events";
 import { V2_FOCUS_STYLE } from "./focus";

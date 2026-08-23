@@ -16,6 +16,34 @@ import { V2 } from "./theme";
 // L2/R2 alphabet fast-scroll ("letter scrubber", à la Big Picture): the visible
 // GroupsPanel registers its jump function here; the library root page's
 // onButtonDown dispatches trigger presses into it.
+// Shared jump math: given the displayed labels and the current index, the index
+// to land on. R2 → first item of the next letter block (last item from the last
+// block); L2 → first item of the current block, or of the previous block when
+// already there.
+export function _scrubTargetIdx(labels: string[], cur: number, dir: 1 | -1): number {
+  const curL = _scrubLetterOf(labels[cur]);
+  if (dir === 1) {
+    for (let i = cur + 1; i < labels.length; i++) {
+      if (_scrubLetterOf(labels[i]) !== curL) return i;
+    }
+    return labels.length - 1;
+  }
+  let start = cur;
+  while (start > 0 && _scrubLetterOf(labels[start - 1]) === curL) start--;
+  if (start === cur && start > 0) {
+    const prevL = _scrubLetterOf(labels[start - 1]);
+    let i = start - 1;
+    while (i > 0 && _scrubLetterOf(labels[i - 1]) === prevL) i--;
+    return i;
+  }
+  return start;
+}
+
+export const _scrubLetterOf = (s: string) => {
+  const c = (s || '').trim().charAt(0).toUpperCase();
+  return c >= 'A' && c <= 'Z' ? c : '#';
+};
+
 let _libLetterJump: ((dir: 1 | -1) => void) | null = null;
 
 // Fast-scroll glimpse (Big Picture-style): show the current letter only while

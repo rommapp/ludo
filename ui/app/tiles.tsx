@@ -10,18 +10,19 @@ import {
   standaloneFor,
   useSaveActivityFor,
   _emuStatus,
-  _setFocusedPlatform,
   _tileElsByRomId,
   _tileFocusScrub,
   libCacheDelete,
   MODAL_SCRIM_INSET,
   PickerModal,
-  libCacheDrop, _focusedPlatform, NAV_MAINTAIN_X} from "./index";
+  libCacheDrop,
+  NAV_MAINTAIN_X,
+} from "./index";
 import { useCollectionSync, useOffline } from "./status";
 import { deleteCollectionRoms, deleteGame, downloadGame, getLibraryGames, getLocalDiscs, getLocalSiblings, resyncPlatform, toggleCollectionSync } from "./rpc";
 import { Focusable, GamepadButton, Menu, MenuItem, showContextMenu, showModal, toaster, ModalRoot} from "@ludo/host";
 import { maybePromptSwitchFirmware } from "./firmware";
-import { _libGamesCache, libCacheSetDownloaded } from "./libcache";
+import { _libGamesCache, libCacheSetDownloaded, _focusedPlatform, _setFocusedPlatform} from "./libcache";
 import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImage } from "./media";
 import { PlatformIcon, ProgressRing, UserMenuRow} from "./kit";

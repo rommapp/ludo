@@ -231,3 +231,67 @@ export function useDownloadGlimpse(): { count: number; pct: number | null } {
   }, [on]);
   return { count, pct: on ? pct : null };
 }
+
+// ── Library staleness ───────────────────────────────────────────────────────
+//
+// Whether what is on disk still matches the server. Checked on a long interval
+// rather than polled, because the answer only changes when someone adds or
+// removes roms on the RomM side.
+
+// Every stale path now earns a Home banner. That was once saves-only, on the
+// grounds that only saves fail silently — but staleness itself was then loose
+// enough to flag a ROM folder that worked fine, and interrupting for a
+// non-problem is what the restraint was really guarding against. With that false
+// positive gone (see stale_emulator_paths), the survivors all genuinely break
+// the app: saves lose progress, BIOS blocks the games that need it, and a dead
+// executable override stops launching altogether.
+// Headline and detail per kind, worst first. Saves lead when several are broken:
+// it's the only one that loses data you can't recreate.
+export const _STALE_RANK: Record<string, number> = { saves: 0, exe: 1, bios: 2, roms: 3 };
+
+// ── Staleness detection ─────────────────────────────────────────────────────
+// Games appear and disappear on RomM while the app is open, and until now
+// nothing asked unless the user pressed a button — the library was fetched on
+// connect and never again.
+//
+// Detect automatically, apply on consent. This started as a silent automatic
+// reconcile and that was the wrong shape: applying costs a walk of every
+// platform that moved (seconds to minutes), it renders a sticky fetch toast and
+// a loading banner, and it reorders the grid — all of it landing on someone who
+// is mid-browse and asked for none of it. Detection, by contrast, is one
+// /api/platforms call: 0.04s on a 20k-ROM instance, flat in library size,
+// touching nothing. So the cheap half runs unasked and the expensive half waits
+// for a press.
+//
+// Fires on the library tab becoming visible, at most once per interval —
+// event-driven rather than a timer, because a poll running while the user is in
+// a game can change nothing they are looking at, whereas arriving at the library
+// is exactly when a stale grid is about to be seen. argosy-launcher checks at
+// app start on a 7-day bound; it can only afford that because every sync it runs
+// is a full walk.
+//
+// No setting. There is no cost to trade away, and an interval nobody can predict
+// the value of is not a choice, it is a guess with a slider.
+export const _STALE_CHECK_MS = 15 * 60 * 1000;
+
+let _lastStaleCheck = 0;
+
+/** When the staleness check last ran, and a way to say it just did. */
+export function lastStaleCheck(): number { return _lastStaleCheck; }
+export function markStaleChecked() { _lastStaleCheck = Date.now(); }
+
+export type StaleInfo = { added: number; removed: number; platforms: string[] };
+
+export let _staleInfo: StaleInfo | null = null;
+
+export const _staleSubs = new Set<(s: StaleInfo | null) => void>();
+
+export function _setStale(s: StaleInfo | null) {
+  _staleInfo = s;
+  _staleSubs.forEach((fn) => { try { fn(s); } catch { /* ignore */ } });
+}
+
+// Any path that brings the library back in step retires the banner and restarts
+// the interval — a manual refresh resolves it just as the banner's own button
+// does, and one left on screen after the fact reads as a failure.
+export function _clearStale() { _setStale(null); markStaleChecked(); }

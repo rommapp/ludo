@@ -152,3 +152,23 @@ export function getHomeCache() { return _homeCache; }
 // The downloader announces; this cache is what acts on it. See events.ts for
 // why the dependency runs this way round.
 _downloadedListeners.add((romId, downloaded) => libCacheSetDownloaded(romId, downloaded));
+
+// ── Focused platform ────────────────────────────────────────────────────────
+//
+// The platform the currently-focused tile belongs to, so the top bar can offer
+// "open this platform" without the grid having to reach up into the chrome.
+
+// The focused platform tile's actions menu, published so the library page's Y
+// handler can reach it. Y opens the account menu everywhere EXCEPT a focused
+// platform tile, where the platform's own menu is the more useful thing and the
+// account menu is still one press away on ☰ Start. A module-level handle rather
+// than prop drilling: the handler lives on the page root, five components above
+// the tile, and only ever wants whichever tile is focused right now.
+export let _focusedPlatform: { label: string; open: () => void } | null = null;
+
+export const _focusedPlatformSubs = new Set<(p: typeof _focusedPlatform) => void>();
+
+export function _setFocusedPlatform(p: typeof _focusedPlatform) {
+  _focusedPlatform = p;
+  _focusedPlatformSubs.forEach((fn) => { try { fn(p); } catch { /* ignore */ } });
+}
