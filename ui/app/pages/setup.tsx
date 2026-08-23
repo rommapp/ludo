@@ -1,4 +1,4 @@
-import { type EmuStalePath, installSize, loadEmulatorStatus, startEmulatorInstall, useEmulatorInstall, useEmulatorStatus, MODAL_SCRIM_INSET, publishEmulatorStatus, V2CardRow, setWizardOpen, usePlatformSync, InstallProgressBar, PlatformSyncList, ScrollFade} from "../index";
+import { MODAL_SCRIM_INSET, V2CardRow, ScrollFade } from "../index";
 import { cloneElement, useEffect, useRef, useState } from "react";
 import { finishOnboarding, getConfig, getRommLogo, getSteamTileStatus, pairDevice, repairEmulatorPaths, saveConfig, setDeviceNameRpc, setLibraryPaths, setSteamTile, testRommConnection } from "../rpc";
 import { FileSelectionType, Focusable, Navigation, host, openFilePicker, showModal, toaster, ModalRoot, GamepadButton} from "@ludo/host";
@@ -10,6 +10,7 @@ import { _forceGamepadFocus, playSteamSound, useAutoFocus } from "../shell";
 import { V2Bg } from "../media";
 import { V2_FOCUS_STYLE } from "../focus";
 import { QrCode, pickerStart, useQrPairing } from "../pairing";
+import { EmuStalePath, InstallProgressBar, PlatformSyncList, installSize, loadEmulatorStatus, publishEmulatorStatus, startEmulatorInstall, useEmulatorInstall, useEmulatorStatus, usePlatformSync, setWizardOpen} from "../emulator";
 // First run: welcome, connect, folders, done.
 //
 // Opened automatically when nothing is configured, and reachable afterwards

@@ -7,22 +7,16 @@ import { Bumper, GameActionButton, V2SearchField, useEtaFromPct } from "../kit";
 import { V2, formatEta, formatSpeed } from "../theme";
 import { Focusable, GamepadButton, Navigation, host, showModal, toaster } from "@ludo/host";
 import {
-  InstallProgressBar,
   NAV_MAINTAIN_X,
   _resumeStatesPref,
   _setResumeStatesPref,
   _tileElsByRomId,
-  installSize,
   libCacheDelete,
-  loadEmulatorStatus,
-  publishEmulatorStatus,
-  startEmulatorInstall,
-  useEmulatorInstall,
-  useEmulatorStatus,
-  EmuStalePath,
   Shimmer,
   _stateThumbListeners,
-  loadStateThumbs, _stateThumbs} from "../index";
+  loadStateThumbs,
+  _stateThumbs,
+} from "../index";
 import { FaBookmark, FaCheck, FaChevronRight, FaDownload, FaEllipsisH, FaExclamationTriangle, FaGamepad, FaLayerGroup, FaPlay, FaRegClock, FaSync } from "react-icons/fa";
 import { LibView, NavId, libBack, libNavigate, navExitPlugin, pushLibView, setLibViewHooks } from "../nav";
 import { _groupsCache, _libGamesCache, getHomeCache, getLibGroupHolder, getLibGroupsHolder, getLibLastTab, libCacheSet, libCacheSetDownloaded, persistGroupsCache, persistHomeCache, setHomeCache, setLibGameHolder, setLibGameOrigin, setLibGroupHolder, setLibGroupsHolder, setLibLastTab, _focusedPlatformSubs, _focusedPlatform} from "../libcache";
@@ -40,6 +34,7 @@ import { lastLaunchedRomId } from "../launch";
 import { CollectionActionsModal, NAV_ORDER, UserMenuModal, V2NavBar, useNavChrome } from "../topbar";
 import { v2Page } from "../focus";
 import { _dlActive, runCollectionBatch, useBatchJob } from "../downloads";
+import { EmuStalePath, InstallProgressBar, installSize, loadEmulatorStatus, publishEmulatorStatus, startEmulatorInstall, useEmulatorInstall, useEmulatorStatus } from "../emulator";
 // The library: home, platforms, collections, search, and the grid underneath.
 //
 // The root page keeps all four panels mounted and hides the inactive ones

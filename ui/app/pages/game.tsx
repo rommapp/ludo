@@ -8,13 +8,11 @@ import { _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "..
 import {
   MODAL_SCRIM_INSET,
   openGameById,
-  useEmulatorStatus,
   SectionHeading,
   discDisplayLabel,
   LocalDisc,
   ToastCover,
   openDiscPicker,
-  standaloneFor,
   useRommImage,
   useSaveActivityFor,
 } from "../index";
@@ -26,6 +24,7 @@ import { GameCover } from "../media";
 import { MdVerified } from "react-icons/md";
 import { getLibGameHolder, getLibGameOrigin, libCacheSetDownloaded} from "../libcache";
 import { cannotLaunch, runLaunch } from "../launch";
+import { standaloneFor, useEmulatorStatus } from "../emulator";
 // One game, in full: the hero art, the actions, and the four metadata tabs.
 //
 // The tabs are where most of this lives — overview, files, save data,

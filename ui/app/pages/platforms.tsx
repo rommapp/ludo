@@ -1,10 +1,11 @@
-import { PlatformSyncList, ScrollFade, usePlatformSync } from "../index";
+import { ScrollFade } from "../index";
 import { v2Page } from "../focus";
 import { Focusable } from "@ludo/host";
 import { libBack } from "../nav";
 import { GameActionButton, V2SettingsSection } from "../kit";
 import { FaChevronLeft } from "react-icons/fa";
 import { V2 } from "../theme";
+import { PlatformSyncList, usePlatformSync } from "../emulator";
 // Platform folder mapping: where each platform's roms live on this device.
 //
 // The sync itself is usePlatformSync, which stays shared — the setup wizard

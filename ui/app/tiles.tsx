@@ -7,9 +7,7 @@ import {
   ToastCover,
   openDiscPicker,
   openGameById,
-  standaloneFor,
   useSaveActivityFor,
-  _emuStatus,
   _tileElsByRomId,
   _tileFocusScrub,
   libCacheDelete,
@@ -32,6 +30,7 @@ import { MdFlashOn } from "react-icons/md";
 import { _forceGamepadFocus } from "./shell";
 import { BiosDetailModal } from "./pages/bios";
 import { launchGameSmart, offerCoreInstall, cannotLaunch, runLaunch} from "./launch";
+import { _emuStatus, standaloneFor } from "./emulator";
 // The things a grid is made of.
 //
 // A tile is not just a cover: it carries the download state, the focus

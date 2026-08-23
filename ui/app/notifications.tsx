@@ -1,10 +1,11 @@
 import { ackLibraryAnnouncement, drainNotifications, getServiceStatus, getSyncIndicator } from "./rpc";
 import { Navigation, toaster } from "@ludo/host";
 import { _pushSaveActivity, useSaveActivity, useServiceStatus} from "./status";
-import { ToastCover, _setSyncPillPref, syncPillPref, invalidateStateThumbs, openGameById, _emuInstall} from "./index";
+import { ToastCover, _setSyncPillPref, syncPillPref, invalidateStateThumbs, openGameById } from "./index";
 import { useRef } from "react";
 import { FaCloudUploadAlt } from "react-icons/fa";
 import { PlatformIcon } from "./kit";
+import { _emuInstall } from "./emulator";
 // Background monitoring: the toasts that appear when nothing is on screen.
 //
 // This runs whether or not any of Ludo's pages are mounted, because most of

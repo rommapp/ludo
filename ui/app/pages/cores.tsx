@@ -7,7 +7,8 @@ import { Focusable, ModalRoot, showModal, toaster } from "@ludo/host";
 import { V2_FOCUS_STYLE, v2Page } from "../focus";
 import { V2 } from "../theme";
 import { libBack } from "../nav";
-import { MODAL_SCRIM_INSET, useEmulatorStatus, EmuStatus, installSize, useEmulatorInstall, loadEmulatorStatus, startEmulatorInstall} from "../index";
+import { MODAL_SCRIM_INSET } from "../index";
+import { EmuStatus, installSize, loadEmulatorStatus, startEmulatorInstall, useEmulatorInstall, useEmulatorStatus } from "../emulator";
 // Emulator cores: which one runs a platform, and getting one installed.
 //
 // The picker is a modal rather than a page of its own because it is reached
