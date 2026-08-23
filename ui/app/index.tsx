@@ -125,6 +125,16 @@ import { _lsAvail, _LS_REOPEN_HOME } from "./storage";
 import { _libRefreshListeners, _broadcastLibRefresh, _downloadedListeners } from "./events";
 import { _LS_PLATICON, _coverInflight } from "./media";
 import { setPreDownloadHook } from "./downloads";
+import { V2_FOCUS_STYLE, V2Focus, v2Page } from "./focus";
+import {
+  _forceGamepadFocus,
+  _gpFocusEl,
+  _summonVirtualKeyboard,
+  _dismissVirtualKeyboard,
+  _autoFocusFirstRef,
+  useAutoFocus,
+  playSteamSound,
+} from "./shell";
 import {
   awaitDownload,
   _dlActive,
@@ -619,24 +629,7 @@ function ProgressRing({ pct, size = 40, stroke = 3, glow = false, color = V2.bra
   );
 }
 
-// Returns a ref to attach to the FIRST selectable item on a screen; once `ready`
-// flips true (content loaded), it drops gamepad focus onto that item with a few
-// retries to beat Steam's default focus-acquisition — so a direction press moves
-// straight into the grid instead of needing a DOWN press out of the header.
-// Gamepad focus and the on-screen keyboard are the shell's, not ours: what
-// they cost differs completely between a Deck and a PC (see ui/host/contract.ts
-// and each adapter's focus.ts). These four wrappers keep the call sites reading
-// as intent, and all four no-op where the shell has no such facility — which is
-// why no caller checks first.
-function _forceGamepadFocus(el: any): void { host.focus.force(el); }
-function _gpFocusEl(): Element | null { return host.focus.current(); }
-function _summonVirtualKeyboard(): void { host.keyboard.show(); }
-function _dismissVirtualKeyboard(): void { host.keyboard.hide(); }
 
-// The most recently readied auto-focus target (the active panel's first item);
-// the post-emulator-session focus restore aims here so the first game/group is
-// highlighted, matching what a normal tab switch lands on.
-let _autoFocusFirstRef: React.MutableRefObject<any> | null = null;
 
 // Live game tiles by rom_id, and the rom_id of the last game launched. Coming
 // back from a session, restoring focus to the FIRST tile lost the user's place
@@ -646,22 +639,6 @@ let _autoFocusFirstRef: React.MutableRefObject<any> | null = null;
 // entries are removed on unmount.
 const _tileElsByRomId = new Map<number, any>();
 let _rommLastLaunchedRomId: number | null = null;
-function useAutoFocus(ready: boolean, dep?: any) {
-  const ref = useRef<any>(null);
-  useEffect(() => {
-    if (!ready) return;
-    _autoFocusFirstRef = ref;
-    // _forceGamepadFocus, not plain focus(): gamescope leaves the window
-    // OS-unfocused after an emulator session, so element.focus() fires no DOM
-    // focus event and Steam never converts it into gamepad focus — the panel
-    // would come up with nothing selected and the next press gets spent
-    // re-acquiring focus. In the healthy state it degrades to the same focus().
-    const timers = [0, 60, 160, 320].map((d) =>
-      setTimeout(() => { try { if (ref.current) _forceGamepadFocus(ref.current); } catch { } }, d));
-    return () => timers.forEach(clearTimeout);
-  }, [ready, dep]);
-  return ref;
-}
 
 // memo: a focus move updates the parent page's background-art state, which
 // would otherwise re-render every tile in the grid on each dpad press (felt
@@ -4349,36 +4326,6 @@ function RouteGuard({ children }: { children: any }) {
   return children;
 }
 
-// Play a Steam Deck UI sound (the same .wav files Big Picture / the Deck UI use
-// for its own navigation). Steam serves them from the SP window's loopback host,
-// so a plain Audio element reaches them. Everything is wrapped/swallowed: a
-// missing file or a blocked autoplay must never break navigation. Elements are
-// cached and cloned so rapid LB/RB presses can overlap instead of cutting off.
-// The desktop app has no steamloopback.host, so its shell sets
-// __ludoSoundBase to a backend route that serves the same files off the local
-// Steam install; on the Deck the constant below is used unchanged.
-const _navSoundCache: Record<string, HTMLAudioElement> = {};
-function soundBase(): string {
-  return (window as any).__ludoSoundBase || 'https://steamloopback.host/sounds/';
-}
-function playSteamSound(name: string) {
-  try {
-    let base = _navSoundCache[name];
-    if (!base) {
-      base = new Audio(`${soundBase()}${name}.wav`);
-      base.preload = 'auto';
-      _navSoundCache[name] = base;
-    }
-    const a = base.cloneNode(true) as HTMLAudioElement;
-    a.volume = 1;
-    // play() REJECTS when the source won't load, and the try/catch around this
-    // only sees synchronous throws — so on any machine whose shell serves no
-    // Steam sounds (a PC with no Steam install; the backend logs "silent" and
-    // 404s), every navigation press left an unhandled rejection in the console.
-    // Swallow it here: a missing sound is the expected case, not an error.
-    void a.play?.()?.catch(() => { });
-  } catch { /* no audio → silent, never fatal */ }
-}
 // Per-group games cache (key: `${mode}:${groupKey}`) so paging to an already
 // prefetched neighbour shows its covers instantly — the grid slides in with real
 // content instead of popping in after an async fetch.
@@ -5378,132 +5325,10 @@ function slotLabel(e: HistoryEntry): string {
 // Routes: /romm-sync-library  ->  /romm-sync-library/:key  ->  /romm-sync-game/:romId
 // ---------------------------------------------------------------------------
 
-// Suppress Steam's gamepad focus highlight (the square "overdraw" box drawn on
-// every Focusable) inside the plugin UI. We rely on our own per-component focus
-// styling (card scale/glow, row lift, button glow) instead, so the Steam box is
-// fully removed rather than restyled.
-// Steam draws its gamepad focus box in JS; we disable it per-element via the
-// noFocusRing prop on every Focusable. Here we only strip the CEF :focus
-// outline (our components supply their own glow), without touching box-shadow
-// so our focus glows survive.
-const V2_FOCUS_STYLE = `
-  .romm-ui *:focus, .romm-ui *:focus-visible { outline: none !important; }
-  /* Nothing here is a document to be read and copied — drag-selecting a game
-     title just leaves stray highlight behind. Scoped to .romm-ui so Steam's own
-     UI is untouched; inputs keep selection so the caret still works. */
-  .romm-ui { user-select: none; -webkit-user-select: none; }
-  .romm-ui input, .romm-ui textarea, .romm-ui [contenteditable="true"] {
-    user-select: text; -webkit-user-select: text;
-  }
-`;
 
-// Shared list-row / tile hover+focus treatment — the canonical RomM interaction
-// vocabulary (brand ring + soft purple glow + slight lift). Injected globally by
-// v2Page so every list (saves, achievements, …) reads identically instead of
-// each component reinventing it. `.romm-row` for full-width rows, `.romm-tile`
-// for the card grid. Note: hosts must NOT clip these (no overflow:hidden on the
-// immediate wrapper) or the outset glow gets cut off.
-const _EASE = 'cubic-bezier(0.22,1,0.36,1)';
 
-// ── Focus system ────────────────────────────────────────────────────────────
-// Single source of truth for how a focused (gamepad or mouse) element reads.
-// Gamepad focus under gamescope doesn't reliably fire CSS :focus-within, so most
-// call sites drive focus with JS state (onFocus/onBlur) and spread one of these
-// fragments; the .romm-row / .romm-tile CSS below is sourced from the SAME
-// constants so mouse (:hover/:focus-within) and gamepad focus render identically.
-//
-//   V2Focus.tile(f)   — card/tile-shaped things that pop toward you (scale)
-//   V2Focus.row(f)    — full-width list rows (lift instead of scale)
-//   V2Focus.field(f)  — text inputs: quiet halo, no lift/ring
-//   V2Focus.flat(f)   — buttons/pills: crisp ring, no lift; opts.glow adds a
-//                       faint halo for filled/primary buttons
-//   V2Focus.segment(f)— selected-segment tint (nav tabs / channel switch); the
-//                       one intentional no-ring affordance
-const _RING = `0 0 0 2px ${V2.brand}`;
-const _GLOW = 'rgba(139,116,232,0.45)';
-const V2Focus = {
-  tile: (f: boolean) => f ? {
-    transform: 'scale(1.04)', borderColor: V2.brand,
-    boxShadow: `0 8px 28px rgba(0,0,0,0.4), ${_RING}, 0 0 18px rgba(139,116,232,0.55)`,
-  } : {},
-  row: (f: boolean) => f ? {
-    background: V2.surfaceHover, borderColor: V2.brand, transform: 'translateY(-1px)',
-    boxShadow: `0 8px 22px rgba(0,0,0,0.4), ${_RING}, 0 0 16px ${_GLOW}`,
-  } : {},
-  // field returns borderColor on BOTH branches: callers pair it with a
-  // `border: 1px solid …` shorthand, and if the longhand is only present while
-  // focused, React drops border-color entirely on blur (without re-applying the
-  // shorthand) — border-color then falls back to currentColor and the field
-  // keeps a solid white 1px ring. Verified live on-device via CDP.
-  field: (f: boolean) => f ? {
-    borderColor: V2.brand, boxShadow: `0 0 0 3px rgba(139,116,232,0.22)`,
-  } : { borderColor: V2.border },
-  flat: (f: boolean, opts?: { glow?: boolean }) => f ? {
-    boxShadow: opts?.glow ? `${_RING}, 0 0 14px rgba(139,116,232,0.35)` : _RING,
-  } : {},
-  segment: (f: boolean) => f ? { background: 'rgba(255,255,255,0.10)' } : {},
-};
 
-const V2_ROW_STYLE = `
-  .romm-row { background: ${V2.surface}; border: 1px solid ${V2.border}; transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ${_EASE}, box-shadow 0.15s ease; }
-  .romm-row:hover, .romm-row.gpfocuswithin {
-    background: ${V2.surfaceHover}; border-color: ${V2.brand}; transform: translateY(-1px);
-    box-shadow: 0 8px 22px rgba(0,0,0,0.4), ${_RING}, 0 0 16px ${_GLOW};
-  }
-  .romm-tile { background: ${V2.surface}; border: 1px solid ${V2.border}; transition: background 0.15s ease, transform 0.15s ${_EASE}, box-shadow 0.15s ease, border-color 0.15s ease; }
-  .romm-tile:hover, .romm-tile.gpfocuswithin {
-    background: ${V2.surfaceHover}; transform: translateY(-2px); border-color: ${V2.brand};
-    box-shadow: 0 8px 22px rgba(0,0,0,0.4), ${_RING}, 0 0 16px ${_GLOW};
-  }
-  /* Gamepad focus can be FORCED onto a tile (returning from an emulator
-     session) without firing React's onFocus, so the highlight must also be
-     reachable via CSS. Keyed to Steam's own .gpfocuswithin marker — NOT DOM
-     :focus-within: gamescope leaves the window unfocused after a session, so
-     element.focus() (e.g. useAutoFocus on remount) moves DOM activeElement
-     silently and :focus-within would light a SECOND tile alongside the one
-     Steam actually has gamepad focus on. */
-  .romm-ptile-wrap:hover .romm-ptile-v, .romm-ptile-wrap.gpfocuswithin .romm-ptile-v {
-    background: ${V2.surface} !important; border-color: ${V2.brand} !important; transform: scale(1.04) !important;
-    box-shadow: 0 8px 28px rgba(0,0,0,0.4), ${_RING}, 0 0 18px rgba(139,116,232,0.55) !important;
-  }
-  .romm-ptile-wrap:hover .romm-ptile-ic, .romm-ptile-wrap.gpfocuswithin .romm-ptile-ic { color: ${V2.brandHover} !important; opacity: 1 !important; }
-  .romm-ptile-wrap:hover .romm-ptile-lb, .romm-ptile-wrap.gpfocuswithin .romm-ptile-lb { color: ${V2.fg} !important; }
-  .romm-gt-wrap:hover .romm-gt-cover, .romm-gt-wrap.gpfocuswithin .romm-gt-cover {
-    transform: scale(1.04) !important;
-    box-shadow: 0 8px 28px rgba(0,0,0,0.4), ${_RING}, 0 0 18px rgba(139,116,232,0.55) !important;
-  }
-  /* Reveal the cover's action overlay on real mouse hover, not just the React
-     focused state — onMouseEnter can miss when the pointer ends up inside a
-     cover without crossing its boundary (see the overlay comment in GameTile),
-     which otherwise left the Details/Delete/Play buttons unclickable. */
-  .romm-gt-wrap:hover .romm-gt-scrim,
-  .romm-gt-wrap:hover .romm-gt-primary { opacity: 1 !important; }
-  .romm-gt-wrap:hover .romm-gt-actions { opacity: 1 !important; transform: translateY(0) !important; }
-  .romm-ct-wrap:hover .romm-ct-cover, .romm-ct-wrap.gpfocuswithin .romm-ct-cover {
-    transform: scale(1.04) !important;
-    box-shadow: 0 8px 28px rgba(0,0,0,0.4), ${_RING}, 0 0 18px rgba(139,116,232,0.55) !important;
-  }
-`;
 
-function v2Page(children: any, bgUri: string | null = null) {
-  return (
-    <div className="romm-ui" style={{
-      fontFamily: V2.font, color: V2.fg, background: V2.bg,
-      position: 'relative', overflowY: 'auto', height: 'calc(100vh - 40px)',
-      marginTop: '40px', scrollPaddingTop: '120px', scrollPaddingBottom: '80px',
-    }}>
-      <style>{V2_FOCUS_STYLE}{V2_ROW_STYLE}</style>
-      <V2Bg uri={bgUri} />
-      {/* Bottom padding covers Steam's fixed footer button legend (measured
-          42px tall on-device, overlaying the screen bottom) + ~22px of real
-          clearance, so a fully scrolled last row sits above the glass bar
-          instead of under it. */}
-      <div style={{ position: 'relative', zIndex: 2, padding: '0 0 64px' }}>
-        {children}
-      </div>
-    </div>
-  );
-}
 
 const NAV_ORDER: NavId[] = ['home', 'platforms', 'collections', 'search'];
 
