@@ -13,15 +13,15 @@ import {
   V2CardRow,
   _setSyncPillPref,
   _syncPillListeners,
-  _syncPillPref,
+  syncPillPref,
   _setResumeStatesPref,
   _resumeStatesPref,
-  resetAnnouncementShown,
 } from "../index";
 import { FoldersSection } from "./setup";
 import { _groupsCache, clearBrowseCaches, persistGroupsCache } from "../libcache";
 import { clearIdentityCache } from "../topbar";
 import { _clearStale } from "../status";
+import { resetAnnouncementShown } from "../notifications";
 // Settings: the account, the folders, updates, and what the app is allowed to do.
 //
 // Most of it is capability-gated rather than shell-gated — the Steam-tile row
@@ -68,14 +68,14 @@ function useSyncPillEnabled(): boolean {
     // Undefined until the first answer lands, and treated as ON meanwhile —
     // suppressing it on the launch where it matters most would be the worse
     // failure, and the round-trip beats any save to the finish anyway.
-    if (_syncPillPref === null) {
+    if (syncPillPref() === null) {
       getSyncIndicator()
         .then((r) => _setSyncPillPref(r?.enabled !== false))
         .catch(() => _setSyncPillPref(true));
     }
     return () => { _syncPillListeners.delete(listener); };
   }, []);
-  return _syncPillPref !== false;
+  return syncPillPref() !== false;
 }
 
 // Set while a timed fetch is in flight, so re-entering Settings shows the row
