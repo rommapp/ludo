@@ -3,7 +3,7 @@
 // On the Deck, Steam's own focus engine plays a click for every navigation,
 // activation and back — the plugin only ever asks for the handful of sounds
 // Steam has no opinion about (tab transitions, opening the settings modal). The
-// desktop shim replaces that focus engine with its own (gamepad.ts), so the
+// desktop shell replaces that focus engine with its own (gamepad.ts), so the
 // ambient sounds have to be played here or the app is silent.
 //
 // Files are Steam's: the backend serves them out of the local Steam install at
@@ -36,7 +36,7 @@ export function playUiSound(name: string, volume = 1) {
   } catch { /* no audio → silent */ }
 }
 
-// Steam's names for the events this shim generates. Kept as one table so the
+// Steam's names for the events this shell generates. Kept as one table so the
 // mapping is reviewable in a single place rather than spread over call sites.
 const NAMES = {
   navigate: "deck_ui_navigation",
@@ -67,7 +67,7 @@ export function playSound(kind: UiSound) {
   playUiSound(NAMES[kind], VOLUME[kind] ?? 1);
 }
 
-// Real (isTrusted) clicks — the mouse path. The shim's own programmatic
+// Real (isTrusted) clicks — the mouse path. This shell's own programmatic
 // .click() after a pad press is untrusted, and is sounded by gamepad.ts, so
 // this listener can't double it; keyboard-activated clicks ARE trusted and land
 // here, where the dedupe above merges them with the Focusable's Enter handler.

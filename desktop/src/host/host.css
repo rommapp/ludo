@@ -1,4 +1,4 @@
-/* Baseline styling for the shimmed @decky/ui primitives.
+/* Baseline styling for this shell's widget kit.
  *
  * Deliberately minimal: index.tsx carries its own inline styles for nearly
  * everything, so this only needs to make the primitives behave sanely (focus
@@ -6,16 +6,16 @@
  */
 
 :root {
-  --shim-bg: #1a1f24;
-  --shim-fg: #dcdedf;
-  --shim-muted: #8b929a;
-  --shim-accent: #1a9fff;
-  --shim-surface: #23282e;
-  --shim-border: #3d4450;
+  --desk-bg: #1a1f24;
+  --desk-fg: #dcdedf;
+  --desk-muted: #8b929a;
+  --desk-accent: #1a9fff;
+  --desk-surface: #23282e;
+  --desk-border: #3d4450;
   /* Height of the fixed footer button legend. Modal scrims and bottom-corner
      toasts both keep clear of it, so read it from here rather than repeating
      the number. */
-  --shim-legend-h: 40px;
+  --desk-legend-h: 40px;
 }
 
 html,
@@ -30,8 +30,8 @@ body,
 }
 
 body {
-  background: var(--shim-bg);
-  color: var(--shim-fg);
+  background: var(--desk-bg);
+  color: var(--desk-fg);
   font-family: "Motiva Sans", system-ui, -apple-system, sans-serif;
   font-size: 14px;
 }
@@ -51,7 +51,7 @@ textarea,
   -webkit-user-select: text;
 }
 
-.shim-app {
+.desk-app {
   min-height: 100%;
   position: relative;
 }
@@ -148,17 +148,17 @@ div[class*="v2pf-"] > div {
  * is scrolled hard against an end and can't recentre) that overflow is clipped
  * by the track's overflow clip. Widen just the inline ends so the first and last
  * covers have the same breathing room as the middle ones. The track's inner flex
- * row is the `.shim-focusable` that is the DIRECT CHILD of the CardRow track.
+ * row is the `.desk-focusable` that is the DIRECT CHILD of the CardRow track.
  * That track's `overflowX:'auto', overflowY:'visible'` serializes in the DOM as
  * the SHORTHAND `overflow: auto visible` (verified by live inspection — NOT
  * `overflow-x: auto`, which is why earlier substring selectors matched nothing),
- * so we key off that and pad its direct `.shim-focusable` flex-row child. Padding
+ * so we key off that and pad its direct `.desk-focusable` flex-row child. Padding
  * lives on the row (scroll CONTENT), not the track, because WebKit historically
  * drops a scroll container's own padding-right. That inline overflow shorthand is
  * unique to these card tracks, so grids / nav bar / footers are untouched.
  * Desktop-only; index.tsx is untouched.
  */
-[style*="overflow: auto visible"] > .shim-focusable {
+[style*="overflow: auto visible"] > .desk-focusable {
   padding-left: 28px !important;
 }
 /* Trailing breathing room: a flex scroll-container's own padding-right is NOT
@@ -167,7 +167,7 @@ div[class*="v2pf-"] > div {
  * clips, even though scrollWidth includes the 48px). A real flex ITEM at the end
  * IS reserved, so add a zero-content ::after spacer instead of padding-right.
  * padding-left (the leading edge) works fine, so it stays. */
-[style*="overflow: auto visible"] > .shim-focusable::after {
+[style*="overflow: auto visible"] > .desk-focusable::after {
   content: "";
   flex: 0 0 28px;
   align-self: stretch;
@@ -232,23 +232,23 @@ div[class*="v2pf-"] > div {
 
 /* ── Focusable ─────────────────────────────────────────────────────────── */
 
-.shim-focusable:focus-visible {
-  outline: 2px solid var(--shim-accent);
+.desk-focusable:focus-visible {
+  outline: 2px solid var(--desk-accent);
   outline-offset: 2px;
 }
 
-.shim-focusable.shim-no-focus-ring:focus-visible {
+.desk-focusable.desk-no-focus-ring:focus-visible {
   outline: none;
 }
 
 /* ── Panels ────────────────────────────────────────────────────────────── */
 
-.shim-panel-section {
+.desk-panel-section {
   padding: 8px 0;
 }
 
-.shim-panel-title {
-  color: var(--shim-muted);
+.desk-panel-title {
+  color: var(--desk-muted);
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.5px;
@@ -256,66 +256,66 @@ div[class*="v2pf-"] > div {
   padding: 4px 12px;
 }
 
-.shim-panel-row {
+.desk-panel-row {
   padding: 2px 12px;
 }
 
-.shim-title {
+.desk-title {
   font-size: 18px;
   font-weight: 700;
 }
 
 /* ── Buttons & inputs ──────────────────────────────────────────────────── */
 
-.shim-button,
-.shim-dialog-button {
-  background: var(--shim-surface);
-  border: 1px solid var(--shim-border);
+.desk-button,
+.desk-dialog-button {
+  background: var(--desk-surface);
+  border: 1px solid var(--desk-border);
   border-radius: 3px;
-  color: var(--shim-fg);
+  color: var(--desk-fg);
   cursor: pointer;
   font: inherit;
   padding: 8px 12px;
   width: 100%;
 }
 
-.shim-dialog-button {
+.desk-dialog-button {
   width: auto;
 }
 
-.shim-button:hover:not(:disabled),
-.shim-dialog-button:hover:not(:disabled) {
-  background: var(--shim-accent);
+.desk-button:hover:not(:disabled),
+.desk-dialog-button:hover:not(:disabled) {
+  background: var(--desk-accent);
   color: #fff;
 }
 
-.shim-button:disabled,
-.shim-dialog-button:disabled {
+.desk-button:disabled,
+.desk-dialog-button:disabled {
   opacity: 0.5;
   cursor: default;
 }
 
-.shim-button-item.shim-sep {
-  border-bottom: 1px solid var(--shim-border);
+.desk-button-item.desk-sep {
+  border-bottom: 1px solid var(--desk-border);
 }
 
-.shim-item-label {
-  color: var(--shim-muted);
+.desk-item-label {
+  color: var(--desk-muted);
   font-size: 12px;
   padding-bottom: 4px;
 }
 
-.shim-item-description {
-  color: var(--shim-muted);
+.desk-item-description {
+  color: var(--desk-muted);
   font-size: 12px;
   padding-top: 4px;
 }
 
-.shim-input {
-  background: var(--shim-surface);
-  border: 1px solid var(--shim-border);
+.desk-input {
+  background: var(--desk-surface);
+  border: 1px solid var(--desk-border);
   border-radius: 3px;
-  color: var(--shim-fg);
+  color: var(--desk-fg);
   font: inherit;
   padding: 8px;
   width: 100%;
@@ -324,11 +324,11 @@ div[class*="v2pf-"] > div {
 
 /* ── Modals ────────────────────────────────────────────────────────────── */
 
-.shim-modal-scrim {
+.desk-modal-scrim {
   position: fixed;
   /* Stop above the legend: it is what tells the user which button confirms the
      modal, so covering it with the modal's own scrim is exactly backwards. */
-  inset: 0 0 var(--shim-legend-h) 0;
+  inset: 0 0 var(--desk-legend-h) 0;
   background: rgba(0, 0, 0, 0.7);
   display: flex;
   align-items: center;
@@ -336,8 +336,8 @@ div[class*="v2pf-"] > div {
   z-index: 1000;
 }
 
-.shim-modal {
-  background: var(--shim-surface);
+.desk-modal {
+  background: var(--desk-surface);
   border-radius: 6px;
   padding: 20px;
   min-width: 320px;
@@ -347,37 +347,37 @@ div[class*="v2pf-"] > div {
   position: relative;
 }
 
-.shim-modal-close {
+.desk-modal-close {
   position: absolute;
   top: 8px;
   right: 8px;
   background: transparent;
   border: none;
-  color: var(--shim-muted);
+  color: var(--desk-muted);
   cursor: pointer;
   font-size: 16px;
 }
 
 /* ── Context menu ──────────────────────────────────────────────────────── */
 
-.shim-context-menu {
-  background: var(--shim-surface);
-  border: 1px solid var(--shim-border);
+.desk-context-menu {
+  background: var(--desk-surface);
+  border: 1px solid var(--desk-border);
   border-radius: 4px;
   min-width: 200px;
   padding: 4px;
 }
 
-.shim-menu-label {
-  color: var(--shim-muted);
+.desk-menu-label {
+  color: var(--desk-muted);
   font-size: 12px;
   padding: 6px 10px;
 }
 
-.shim-menu-item {
+.desk-menu-item {
   background: transparent;
   border: none;
-  color: var(--shim-fg);
+  color: var(--desk-fg);
   cursor: pointer;
   display: block;
   font: inherit;
@@ -386,14 +386,14 @@ div[class*="v2pf-"] > div {
   width: 100%;
 }
 
-.shim-menu-item:hover:not(:disabled) {
-  background: var(--shim-accent);
+.desk-menu-item:hover:not(:disabled) {
+  background: var(--desk-accent);
   color: #fff;
 }
 
 /* ── Toasts ────────────────────────────────────────────────────────────── */
 
-.shim-toast-host {
+.desk-toast-host {
   position: fixed;
   top: 16px;
   right: 16px;
@@ -407,20 +407,20 @@ div[class*="v2pf-"] > div {
 /* User-selectable corner (Settings ▸ Notifications, desktop only). Bottom
    corners stack upward (column-reverse) so the newest toast is nearest the
    screen edge, matching the top corners' feel. */
-.shim-toast-host[data-pos="top-left"] { top: 16px; left: 16px; right: auto; bottom: auto; }
-.shim-toast-host[data-pos="top-right"] { top: 16px; right: 16px; left: auto; bottom: auto; }
-.shim-toast-host[data-pos="bottom-left"] {
-  bottom: calc(var(--shim-legend-h) + 16px); left: 16px; top: auto; right: auto;
+.desk-toast-host[data-pos="top-left"] { top: 16px; left: 16px; right: auto; bottom: auto; }
+.desk-toast-host[data-pos="top-right"] { top: 16px; right: 16px; left: auto; bottom: auto; }
+.desk-toast-host[data-pos="bottom-left"] {
+  bottom: calc(var(--desk-legend-h) + 16px); left: 16px; top: auto; right: auto;
   flex-direction: column-reverse;
 }
-.shim-toast-host[data-pos="bottom-right"] {
-  bottom: calc(var(--shim-legend-h) + 16px); right: 16px; top: auto; left: auto;
+.desk-toast-host[data-pos="bottom-right"] {
+  bottom: calc(var(--desk-legend-h) + 16px); right: 16px; top: auto; left: auto;
   flex-direction: column-reverse;
 }
 
 /* RomM v2 visual language: dark glass surface, brand-purple accent rail,
    soft elevation and rounded card corners (mirrors the tokens in index.tsx). */
-.shim-toast {
+.desk-toast {
   position: relative;
   background: rgba(18, 18, 30, 0.92);
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -439,17 +439,17 @@ div[class*="v2pf-"] > div {
   overflow: hidden;
   pointer-events: auto;
   font-family: "Motiva Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
-  animation: shimToastIn 0.24s cubic-bezier(0.22, 1, 0.36, 1);
+  animation: deskToastIn 0.24s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 /* Toasts that navigate somewhere (a finished download → the game) read as
    pressable; the rest stay inert. */
-.shim-toast-clickable {
+.desk-toast-clickable {
   cursor: pointer;
   transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
 }
 
-.shim-toast-clickable:hover {
+.desk-toast-clickable:hover {
   border-color: #8b74e8;
   background: rgba(28, 26, 46, 0.94);
   /* Border + flush 1px ring, the same hover the pill-shaped triggers use in
@@ -459,7 +459,7 @@ div[class*="v2pf-"] > div {
 }
 
 /* Brand accent rail down the leading edge. */
-.shim-toast::before {
+.desk-toast::before {
   content: "";
   position: absolute;
   top: 0;
@@ -469,10 +469,10 @@ div[class*="v2pf-"] > div {
   background: #8b74e8;
 }
 
-.shim-toast-critical {
+.desk-toast-critical {
   border-color: rgba(255, 80, 80, 0.35);
 }
-.shim-toast-critical::before {
+.desk-toast-critical::before {
   background: #ff5050;
 }
 
@@ -480,7 +480,7 @@ div[class*="v2pf-"] > div {
    `:empty` hides the slot when the node rendered nothing — a rom with no
    cover art returns null, and without this the flex gap would leave the text
    indented for art that isn't there. */
-.shim-toast-logo {
+.desk-toast-logo {
   flex: none;
   display: flex;
   align-items: center;
@@ -492,19 +492,19 @@ div[class*="v2pf-"] > div {
   max-width: 96px;
   max-height: 76px;
 }
-.shim-toast-logo > * {
+.desk-toast-logo > * {
   max-width: 100%;
   max-height: 100%;
 }
-.shim-toast-logo:empty {
+.desk-toast-logo:empty {
   display: none;
 }
 
-.shim-toast-text {
+.desk-toast-text {
   min-width: 0;
 }
 
-.shim-toast-title {
+.desk-toast-title {
   font-weight: 700;
   font-size: 13.5px;
   line-height: 1.3;
@@ -512,26 +512,26 @@ div[class*="v2pf-"] > div {
   letter-spacing: 0.01em;
 }
 
-.shim-toast-body {
+.desk-toast-body {
   color: rgba(255, 255, 255, 0.72);
   font-size: 12.5px;
   line-height: 1.4;
   margin-top: 2px;
 }
 
-@keyframes shimToastIn {
+@keyframes deskToastIn {
   from { opacity: 0; transform: translateY(-6px) scale(0.98); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 /* ── Footer button-hint legend (Deck bottom-bar equivalent) ────────────────── */
 
-.shim-legend {
+.desk-legend {
   position: fixed;
   left: 0;
   right: 0;
   bottom: 0;
-  height: var(--shim-legend-h);
+  height: var(--desk-legend-h);
   /* Above the modal scrim (1000), below toasts (1100). The scrim already stops
      short of this bar, but sitting above it too means no future overlay can
      bury the one row of chrome that says which button does what. */
@@ -555,14 +555,14 @@ div[class*="v2pf-"] > div {
    over a blurred, dimmed backdrop that same treatment made it look like part
    of the blur. Go opaque and drop the backdrop blur for as long as a modal is
    up: same bar, unmistakably in front. */
-body.shim-modal-open .shim-legend {
+body.desk-modal-open .desk-legend {
   background: rgb(14, 14, 24);
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
   border-top-color: rgba(255, 255, 255, 0.14);
 }
 
-.shim-legend-group {
+.desk-legend-group {
   display: flex;
   align-items: center;
   gap: 16px;
@@ -570,7 +570,7 @@ body.shim-modal-open .shim-legend {
   overflow: hidden;
 }
 
-.shim-legend-hint {
+.desk-legend-hint {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -579,27 +579,27 @@ body.shim-modal-open .shim-legend {
 
 /* Kenney glyphs carry their own button shape and colour, so unlike the drawn
    letters they replaced they get no border/background chrome of their own. */
-.shim-glyph {
+.desk-glyph {
   display: inline-flex;
   flex-shrink: 0;
   width: 20px;
   height: 20px;
 }
 
-.shim-glyph svg {
+.desk-glyph svg {
   width: 100%;
   height: 100%;
   display: block;
 }
 
 /* Chords (Shift+Enter) overlap slightly so they read as one hint, not two. */
-.shim-legend-chord {
+.desk-legend-chord {
   display: inline-flex;
   align-items: center;
   gap: 1px;
 }
 
-.shim-legend-label {
+.desk-legend-label {
   font-size: 12px;
   font-weight: 500;
   color: rgba(255, 255, 255, 0.68);
@@ -608,35 +608,35 @@ body.shim-modal-open .shim-legend {
 
 /* ── File picker ───────────────────────────────────────────────────────── */
 
-.shim-picker {
+.desk-picker {
   width: 560px;
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
-.shim-picker-path {
-  color: var(--shim-muted);
+.desk-picker-path {
+  color: var(--desk-muted);
   font-family: monospace;
   font-size: 12px;
   word-break: break-all;
 }
 
-.shim-picker-error {
+.desk-picker-error {
   color: #d94126;
 }
 
-.shim-picker-list {
-  border: 1px solid var(--shim-border);
+.desk-picker-list {
+  border: 1px solid var(--desk-border);
   border-radius: 4px;
   max-height: 50vh;
   overflow-y: auto;
 }
 
-.shim-picker-entry {
+.desk-picker-entry {
   background: transparent;
   border: none;
-  color: var(--shim-fg);
+  color: var(--desk-fg);
   cursor: pointer;
   display: block;
   font: inherit;
@@ -645,22 +645,22 @@ body.shim-modal-open .shim-legend {
   width: 100%;
 }
 
-.shim-picker-entry:hover {
-  background: var(--shim-accent);
+.desk-picker-entry:hover {
+  background: var(--desk-accent);
   color: #fff;
 }
 
-.shim-picker-actions {
+.desk-picker-actions {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
 }
 
-.shim-picker-actions button {
-  background: var(--shim-surface);
-  border: 1px solid var(--shim-border);
+.desk-picker-actions button {
+  background: var(--desk-surface);
+  border: 1px solid var(--desk-border);
   border-radius: 3px;
-  color: var(--shim-fg);
+  color: var(--desk-fg);
   cursor: pointer;
   font: inherit;
   padding: 8px 14px;

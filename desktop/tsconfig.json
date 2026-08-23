@@ -14,9 +14,16 @@
     "isolatedModules": true,
     "allowJs": false,
     "baseUrl": ".",
+    // Mirrors the aliases in vite.config.ts. tsc does not read those, so
+    // without these it resolves bare imports by walking up from the shared UI,
+    // never reaches desktop/node_modules, and reports phantom implicit-any
+    // errors cascading from an unresolved `react`. Keep the two lists in step.
     "paths": {
-      "@decky/ui": ["src/shim/ui.tsx"],
-      "@decky/api": ["src/shim/api.tsx"]
+      "@ludo/host": ["src/host/index.ts"],
+      "react": ["node_modules/@types/react"],
+      "react-dom": ["node_modules/@types/react-dom"],
+      "react/jsx-runtime": ["node_modules/@types/react/jsx-runtime"],
+      "react-icons/*": ["node_modules/react-icons/*"]
     }
   },
   "include": ["src", "vite.config.ts", "../decky_plugin/src"]

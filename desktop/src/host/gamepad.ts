@@ -305,12 +305,12 @@ function isVisible(el: HTMLElement) {
 
 // When a modal/context menu is open, trap focus inside the topmost one.
 function focusRoot(): ParentNode {
-  const overlays = document.querySelectorAll(".shim-modal, .shim-context-menu");
+  const overlays = document.querySelectorAll(".desk-modal, .desk-context-menu");
   return overlays.length ? overlays[overlays.length - 1] : document;
 }
 
 // Seed controller focus into an overlay's first target. On the Deck, ModalRoot
-// hands gamepad focus to the modal it opens; the desktop shim has no Steam nav
+// hands gamepad focus to the modal it opens; this shell has no Steam nav
 // controller, so without this the pad's origin (document.activeElement) stays on
 // the background control that opened the overlay — directional moves then compute
 // from OUTSIDE the overlay and A-button routing walks the wrong subtree, leaving
@@ -327,7 +327,7 @@ export function focusFirstIn(root: ParentNode): boolean {
   const all = (Array.from(root.querySelectorAll(FOCUS_SELECTOR)) as HTMLElement[])
     .filter(isVisible)
     // Don't land on the modal's ✕ close button — start on real content.
-    .filter((el) => !el.classList.contains("shim-modal-close"));
+    .filter((el) => !el.classList.contains("desk-modal-close"));
   const inner = all.filter((el) => !all.some((o) => o !== el && el.contains(o)));
   const targets = dedupe(inner.map(fieldFootprint));
   const first = targets[0];
@@ -347,7 +347,7 @@ export function focusFirstIn(root: ParentNode): boolean {
 
 // Seed controller focus onto the current page/overlay's first target — used
 // after a navigation so a gamepad user lands on a control by default. On the
-// Deck, Steam's useAutoFocus does this; the shim honours useAutoFocus too, but
+// Deck, Steam's useAutoFocus does this; this shell honours useAutoFocus too, but
 // pages without it (e.g. Settings) would otherwise come up with nothing
 // selected. No-op in mouse mode (a mouse user needs no forced highlight), and
 // focusFirstIn() leaves an already-focused control alone, so pages that DO
@@ -367,7 +367,7 @@ export function seedFocus(): void {
 
 // ── Focus restore after a transient blur ────────────────────────────────────
 //
-// A control that dims while it's working (opacity < 1 is the shim's "disabled"
+// A control that dims while it's working (opacity < 1 is this shell's "disabled"
 // convention — see Focusable in ui.tsx) loses its tabindex for the duration, and
 // the browser blurs it to <body>. Without this, the reseed below treated that as
 // a page swap and seeded the page's FIRST target — so pressing "Check for
@@ -423,7 +423,7 @@ function focusTargets(): HTMLElement[] {
   const all = (Array.from(root.querySelectorAll(FOCUS_SELECTOR)) as HTMLElement[])
     .filter(isVisible);
   // Collapse nested focusables to a single stop. The plugin wraps controls in a
-  // Focusable (which the shim makes tabbable), so a text field is BOTH the
+  // Focusable (which this shell makes tabbable), so a text field is BOTH the
   // wrapper div and the inner <input> — two landing spots for one field, which
   // is what made a field take two presses (and drop into edit mode on the
   // second). Keep only the innermost interactive element: if a candidate
@@ -663,7 +663,7 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
     const group = opt ? best.parentElement : null;
     if (group && !group.contains(active)) {
       const on = group.querySelector("[data-seg-on]");
-      const target = on?.closest<HTMLElement>(".shim-focusable");
+      const target = on?.closest<HTMLElement>(".desk-focusable");
       if (target && targets.includes(target)) best = target;
     }
   }
@@ -743,7 +743,7 @@ function inStickyTopBar(el: HTMLElement): boolean {
   return false;
 }
 
-// The nav tabs pill lives inside the sticky top bar, marked `.shim-topnav` by
+// The nav tabs pill lives inside the sticky top bar, marked `.desk-topnav` by
 // index.tsx. Return the FIRST focusable tab in the pill — an Up into the nav
 // always lands there, regardless of which tile you came up from, matching the
 // Deck. null if there's no pill.
@@ -753,14 +753,14 @@ function navPillTarget(inBar: HTMLElement): HTMLElement | null {
     const pos = getComputedStyle(bar).position;
     if (pos === "sticky" || pos === "fixed") break;
   }
-  const pill = (bar ?? document).querySelector(".shim-topnav") as HTMLElement | null;
+  const pill = (bar ?? document).querySelector(".desk-topnav") as HTMLElement | null;
   if (!pill) return null;
   const tabs = (Array.from(pill.querySelectorAll(FOCUS_SELECTOR)) as HTMLElement[])
     .filter(isVisible);
   if (!tabs.length) return null;
   // Land on the first tab that ISN'T the current page's (active) tab — matching
   // the Deck (on Home, Up lands on Platforms). Fall back to the first tab.
-  return tabs.find((t) => !t.classList.contains("shim-navtab-active")) ?? tabs[0];
+  return tabs.find((t) => !t.classList.contains("desk-navtab-active")) ?? tabs[0];
 }
 
 // Nearest vertically-scrollable ancestor of `el`, or null (the page scroll host).
@@ -779,7 +779,7 @@ function scrollParentOf(el: HTMLElement): HTMLElement | null {
 // last focus target (its primary button); otherwise null.
 function footerPrimary(target: HTMLElement, origin: HTMLElement): HTMLElement | null {
   for (let node = target.parentElement; node; node = node.parentElement) {
-    if (!node.classList.contains("shim-focusable")) continue;
+    if (!node.classList.contains("desk-focusable")) continue;
     const cs = getComputedStyle(node);
     if (cs.display !== "flex" || cs.justifyContent !== "space-between" ||
         cs.flexDirection.startsWith("column")) continue;
@@ -829,7 +829,7 @@ declare global {
 // NOT the programmatic .focus()/.click() this layer uses) and hide the cursor;
 // restore both the instant the real mouse moves.
 let mouseMode = true;
-// True while the pointer is the active input. Exported so the React shim can skip
+// True while the pointer is the active input. Exported so the widget kit can skip
 // its own focus grabs (a Focusable's autoFocus, restoring a modal's opener) for
 // the same reason focusFirstIn does: with a mouse there's nothing to highlight.
 export function inMouseMode(): boolean { return mouseMode; }
@@ -960,7 +960,7 @@ export function startGamepad() {
   // Mirror Steam's gpfocus markers. On the Deck, Steam tags the gamepad-focused
   // Focusable AND its ancestors with `gpfocuswithin` (the leaf also with
   // `gpfocus`), and the plugin's focus CSS (.romm-row.gpfocuswithin,
-  // .romm-*-wrap.gpfocuswithin, …) is built entirely on those markers. The shim
+  // .romm-*-wrap.gpfocuswithin, …) is built entirely on those markers. The kit
   // uses plain DOM focus, so without this rows/covers/tiles never highlight under
   // the controller. Only in gamepad mode: mouse hover has its own :hover rules,
   // and a lingering marker after the pointer takes over would double-highlight.
@@ -1146,7 +1146,7 @@ export function startGamepad() {
     const a = document.activeElement as HTMLElement | null;
     if (a && a !== document.body && document.contains(a)) return a;
     if (hovered && document.contains(hovered)) return hovered;
-    const modals = document.querySelectorAll<HTMLElement>(".shim-modal");
+    const modals = document.querySelectorAll<HTMLElement>(".desk-modal");
     const modal = modals[modals.length - 1];
     if (modal) return modal;
     for (const [el, h] of registry) {

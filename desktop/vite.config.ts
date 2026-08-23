@@ -2,16 +2,16 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { resolve } from "path";
 
-// The whole point of this config: `@decky/ui` and `@decky/api` resolve to the
-// shim instead of the real packages, so decky_plugin/src/index.tsx is consumed
-// BYTE-IDENTICAL by both builds. Never fork that file — if something it imports
-// is missing here, add it to the shim.
+// The whole point of this config: `@ludo/host` resolves to this shell's
+// adapter, so the shared UI is consumed BYTE-IDENTICAL by both builds. Never
+// fork it — if something it imports is missing here, add it to the adapter
+// (src/host/), and add it to the Decky adapter too so the two stay in step.
+// The contract they both satisfy is ui/host/contract.ts.
 export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: [
-      { find: "@decky/ui", replacement: resolve(__dirname, "src/shim/ui.tsx") },
-      { find: "@decky/api", replacement: resolve(__dirname, "src/shim/api.tsx") },
+      { find: "@ludo/host", replacement: resolve(__dirname, "src/host/index.ts") },
       // decky_plugin/src/index.tsx lives outside this root and there is no
       // node_modules next to it, so Node resolution walks past desktop/ and
       // never finds react/react-icons. Pin them to ours.
@@ -23,7 +23,7 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    // The Python backend serves the RPC endpoints the shim's `callable` hits.
+    // The Python backend serves the RPC endpoints this shell's `callable` hits.
     proxy: {
       "/api": { target: "http://127.0.0.1:8723", changeOrigin: true },
     },

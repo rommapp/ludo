@@ -192,8 +192,8 @@ ENGINE: Engine | None = None
 
 # ── Non-plugin RPC: filesystem listing for the file picker ──────────────────
 
-def shim_list_dir(path: str, include_files: bool = False) -> dict:
-    """Backs the shim's openFilePicker — a browser can't enumerate the FS."""
+def host_list_dir(path: str, include_files: bool = False) -> dict:
+    """Backs the host adapter's openFilePicker — a browser can't enumerate the FS."""
     p = Path(path).expanduser()
     if not p.is_dir():
         p = Path.home()
@@ -300,7 +300,7 @@ def get_image(path: str = ""):
     return ENGINE.call("get_image", [path])
 
 
-LOCAL_RPC = {"shim_list_dir": shim_list_dir, "get_image": get_image}
+LOCAL_RPC = {"host_list_dir": host_list_dir, "get_image": get_image}
 
 
 # ── HTTP ────────────────────────────────────────────────────────────────────

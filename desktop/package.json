@@ -9,6 +9,7 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs",
     "preview": "vite preview",
     "electron": "npm run build && node electron/launch.cjs",
     "electron:dev": "node electron/launch.cjs --dev",

@@ -67,7 +67,7 @@ export function Glyph({ set, name, title }: { set: GlyphSet; name: string; title
   if (!svg) return null;
   return (
     <span
-      className="shim-glyph"
+      className="desk-glyph"
       role="img"
       aria-label={title}
       dangerouslySetInnerHTML={{ __html: svg }}

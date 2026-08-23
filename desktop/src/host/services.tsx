@@ -1,36 +1,22 @@
-// Web implementations of the @decky/api surface consumed by index.tsx.
+// This shell's half of the host contract's services: RPC, toasts, modals and
+// the file picker. The widget kit is next door in kit.tsx.
 import { useState } from "react";
 import { pushToast, pushModal, type ToastOpts } from "./overlays";
 
 export { routerHook } from "./router";
 
 // ── RPC ─────────────────────────────────────────────────────────────────────
-
-const RPC_BASE = "/api";
-
-/**
- * Decky's `callable` binds a name to a Python method on the plugin backend and
- * marshals positional args. The desktop backend mirrors that contract, so the
- * 51 call sites in index.tsx need no changes: POST /api/<method> with
- * {args: [...]}, reply {result} or {error}.
- */
-export function callable<A extends any[], R>(method: string) {
-  return async (...args: A): Promise<R> => {
-    const res = await fetch(`${RPC_BASE}/${encodeURIComponent(method)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ args }),
-    });
-    if (!res.ok) {
-      throw new Error(`${method}: HTTP ${res.status} ${res.statusText}`);
-    }
-    const payload = await res.json();
-    if (payload && payload.error) throw new Error(String(payload.error));
-    return payload.result as R;
-  };
-}
+// Lives in its own module because it is plain fetch: the launcher and anything
+// else that only needs to reach the backend can import it without pulling in
+// React and the widget kit.
+// Imported as well as re-exported: this module calls it itself, and a bare
+// `export ... from` creates no local binding.
+import { callable } from "./rpc";
+export { callable };
 
 // ── Plugin entry ────────────────────────────────────────────────────────────
+// Still here because the shared UI is still a Decky plugin factory. It stops
+// being needed once the app entry is split out of the QAM panel.
 
 export type PluginDescriptor = {
   name?: string;
@@ -71,11 +57,11 @@ type DirListing = {
   entries: { name: string; path: string; isdir: boolean }[];
 };
 
-// The only shim entry that needs real backend support: a browser cannot
+// The only host service that needs real backend support: a browser cannot
 // enumerate the filesystem, and <input type=file webkitdirectory> yields file
 // lists rather than a directory path. So the backend exposes a listing endpoint
 // and this renders a picker over it.
-const listDir = callable<[string, boolean], DirListing>("shim_list_dir");
+const listDir = callable<[string, boolean], DirListing>("host_list_dir");
 
 function FolderPicker({
   startPath,
@@ -111,13 +97,13 @@ function FolderPicker({
   };
 
   return (
-    <div className="shim-modal shim-picker">
-      <div className="shim-picker-path">{cwd}</div>
-      {error ? <div className="shim-picker-error">{error}</div> : null}
-      <div className="shim-picker-list">
+    <div className="desk-modal desk-picker">
+      <div className="desk-picker-path">{cwd}</div>
+      {error ? <div className="desk-picker-error">{error}</div> : null}
+      <div className="desk-picker-list">
         {listing?.parent ? (
           <button
-            className="shim-picker-entry"
+            className="desk-picker-entry"
             type="button"
             onClick={() => void load(listing.parent!)}
           >
@@ -127,7 +113,7 @@ function FolderPicker({
         {listing?.entries.map((e) => (
           <button
             key={e.path}
-            className="shim-picker-entry"
+            className="desk-picker-entry"
             type="button"
             onClick={() =>
               e.isdir
@@ -139,7 +125,7 @@ function FolderPicker({
           </button>
         ))}
       </div>
-      <div className="shim-picker-actions">
+      <div className="desk-picker-actions">
         <button type="button" onClick={() => done(null)}>
           Cancel
         </button>

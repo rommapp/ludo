@@ -1,21 +1,23 @@
 import { StrictMode, useEffect } from "react";
 import { createRoot } from "react-dom/client";
 
-import { callable } from "./shim/api";
-import { seedFocus, startGamepad } from "./shim/gamepad";
-import { ModalHost, ToastHost } from "./shim/overlays";
-import { FooterLegend } from "./shim/footer";
-import { Navigation, matchRoute, useRoutePath, useRouteRegistry } from "./shim/router";
-import { startSound } from "./shim/sound";
-import "./shim/shim.css";
+import { callable } from "./host/services";
+import { seedFocus, startGamepad } from "./host/gamepad";
+import { ModalHost, ToastHost } from "./host/overlays";
+import { FooterLegend } from "./host/footer";
+import { Navigation, matchRoute, useRoutePath, useRouteRegistry } from "./host/router";
+import { startSound } from "./host/sound";
+import "./host/host.css";
 
 // Importing the plugin runs its definePlugin factory, which registers every
 // route. Must happen before first render so the router already has them. This
 // is a side-effect import — we deliberately do NOT use the returned plugin
 // object (see below).
 //
-// NOTE: this is decky_plugin/src/index.tsx, imported unmodified. Vite aliases
-// @decky/ui and @decky/api to the shim (see vite.config.ts).
+// NOTE: this is decky_plugin/src/index.tsx. It asks for its shell through the
+// `@ludo/host` specifier, which vite.config.ts points at this shell's adapter
+// (src/host/); the Decky build points the same specifier at its own. Both
+// satisfy ui/host/contract.ts.
 import "../../decky_plugin/src/index";
 
 // Where the desktop app lands. The Decky Quick Access panel (plugin.content) is
@@ -77,7 +79,7 @@ function App() {
   }, [route, path]);
 
   return (
-    <div className="shim-app">
+    <div className="desk-app">
       {route ? route.component() : null}
       <ModalHost />
       <ToastHost />

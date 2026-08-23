@@ -155,8 +155,8 @@ export const Focusable = forwardRef(function Focusable(
       ref={setRef}
       style={style}
       className={
-        "shim-focusable" +
-        (noFocusRing ? " shim-no-focus-ring" : "") +
+        "desk-focusable" +
+        (noFocusRing ? " desk-no-focus-ring" : "") +
         (className ? " " + className : "")
       }
       tabIndex={tabIndex}
@@ -230,15 +230,15 @@ export function PanelSection({
   children?: ReactNode;
 }) {
   return (
-    <div className="shim-panel-section">
-      {title ? <div className="shim-panel-title">{title}</div> : null}
+    <div className="desk-panel-section">
+      {title ? <div className="desk-panel-title">{title}</div> : null}
       {children}
     </div>
   );
 }
 
 export function PanelSectionRow({ children }: { children?: ReactNode }) {
-  return <div className="shim-panel-row">{children}</div>;
+  return <div className="desk-panel-row">{children}</div>;
 }
 
 // ── Buttons ─────────────────────────────────────────────────────────────────
@@ -266,13 +266,13 @@ export function ButtonItem({
   return (
     <div
       className={
-        "shim-button-item" + (bottomSeparator ? " shim-sep" : "")
+        "desk-button-item" + (bottomSeparator ? " desk-sep" : "")
       }
     >
-      {label ? <div className="shim-item-label">{label}</div> : null}
+      {label ? <div className="desk-item-label">{label}</div> : null}
       <button
         type="button"
-        className="shim-button"
+        className="desk-button"
         disabled={disabled}
         onClick={onClick}
         {...safe}
@@ -280,7 +280,7 @@ export function ButtonItem({
         {children}
       </button>
       {description ? (
-        <div className="shim-item-description">{description}</div>
+        <div className="desk-item-description">{description}</div>
       ) : null}
     </div>
   );
@@ -308,7 +308,7 @@ export const DialogButton = forwardRef(function DialogButton(
     <button
       ref={ref}
       type="button"
-      className={"shim-dialog-button" + (className ? " " + className : "")}
+      className={"desk-dialog-button" + (className ? " " + className : "")}
       style={style}
       disabled={disabled}
       onClick={onClick}
@@ -348,11 +348,11 @@ export const TextField = forwardRef(function TextField(
   ref: Ref<HTMLInputElement>,
 ) {
   return (
-    <div className="shim-textfield">
-      {label ? <div className="shim-item-label">{label}</div> : null}
+    <div className="desk-textfield">
+      {label ? <div className="desk-item-label">{label}</div> : null}
       <input
         ref={ref}
-        className={"shim-input" + (className ? " " + className : "")}
+        className={"desk-input" + (className ? " " + className : "")}
         style={style}
         type={bIsPassword ? "password" : mustBeNumeric ? "number" : "text"}
         value={value}
@@ -374,7 +374,7 @@ export function ModalRoot({
   onEscKeypress,
   bHideCloseIcon,
   className,
-  // Deck-only prop naming the inner panel element; the shim's modal is a single
+  // Deck-only prop naming the inner panel element; this modal is a single
   // div, so consume it here rather than letting it spread onto the DOM (React
   // would warn about an unknown `modalClassName` attribute). Callers that style
   // via it also pass the same value as `className`, which we keep below.
@@ -406,7 +406,7 @@ export function ModalRoot({
   }, []);
   // Register the modal root itself as a Focusable carrying onCancelButton, so the
   // controller's B button dismisses the modal. On the Deck, ModalRoot's onCancel/
-  // onEscKeypress are wired to Steam's native B handling; the shim has no such
+  // onEscKeypress are wired to Steam's native B handling; this shell has no such
   // wiring, and a bHideCloseIcon modal (e.g. the core picker) then has no ✕ and
   // no B route either — trapping the user. Registering here means routeButton()
   // finds this handler while walking up from any focused row inside the modal.
@@ -424,10 +424,10 @@ export function ModalRoot({
   return (
     <div
       ref={rootRef}
-      // Compose, don't let a caller's className replace shim-modal: the gamepad
-      // focus trap (focusRoot) keys off .shim-modal, so dropping it makes the
+      // Compose, don't let a caller's className replace desk-modal: the gamepad
+      // focus trap (focusRoot) keys off .desk-modal, so dropping it makes the
       // modal uncontrollable and nav leaks to the background.
-      className={"shim-modal" + (className ? " " + className : "")}
+      className={"desk-modal" + (className ? " " + className : "")}
       role="dialog"
       onKeyDown={(e) => {
         if (e.key === "Escape") {
@@ -438,7 +438,7 @@ export function ModalRoot({
       {...rest}
     >
       {!bHideCloseIcon && dismiss ? (
-        <button className="shim-modal-close" onClick={dismiss} type="button">
+        <button className="desk-modal-close" onClick={dismiss} type="button">
           ✕
         </button>
       ) : null}
@@ -477,8 +477,8 @@ export function Menu({
   [key: string]: any;
 }) {
   return (
-    <div className="shim-menu" {...rest}>
-      {label ? <div className="shim-menu-label">{label}</div> : null}
+    <div className="desk-menu" {...rest}>
+      {label ? <div className="desk-menu-label">{label}</div> : null}
       {children}
     </div>
   );
@@ -501,7 +501,7 @@ export function MenuItem({
   return (
     <button
       type="button"
-      className="shim-menu-item"
+      className="desk-menu-item"
       disabled={disabled}
       onClick={() => act?.()}
       {...rest}
@@ -527,7 +527,7 @@ function ContextMenuOverlay({ element, onClose }: { element: ReactNode; onClose:
     });
   }, [onClose]);
   return (
-    <div ref={rootRef} className="shim-context-menu" onClick={onClose}>
+    <div ref={rootRef} className="desk-context-menu" onClick={onClose}>
       {element}
     </div>
   );
@@ -542,5 +542,5 @@ export function showContextMenu(element: any, _parent?: any): ModalHandle {
 // ── Misc ────────────────────────────────────────────────────────────────────
 
 export const staticClasses = {
-  Title: "shim-title",
+  Title: "desk-title",
 };

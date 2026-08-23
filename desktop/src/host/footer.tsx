@@ -1,6 +1,6 @@
 // Desktop button-hint bar — the equivalent of Steam's fixed bottom legend on
 // the Deck. Steam renders that bar natively from each Focusable's
-// on*ActionDescription / actionDescriptionMap props; our shim has no such chrome,
+// on*ActionDescription / actionDescriptionMap props; this shell has no such chrome,
 // so we rebuild it here. The gamepad layer (gamepad.ts) aggregates the current
 // target's labels via computeLegend() and tells us when to refresh.
 //
@@ -78,14 +78,14 @@ function Hint({ set, slot, label }: { set: GlyphSet; slot: string; label?: strin
   const binds = set === "kbm" ? KBM_SLOTS[slot] : [GAMEPAD_SLOTS[set][slot]];
   if (!binds || binds.some((b) => !b)) return null;
   return (
-    <span className="shim-legend-hint">
+    <span className="desk-legend-hint">
       {/* Multi-glyph slots are chords, e.g. Shift+Enter. */}
-      <span className="shim-legend-chord">
+      <span className="desk-legend-chord">
         {binds.map((b, i) => (
           <Glyph key={i} set={set} name={b.name} title={b.title} />
         ))}
       </span>
-      <span className="shim-legend-label">{label}</span>
+      <span className="desk-legend-label">{label}</span>
     </span>
   );
 }
@@ -135,13 +135,13 @@ export function FooterLegend() {
 
   // Left cluster: system buttons. Right cluster: face-button actions.
   return (
-    <div className="shim-legend">
-      <div className="shim-legend-group">
+    <div className="desk-legend">
+      <div className="desk-legend-group">
         <Hint set={set} slot="navigate" label="Navigate" />
         <Hint set={set} slot="select" label={legend.select} />
         <Hint set={set} slot="start" label={legend.start} />
       </div>
-      <div className="shim-legend-group">
+      <div className="desk-legend-group">
         <Hint set={set} slot="ok" label={legend.ok} />
         <Hint set={set} slot="secondary" label={legend.secondary} />
         <Hint set={set} slot="options" label={legend.options} />

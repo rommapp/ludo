@@ -14,8 +14,14 @@ import {
   showContextMenu,
   Menu,
   MenuItem,
-} from "@decky/ui";
-import { callable, definePlugin, toaster, routerHook, openFilePicker, FileSelectionType } from "@decky/api";
+  callable,
+  definePlugin,
+  toaster,
+  routerHook,
+  openFilePicker,
+  FileSelectionType,
+  host,
+} from "@ludo/host";
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, forwardRef, memo, cloneElement, type Ref, type ChangeEvent } from "react";
 import { FaSync, FaTrash, FaCog, FaGithub, FaBug, FaUndo, FaCopy, FaGamepad, FaBookmark, FaHome, FaSearch, FaTimes, FaTimesCircle, FaDownload, FaPlay, FaInfoCircle, FaRegClock, FaLayerGroup, FaChevronLeft, FaChevronRight, FaCheckCircle, FaUsers, FaExternalLinkAlt, FaPuzzlePiece, FaBoxOpen, FaClone, FaRedo, FaClock, FaCheck, FaEllipsisH, FaGlobe, FaChevronDown, FaChartBar, FaSave, FaUser, FaExclamationTriangle, FaHistory, FaPowerOff, FaCloudUploadAlt, FaMicrochip, FaStopwatch, FaUnlink, FaFolder, FaLink, FaBolt } from "react-icons/fa";
 import { MdFlashOn } from "react-icons/md";
@@ -83,7 +89,6 @@ const updateLoggingEnabled = callable<[boolean], boolean>("set_logging_enabled")
 const getRetrodeckButtonEnabled = callable<[], boolean>("get_retrodeck_button_enabled");
 const setRetrodeckButtonEnabled = callable<[boolean], boolean>("set_retrodeck_button_enabled");
 const getRetrodeckLogo = callable<[], any>("get_retrodeck_logo");
-const launchRetrodeckNative = callable<[], { ok: boolean; reason?: string }>("launch_retrodeck");
 const getSteamTileStatus = callable<[], any>("get_steam_tile_status");
 const setSteamTile = callable<[boolean, string, string, string], any>("set_steam_tile");
 const getCoreMappings = callable<[], any>("get_core_mappings");
@@ -143,7 +148,6 @@ const prepareSteamLaunch = callable<[number, (string | null)?, (number | null)?,
 const getResumeStateEnabled = callable<[], boolean>("get_resume_state_enabled");
 const setResumeStateEnabled = callable<[boolean], boolean>("set_resume_state_enabled");
 const getStateThumbnails = callable<[number[], (boolean)?], any>("get_state_thumbnails");
-const getSessionHostPath = callable<[], any>("get_session_host_path");
 // BIOS inventory: what RomM holds per platform vs. what's in RetroArch's system
 // dir. Distinct from get_bios_status, which reports background download progress.
 const getBiosInventory = callable<[(boolean)?], any>("get_bios_inventory");
@@ -168,8 +172,6 @@ const getLocalDiscs = callable<[number], any>("get_local_discs");
 const getLocalSiblings = callable<[number], any>("get_local_siblings");
 const getHomeData = callable<[], any>("get_home_data");
 const getSyncEpoch = callable<[], any>("get_sync_epoch");
-const getPluginLogo = callable<[], any>("get_plugin_logo");
-const getRommArtwork = callable<[], any>("get_romm_artwork");
 const getRommLogo = callable<[], any>("get_romm_logo");
 
 // Shared image-fetch queue. The home page mounts dozens of tiles at once, each
@@ -1207,207 +1209,15 @@ function ProgressRing({ pct, size = 40, stroke = 3, glow = false, color = V2.bra
 // flips true (content loaded), it drops gamepad focus onto that item with a few
 // retries to beat Steam's default focus-acquisition — so a direction press moves
 // straight into the grid instead of needing a DOWN press out of the header.
-// Forcibly hand Steam's gamepad focus to `el`. Plain HTMLElement.focus() only
-// works while the gamepad UI's focus context is already inside our tree; right
-// after an emulator session ends it isn't, so we also locate the element's
-// navigation node inside Steam's FocusNavController trees and take focus
-// through the controller itself (BTakeFocus). All internals are undocumented,
-// hence the fully defensive access — worst case this degrades to focus().
-// Taking focus through the nav controller (BTakeFocus) sets Steam's gamepad
-// focus + DOM activeElement, but does NOT emit a bubbling focus event — so
-// React's onFocus never fires and our tiles' focused STATE stays false. The
-// tile then highlights (CSS :focus-within) yet its focus-gated overlays (play
-// button, download scrim, etc.) stay hidden. Fire a synthetic focusin on the
-// newly-focused element so React updates its state, restoring the overlays.
-let _focusMirrorStop: (() => void) | null = null;
-// The element the mirror currently considers focused — module-level so a
-// mirror RESTART (every forced focus) can flush the previous element's
-// synthetic blur. Without this, tearing down the old observer before it
-// processed the pending gpfocus change loses that focusout forever and the
-// old element (e.g. a nav pill) keeps its React focused tint.
-let _focusMirrorCur: any = null;
-function _fireReactFocus(doc: any): void {
-  try {
-    const ae = doc?.activeElement;
-    if (!ae) return;
-    const FE = doc.defaultView?.FocusEvent || (window as any).FocusEvent;
-    if (_focusMirrorCur && _focusMirrorCur !== ae) {
-      try { _focusMirrorCur.dispatchEvent(new FE('focusout', { bubbles: true })); } catch { /* ignore */ }
-    }
-    // After the post-session restore, Steam moves its gpfocus WITHOUT emitting
-    // DOM focus events at all — not just for the forced element but for every
-    // subsequent dpad move (tiles highlight via CSS but their React onFocus
-    // never fires, so focus-gated overlays only ever showed on the first one).
-    // Mirror Steam's gpfocus marker into synthetic focusin/focusout pairs so
-    // React state follows the cursor. Duplicate events on tiles whose native
-    // handlers DO fire are harmless (state setters are idempotent).
-    try { _focusMirrorStop?.(); } catch { /* ignore */ }
-    let cur: any = ae;
-    _focusMirrorCur = ae;
-    cur.dispatchEvent(new FE('focusin', { bubbles: true }));
-    // React to the class change itself, not on a timer: a polling mirror lags
-    // behind fast dpad movement, leaving the previous tile lit (double
-    // highlight) until the next tick. The observer fires in the same frame
-    // Steam moves the gpfocus marker.
-    const sync = () => {
-      try {
-        const next = doc.querySelector('.gpfocus');
-        if (next === cur) return;
-        if (cur) { try { cur.dispatchEvent(new FE('focusout', { bubbles: true })); } catch { /* ignore */ } }
-        cur = next;
-        _focusMirrorCur = cur;
-        if (cur) cur.dispatchEvent(new FE('focusin', { bubbles: true }));
-      } catch { /* ignore */ }
-    };
-    const MO = doc.defaultView?.MutationObserver || (window as any).MutationObserver;
-    const obs = new MO(sync);
-    obs.observe(doc.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
-    // Steam can flip the focus context back to inactive while it's still
-    // healing (~5.5s after app exit); an inactive context swallows the next
-    // button press to reactivate itself — the "press LB/RB twice to switch
-    // tabs" bug. Keep re-asserting the context active through the healing
-    // window so every press lands on the first try, like a fresh open.
-    const ctxIv = setInterval(() => {
-      try {
-        const fnc: any = (window as any).FocusNavController;
-        const ctx: any = fnc?.m_ActiveContext ?? fnc?.m_LastActiveContext ?? fnc?.m_rgAllContexts?.[0];
-        if (ctx && !ctx.BIsActive?.()) ctx.SetActive?.(true);
-      } catch { /* ignore */ }
-    }, 300);
-    setTimeout(() => clearInterval(ctxIv), 8000);
-    const stop = () => {
-      try { obs.disconnect(); } catch { /* ignore */ }
-      try { clearInterval(ctxIv); } catch { /* ignore */ }
-      if (_focusMirrorStop === stop) _focusMirrorStop = null;
-    };
-    _focusMirrorStop = stop;
-    setTimeout(stop, 600000);   // leak guard
-  } catch { /* ignore */ }
-}
-
-function _forceGamepadFocus(el: any): void {
-  try { el?.focus?.(); } catch { /* ignore */ }
-  // Fast path — healthy state only. The degraded state this function exists
-  // for (post-emulator-session) is precisely characterized by the window
-  // being OS-unfocused: gamescope never returns focus to Steam's window, so
-  // document.hasFocus() stays false and focus() fires no DOM events. When the
-  // window IS focused and the context is active, the plain focus() above
-  // already landed gamepad focus natively — skip the full nav-tree DFS and
-  // the focus-mirror restart, which burn main-thread ms on every tab switch
-  // (×5: the pill bridge + 4 useAutoFocus retries), and more so now that all
-  // tab panels stay mounted and the tree holds every hidden panel's nodes.
-  try {
-    const ctx0: any = (window as any).FocusNavController?.m_ActiveContext;
-    if (ctx0?.BIsActive?.() && ctx0?.m_rootWindow?.document?.hasFocus?.()) return;
-  } catch { /* ignore */ }
-  try {
-    const fnc: any = (window as any).FocusNavController;
-    // Verified live on-device: after an emulator session ends, Steam leaves the
-    // gamepad focus CONTEXT deactivated (m_ActiveContext === undefined) and no
-    // nav tree active — BTakeFocus then "succeeds" but paints no highlight
-    // (no .gpfocus class) and the user steers an invisible cursor. Reactivate
-    // the context and re-declare the main page tree active before focusing.
-    const ctx: any = fnc?.m_ActiveContext ?? fnc?.m_LastActiveContext ?? fnc?.m_rgAllContexts?.[0];
-    try { if (ctx && !ctx.BIsActive?.()) ctx.SetActive?.(true); } catch { /* ignore */ }
-    try {
-      const mainTree = ctx?.m_rgGamepadNavigationTrees?.find?.((t: any) => t?.m_ID === 'GamepadUI_Full_Root');
-      if (mainTree) ctx.SetActiveNavTree?.(mainTree);
-    } catch { /* ignore */ }
-    const doc: any = ctx?.m_rootWindow?.document;
-    const ctxs: any[] = fnc?.m_rgAllContexts ?? (ctx ? [ctx] : []);
-    let pageTree: any = null;
-    for (const ctx of ctxs) {
-      for (const t of (ctx?.m_rgGamepadNavigationTrees ?? [])) {
-        if (t?.m_ID === 'GamepadUI_Full_Root') pageTree = t;
-        const root = t?.m_Root;
-        if (!root) continue;
-        const stack: any[] = [root];
-        while (stack.length) {
-          const n = stack.pop();
-          const nEl = n?.m_element;
-          // Match by identity OR containment: the ref may point at a wrapper
-          // whose actual focus-registered element is a descendant.
-          if (nEl && el && (nEl === el || (typeof el.contains === 'function' && el.contains(nEl)))) {
-            try { if (n.BTakeFocus?.(3)) { _fireReactFocus(doc); return; } } catch { /* ignore */ }
-          }
-          const kids = n?.m_rgChildren;
-          if (Array.isArray(kids)) for (const k of kids) stack.push(k);
-        }
-      }
-    }
-    // No node matched the target element — put focus SOMEWHERE visible on the
-    // gamepad-UI page tree so the user isn't stranded with an invisible cursor.
-    try {
-      pageTree?.m_Root?.BFocusFirstChild?.(3);
-      _fireReactFocus(doc);
-    } catch { /* ignore */ }
-  } catch (e) { console.error('[RomM] forceGamepadFocus', e); }
-}
-
-// Summon Steam's virtual keyboard for an input that already has DOM focus.
-// Normally DialogInput shows it by itself on focus, but in the degraded
-// post-session state (focus context inactive) the show is suppressed even
-// though the input registers itself as the keyboard's target. Re-activate the
-// context and use the manager's own recovery hook to bring the keyboard up.
-function _summonVirtualKeyboard(): void {
-  setTimeout(() => {
-    try {
-      const win: any = (Router as any)?.WindowStore?.GamepadUIMainWindowInstance;
-      const vkm: any = win?.VirtualKeyboardManager;
-      const doc: any = win?.BrowserWindow?.document;
-      const input: any = doc?.activeElement;
-      if (!vkm || !input || input.tagName !== 'INPUT') return;
-      if (vkm.m_bIsInlineVirtualKeyboardOpen?.m_currentValue) return;
-      // gamescope never returns OS focus to the Steam window after a game
-      // session (document.hasFocus() stays false), so input.focus() moves
-      // activeElement WITHOUT firing a DOM focus event — DialogInput's own
-      // focus listener never registers the input with the keyboard manager
-      // and nothing shows. Register + show it ourselves via the manager's
-      // ref factory (verified live on-device).
-      const ref = vkm.CreateVirtualKeyboardRef?.({
-        BIsElementValidForInput: () => doc.activeElement === input,
-      });
-      ref?.ShowVirtualKeyboard?.();
-    } catch { /* ignore */ }
-  }, 150);
-}
-
-// Close the on-screen keyboard programmatically (used when Enter/R2 submits a
-// wizard field: the step advances, so the keyboard shouldn't linger). Method
-// names verified on-device: SetVirtualKeyboardDone is the "user finished" path,
-// SetVirtualKeyboardHidden the plain hide.
-function _dismissVirtualKeyboard(): void {
-  try {
-    const win: any = (Router as any)?.WindowStore?.GamepadUIMainWindowInstance;
-    const vkm: any = win?.VirtualKeyboardManager;
-    if (!vkm) return;
-    if (typeof vkm.SetVirtualKeyboardDone === 'function') vkm.SetVirtualKeyboardDone();
-    else vkm.SetVirtualKeyboardHidden?.();
-  } catch { /* ignore */ }
-}
-
-// The document that gamepad focus actually lives in. Plugin code runs in
-// Decky's SharedJSContext — its global `document` is NOT the Big Picture
-// window's document, so .gpfocus queries there always come back empty.
-function _gpFocusEl(): Element | null {
-  try {
-    const fnc: any = (window as any).FocusNavController;
-    // Desktop shell (the @decky/* shim): there is no Steam FocusNavController —
-    // gamepad focus is plain DOM focus in this SAME document. Report the active
-    // element so callers that ask "where is focus / did the user move it" work
-    // off real focus. Without this they always saw null and, e.g., the detail
-    // page's tab-switch focus ladder could never tell the user had moved and kept
-    // yanking focus back to the subtab's first element.
-    if (!fnc) {
-      const ae = document.activeElement as Element | null;
-      return ae && ae !== document.body ? ae : null;
-    }
-    // m_ActiveContext is undefined while the context is deactivated (the very
-    // state the post-session restore runs in) — fall back to the last one.
-    const ctx = fnc?.m_ActiveContext ?? fnc?.m_LastActiveContext ?? fnc?.m_rgAllContexts?.[0];
-    return ctx?.m_rootWindow?.document?.querySelector?.('.gpfocus') ?? null;
-  } catch { return null; }
-}
+// Gamepad focus and the on-screen keyboard are the shell's, not ours: what
+// they cost differs completely between a Deck and a PC (see ui/host/contract.ts
+// and each adapter's focus.ts). These four wrappers keep the call sites reading
+// as intent, and all four no-op where the shell has no such facility — which is
+// why no caller checks first.
+function _forceGamepadFocus(el: any): void { host.focus.force(el); }
+function _gpFocusEl(): Element | null { return host.focus.current(); }
+function _summonVirtualKeyboard(): void { host.keyboard.show(); }
+function _dismissVirtualKeyboard(): void { host.keyboard.hide(); }
 
 // The most recently readied auto-focus target (the active panel's first item);
 // the post-emulator-session focus restore aims here so the first game/group is
@@ -3522,9 +3332,10 @@ function UserMenuModal({ username, role, avatar, closeModal }:
       setRefreshing(false);
     }
   };
-  // Desktop shell exposes a quit bridge; the Deck build has no such object, so
-  // the Exit row only appears in the PC app. Logout lives in Settings.
-  const desktop = (window as any).__rommDesktop;
+  // Only a shell that owns its own process can be exited from in-app; inside a
+  // plugin host, quitting would mean closing someone else's application. Logout
+  // lives in Settings.
+  const canExit = host.capabilities.exit;
   // Quit is one keypress away from killing a session, so it arms on the first
   // activate and only exits on the second (same arm → confirm shape as
   // CollectionActionsModal's "Remove downloaded"), disarming after 4s.
@@ -3534,7 +3345,7 @@ function UserMenuModal({ username, role, avatar, closeModal }:
     if (!quitArmed) { setQuitArmed(true); return; }
     setQuitArmed(false);
     closeModal?.();
-    try { desktop?.quit?.(); } catch { /* no-op */ }
+    host.app.quit();
   };
 
   return (
@@ -3594,7 +3405,7 @@ function UserMenuModal({ username, role, avatar, closeModal }:
           <UserMenuRow icon={<FaDownload size={15} />}
             label={`Downloads${dlGlimpse.count > 0 ? ` (${dlGlimpse.count})` : ''}`}
             onSelect={() => go("/romm-sync-downloads")} />
-          {desktop && (
+          {canExit && (
             <>
               <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
               <UserMenuRow icon={quitArmed ? <FaCheck size={15} /> : <FaPowerOff size={15} />}
@@ -8104,7 +7915,7 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   useEffect(() => { try { localStorage.removeItem(_LS_REOPEN_HOME); } catch { /* ignore */ } }, []);
   // Opening the Game Browser counts as "using RomM": surface the tile in the
   // home row's Recent Games even when no emulator session runs this visit.
-  useEffect(() => { touchRommRecency(); }, []);
+  useEffect(() => { host.launcher.markRecentlyUsed(); }, []);
   const [active, setActive] = useState<NavId>(_libLastTab);
   const [bgUri, setBgUri] = useState<string | null>(null);
   const svcStatus = useServiceStatus();
@@ -8171,14 +7982,13 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   // effect never runs. It still fires on mount too, for the remount case.
   const returnFocusIv = useRef<any>(null);
   const runReturnFocusRestore = () => {
-    if (!_rommReturnFocusPending) return;
-    _rommReturnFocusPending = false;
+    if (!host.launcher.consumeReturnFocus()) return;
     if (returnFocusIv.current) clearInterval(returnFocusIv.current);
     // Steam's input pipeline swallows the first button press after a session
     // to wake itself back up (the "press twice" bug: LB/RB, dpad, anything).
     // Feed it a sacrificial virtual press of an unbound button (INVALID=0) so
     // the wake-up happens now and the user's first real press lands.
-    try { (window as any).FocusNavController?.DispatchVirtualButtonClick?.(0, true); } catch { /* ignore */ }
+    host.focus.wakeInput();
     // After a game exits Steam often parks gamepad focus on our ROOT Focusable
     // (noFocusRing — buttons respond but nothing is highlighted) or on its own
     // chrome, so "some element has .gpfocus" is not success. Poll and re-assert
@@ -8230,13 +8040,13 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   returnFocusRef.current = runReturnFocusRestore;
   useEffect(() => {
     const fire = () => returnFocusRef.current();
-    _returnFocusSubs.add(fire);
+    const unsubscribe = host.launcher.onReturnFocus(fire);
     // Mount path: a session that DID unmount this route (launched from the game
     // detail page, or Steam navigated away) arms the flag while nobody is
     // subscribed, so the pending flag has to be checked here as well.
     fire();
     return () => {
-      _returnFocusSubs.delete(fire);
+      unsubscribe();
       if (returnFocusIv.current) clearInterval(returnFocusIv.current);
     };
   }, []);
@@ -8270,7 +8080,7 @@ function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   const chrome = useNavChrome();
   const launchRd = async () => {
     try {
-      const r = await launchRetrodeckViaSteam();
+      const r = await host.launcher.launchRetroDeck();
       if (r.ok) { try { Navigation.CloseSideMenus(); } catch { /* ignore */ } }
       else toaster.toast({ title: 'RetroDECK', body: r.reason || 'Launch failed' });
     } catch (e) { toaster.toast({ title: 'RetroDECK', body: String(e) }); }
@@ -9826,38 +9636,19 @@ async function launchGameSmart(romId: number, disc: string | null = null,
   // launched — the post-session focus restore reads it.
   _rommLastLaunchedRomId = romId;
   try {
-    // Re-resolve the live tile appid: SetShortcutExe renumbers it (appid is a
-    // hash of exe+name), so a cached _rommAppId can be stale.
-    const liveIds = _rommAppIds();
-    const appId = (liveIds.length ? liveIds[0] : (_rommAppId ?? await findRommShortcut()));
-    if (appId != null) {
-      _rommAppId = appId;
+    if (await host.launcher.hasTile()) {
       const prep = await prepareSteamLaunch(romId, disc, siblingRomId, resume);
       if (prep?.steam_host) {
-        _rommLaunchPending = true;
-        // Mark the session active HERE, not only in the GameActionStart
-        // intercept: on some Steam builds RunGame-initiated launches don't
-        // fire GameActionStart, and then the app-lifetime end-watch would
-        // never navigate back to the Game Browser.
-        _rommSessionActive = true;
-        try {
-          // A non-Steam shortcut is launched by its 64-bit gameID, not the bare
-          // 32-bit appid: gameID = (appid << 32) | 0x02000000 (shortcut tag).
-          // This is the same value GameActionStart reports back to the intercept.
-          const gid = ((BigInt(appId) << 32n) | 0x2000000n).toString();
-          await _sc()?.Apps?.RunGame?.(gid, "", -1, 100);
-          touchRommRecency();
+        if (await host.launcher.launchTile()) {
           // Carry the prep's BIOS verdict through: this path returns a synthetic
           // success, so anything prepare_steam_launch resolved (the warning, or
           // the files it fetched to avoid one) is lost unless it is forwarded.
           return { success: true, message: 'Launching',
             ...(prep.bios_warning ? { bios_warning: prep.bios_warning } : {}),
             ...(prep.bios_fetched ? { bios_fetched: prep.bios_fetched } : {}) };
-        } catch (e) {
-          _rommLaunchPending = false;
-          _rommSessionActive = false;
-          console.error('[RomM] RunGame', e);
         }
+        // launchTile already reset its own session state; fall through to the
+        // direct daemon launch below.
       } else if (prep && prep.success === false && prep.steam_host === false
         && prep.message && prep.message !== 'Not running under gamescope') {
         // A real failure (e.g. game not downloaded) — surface it rather than
@@ -10784,7 +10575,7 @@ function V2SettingsRow({ icon, title, subtitle, onClick, right, danger, disabled
 // is how the picker ended up opening on an empty listing.
 function pickerStart(current?: string | null): string {
   if (current) return current;
-  return (window as any).__rommDesktop ? '' : '/home/deck';
+  return host.capabilities.exit ? '' : '/home/deck';
 }
 
 // The same row, but flat: no card of its own, so several can live inside ONE
@@ -12911,10 +12702,10 @@ function SettingsPage() {
   const [tileBusy, setTileBusy] = useState<boolean>(false);
   const [tileNote, setTileNote] = useState<string>('');
 
-  // Desktop-only: which screen corner notification toasts appear in. Persisted
-  // in localStorage and read by the shim's ToastHost; the Deck build has no
-  // __rommDesktop object so this section never renders there.
-  const isDesktop = !!(window as any).__rommDesktop;
+  // Which screen corner notification toasts appear in. Persisted in
+  // localStorage and read by the host's own toast host — only offered where the
+  // shell draws toasts itself rather than the platform owning presentation.
+  const canPlaceToasts = host.capabilities.toastPlacement;
   const [toastPos, setToastPos] = useState<string>(() => {
     try { return localStorage.getItem('romm:toastPos') || 'bottom-right'; }
     catch { return 'bottom-right'; }
@@ -12941,7 +12732,7 @@ function SettingsPage() {
     // to sweep duplicates and repair the survivor's exe/name/art after updates.
     // Deliberately not awaited: nothing on this page renders from it, and
     // chaining it in front of the reads it doesn't feed just delays the paint.
-    try { reconcileRommTile()?.catch?.(() => { /* ignore */ }); } catch { /* ignore */ }
+    try { host.launcher.reconcileTile().catch(() => { /* ignore */ }); } catch { /* ignore */ }
 
     // Never let a wedged IPC hide the whole page — show what we have and let
     // the stragglers fill in, which is the old behaviour but only as a fallback.
@@ -12976,7 +12767,7 @@ function SettingsPage() {
       return on;
     })();
     const tile = (async () => {
-      if (!(window as any).__rommDesktop) return null;
+      if (!host.capabilities.shortcutTile) return null;
       const st = await getSteamTileStatus();
       const t = { available: !!st?.available, installed: !!st?.installed };
       setTileState(t);
@@ -13124,7 +12915,7 @@ function SettingsPage() {
     try {
       // The launch command can only come from the Electron main process — it
       // alone knows whether we're an AppImage, a packaged binary or a checkout.
-      const spec = enabled ? (window as any).__rommDesktop?.launchSpec?.() : null;
+      const spec = enabled ? host.app.launchSpec() : null;
       if (enabled && !spec?.exe) {
         setTileNote('Could not determine how to relaunch this app.');
         return;
@@ -13293,11 +13084,11 @@ function SettingsPage() {
     setStatusMsg(null);
     setInstallPct(0);
     try {
-      // Desktop: there is no plugin loader. The release asset is a single
-      // AppImage, so we download it and swap the running file. The swap only
-      // takes effect on restart, which Decky never needs since it reloads the
-      // plugin in place.
-      if ((window as any).__rommDesktop) {
+      // A self-updating shell has no plugin loader behind it. The release asset
+      // is a single executable, so we download it and swap the running file; the
+      // swap only takes effect on restart, which a loader never needs since it
+      // reloads the code in place.
+      if (host.capabilities.selfUpdate) {
         // No progress events on this path — the download is one long request,
         // so a percentage would sit at 0 for the whole ~170MB and read as
         // stalled. Use the busy state and say what is happening instead.
@@ -13634,7 +13425,7 @@ function SettingsPage() {
         </V2SettingsSection>
       )}
 
-      {isDesktop && tileState.available && (
+      {host.capabilities.shortcutTile && tileState.available && (
         <V2SettingsSection title="Steam">
           <V2SettingsRow
             icon={<FaExternalLinkAlt size={16} />}
@@ -13647,7 +13438,7 @@ function SettingsPage() {
         </V2SettingsSection>
       )}
 
-      {isDesktop && (
+      {canPlaceToasts && (
         <V2SettingsSection title="Notifications">
           <div style={{
             display: 'flex', flexDirection: 'column', gap: '12px', padding: '16px',
@@ -13730,7 +13521,7 @@ function SettingsPage() {
               : updateInfo?.available && !updating ? <FaDownload size={13} />
                 : <FaSync size={13} />}
             onClick={updateInfo?.restartRequired
-              ? () => (window as any).__rommDesktop?.restart?.()
+              ? () => host.app.restart()
               : updateInfo?.available ? handleInstallUpdate : handleCheckUpdate}
             disabled={checking || updating}
             primary={(!!updateInfo?.available || !!updateInfo?.restartRequired) && !updating}
@@ -14293,10 +14084,9 @@ function SetupWizard() {
     let last: boolean | null = null;
     const iv = setInterval(() => {
       try {
-        const win: any = (Router as any)?.WindowStore?.GamepadUIMainWindowInstance;
-        const open = !!win?.VirtualKeyboardManager?.m_bIsInlineVirtualKeyboardOpen?.m_currentValue;
+        const open = host.keyboard.isOpen();
         if (last === null) { last = open; return; }
-        if (open && !kbRoomRef.current) openRoom(win?.BrowserWindow?.document);
+        if (open && !kbRoomRef.current) openRoom(host.uiDocument());
         if (open === last) return;
         last = open;
         if (!open && kbRoomRef.current) {
@@ -14318,7 +14108,7 @@ function SetupWizard() {
         setHasPassword(c.has_password || false);
       } catch { /* ignore */ }
       try { const l = await getRommLogo(); setLogo(l?.data_uri || null); } catch { /* ignore */ }
-      if ((window as any).__rommDesktop) {
+      if (host.capabilities.shortcutTile) {
         try {
           const st = await getSteamTileStatus();
           setTileAvailable(!!st?.available);
@@ -14367,10 +14157,11 @@ function SetupWizard() {
     // pop below did nothing and the library was pushed on top of the wizard.
     // Replacing the entry is what actually retires it, and it leaves the library
     // as the floor, where root-B is correctly inert.
-    if ((window as any).__rommDesktop) {
+    if (host.capabilities.exit) {
       try {
-        // Cast: NavigateReplace is the desktop shim's, not in Steam's Navigation
-        // type — which is exactly why this is behind the __rommDesktop guard.
+        // Cast: NavigateReplace belongs to a shell that owns its own history,
+        // not to Steam's Navigation type — which is why it is behind a
+        // capability rather than called unconditionally.
         (Navigation as any).NavigateReplace("/romm-sync-library");
         Navigation.CloseSideMenus();
         return;
@@ -14442,14 +14233,14 @@ function SetupWizard() {
       try {
         // force=true: this is user-initiated (store is long since loaded),
         // and a fresh install can legitimately have an empty shortcut list.
-        if ((await reconcileRommTile()) == null) await addRommShortcut(true);
+        if ((await host.launcher.reconcileTile()) == null) await host.launcher.ensureTile(true);
       } catch (e) { console.error('[RomM] wizard steam tile', e); }
 
       // Desktop: no SteamClient, so the tile is the opt-in shortcuts.vdf one
       // from the final step. Never fatal — a failed write must not block setup.
-      if ((window as any).__rommDesktop && tileAvailable && wantTile) {
+      if (host.capabilities.shortcutTile && tileAvailable && wantTile) {
         try {
-          const spec = (window as any).__rommDesktop?.launchSpec?.();
+          const spec = host.app.launchSpec();
           if (spec?.exe) {
             // No toast on success: the row the user just ticked says Steam has
             // to be restarted, so repeating it is noise on a screen they are
@@ -14893,7 +14684,7 @@ function SetupWizard() {
                     know why Play is still unavailable when they arrive. */}
                 {emuInstall.active && ' RetroArch is still installing; it will be ready shortly.'}
               </div>
-              {(window as any).__rommDesktop && tileAvailable && (
+              {host.capabilities.shortcutTile && tileAvailable && (
                 <div style={{ width: '100%', textAlign: 'left' }}>
                   <V2SettingsRow
                     icon={<FaExternalLinkAlt size={16} />}
@@ -14918,431 +14709,10 @@ function SetupWizard() {
   );
 }
 
-// ─── Steam library "Ludo" shortcut (mandatory) ───────────────────────────────
-// A non-Steam shortcut named "Ludo" is auto-created at plugin load (once RomM is
-// configured) and is required: launching it from the library opens the Game
-// Browser, and picking a game RunGame's this same tile so the emulator runs as a
-// Steam-tracked child (working overlay). All SteamClient calls are undocumented +
-// version-fragile, so every call is feature-detected and wrapped — failures
-// degrade to a toast, never a crash.
-const ROMM_SHORTCUT_NAME = "Ludo";
-// Tiles created before the rename still carry "RomM" on disk. They're matched
-// (and renamed on the next reconcile) rather than left behind as a duplicate.
-const ROMM_SHORTCUT_LEGACY_NAMES = ["RomM"];
-// Fallback exe when the session-host script can't be resolved. With /bin/true the
-// tile still opens the browser (via the launch intercept) but the Steam-overlay
-// session-host launch path is unavailable, so Play falls back to a direct launch.
-const ROMM_SHORTCUT_EXE = "/bin/true";
-// The real exe: bin/romm-session-host. When the tile is RunGame'd after a game is
-// picked, Steam launches this as a tracked game (opening the overlay session) and
-// it execs the resolved emulator argv in-place — so the emulator inherits the
-// overlay. Resolved lazily from the backend (absolute, plugin-dir dependent).
-let _sessionHostExe: string | null = null;
-async function rommShortcutExe(): Promise<string> {
-  if (_sessionHostExe) return _sessionHostExe;
-  try {
-    const r = await getSessionHostPath();
-    const p = typeof r === 'string' ? r : r?.path;
-    if (p) { _sessionHostExe = p; return p; }
-  } catch (e) { console.error('[RomM] getSessionHostPath', e); }
-  return ROMM_SHORTCUT_EXE;
-}
-// Stamped into the shortcut's launch options so we can re-identify our tile
-// even when Steam hasn't persisted its name (the root cause of duplicates and
-// the toggle flipping off after an update).
-const ROMM_TILE_SENTINEL = "ludo-tile";
-let _rommAppId: number | null = null;
-let _rommNavTimer: any = null;
-let _rommActionReg: { unregister: () => void } | null = null;
-// Set true immediately before we RunGame the tile to launch a *picked* game, so
-// the launch intercept lets the session-host run (and execs the emulator) instead
-// of treating it as a bare tile click (terminate + open the browser).
-let _rommLaunchPending = false;
-// Set true while a *picked-game* session is running (host execs the emulator as a
-// Steam-tracked child). When that session ends we want to return to the Game
-// Browser, not leave the user dropped on the Steam/Big-Picture library.
-let _rommSessionActive = false;
-// Set when the session-end watch navigates back to the Game Browser: the route
-// comes back without gamepad focus (Steam parks it on its own chrome after a
-// game exits), leaving the user unable to see or move a selection. The library
-// root consumes this and pulls focus onto the tile that was played.
-let _rommReturnFocusPending = false;
-// Notified when the flag is armed. Consuming it on mount alone was not enough:
-// a game launched from a TILE never leaves the Game Browser route, so the page
-// is still mounted when the session ends and the mount effect — which is where
-// the whole restore lived — simply never ran again. That is the "launch from
-// Home, come back to no selection" case.
-const _returnFocusSubs = new Set<() => void>();
-function armReturnFocus() {
-  _rommReturnFocusPending = true;
-  _returnFocusSubs.forEach((f) => { try { f(); } catch { /* ignore */ } });
-}
-let _rommLifetimeReg: { unregister: () => void } | null = null;
+
+
 // Guards the startup setup-wizard auto-open so it fires at most once per session.
 let _setupAutoOpened = false;
-
-const _sc = (): any => (typeof window !== 'undefined' ? (window as any).SteamClient : undefined);
-
-// Enumerate all non-Steam shortcut overviews. This build does NOT expose
-// SteamClient.Apps.GetAllShortcuts, so we read the app stores Steam keeps in
-// memory and keep only entries that report themselves as shortcuts.
-// AppIds of all non-Steam shortcuts. deckDesktopApps.apps is a Map keyed by
-// appid on this build; the map values are not overviews, so we resolve each
-// overview separately via appStore.GetAppOverviewByAppID.
-function _shortcutAppIds(): number[] {
-  const m = (window as any).collectionStore?.deckDesktopApps?.apps;
-  try { if (m?.keys) return Array.from(m.keys()).map((k: any) => Number(k)); } catch { /* ignore */ }
-  return [];
-}
-
-// True once Steam's shortcut store is actually populated. Early in Steam
-// startup deckDesktopApps.apps can be missing or still empty; creating a
-// shortcut then duplicates a tile that already exists on disk but isn't
-// visible yet — the root cause of multiple "Ludo" entries piling up.
-function _shortcutStoreReady(): boolean {
-  try {
-    const m = (window as any).collectionStore?.deckDesktopApps?.apps;
-    return !!m?.keys && Array.from(m.keys()).length > 0;
-  } catch { return false; }
-}
-
-function _appName(appid: number): string {
-  try { return String((window as any).appStore?.GetAppOverviewByAppID?.(appid)?.display_name ?? ''); } catch { return ''; }
-}
-
-// All our tiles carry the name "Ludo" (or "RomM", pre-rename); also accept the
-// exe-derived fallback names Steam uses when a name didn't persist. Real games
-// carry their own names.
-function _isRommName(nm: string): boolean {
-  return nm === ROMM_SHORTCUT_NAME || ROMM_SHORTCUT_LEGACY_NAMES.includes(nm)
-    || nm === 'true' || nm === '/bin/true'
-    || nm === 'romm-session-host';
-}
-
-function _rommAppIds(): number[] {
-  return _shortcutAppIds().filter((aid) => _isRommName(_appName(aid)));
-}
-
-// Stamp "played just now" onto the Ludo tile's overview so it surfaces in the
-// home row's Recent Games. Steam only records last-played for sessions it ran
-// to completion — bare tile clicks are terminated by the intercept before that
-// happens, and opening the browser from the Decky panel never touches the tile
-// at all. Writing rt_last_time_played on the in-memory overview is how Steam's
-// own recents sort is fed (same approach MoonDeck uses); real picked-game
-// sessions still persist it properly on exit.
-function touchRommRecency() {
-  try {
-    const aid = _rommAppId ?? _rommAppIds()[0];
-    if (aid == null) return;
-    const ov = (window as any).appStore?.GetAppOverviewByAppID?.(aid);
-    if (!ov) return;
-    ov.rt_last_time_played = Math.floor(Date.now() / 1000);
-    // The recents carousel can exclude apps with zero recorded playtime, and a
-    // plain field write doesn't always notify the (MobX-backed) collections.
-    // Give the tile a minute of playtime and poke the store's change hooks so
-    // the home row actually re-sorts without needing a real session first.
-    if (!Number(ov.minutes_playtime_forever)) ov.minutes_playtime_forever = "1";
-    try { ov.OnAppOverviewChanged?.(); } catch { /* ignore */ }
-    try { (window as any).appStore?.m_mapApps?.set?.(Number(aid), ov); } catch { /* ignore */ }
-  } catch { /* ignore */ }
-}
-
-// Every app overview Steam knows about (installed games + non-Steam shortcuts),
-// used to locate RetroDECK's library entry by name.
-function _allAppOverviews(): any[] {
-  try { return (window as any).collectionStore?.allAppsCollection?.allApps ?? []; }
-  catch { return []; }
-}
-
-// Launch RetroDECK via its Steam library entry instead of spawning the flatpak
-// ourselves. Steam runs it inside the real graphical session (correct display/
-// dbus/env + overlay), sidestepping the env contamination that makes a
-// daemon-spawned `flatpak run` crash. RetroDECK's installer adds a non-Steam
-// shortcut named "RetroDECK"; we also scan installed apps as a fallback.
-async function launchRetrodeckViaSteam(): Promise<{ ok: boolean; reason?: string }> {
-  const apps = _sc()?.Apps;
-  // No SteamClient at all (Electron desktop shell) — spawn RetroDECK from the
-  // backend instead. Nothing here is Steam-tracked, but neither is the shell.
-  if (!apps?.RunGame) {
-    try { return await launchRetrodeckNative(); }
-    catch (e) { return { ok: false, reason: String(e) }; }
-  }
-  const isRd = (nm: string) => /retrodeck/i.test(nm || '');
-  const shortcutIds = _shortcutAppIds();
-  let appId: number | null = null;
-  for (const aid of shortcutIds) { if (isRd(_appName(aid))) { appId = aid; break; } }
-  if (appId == null) {
-    for (const ov of _allAppOverviews()) {
-      if (isRd(ov?.display_name)) { appId = Number(ov.appid); break; }
-    }
-  }
-  if (appId == null) {
-    // Installed but never added to Steam: still launchable directly.
-    try {
-      const r = await launchRetrodeckNative();
-      if (r.ok) return r;
-    } catch { /* fall through to the library-side message */ }
-    return { ok: false, reason: 'RetroDECK not found in your Steam library' };
-  }
-  // A non-Steam shortcut launches by its 64-bit gameID ((appid<<32)|0x02000000);
-  // a real Steam app launches by its bare appid.
-  const gid = shortcutIds.includes(appId)
-    ? ((BigInt(appId) << 32n) | 0x2000000n).toString()
-    : String(appId);
-  await apps.RunGame(gid, "", -1, 100);
-  return { ok: true };
-}
-
-async function findRommShortcut(): Promise<number | null> {
-  if (_rommAppId != null) return _rommAppId;
-  try {
-    const ids = _rommAppIds();
-    if (ids.length) return ids[0];
-  } catch (e) { console.error('[RomM] findRommShortcut', e); }
-  return null;
-}
-
-// Remove duplicate Ludo tiles left behind by earlier sessions, keeping one.
-// Returns the surviving appId (or null if none).
-async function cleanupRommShortcuts(): Promise<number | null> {
-  try {
-    const apps = _sc()?.Apps;
-    const mine = _rommAppIds();
-    if (mine.length === 0) return null;
-    // Keep the tile the user has actually used (play history / recent-games
-    // placement lives on the appid), not whichever duplicate enumerates first.
-    const score = (aid: number): number => {
-      try {
-        const ov = (window as any).appStore?.GetAppOverviewByAppID?.(aid);
-        return (Number(ov?.rt_last_time_played) || 0) * 1e6
-          + (Number(ov?.minutes_playtime_forever) || 0);
-      } catch { return 0; }
-    };
-    const keep = mine.reduce((a, b) => (score(b) > score(a) ? b : a));
-    for (const aid of mine.filter((x) => x !== keep)) {
-      try { await apps?.RemoveShortcut?.(aid); } catch (e) { console.error('[RomM] dedup remove', e); }
-    }
-    return keep;
-  } catch (e) { console.error('[RomM] cleanupRommShortcuts', e); return null; }
-}
-
-// Bring the Ludo tile into a known-good state: collapse duplicates to one,
-// repair the survivor's name + sentinel, repaint art, and bind the launch
-// intercept. Safe to call repeatedly. Returns the surviving appId (or null).
-// Run this when the shortcut store is ready (e.g. on Settings open), not only
-// at plugin load, where GetAllShortcuts can still be empty.
-async function reconcileRommTile(): Promise<number | null> {
-  // Desktop has no Steam client — the shortcut/tile feature doesn't apply.
-  if ((window as any).__rommDesktop) return null;
-  const appId = (await cleanupRommShortcuts()) ?? (await findRommShortcut());
-  if (appId == null) return null;
-  _rommAppId = appId;
-  const apps = _sc()?.Apps;
-  try { await apps?.SetShortcutName?.(appId, ROMM_SHORTCUT_NAME); } catch { /* ignore */ }
-  try { await apps?.SetShortcutLaunchOptions?.(appId, ROMM_TILE_SENTINEL); } catch { /* ignore */ }
-  // Migrate the exe to the session-host script (older tiles used /bin/true).
-  try {
-    const exe = await rommShortcutExe();
-    if (apps?.SetShortcutExe) await apps.SetShortcutExe(appId, exe);
-  } catch (e) { console.error('[RomM] reconcile SetShortcutExe', e); }
-  // Stamping name/launch-options can renumber the shortcut appid (it's a hash of
-  // exe+name+options). Re-resolve so the cache, intercept and artwork all target
-  // the live tile rather than the now-dead pre-stamp appid.
-  const liveId = (_rommAppIds()[0]) ?? appId;
-  _rommAppId = liveId;
-  registerRommLaunchIntercept();
-  ensureRommArtwork(liveId);
-  // Keep the tile visible in the home row's Recent Games across restarts: the
-  // recency stamp is in-memory, so re-assert it whenever we reconcile (plugin
-  // load included) rather than only when the browser opens.
-  touchRommRecency();
-  return liveId;
-}
-
-async function ensureRommArtwork(appId: number) {
-  try {
-    const apps = _sc()?.Apps;
-    if (!apps?.SetCustomArtworkForApp) return;
-    // Steam asset types -> files this build writes:
-    //   0 -> {appid}p.png   (portrait capsule)  : grid
-    //   1 -> {appid}_hero   (hero background)    : hero
-    //   2 -> {appid}_logo   (transparent logo)   : logo
-    //   4 -> {appid}.png    (landscape capsule)  : THIS is the image Big
-    //        Picture's "Recent Games" featured banner uses, so it must get the
-    //        background-only landscape art, not the centered-mark icon.
-    // (Type 3 is a no-op on this build, so the landscape goes through type 4.)
-    const res = await getRommArtwork();
-    const art = res?.art as Record<string, string> | undefined;
-    if (art && Object.keys(art).length) {
-      const ext = res.ext || 'png';
-      // type -> source art key. Type 4 (the landscape {appid}.png) is fed the
-      // header (bg-only) art instead of the icon.
-      const plan: [number, string][] = [[0, '0'], [1, '1'], [2, '2'], [4, '3']];
-      for (const [n, key] of plan) {
-        if (!art[key]) continue;
-        // Clear first: Steam won't overwrite an existing custom asset, so a
-        // repaint over stale art would otherwise silently no-op.
-        try { await apps.ClearCustomArtworkForApp?.(appId, n); } catch { /* ignore */ }
-        try { await apps.SetCustomArtworkForApp(appId, art[key], ext, n); } catch { /* ignore */ }
-      }
-      return;
-    }
-    // Fallback to the flat logo if branded artwork is unavailable.
-    const logo = await getPluginLogo();
-    if (!logo?.b64) return;
-    try { await apps.SetCustomArtworkForApp(appId, logo.b64, logo.ext || 'png', 0); } catch { /* ignore */ }
-    try { await apps.SetCustomArtworkForApp(appId, logo.b64, logo.ext || 'png', 4); } catch { /* ignore */ }
-  } catch (e) { console.error('[RomM] ensureRommArtwork', e); }
-}
-
-// Create the shortcut if missing; returns the appId (or null on failure).
-// `force` skips the store-readiness gate — used only as a last resort when the
-// store never reported ready (e.g. a user with zero non-Steam shortcuts, where
-// the empty store is legitimate and creating cannot duplicate anything).
-async function addRommShortcut(force = false): Promise<number | null> {
-  // Desktop has no Steam client — never attempt to create a shortcut (this is
-  // where the "Steam shortcuts API unavailable" toast came from).
-  if ((window as any).__rommDesktop) return null;
-  try {
-    // Never create while the shortcut store is empty/unloaded: the existing
-    // Ludo tile may simply not be visible yet, and AddShortcut here is exactly
-    // how duplicate "Ludo" entries were piling up on each Steam restart.
-    if (!force && !_shortcutStoreReady()) return null;
-    const apps = _sc()?.Apps;
-    if (!apps?.AddShortcut) { toaster.toast({ title: 'Ludo', body: 'Steam shortcuts API unavailable on this build.' }); return null; }
-    const exe = await rommShortcutExe();
-    let appId = await findRommShortcut();
-    if (appId == null) {
-      appId = Number(await apps.AddShortcut(ROMM_SHORTCUT_NAME, exe, "", ""));
-    } else if (apps.SetShortcutExe) {
-      // Migrate older /bin/true tiles to the session-host exe so the overlay
-      // launch path works. Harmless if already set.
-      try { await apps.SetShortcutExe(appId, exe); } catch (e) { console.error('[RomM] SetShortcutExe', e); }
-    }
-    // Always (re)assert the display name. AddShortcut's name arg doesn't reliably
-    // persist to the shortcut's strAppName on all Steam builds, so the tile can
-    // show up blank/"true" without an explicit SetShortcutName.
-    if (apps.SetShortcutName) {
-      try { await apps.SetShortcutName(appId, ROMM_SHORTCUT_NAME); } catch (e) { console.error('[RomM] SetShortcutName', e); }
-    }
-    // Stamp the sentinel so we can always re-find this tile even if the name
-    // doesn't persist — this is what prevents duplicate tiles piling up.
-    if (apps.SetShortcutLaunchOptions) {
-      try { await apps.SetShortcutLaunchOptions(appId, ROMM_TILE_SENTINEL); } catch (e) { console.error('[RomM] SetShortcutLaunchOptions', e); }
-    }
-    _rommAppId = appId;
-    await ensureRommArtwork(appId);
-    registerRommLaunchIntercept();
-    registerRommSessionEndWatch();
-    return appId;
-  } catch (e) {
-    console.error('[RomM] addRommShortcut', e);
-    toaster.toast({ title: 'Ludo', body: 'Could not add the library tile.' });
-    return null;
-  }
-}
-
-
-// Intercept the Ludo tile's launch → cancel the no-op run and open the browser.
-function registerRommLaunchIntercept() {
-  try {
-    if (_rommActionReg) return;
-    const apps = _sc()?.Apps;
-    if (!apps?.RegisterForGameActionStart) return;
-    _rommActionReg = apps.RegisterForGameActionStart((_actionType: number, strAppId: string) => {
-      const raw = Number(strAppId);
-      // GameActionStart may pass the full 64-bit gameID; the 32-bit appid is its
-      // high dword. Try both the raw value and the extracted appid.
-      const hi = Math.floor(raw / 4294967296);
-      const aid = hi > 0 ? hi : raw;
-      // Identify by name/overview, not numeric id: GameActionStart's appid
-      // representation (signed/unsigned/gameid) doesn't reliably equal the
-      // collectionStore key, and stamping renumbers the cached id. Name match
-      // sidesteps all of that.
-      let mine = aid === _rommAppId || raw === _rommAppId;
-      if (!mine) { try { mine = _isRommName(_appName(aid)) || _isRommName(_appName(raw)); } catch { /* ignore */ } }
-      if (!mine) { try { mine = _rommAppIds().includes(aid) || _rommAppIds().includes(raw); } catch { /* ignore */ } }
-      if (mine) {
-        _rommAppId = aid;
-        // A picked-game launch: we wrote a launch-spec and RunGame'd the tile so
-        // the session-host can exec the emulator as a Steam-tracked child (overlay
-        // works). Let it run — do NOT terminate or navigate.
-        if (_rommLaunchPending) {
-          _rommLaunchPending = false;
-          // Remember this is a live emulator session so the app-lifetime
-          // listener can navigate back to the Game Browser when it quits
-          // (instead of leaving the user on the Steam/Big-Picture library).
-          _rommSessionActive = true;
-          return;
-        }
-        // Bare tile click: the exe is a no-op without a fresh spec. The tile
-        // fires this twice (launch start type=6, then exit type=7 ~1.5s later).
-        // End the launch immediately and open the Game Browser instead.
-        try { _sc()?.Apps?.TerminateApp?.(String(strAppId), false); } catch { /* ignore */ }
-        if (_rommNavTimer != null) { try { clearTimeout(_rommNavTimer); } catch { /* ignore */ } }
-        _rommNavTimer = setTimeout(() => {
-          _rommNavTimer = null;
-          try { Navigation.Navigate("/romm-sync-library"); Navigation.CloseSideMenus(); } catch (e) { console.error('[RomM] nav', e); }
-        }, 0);
-      }
-    });
-  } catch (e) { console.error('[RomM] registerRommLaunchIntercept', e); }
-}
-
-// When a picked-game emulator session ends, the session-host PID exits and Steam
-// returns to the library (Big Picture) — not the plugin. Register for app
-// lifetime notifications so that when OUR tile stops running after a real
-// session, we navigate straight back to the Game Browser.
-function registerRommSessionEndWatch() {
-  try {
-    if (_rommLifetimeReg) return;
-    const gs = _sc()?.GameSessions;
-    if (!gs?.RegisterForAppLifetimeNotifications) return;
-    _rommLifetimeReg = gs.RegisterForAppLifetimeNotifications((data: any) => {
-      try {
-        if (data?.bRunning) return;            // only care about stop events
-        if (!_rommSessionActive) return;       // not our emulator session
-        // Like the launch intercept, the notification may carry the 64-bit
-        // gameID rather than the bare 32-bit appid — the appid is its high
-        // dword. Check both representations.
-        const raw = Number(data?.unAppID);
-        const hi = Math.floor(raw / 4294967296);
-        const candidates = hi > 0 ? [raw, hi] : [raw];
-        let mine = candidates.some((a) => a === _rommAppId);
-        if (!mine) { try { const ids = _rommAppIds(); mine = candidates.some((a) => ids.includes(a)); } catch { /* ignore */ } }
-        if (!mine) { try { mine = candidates.some((a) => _isRommName(_appName(a))); } catch { /* ignore */ } }
-        if (!mine) return;
-        _rommSessionActive = false;
-        if (_rommNavTimer != null) { try { clearTimeout(_rommNavTimer); } catch { /* ignore */ } }
-        // Navigate back almost immediately. Steam runs its own post-exit
-        // navigation to Big Picture home on its own schedule — a single early
-        // Navigate can get stomped by it (that's why this used to wait 900ms).
-        // Instead: go at 250ms, then for the next ~2s re-assert our route if
-        // Steam moved it off. Steam's focus context also delivers NO focus
-        // events for ~5.5s after an app exits (measured on-device); the
-        // forced-focus + gpfocus mirror machinery bridges that gap.
-        const nav = () => {
-          armReturnFocus();
-          try { Navigation.Navigate("/romm-sync-library"); Navigation.CloseSideMenus(); } catch (e) { console.error('[RomM] nav', e); }
-        };
-        _rommNavTimer = setTimeout(() => {
-          _rommNavTimer = null;
-          nav();
-          [500, 1100, 1900].forEach((d) => setTimeout(() => {
-            try {
-              const p = (Router as any)?.WindowStore?.GamepadUIMainWindowInstance?.m_history?.location?.pathname;
-              // Only reclaim the screen from STEAM's post-exit navigation. Any
-              // /romm-sync-* route means the user is already navigating inside
-              // the plugin (e.g. straight into Settings) — yanking them back to
-              // the library here caused the "Settings opens then closes" bug.
-              if (p && !p.startsWith("/romm-sync")) nav();
-            } catch { /* ignore */ }
-          }, d));
-        }, 250);
-      } catch (e) { console.error('[RomM] sessionEnd', e); }
-    });
-  } catch (e) { console.error('[RomM] registerRommSessionEndWatch', e); }
-}
 
 export default definePlugin(() => {
   // Every route is wrapped in RouteGuard: a page surfaced by a history POP the
@@ -15365,8 +14735,10 @@ export default definePlugin(() => {
   // is safe to bind before the shortcut store is ready.  This fixes the bug
   // where clicking the Ludo tile in Big Picture did nothing until the user
   // opened the Decky panel (which triggered reconcileRommTile → register…).
-  registerRommLaunchIntercept();
-  registerRommSessionEndWatch();
+  host.launcher.start({
+    openLibrary: () => { Navigation.Navigate("/romm-sync-library"); Navigation.CloseSideMenus(); },
+    isOwnRoute: (path) => path.startsWith("/romm-sync"),
+  });
 
   // OS-level connectivity bridge: the Decky frontend runs in a Chromium context,
   // so navigator's online/offline events fire the instant the Deck's network
@@ -15457,12 +14829,12 @@ export default definePlugin(() => {
         const MAX_ATTEMPTS = 8;
         const ensureTile = async (attempt: number) => {
           try {
-            if ((await reconcileRommTile()) != null) return;   // found + repaired
+            if ((await host.launcher.reconcileTile()) != null) return;   // found + repaired
             // Create only once the shortcut store is populated — an empty
             // store usually means "not loaded yet", and creating then
             // duplicates the tile. On the final attempt force-create so a
             // user with a genuinely empty shortcut list still gets the tile.
-            if ((await addRommShortcut(attempt >= MAX_ATTEMPTS)) != null) return;
+            if ((await host.launcher.ensureTile(attempt >= MAX_ATTEMPTS)) != null) return;
           } catch (e) { console.error('[RomM] ensure tile', e); }
           if (attempt < MAX_ATTEMPTS) {
             const delay = Math.min(4000 * Math.pow(1.5, attempt), 15000);
@@ -15491,10 +14863,7 @@ export default definePlugin(() => {
         window.removeEventListener('offline', onNetOffline);
         window.removeEventListener('online', onNetOnline);
       } catch { /* ignore */ }
-      try { _rommActionReg?.unregister(); } catch { /* ignore */ }
-      _rommActionReg = null;
-      try { _rommLifetimeReg?.unregister(); } catch { /* ignore */ }
-      _rommLifetimeReg = null;
+      host.launcher.stop();
 
       routerHook.removeRoute("/romm-sync-setup");
       routerHook.removeRoute("/romm-sync-settings");

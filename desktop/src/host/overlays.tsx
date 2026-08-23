@@ -1,4 +1,4 @@
-// Modal + toast plumbing, shared by the ui and api shims.
+// Modal + toast plumbing, shared by the widget kit and the services.
 //
 // Lives in its own module because showModal/ModalRoot come from @decky/ui while
 // toaster comes from @decky/api, and openFilePicker (api) needs to open a modal
@@ -72,9 +72,9 @@ export function ModalHost() {
   // it stays legible against the blurred backdrop. Body class rather than a
   // context: the legend is a sibling of ModalHost, not a descendant.
   useEffect(() => {
-    document.body.classList.toggle("shim-modal-open", modals.length > 0);
+    document.body.classList.toggle("desk-modal-open", modals.length > 0);
   });
-  useEffect(() => () => document.body.classList.remove("shim-modal-open"), []);
+  useEffect(() => () => document.body.classList.remove("desk-modal-open"), []);
 
   if (!modals.length) return null;
   return (
@@ -82,7 +82,7 @@ export function ModalHost() {
       {modals.map((m) => {
         const handle: ModalHandle = { Close: () => popModal(m.id) };
         return (
-          <div className="shim-modal-scrim" key={m.id}>
+          <div className="desk-modal-scrim" key={m.id}>
             {m.render(handle)}
           </div>
         );
@@ -104,7 +104,7 @@ export type ToastOpts = {
   critical?: boolean;
   onClick?: () => void;
   // Accepted for parity with Decky's ToastData so shared callers typecheck.
-  // The shim's own chime is unconditional; opting out isn't wired up here.
+  // This shell's own chime is unconditional; opting out isn't wired up here.
   playSound?: boolean;
 };
 
@@ -164,20 +164,20 @@ export function ToastHost() {
   }, []);
 
   return (
-    <div className="shim-toast-host" data-pos={pos}>
+    <div className="desk-toast-host" data-pos={pos}>
       {toasts.map((t) => (
         <div
           key={t.id}
-          className={"shim-toast" + (t.critical ? " shim-toast-critical" : "")
+          className={"desk-toast" + (t.critical ? " desk-toast-critical" : "")
             // Only a toast that actually does something gets the pointer — most
             // are pure notifications and shouldn't look pressable.
-            + (t.onClick ? " shim-toast-clickable" : "")}
+            + (t.onClick ? " desk-toast-clickable" : "")}
           onClick={t.onClick}
         >
-          {t.logo ? <div className="shim-toast-logo">{t.logo}</div> : null}
-          <div className="shim-toast-text">
-            {t.title ? <div className="shim-toast-title">{t.title}</div> : null}
-            {t.body ? <div className="shim-toast-body">{t.body}</div> : null}
+          {t.logo ? <div className="desk-toast-logo">{t.logo}</div> : null}
+          <div className="desk-toast-text">
+            {t.title ? <div className="desk-toast-title">{t.title}</div> : null}
+            {t.body ? <div className="desk-toast-body">{t.body}</div> : null}
           </div>
         </div>
       ))}
