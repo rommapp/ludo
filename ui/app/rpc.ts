@@ -29,6 +29,10 @@ export const resyncPlatform = callable<[string], any>("resync_platform");
 export const checkLibraryStale = callable<[], any>("check_library_stale");
 export const getLibraryAutoUpdate = callable<[], any>("get_library_auto_update");
 export const setLibraryAutoUpdate = callable<[boolean], any>("set_library_auto_update");
+// Games the RomM server stopped returning but that still have local data.
+// Each can be deleted (files + saves, to trash) — never automatically.
+export const getOrphanGames = callable<[], any>("get_orphan_games");
+export const deleteOrphanGame = callable<[number], any>("delete_orphan_game");
 export const getVirtualCollectionsVisible = callable<[], any>("get_virtual_collections_visible");
 export const setVirtualCollectionsVisibleRpc = callable<[boolean], any>("set_virtual_collections_visible");
 export const getSyncIndicator = callable<[], any>("get_sync_indicator");

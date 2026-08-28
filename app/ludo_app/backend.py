@@ -794,6 +794,7 @@ class LudoBackend:
                 settings=self._settings,
                 log_callback=lambda msg: logging.info(f"[AUTO-SYNC] {msg}"),
                 get_games_callback=lambda: self._available_games,
+                rom_removed_callback=self._on_rom_removed_from_server,
                 parent_window=None,
             )
 
@@ -1882,6 +1883,8 @@ class LudoBackend:
                 self._last_full_fetch_time = self._server_watermark(raw_games, fetch_stamp)
                 self._snapshot_fetched_at = self._last_full_fetch_time
                 self._persist_snapshot()
+                if not incomplete:
+                    self._stamp_full_refresh()
                 # Library is fetched on connect and on manual refresh (the reference
                 # client's on-demand model) — no background polling.
 
@@ -1898,6 +1901,7 @@ class LudoBackend:
                     settings=self._settings,
                     log_callback=lambda msg: logging.info(f"[AUTO-SYNC] {msg}"),
                     get_games_callback=lambda: self._available_games,
+                    rom_removed_callback=self._on_rom_removed_from_server,
                     parent_window=None,
                 )
             else:
@@ -2034,6 +2038,16 @@ class LudoBackend:
         self._connection_attempted = True
         if connected:
             self._note_reachable()
+
+        # Weekly reconciliation backstop (see _weekly_full_refresh_due).
+        # Checked here rather than inside connect so reconnects — every wake
+        # from sleep — only pay a settings read, and the one walk per week
+        # starts after startup settles, off the connect path itself.
+        if (self._romm_client and self._romm_client.authenticated
+                and self._library_auto_update()
+                and self._weekly_full_refresh_due()):
+            threading.Thread(target=self._run_weekly_full_refresh, daemon=True,
+                             name='weekly-full-refresh').start()
 
         # If initial connection failed, retry quickly (DNS may not be ready yet)
         if not connected:
@@ -2847,6 +2861,8 @@ class LudoBackend:
 
             self._last_full_fetch_time = self._server_watermark(fetched_rows, current_time)
             self._snapshot_fetched_at = self._last_full_fetch_time
+            if not use_incremental and not refresh_incomplete:
+                self._stamp_full_refresh()
             # Write-through the freshly merged library so a later cold start /
             # offline session sees this data.
             self._persist_snapshot()
@@ -6074,6 +6090,168 @@ class LudoBackend:
             new_games.append(entry)
             preserved += 1
         return preserved
+
+    def _on_rom_removed_from_server(self, rom_id):
+        """Flag a library entry orphaned after the server said the ROM is gone.
+
+        The save-sync backstop: an upload 404 ("rom not found") means the ROM
+        was deleted on RomM after the last reconciliation, so the entry goes
+        orphaned now rather than erroring on every sync until the next one.
+        Data is never touched here — marking is all this does; removal is the
+        user's call from Settings ▸ Removed from RomM.
+        """
+        try:
+            for g in self._available_games:
+                if g.get('rom_id') == rom_id and not g.get('is_orphan'):
+                    g['is_orphan'] = True
+                    logging.info(f"[ORPHAN] rom {rom_id} marked removed-on-server "
+                                 f"after upload 404; local data kept")
+                    _record_activity('sync', 'Removed from RomM',
+                                     f"{g.get('display_name') or g.get('name')} — "
+                                     "kept on this device; save-sync stopped",
+                                     rom_id=rom_id)
+                    self._persist_snapshot()
+                    break
+        except Exception as e:
+            logging.warning(f"could not flag orphaned rom {rom_id}: {e}")
+
+    async def get_orphan_games(self):
+        """Games the server stopped returning that are still on this device.
+
+        Feeds the Settings ▸ Removed from RomM list; each entry can be deleted
+        (files + saves, to trash) from there.
+        """
+        games = [{'rom_id': g['rom_id'],
+                  'name': g.get('display_name') or g.get('name'),
+                  'platform': g.get('platform'),
+                  'local_size': g.get('local_size') or 0}
+                 for g in self._available_games if g.get('is_orphan')]
+        return {'success': True, 'games': games}
+
+    async def delete_orphan_game(self, rom_id):
+        """Delete a removed-from-RomM game's local data: ROM files AND saves.
+
+        One decision, one scope — the file and the saves it produced go
+        together, which is what "delete them together with the game" means.
+        Nothing is unlinked outright: everything lands under
+        ~/.config/<app>/trash/<rom_id>-<timestamp>/ so a misclick is
+        recoverable by hand. Only orphaned entries qualify; a game still on
+        the server goes through delete_game instead.
+        """
+        try:
+            g = next((x for x in self._available_games
+                      if x.get('rom_id') == rom_id), None)
+            if g is None:
+                return {'success': False, 'message': 'Game not found'}
+            if not g.get('is_orphan'):
+                return {'success': False,
+                        'message': 'Game is still on RomM — delete it from its page'}
+
+            trash_dir = CONFIG_DIR / 'trash' / f"{rom_id}-{int(time.time())}"
+            trash_dir.mkdir(parents=True, exist_ok=True)
+            moved = []
+
+            def _to_trash(path):
+                p = Path(path)
+                if not p.exists():
+                    return
+                try:
+                    shutil.move(str(p), str(trash_dir / p.name))
+                    moved.append(str(p))
+                except Exception as e:
+                    logging.warning(f"could not move {p} to trash: {e}")
+
+            # ROM files: the main target plus any variant downloads recorded
+            # on the parent (same sweep delete_game does, move instead of unlink).
+            for v in self._variant_downloads(g).values():
+                if v.get('local_path'):
+                    _to_trash(v['local_path'])
+            if g.get('local_path'):
+                _to_trash(g['local_path'])
+            else:
+                platform_slug = g.get('platform_slug') or (g.get('romm_data') or {}).get('platform_slug')
+                file_name = g.get('file_name') or (g.get('romm_data') or {}).get('fs_name')
+                if platform_slug and file_name:
+                    target, _dl = _resolve_download_path(
+                        Path(self._settings.get('Download', 'rom_directory',
+                                                _default_roms_dir())).expanduser(),
+                        platform_slug, file_name)
+                    _to_trash(target)
+
+            # Saves and states attributed to this rom — orphans included,
+            # which is the point (the ordinary matcher skips them).
+            if self._auto_sync is not None:
+                for sp in self._auto_sync.save_paths_for_rom(rom_id):
+                    _to_trash(sp)
+
+            self._available_games = [x for x in self._available_games
+                                     if x.get('rom_id') != rom_id]
+            self._persist_snapshot()
+            name = g.get('display_name') or g.get('name') or str(rom_id)
+            _record_activity('delete', 'Removed from RomM, deleted local data',
+                             f"{name} — {len(moved)} item(s) moved to "
+                             f"{trash_dir}", rom_id=rom_id)
+            logging.info(f"[ORPHAN] deleted local data for rom {rom_id} "
+                         f"({len(moved)} item(s) to {trash_dir})")
+            return {'success': True, 'message': 'Deleted', 'moved': len(moved),
+                    'trash': str(trash_dir)}
+        except Exception as e:
+            logging.error(f"delete_orphan_game error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    def _weekly_full_refresh_due(self) -> bool:
+        """Whether the weekly reconciliation full walk is due.
+
+        Per-platform reconciliation catches deletions by count on every
+        refresh, and a net-zero add/delete inside one platform is closed by
+        the force-walk the add triggers — but heuristics can both be fooled
+        (a server that caches rom_count, say), and a deleted game with no
+        local save never 404s. A low-frequency full walk is the backstop
+        that heals any drift the cheap paths miss. Seven days: worst-case
+        linger for something invisible is harmless, since nothing syncs
+        against a deleted ROM once flagged.
+        """
+        last = self._settings.get('RomM', 'last_full_refresh', '')
+        if not last:
+            return True
+        try:
+            stamp = datetime.fromisoformat(last)
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            return datetime.now(timezone.utc) - stamp >= timedelta(days=7)
+        except ValueError:
+            return True
+
+    def _stamp_full_refresh(self):
+        """Record that a complete full walk just ran.
+
+        Only called on walks that finished — stamping a failed one would
+        silence the backstop for another week on the strength of nothing.
+        """
+        try:
+            self._settings.set('RomM', 'last_full_refresh',
+                               datetime.now(timezone.utc).isoformat())
+            self._settings.save_settings()
+        except Exception as e:
+            logging.debug(f"could not stamp last_full_refresh: {e}")
+
+    def _run_weekly_full_refresh(self):
+        """Background thread body for the weekly reconciliation walk.
+
+        Deferred a few seconds so it never competes with the connect-time
+        fetch or session save-sync for the single library-busy slot; if one
+        of those still holds it, the walk is skipped and retried at the next
+        startup (the stamp only happens on success).
+        """
+        time.sleep(10)
+        try:
+            result = asyncio.run(self.refresh_from_romm(force_full_refresh=True))
+            if result.get('success'):
+                logging.info("Weekly full refresh complete")
+            else:
+                logging.info(f"Weekly full refresh skipped: {result.get('message')}")
+        except Exception as e:
+            logging.warning(f"Weekly full refresh failed: {e}")
 
     @staticmethod
     def _variant_downloads(game: dict) -> dict:

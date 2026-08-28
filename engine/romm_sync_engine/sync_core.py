@@ -1554,7 +1554,8 @@ class SettingsManager:
                 'password': '',
                 'remember_credentials': 'false',
                 'auto_connect': 'false',
-                'auto_refresh': 'false'
+                'auto_refresh': 'false',
+                'last_full_refresh': ''
             }
             self.config['Download'] = {
                 'rom_directory': str(library_dir() / 'roms'),
@@ -1649,6 +1650,15 @@ class SettingsManager:
 
         if 'debug_mode' not in self.config['System']:
             self.config['System']['debug_mode'] = 'false'
+            modified = True
+
+        # Weekly full-refresh watermark (see backend's weekly reconcile
+        # backstop): absent means "never", which reads as due.
+        if 'RomM' not in self.config:
+            self.config['RomM'] = {}
+            modified = True
+        if 'last_full_refresh' not in self.config['RomM']:
+            self.config['RomM']['last_full_refresh'] = ''
             modified = True
 
         # Save if any migrations were applied
@@ -5520,6 +5530,15 @@ class RomMClient:
 
                 elif response.status_code == 400:
                     logging.warning(f"Upload bad request (400): {response.text[:300]}")
+
+                elif response.status_code == 404:
+                    # The ROM this save belongs to no longer exists on the
+                    # server. Not an error the user can act on by retrying —
+                    # the caller flags the game orphaned and stops syncing it.
+                    logging.warning(
+                        f"Upload 404 for rom={rom_id} — ROM deleted on server: "
+                        f"{response.text[:200]}")
+                    return 'rom_gone'
 
                 else:
                     logging.warning(f"Upload unexpected status {response.status_code}: {response.text[:200]}")
@@ -10652,12 +10671,16 @@ class RetroArchInterface:
 class AutoSyncManager:
     """Manages automatic synchronization of saves/states between RetroArch and RomM"""
     
-    def __init__(self, romm_client, retroarch, settings, log_callback, get_games_callback, parent_window=None):
+    def __init__(self, romm_client, retroarch, settings, log_callback, get_games_callback, parent_window=None, rom_removed_callback=None):
         self.romm_client = romm_client
         self.retroarch = retroarch
         self.settings = settings
         self.log = log_callback
         self.get_games = get_games_callback  # Function to get current games list
+        # Backend hook fired when an upload 404s because the ROM was deleted
+        # on the server — the backend marks the library entry orphaned so the
+        # save stops syncing (and shows up in the cleanup list).
+        self.rom_removed_callback = rom_removed_callback
         self.parent_window = parent_window
         
         # Auto-sync state
@@ -11066,6 +11089,13 @@ class AutoSyncManager:
             rom_id = self.find_rom_id_for_save_file(Path(path))
         except Exception:
             rom_id = None
+        if rom_id is not None:
+            # The finder's name tiers already skip orphans, but the launch-alias
+            # tier can still hand back a ROM orphaned since it was booted. One
+            # guard here covers every attribution path at once.
+            if any(g.get('rom_id') == rom_id and g.get('is_orphan')
+                   for g in games):
+                rom_id = None
         # Bounded. Normally one entry per save on disk, but the activity
         # readout feeds it from filesystem events, so it must not grow without
         # limit on a machine that churns save paths.
@@ -11073,6 +11103,30 @@ class AutoSyncManager:
             self._rom_match_cache = {}
         self._rom_match_cache[key] = rom_id
         return rom_id
+
+    def save_paths_for_rom(self, rom_id):
+        """Local save/state paths attributed to `rom_id`, orphans included.
+
+        The mirror image of rom_id_for_save: cleanup deleting a removed game's
+        local data must find its saves, and the ordinary matcher deliberately
+        returns None for orphans. Walks the same buckets get_save_files does
+        and re-runs attribution per file with orphans admitted.
+        """
+        paths = []
+        try:
+            buckets = self.retroarch.get_save_files() or {}
+        except Exception as e:
+            logging.debug(f"save_paths_for_rom: save walk failed: {e}")
+            return paths
+        for entries in buckets.values():
+            for entry in entries or []:
+                try:
+                    if self.find_rom_id_for_save_file(Path(entry['path']),
+                                                      include_orphans=True) == rom_id:
+                        paths.append(Path(entry['path']))
+                except Exception:
+                    continue
+        return paths
 
     def start_auto_sync(self):
         """Start all auto-sync components"""
@@ -13482,6 +13536,27 @@ class AutoSyncManager:
                             _bump(rom_id, 'up')
                             if self._record_synced(entry['_path']):
                                 _fp_dirty = True
+                        elif ok == 'rom_gone':
+                            # The ROM was deleted on the server. Flag it via
+                            # the backend so the entry goes orphaned — the next
+                            # inventory build skips it and the cleanup list
+                            # shows it. Not an error: nothing the user can
+                            # retry will fix it, and counting it as one made
+                            # every sync end in "1 error(s)".
+                            summary['rom_gone'] = summary.get('rom_gone', 0) + 1
+                            self.log(f"🗑️ ROM {rom_id} no longer on RomM — "
+                                     f"keeping local data, stopping save-sync for it")
+                            # Baseline the file so it drops out of the pending
+                            # queue: it is local-only now, and "waiting to
+                            # upload" would describe something that will never
+                            # happen (and never should).
+                            if self._record_synced(entry['_path']):
+                                _fp_dirty = True
+                            try:
+                                if self.rom_removed_callback:
+                                    self.rom_removed_callback(rom_id)
+                            except Exception as cb_err:
+                                logging.debug(f"rom_removed_callback failed: {cb_err}")
                         elif ok == 'conflict':
                             # The server rejected a "clean" upload with 409 — a
                             # version diverged underneath us. Resolve like any
@@ -13807,12 +13882,21 @@ class AutoSyncManager:
         )
         return target_dir / local_name
 
-    def find_rom_id_for_save_file(self, file_path):
-        """Find ROM ID by matching save filename to game library"""
+    def find_rom_id_for_save_file(self, file_path, include_orphans=False):
+        """Find ROM ID by matching save filename to game library
+
+        Orphaned entries — games deleted on the RomM server but kept locally —
+        are skipped by default: attributing a save to one produces an upload
+        the server answers with 404, every sync, forever. `include_orphans`
+        re-admits them for the one caller that WANTS the pairing: cleanup that
+        deletes a removed game's local data must find its saves too.
+        """
         try:
             games = self.get_games()
             if not games:
                 return None
+            if not include_orphans:
+                games = [g for g in games if not g.get('is_orphan')]
 
             # RetroArch auto-savestate "<content>.state.auto" is a two-part suffix;
             # file_path.stem only drops ".auto", leaving ".state" which would never

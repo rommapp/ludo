@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
+import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
 import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel, V2CardRow} from "../kit";
-import { V2, fmtAgo } from "../theme";
+import { V2, fmtAgo, fmtBytes } from "../theme";
 import { FaBookmark, FaBug, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaInfoCircle, FaLayerGroup, FaPlay, FaRedo, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
 import { Focusable, Navigation, host, toaster } from "@ludo/host";
 import { useAutoFocus } from "../shell";
@@ -151,6 +151,89 @@ export const _UPD_CACHE_MS = 5 * 60 * 1000;
 // Floor on how long a MANUAL update check shows its busy state, so the press
 // reads as an action that ran rather than a flicker (see runUpdateCheck).
 export const MIN_CHECK_MS = 900;
+
+// Games deleted on the RomM server that still have local data. Shown ONLY
+// when there are any — the empty state is the healthy one and a permanent
+// empty section would just be noise. Deleting is two presses (arm, then
+// confirm), and the backend moves to trash rather than unlinking, so a slip
+// is recoverable by hand.
+export function RemovedFromRomMSection() {
+  const [games, setGames] = useState<any[]>([]);
+  const [armed, setArmed] = useState<number | null>(null);
+  const [busy, setBusy] = useState<number | null>(null);
+
+  useEffect(() => {
+    getOrphanGames()
+      .then(r => setGames(r?.games || []))
+      .catch(() => { });
+  }, []);
+
+  if (!games.length) return null;
+
+  const doDelete = async (romId: number) => {
+    if (armed !== romId) { setArmed(romId); return; }
+    setBusy(romId);
+    try {
+      const r = await deleteOrphanGame(romId);
+      if (r?.success) {
+        toaster.toast({ title: 'Moved to trash', body: r.trash || '' });
+        setGames(gs => gs.filter(g => g.rom_id !== romId));
+      } else {
+        toaster.toast({ title: 'Could not delete', body: r?.message || '' });
+      }
+    } catch {
+      toaster.toast({ title: 'Could not delete', body: 'The backend did not answer.' });
+    }
+    setArmed(null);
+    setBusy(null);
+  };
+
+  return (
+    <V2SettingsSection title="Removed from RomM">
+      <div style={{
+        borderRadius: V2.radiusCard, background: V2.surface,
+        border: `1px solid ${V2.border}`, overflow: 'hidden',
+      }}>
+        <div style={{
+          padding: '10px 14px', fontSize: '11px', color: V2.fgMuted,
+          borderBottom: `1px solid ${V2.border}`,
+        }}>
+          Deleted on RomM but still on this device. Deleting removes the game
+          files and its saves together — moved to trash, never unlinked.
+        </div>
+        {games.map((g, i) => (
+          <div key={g.rom_id} style={{
+            display: 'flex', alignItems: 'center', gap: '10px', padding: '8px 14px',
+            borderTop: i > 0 ? `1px solid ${V2.border}` : 'none',
+          }}>
+            <div style={{ flexShrink: 0, color: V2.fgFaint, display: 'flex' }}>
+              <FaTrash size={13} />
+            </div>
+            <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+              <div style={{
+                fontSize: '12px', fontWeight: 600, color: V2.fg,
+                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+              }}>{_gameLabel(g.name)}</div>
+              <div style={{ fontSize: '11px', color: V2.fgMuted }}>
+                {g.platform || 'Unknown platform'}
+                {g.local_size ? ` · ${fmtBytes(g.local_size)}` : ''}
+              </div>
+            </div>
+            <Focusable>
+              <V2Button
+                variant={armed === g.rom_id ? 'danger' : 'tonal'}
+                onClick={() => busy === null && doDelete(g.rom_id)}
+              >
+                {busy === g.rom_id ? 'Deleting…'
+                  : armed === g.rom_id ? 'Press again to confirm' : 'Delete'}
+              </V2Button>
+            </Focusable>
+          </div>
+        ))}
+      </div>
+    </V2SettingsSection>
+  );
+}
 
 export function RecentActivitySection() {
   const [events, setEvents] = useState<Array<{ kind: string, title: string, detail: string, timestamp: number }>>([]);
@@ -997,6 +1080,8 @@ export function SettingsPage() {
           />
         </div>
       </V2SettingsSection>
+
+      <RemovedFromRomMSection />
 
       <V2SettingsSection title="Saves">
         <V2SettingsRow
