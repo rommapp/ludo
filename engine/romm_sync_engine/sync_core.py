@@ -13726,6 +13726,12 @@ class AutoSyncManager:
         if summary['_per_game'] or summary['errors'] or summary['conflicts']:
             try:
                 games = {g.get('rom_id'): g for g in (self.get_games() or [])}
+                # A save can be attributed to a grouped sibling's id (regional
+                # variants); resolve those to the parent tile so the feed shows
+                # a name instead of "ROM <id>".
+                for g in list(games.values()):
+                    for sib in (g.get('_sibling_files') or []):
+                        games.setdefault(sib.get('id'), g)
             except Exception:
                 games = {}
             for rid, c in summary['_per_game'].items():
@@ -14017,7 +14023,15 @@ class AutoSyncManager:
                         sibling_fs_name_no_ext = sibling.get('fs_name_no_ext') or (Path(sibling_filename).stem if sibling_filename else '')
                         
                         if sibling_fs_name_no_ext and (sibling_fs_name_no_ext == save_basename or sibling_fs_name_no_ext == clean_basename):
-                            # Return the variant's ROM ID, not the parent's
+                            # Return the variant's ROM ID, not the parent's —
+                            # except on Switch, where _sibling_files are add-on
+                            # content (update/DLC) grouped under the base game's
+                            # tile, not self-owned region ROMs. The save belongs
+                            # to the main entry; attributing it to the sibling
+                            # makes the server see "no save under this rom" and
+                            # duplicate the upload on the sibling id.
+                            if str(game.get('platform_slug') or '').lower() == 'switch':
+                                return game['rom_id']
                             return sibling.get('id')
 
             # TIER 2: Try region-aware matching (NEW)
@@ -14074,7 +14088,11 @@ class AutoSyncManager:
                                 'game': game,
                                 'region': variant_region,
                                 'fs_name_no_ext': sibling_fs_name_no_ext,
-                                'rom_id': sibling.get('id')  # Use variant's ROM ID
+                                # Switch siblings are grouped add-ons, not
+                                # region ROMs — the main entry owns the save.
+                                'rom_id': (game['rom_id']
+                                           if str(game.get('platform_slug') or '').lower() == 'switch'
+                                           else sibling.get('id'))
                             })
 
                 # If we have candidates, prefer region match
