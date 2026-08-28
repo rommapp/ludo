@@ -7776,15 +7776,65 @@ class LudoBackend:
                 return
 
             info = sync.switch_add_on_state(path.name)
-            if info and info.get('kind') in ('update', 'dlc'):
-                sync.install_switch_add_on(path)
-                return
-            if not info:
-                return
+            # A name the regexes cannot read is not the end of the question:
+            # the container is on disk now, and install_switch_add_on asks it
+            # directly (sigil reads the CNMT; the filename was only ever the
+            # cheap first opinion). 'base' and 'not-switch' statuses leave the
+            # file exactly where it is, so trying costs nothing when the name
+            # was silent because this really is the base game.
+            entry_file_installed = False
+            if info is None or info.get('kind') in ('update', 'dlc'):
+                result = sync.install_switch_add_on(path)
+                # 'ok'/'current': it was an add-on and is now installed -- in
+                # extcontent mode the file was MOVED out of the library folder,
+                # which the sibling sweep below has to know.
+                entry_file_installed = result.get('status') in ('ok', 'current')
 
-            # A base game. Its add-ons are separate ROMs on the server, tied to
-            # it by title ID rather than by anything RomM models, so they are
-            # found by name -- see switch_add_ons_for_rom.
+            # Fetch whatever siblings the group holds that are not local yet,
+            # from either direction: the entry file can be the base with its
+            # add-ons still on the server (the Mario Kart shape), or the
+            # patch, with the base still on the server (a scene dump named so
+            # plainly nothing could rank the group and the update won the
+            # tile). Their containers settle which is which.
+            return self._sweep_switch_siblings(
+                rom_id, path, progress_callback,
+                entry_file_installed=entry_file_installed)
+        except Exception as e:
+            logging.error(f"Switch add-on handling failed for {path}: {e}",
+                          exc_info=True)
+            return {'base': None, 'entry_file_installed': False, 'failures': []}
+
+    def _sweep_switch_siblings(self, rom_id, path, progress_callback=None,
+                               entry_file_installed=False):
+        """Download a Switch game's missing siblings and sort them by content.
+
+        RomM groups a base game with its patch/DLC (and duplicate-format
+        dumps) as siblings under one tile, but a download fetches only the
+        group's main file. This closes the gap: name-classifiable add-ons are
+        found by their title-ID ties (switch_add_ons_for_rom), the rest are
+        fetched and read -- install_switch_add_on installs real add-ons and
+        refuses a base game, leaving it in the library folder as the ROM it
+        is (see switch_unresolved_siblings for why downloading to find out is
+        the accepted cost).
+
+        A sibling that turns out to be a base game becomes the group's ROM
+        when the entry's own file was just an add-on moved out to the
+        updates/DLC folder -- otherwise the tile would point at a download
+        that no longer exists. When the entry keeps its own base file, the
+        sibling is a second copy (another format/region) and is recorded as a
+        variant download, launchable through the picker like any duplicate.
+
+        Returns a report for the download worker to tell the user with:
+        {'base': Path-or-None, 'entry_file_installed': bool,
+         'failures': [(file_name, message)]}.
+        """
+        sync = self._auto_sync
+        if not sync:
+            return {'base': None, 'entry_file_installed': entry_file_installed,
+                    'failures': []}
+        report = {'base': None, 'entry_file_installed': entry_file_installed,
+                  'failures': []}
+        try:
             g = self._games_index().get(rom_id) or {}
             add_ons = sync.switch_add_ons_for_rom(
                 g or {'id': rom_id, 'fs_name': path.name},
@@ -7797,6 +7847,7 @@ class LudoBackend:
                        for a in add_ons):
                     add_ons.append(extra)
 
+            base_sibling = None   # (variant_id, name, file_name, target)
             for add_on in add_ons:
                 add_on_id = add_on.get('rom_id') or add_on.get('id')
                 # Library entries key this 'file_name'; folded sibling rows
@@ -7817,11 +7868,43 @@ class LudoBackend:
                         progress_callback)
                     if not ok:
                         logging.warning(f"add-on download failed: {file_name}: {msg}")
+                        report['failures'].append((file_name, msg or 'download failed'))
                         continue
-                sync.install_switch_add_on(target)
+                result = sync.install_switch_add_on(target)
+                if (result.get('status') == 'base' and add_on_id
+                        and base_sibling is None):
+                    base_sibling = (add_on_id, add_on.get('name'), file_name, target)
+
+            if base_sibling is None:
+                return report
+            report['base'] = base_sibling[3]
+            vid, vname, vfile, vtarget = base_sibling
+            try:
+                size = vtarget.stat().st_size
+            except OSError:
+                size = 0
+            entry = self._games_index().get(rom_id) or g
+            # Always a variant download: that record is what survives
+            # _reconcile_downloads, which re-derives is_downloaded from the
+            # entry's own file_name and would otherwise see the moved-away
+            # add-on and flip the tile to not-downloaded.
+            self._record_variant_download(
+                entry, vid, name=vname, file_name=vfile,
+                local_path=str(vtarget))
+            entry_path = entry.get('local_path')
+            if entry_file_installed or not (entry_path and Path(entry_path).exists()):
+                # The entry's own file was an add-on now moved out to the
+                # updates/DLC folder: this base sibling IS the game, so point
+                # the entry at it right away rather than waiting for a
+                # reconcile to dig it out of the variant record.
+                entry['local_path'] = str(vtarget)
+                entry['local_size'] = size
+                entry['is_downloaded'] = True
+                self._persist_snapshot_throttled()
         except Exception as e:
-            logging.error(f"Switch add-on handling failed for {path}: {e}",
+            logging.error(f"Switch sibling sweep failed for {path}: {e}",
                           exc_info=True)
+        return report
 
     async def switch_add_ons(self, rom_id: int):
         """Update and DLC state for a game, for the detail page.
@@ -7984,8 +8067,8 @@ class LudoBackend:
                     # pulls whatever patches and add-ons the library holds for
                     # it -- the user asked for the game, and a game whose patch
                     # sits undownloaded beside it is not the game they meant.
-                    if ok:
-                        self._handle_switch_add_ons(rom_id, final, _on_progress)
+                    sweep = (self._handle_switch_add_ons(rom_id, final, _on_progress)
+                             if ok else None)
                     # `g` was resolved before the download started, which can be
                     # minutes ago — long enough for the 5-minute library refresh
                     # to have replaced _available_games. Re-resolve now, or a rom
@@ -8080,16 +8163,36 @@ class LudoBackend:
                     gone = False
                     if not ok and self._rom_exists_on_server(rom_id) is False:
                         gone = self._forget_deleted_rom(rom_id)
+                    # A Switch download whose entry file turned out to be the
+                    # PATCH is only launchable once a base game is on disk. The
+                    # sweep's report says whether one made it; when it did not,
+                    # "Downloaded" would be a lie the user discovers as "no
+                    # launchable file found" at the worst moment.
+                    base_missing = bool(
+                        sweep and sweep.get('entry_file_installed')
+                        and sweep.get('base') is None)
+                    base_note = ''
+                    if base_missing:
+                        fails = '; '.join(f"{n}: {m}" for n, m in sweep['failures'])
+                        base_note = ('Only the update could be fetched — the base '
+                                     'game was not downloaded'
+                                     + (f' ({fails})' if fails
+                                        else ' (no base game found on RomM)'))
+                        logging.error(f"rom {rom_id}: {base_note}")
                     self._download_progress[rom_id] = {
                         'percent': 100 if ok else 0, 'downloaded': 0, 'total': 0,
-                        'speed': 0, 'eta': 0, 'state': 'done' if ok else 'error',
-                        'message': ('This game is no longer on RomM.' if gone
-                                    else msg or ('Downloaded' if ok else 'Download failed')),
+                        'speed': 0, 'eta': 0,
+                        'state': ('error' if (not ok or base_missing) else 'done'),
+                        'message': (base_note or
+                                    ('This game is no longer on RomM.' if gone
+                                     else msg or ('Downloaded' if ok else 'Download failed'))),
                         'removed': gone,
                     }
-                    _record_activity('download' if ok else 'error',
-                                     'Downloaded' if ok else 'Download failed',
-                                     name or file_name or f'ROM {rom_id}',
+                    _record_activity('error' if (not ok or base_missing) else 'download',
+                                     'Base game not downloaded' if base_missing
+                                     else ('Downloaded' if ok else 'Download failed'),
+                                     (base_note or name or file_name
+                                      or f'ROM {rom_id}'),
                                      rom_id=rom_id)
                 except Exception as e:
                     logging.error(f"download_game worker error: {e}", exc_info=True)

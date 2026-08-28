@@ -3462,15 +3462,40 @@ class RomMClient:
             # title_ids.switch_kind). Ties and non-Switch groups keep the
             # existing order exactly.
             switch_rank = {'base': 0, 'update': 1, 'dlc': 2}
-            if any(title_ids.switch_content_from_name(
-                    r.get('fs_name') or r.get('name') or '') for r in candidates):
+
+            def _switch_content_row(rom):
+                slug = str(rom.get('platform_slug') or '').strip().lower()
+                return (slug == 'switch'
+                        or bool(title_ids.switch_content_from_name(
+                            rom.get('fs_name') or rom.get('name') or '')))
+            # Gated broadly: a scene dump group ("v-..._v196608.nsp" beside
+            # "v-..._nsw.xci") has NO name a title-ID regex can read, and
+            # name-gating alone would leave exactly those groups falling
+            # through to API order -- which is how a 100 MB update wins the
+            # tile over the base game. The slug catches them; the name check
+            # covers rows whose slug is missing.
+            if any(_switch_content_row(r) for r in candidates):
                 def _switch_key(rom):
                     info = title_ids.switch_content_from_name(
                         rom.get('fs_name') or rom.get('name') or '')
                     # Unidentifiable rows sort with the base games rather than
                     # last: a group whose base is untagged is still a group
                     # whose add-ons must not win it.
-                    return switch_rank.get((info or {}).get('kind'), 0)
+                    kind = switch_rank.get((info or {}).get('kind'), 0)
+                    # File count before size: a folder ROM (multi-file, e.g.
+                    # regional variants) is the parent that contains the
+                    # others and must keep outranking its children, whatever
+                    # any single child weighs.
+                    # Size breaks ties inside a kind -- and decides the groups
+                    # no name can classify at all, where every row lands on
+                    # kind 0 above. The base game is the big file, so
+                    # largest-first makes the group's main the one a download
+                    # should fetch first.
+                    try:
+                        size = int(rom.get('fs_size_bytes') or 0)
+                    except (TypeError, ValueError):
+                        size = 0
+                    return (kind, -len(rom.get('files') or []), -size)
                 candidates = sorted(candidates, key=_switch_key)
 
             for rom in candidates:
