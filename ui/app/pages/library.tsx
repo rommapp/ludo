@@ -18,6 +18,7 @@ import { StatsPage } from "./stats";
 import { CoresPage } from "./cores";
 import { BiosPage } from "./bios";
 import { DownloadsPage } from "./downloads";
+import { PlatformsPage } from "./platforms";
 import { _LS_REOPEN_HOME } from "../storage";
 import { lastLaunchedRomId } from "../launch";
 import { CollectionActionsModal, NAV_ORDER, UserMenuModal, V2NavBar, useNavChrome } from "../topbar";
@@ -1211,6 +1212,7 @@ export function LibraryRootPage() {
           {top === 'cores' && <CoresPage />}
           {top === 'bios' && <BiosPage />}
           {top === 'downloads' && <DownloadsPage />}
+          {top === 'platforms' && <PlatformsPage />}
         </div>
       )}
     </>

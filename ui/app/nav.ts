@@ -26,7 +26,7 @@ export type NavId = 'home' | 'platforms' | 'collections' | 'search';
 // These module hooks are only set while LibraryRootPage is mounted; when they
 // are null (e.g. Settings opened from the QAM as a real route) callers fall
 // back to genuine navigation, preserving the old behavior.
-export type LibView = 'grid' | 'game' | 'settings' | 'stats' | 'cores' | 'bios' | 'downloads';
+export type LibView = 'grid' | 'game' | 'settings' | 'stats' | 'cores' | 'bios' | 'downloads' | 'platforms';
 
 // ── History-aware back navigation ────────────────────────────────────────────
 // Navigation.Navigate always PUSHES a history entry. Backing out of our pages
@@ -87,6 +87,7 @@ const _libViewForRoute: Record<string, LibView> = {
   '/romm-sync-cores': 'cores',
   '/romm-sync-bios': 'bios',
   '/romm-sync-downloads': 'downloads',
+  '/romm-sync-platforms': 'platforms',
 };
 
 
