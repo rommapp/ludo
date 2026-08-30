@@ -32,6 +32,7 @@
 // already documented in gamepad_bridge.py and preload.cjs.
 
 const fs = require("fs");
+const { spawnSync } = require("child_process");
 const { findNativePads } = require("./native-pads.cjs");
 
 // GamepadButtonId, as used by the plugin UI (mirrors preload.cjs).
@@ -70,27 +71,101 @@ const STICK_DEADZONE = 0.6;
 // Analog triggers, same 0.3 threshold the other two paths use.
 const TRIGGER_ON = 0.3;
 
-// Axis ranges differ per pad (signed 16-bit on Xbox/DualSense, unsigned 8-bit on
-// some cheap pads) and reading the real range needs an EVIOCGABS ioctl — a native
-// module. So the ranges below are assumed, NOT measured, and the two axis kinds
-// have to be treated differently.
+// Axis ranges differ per pad and guessing them is not survivable, so ASK the
+// kernel: EVIOCGABS reports each axis's real minimum, maximum and current value.
+// Node has no ioctl, so the query runs in the Python interpreter this app already
+// ships and spawns for its backend (see absInfoFor below). When that is
+// unavailable the assumption below is the fallback, and it is only ever a
+// fallback now.
 //
-// STICKS: assume signed 16-bit, the range xpad/xone/DualSense actually report.
-// Scaling against "the largest magnitude seen so far" is the tempting trick and
-// it is wrong: the first events after a pad connects are a few hundred counts of
-// centre drift, which becomes the assumed full scale, so a RESTING stick reads as
-// full deflection — the UI walked to the bottom of the list and pushed straight
-// back down every time the user let go. An axis only counts as unsigned 8-bit
-// once it has proved it (a full sweep that stays inside 0..255); until then a
-// hypothetical 8-bit pad's stick simply never crosses the deadzone, and its d-pad
-// still works. Wrong-but-inert beats confidently-wrong.
-function normalizeStick(seen, code, value) {
+// This used to be assumption-only, and the assumption — signed 16-bit, as
+// xpad reports — is wrong for an Xbox pad on BLUETOOTH, which reports
+// 0..65535 centred near 32768. Measured on one:
+//
+//   ABS_X value=32311 min=0 max=65535     ← resting
+//   ABS_Y value=33091 min=0 max=65535     ← resting
+//
+// Divided by 32767 that resting stick reads 0.99 — past the deadzone — so the
+// pad announced a permanent "down". Vertical beats horizontal in
+// updateDirection, so Left/Right/Down did nothing at all, D-pad Up won only
+// while held, and releasing it handed the grid straight back to the phantom
+// down: focus "moved up, then snapped back", and a held press walked to the
+// bottom of the library. Only for a pad connected AFTER launch, because that is
+// exactly when Chromium refuses to report it and this reader is the only source.
+function normalizeStick(seen, code, value, abs) {
+  // Kernel-reported range: centre is the midpoint, scale is the half-range.
+  const info = abs && abs[code];
+  if (info && info.max > info.min) {
+    const mid = (info.max + info.min) / 2;
+    const half = (info.max - info.min) / 2;
+    return (value - mid) / half;
+  }
   let s = seen.get(code);
   if (!s) { s = { max: value, min: value }; seen.set(code, s); }
   if (value > s.max) s.max = value;
   if (value < s.min) s.min = value;
   if (s.min >= 0 && s.max <= 255 && s.max >= 200) return (value - 128) / 127;
+  // Never seen a negative value, but values far outside a signed-16 stick's
+  // resting band: an unsigned range this code could not measure. Treat it as
+  // centred rather than divide by a scale that makes rest look like full
+  // deflection — the failure above, in the case where the ioctl is unavailable.
+  if (s.min >= 0 && s.max > 4096) return (value - 32768) / 32768;
   return value / 32767;
+}
+
+// EVIOCGABS for every axis this module reads, via the bundled Python.
+//
+// _IOR('E', 0x40 + axis, struct input_absinfo): dir=2, size=24, type=0x45. The
+// struct is six int32s — value, minimum, maximum, fuzz, flat, resolution — and
+// only the range matters here.
+//
+// The script is passed to python as a command-line ARGUMENT, so it must contain
+// no NUL byte — Node refuses to spawn otherwise ("must be a string without null
+// bytes") and the query fails silently, leaving every pad on the guessed range.
+// That is why the buffer below is bytes(24) rather than a zero-byte literal, and
+// why nothing here may mention one, comments included. Synchronous and once per pad at open: a few tens
+// of milliseconds when a controller is plugged in, and nothing at all after.
+function absInfoFor(node, python) {
+  if (!python) return null;
+  const codes = [ABS_X, ABS_Y];
+  const script = `
+import fcntl, json, struct, sys
+out = {}
+try:
+    f = open(sys.argv[1], "rb")
+except OSError:
+    print("{}"); raise SystemExit
+for a in [${codes.join(", ")}]:
+    try:
+        buf = fcntl.ioctl(f, (2 << 30) | (24 << 16) | (0x45 << 8) | (0x40 + a), bytes(24))
+        value, lo, hi, fuzz, flat, res = struct.unpack("<6i", buf)
+        if hi > lo:
+            out[a] = {"min": lo, "max": hi}
+    except OSError:
+        pass
+print(json.dumps(out))
+`;
+  try {
+    const r = spawnSync(python, ["-c", script, node], {
+      encoding: "utf8", timeout: 4000,
+    });
+    if (r.status !== 0 || !r.stdout) {
+      console.error("[pad] axis range query failed for", node,
+                    r.status, (r.stderr || "").slice(0, 200));
+      return null;
+    }
+    const parsed = JSON.parse(r.stdout);
+    const out = {};
+    for (const [k, v] of Object.entries(parsed)) out[Number(k)] = v;
+    if (!Object.keys(out).length) return null;
+    // One line per pad, because a wrong range here is invisible in the UI and
+    // presents as "the controller drives the menu on its own".
+    console.log("[pad] axis ranges for", node, JSON.stringify(out));
+    return out;
+  } catch (e) {
+    console.error("[pad] axis range query threw for", node, e && e.message);
+    return null;
+  }
 }
 
 // TRIGGERS: unipolar, resting at 0 (0..255 on some pads, 0..1023 on xpad), so
@@ -107,9 +182,13 @@ function normalizeTrigger(seen, code, value) {
 
 // One open pad: its evdev fd plus the state needed to emit only CHANGES.
 class PadReader {
-  constructor(node, emit) {
+  constructor(node, emit, python) {
     this.node = node;
     this.emit = emit;
+    // The kernel's own axis ranges, so a stick at rest normalises to ~0 whatever
+    // scale the pad uses. null when the query could not run — normalizeStick
+    // falls back to its guesses then.
+    this.abs = absInfoFor(node, python);
     // O_NONBLOCK matters: an evdev node opened for blocking reads parks
     // readSync() until the next event, which would freeze the ENTIRE main process
     // (window management, IPC, the backend's lifecycle) between button presses.
@@ -169,8 +248,8 @@ class PadReader {
     }
     if (type !== EV_ABS) return;
     switch (code) {
-      case ABS_X: this.axis.x = normalizeStick(this.axisSeen, code, value); break;
-      case ABS_Y: this.axis.y = normalizeStick(this.axisSeen, code, value); break;
+      case ABS_X: this.axis.x = normalizeStick(this.axisSeen, code, value, this.abs); break;
+      case ABS_Y: this.axis.y = normalizeStick(this.axisSeen, code, value, this.abs); break;
       // Hat axes are always -1/0/1, so they need no scaling.
       case ABS_HAT0X: this.hat.x = Math.sign(value); break;
       case ABS_HAT0Y: this.hat.y = Math.sign(value); break;
@@ -212,7 +291,7 @@ const SCAN_MS = 1000;
 // report the same press (the 8BitDo Ultimate does), and the renderer needs to
 // tell them apart to merge them instead of counting each press twice. Returns a
 // stop() function.
-function startNativeInput(emit) {
+function startNativeInput(emit, python) {
   if (process.platform !== "linux") return () => {};
 
   const readers = new Map(); // node path → PadReader
@@ -236,7 +315,7 @@ function startNativeInput(emit) {
       const until = blocked.get(node);
       if (until && Date.now() < until) continue;
       try {
-        readers.set(node, new PadReader(node, emit));
+        readers.set(node, new PadReader(node, emit, python));
         blocked.delete(node);
       } catch (err) {
         // EACCES is the udev-ACL race above; anything else (ENOENT from an

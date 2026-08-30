@@ -371,11 +371,17 @@ function createWindow(url, fullscreen) {
   // while the window is unfocused (a running game owns the pad) and, crucially,
   // releases everything it had held when focus goes — a button that happens to be
   // down at that moment would otherwise stay stuck down forever.
+  // The interpreter is passed in so the reader can ask the kernel for each pad's
+  // real axis range (EVIOCGABS — see native-input.cjs); pythonExe() throws on an
+  // incomplete packaged build, and a missing range only costs us its fallback
+  // guess, so a failure here must not take the whole window down with it.
+  let padPython = null;
+  try { padPython = pythonExe(); } catch { /* fall back to the guesses */ }
   stopNativeInput = startNativeInput({
     button(id, down, node) { sendPadEvent(win, "button", { id, down, node }); },
     direction(dir, node) { sendPadEvent(win, "direction", { dir, node }); },
     gone(node) { sendPadEvent(win, "gone", { node }); },
-  });
+  }, padPython);
   win.on("closed", () => {
     win = null;
     if (stopNativeInput) { stopNativeInput(); stopNativeInput = null; }
