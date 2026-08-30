@@ -945,6 +945,8 @@ function isEditable(el: HTMLElement) {
 }
 let lastPointerX = NaN;
 let lastPointerY = NaN;
+// Movement below this is noise, not intent — see enterMouseMode.
+const POINTER_NOISE_PX = 3;
 function enterMouseMode(e?: Event) {
   // Scrolling content under a physically-stationary pointer makes WebKit
   // synthesize a mousemove (new element slides under the cursor). After a D-pad
@@ -955,7 +957,12 @@ function enterMouseMode(e?: Event) {
   // mouse. (Non-mousemove callers, e.g. an explicit switch, pass no event.)
   const me = e as MouseEvent | undefined;
   if (me && me.type === "mousemove") {
-    if (me.clientX === lastPointerX && me.clientY === lastPointerY) return;
+    // A few pixels of slack rather than exact equality: a scroll under a
+    // stationary cursor usually repeats the position exactly, but a smooth
+    // scroll that lands mid-pixel can report a coordinate one off, and one
+    // pixel is not somebody reaching for the mouse.
+    if (Math.abs(me.clientX - lastPointerX) < POINTER_NOISE_PX
+        && Math.abs(me.clientY - lastPointerY) < POINTER_NOISE_PX) return;
     // Whether we've ever seen a pointer position before this event.
     const hadPrevious = !Number.isNaN(lastPointerX);
     lastPointerX = me.clientX;
@@ -965,7 +972,20 @@ function enterMouseMode(e?: Event) {
     // stationary cursor makes Chromium synthesise one, and counting it handed
     // the legend to the keyboard/mouse set at launch even with a pad attached.
     // Real mouse use always produces a second, differing position.
-    if (hadPrevious) noteKbmInput();
+    //
+    // So the first one is RECORDED AND DROPPED — it must not take over from the
+    // pad either, which is what it used to do. The coordinate guard above only
+    // catches a scroll-synthesised move once a real position is on file; with
+    // none (a window nobody has moved the mouse in yet — exactly the case when a
+    // controller is connected after launch and driven straight away), the very
+    // first D-pad press smooth-scrolled the grid, the scroll slid a new element
+    // under the stationary cursor, Chromium synthesised a mousemove, and this
+    // function treated it as the user grabbing the mouse: mouse mode on, the
+    // focused tile blurred, `hovered` re-armed to whatever sat under the
+    // pointer. The highlight moved and then snapped back to the tile the cursor
+    // was over, about half a second later — i.e. as the button came up.
+    if (!hadPrevious) return;
+    noteKbmInput();
   }
   // Record what the pointer is over so a later gamepad press can resume from it.
   const t = e && (e.target as HTMLElement | null);
