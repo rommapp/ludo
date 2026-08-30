@@ -496,6 +496,29 @@ function moveFocus(el: HTMLElement, horizontal = false, smooth = true) {
   focusAndReveal(el, horizontal, smooth);
 }
 
+// Where to enter a container: the target closest to the middle of the screen.
+//
+// Not the first in DOM order — that is the top nav, so entering a scrolled grid
+// threw the highlight out of the content entirely. Not the first ON screen
+// either, for the same reason. The user is looking at the middle of the
+// viewport, so the least surprising place to appear is the nearest target to it.
+function preferOnScreen(els: HTMLElement[]): HTMLElement {
+  const h = window.innerHeight || 0;
+  const w = window.innerWidth || 0;
+  const cx = w / 2, cy = h / 2;
+  let best = els[0];
+  let bestD = Infinity;
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (r.bottom <= 0 || r.top >= h || r.right <= 0 || r.left >= w) continue;
+    const dx = r.left + r.width / 2 - cx;
+    const dy = r.top + r.height / 2 - cy;
+    const d = dx * dx + dy * dy;
+    if (d < bestD) { bestD = d; best = el; }
+  }
+  return best;
+}
+
 function center(el: HTMLElement) {
   const r = el.getBoundingClientRect();
   return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
@@ -540,14 +563,26 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
     moveFocus(targets[0], false, smooth);
     return;
   }
-  // Focus sits on a WRAPPER that encloses the targets rather than on a target
-  // itself — e.g. a modal panel with autoFocus (index.tsx focuses the inner
-  // Focusable, not a leaf row). Every candidate is then a descendant of `active`
-  // and gets skipped by the descendant guard in the scan below, dead-ending the
-  // move so the overlay looks uncontrollable. Enter from the first target
-  // instead, the same as the no-origin seed above.
-  if (targets.every((t) => t !== active && active.contains(t))) {
-    moveFocus(targets[0], false, smooth);
+  // Focus sits on a WRAPPER that encloses targets rather than on a target itself
+  // — e.g. a modal panel with autoFocus (index.tsx focuses the inner Focusable,
+  // not a leaf row), or a page root that useAutoFocus aimed at. Those candidates
+  // are skipped by the descendant guard in the scan below, and the wrapper's own
+  // rect is meaningless as an origin: a page-root wrapper spans the WHOLE
+  // scrollable document, so its centre sits far below the viewport and an Up
+  // move scored from it lands on the bottom-most tile on the page. That is the
+  // "up jumps to the last cover" bug, and the reason the other directions felt
+  // dead: every press was being scored from the same phantom centre.
+  //
+  // This used to require EVERY target to be inside the wrapper, which the page
+  // root fails — the sticky top bar sits outside it — so the common case fell
+  // through to the geometric scan. Any contained target is enough to prove this
+  // is a container rather than a leaf.
+  const inside = targets.filter((t) => t !== active && active.contains(t));
+  if (inside.length) {
+    // Enter at the first contained target the user can actually see, not the
+    // first in the document: seeding at targets[0] on a scrolled grid threw the
+    // highlight back to the top of the page.
+    moveFocus(preferOnScreen(inside), false, smooth);
     return;
   }
 
