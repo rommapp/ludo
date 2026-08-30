@@ -25,6 +25,7 @@ layout leaves the file exactly as it was.
 """
 
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -195,4 +196,196 @@ def register_external_content_dir(directory, extra_config_dir=None):
         log.warning("could not write Eden config %s: %s", path, e)
         return 'failed'
     log.info("registered external content dir with Eden: %s", value)
+    return 'ok'
+
+
+# ---------------------------------------------------------------------------
+# Player 1's controller
+#
+# Eden binds each input to ONE device by GUID:
+#
+#   player_0_button_a="engine:sdl,port:0,guid:050000005e04...,button:1"
+#
+# which is exactly right until the pad that GUID names is not the pad in the
+# user's hands. On a Deck that is the normal case: the bindings were made with
+# whatever controller was paired at the time, and launching in Gaming Mode with
+# the built-in controls matches nothing, so the game opens and cannot be played.
+#
+# The repair is deliberately the smallest one that works -- rewrite the `guid:`
+# field and nothing else, so every button, axis, threshold and deadzone the user
+# chose survives and only the device it points at changes.
+# ---------------------------------------------------------------------------
+
+# Valve's USB vendor ID: the Deck's own controls, as opposed to anything plugged
+# in or paired. Used to PREFER an external pad over the built-in one, because a
+# Deck with several controllers attached is a docked Deck, and on a docked Deck
+# the built-in sticks are the one device nobody is holding.
+_VALVE_VENDOR = 0x28de
+
+_PLAYER_ONE_PREFIX = 'player_0_'
+_GUID_RE = re.compile(r'guid:([0-9a-fA-F]{32})')
+
+
+def _sdl_guid(bus, vendor, product, version):
+    """The SDL joystick GUID for an evdev device, from its bus/vid/pid/version.
+
+    SDL packs those four 16-bit values little-endian, each followed by a zero
+    pair. Newer SDL builds can fill two of those pairs with a CRC of the device
+    name and a driver tag; this reproduces the plain form, which is what the
+    GUIDs already in Eden's config look like on this platform.
+    """
+    def le(v):
+        return f"{v & 0xff:02x}{(v >> 8) & 0xff:02x}"
+    return f"{le(bus)}0000{le(vendor)}0000{le(product)}0000{le(version)}0000"
+
+
+def connected_gamepads():
+    """Every gamepad currently attached, as {'guid', 'name', 'internal'}.
+
+    Read from sysfs rather than through SDL: this runs inside the plugin host,
+    where pulling in a joystick library to answer one question at launch time
+    would be a large dependency for a small fact. A device counts as a gamepad
+    when the kernel gave it a joystick node (js*), which is the same test the
+    SDL enumeration effectively makes.
+
+    Ordered by input number, so the first entry is what `port:0` would most
+    likely resolve to.
+    """
+    found = []
+    root = Path('/sys/class/input')
+    try:
+        nodes = sorted(root.glob('input*'),
+                       key=lambda p: int(re.sub(r'\D', '', p.name) or 0))
+    except OSError:
+        return found
+    for node in nodes:
+        try:
+            if not any(node.glob('js*')):
+                continue
+            ids = node / 'id'
+            vals = {}
+            for key in ('bustype', 'vendor', 'product', 'version'):
+                vals[key] = int((ids / key).read_text().strip(), 16)
+            try:
+                name = (node / 'name').read_text().strip()
+            except OSError:
+                name = ''
+        except (OSError, ValueError):
+            continue
+        found.append({
+            'guid': _sdl_guid(vals['bustype'], vals['vendor'],
+                              vals['product'], vals['version']),
+            'name': name,
+            'internal': vals['vendor'] == _VALVE_VENDOR,
+        })
+    return found
+
+
+def player_one_guid(extra_config_dir=None):
+    """The GUID player 1's inputs are currently bound to, or None."""
+    path = config_path(extra_config_dir)
+    if path is None:
+        return None
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, sep, value = line.partition('=')
+        if not sep or not key.strip().startswith(_PLAYER_ONE_PREFIX):
+            continue
+        m = _GUID_RE.search(value)
+        if m:
+            return m.group(1).lower()
+    return None
+
+
+def pick_controller(pads):
+    """Which attached pad player 1 should be bound to.
+
+    External before internal. Several controllers attached means a docked Deck,
+    and on a docked Deck the built-in sticks are the device nobody is holding --
+    so the Deck's own controls are the fallback, not the first choice. Within
+    each group the lowest-numbered device wins, which is the one `port:0` would
+    have picked anyway.
+    """
+    if not pads:
+        return None
+    for pad in pads:
+        if not pad['internal']:
+            return pad
+    return pads[0]
+
+
+def ensure_player_one_controller(extra_config_dir=None):
+    """Point player 1's bindings at a controller that is actually connected.
+
+    Returns a status string:
+
+      'ok'          rewritten to {guid}, which is attached now
+      'connected'   the bound device is attached; nothing to do
+      'no-pads'     no gamepad found, so there is nothing to bind to
+      'unbound'     player 1 has no GUID bindings (Eden's own defaults)
+      'no-config'   Eden has no qt-config.ini
+      'running'     Eden is up and would serialise over this on exit
+      'failed'      the write did not land
+
+    The 'connected' case is the common one and is why this is safe to call
+    before every launch: once the user's own pad is paired, this reads the file
+    and returns without touching it.
+    """
+    path = config_path(extra_config_dir)
+    if path is None:
+        return 'no-config'
+    current = player_one_guid(extra_config_dir)
+    if current is None:
+        return 'unbound'
+    pads = connected_gamepads()
+    if not pads:
+        return 'no-pads'
+    if any(pad['guid'] == current for pad in pads):
+        return 'connected'
+    if eden_is_running():
+        return 'running'
+    target = pick_controller(pads)
+
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except OSError as e:
+        log.warning("could not read Eden config %s: %s", path, e)
+        return 'failed'
+
+    # Only player 1's lines, and only the guid inside them. Players 2-8 are a
+    # deliberate local-multiplayer setup and none of our business, and the rest
+    # of each value is the mapping the user chose.
+    out = []
+    changed = 0
+    for line in text.splitlines():
+        key, sep, value = line.partition('=')
+        if sep and key.strip().startswith(_PLAYER_ONE_PREFIX) and current in value.lower():
+            value = _GUID_RE.sub(f"guid:{target['guid']}", value)
+            line = f"{key}{sep}{value}"
+            changed += 1
+        out.append(line)
+    if not changed:
+        return 'connected'
+
+    backup = path.with_suffix('.ini.ludo-bak')
+    try:
+        shutil.copy2(path, backup)
+    except OSError as e:
+        log.debug("could not back up %s: %s", path, e)
+
+    body = '\n'.join(out)
+    if text.endswith('\n'):
+        body += '\n'
+    try:
+        staging = path.with_name(path.name + '.part')
+        staging.write_text(body, encoding='utf-8')
+        staging.replace(path)
+    except OSError as e:
+        log.warning("could not write Eden config %s: %s", path, e)
+        return 'failed'
+    log.info("rebound Eden player 1 from %s to %s (%s), %d line(s)",
+             current, target['guid'], target['name'] or 'unnamed', changed)
     return 'ok'

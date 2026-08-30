@@ -9627,6 +9627,21 @@ class LudoBackend:
             if err or not cmd:
                 return {'success': False, 'steam_host': False,
                         'message': err or 'Could not resolve launch command'}
+            # Eden binds player 1 to one pad by GUID, and a binding made with a
+            # controller that is not the one in the user's hands leaves the game
+            # running with no input at all. Repoint it if -- and only if -- the
+            # bound device is not attached; see ensure_player_one_controller.
+            # Never fatal: a controller that cannot be rebound is still a game
+            # worth launching, and the user can map it in Eden.
+            if str(cmd[0]).lower().find('eden') >= 0:
+                try:
+                    st = await asyncio.to_thread(
+                        eden_config.ensure_player_one_controller)
+                    if st not in ('connected', 'ok'):
+                        logging.debug(f"Eden player 1 binding: {st}")
+                except Exception as e:
+                    logging.debug(f"could not check Eden's controller binding: {e}")
+
             # The host runs under Steam, so it already has the correct display
             # (:1), session vars and the real overlay LD_PRELOAD. We deliberately
             # pass NO env — overriding it would clobber Steam's overlay preload.

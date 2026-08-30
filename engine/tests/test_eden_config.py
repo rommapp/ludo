@@ -122,6 +122,60 @@ def main():
         check('and reads back',
               E.external_content_dirs(cfg), ['/roms/switch/extcontent'])
 
+    # --- player 1's controller binding ---------------------------------
+    check('SDL GUID packs bus/vid/pid/version little-endian',
+          E._sdl_guid(0x0005, 0x045e, 0x0b13, 0x0520),
+          '050000005e040000130b000020050000')
+
+    deck = {'guid': '03000000de280000ff11000001000000', 'name': 'Deck',
+            'internal': True}
+    pad = {'guid': '030000005e040000e002000003090000', 'name': 'Xbox',
+           'internal': False}
+    check('one pad attached is the pad to use', E.pick_controller([deck]), deck)
+    # Several attached means a docked Deck, where the built-in sticks are the
+    # device nobody is holding.
+    check('an external pad beats the built-in controls',
+          E.pick_controller([deck, pad]), pad)
+    check('nothing attached picks nothing', E.pick_controller([]), None)
+
+    bound = 'player_0_button_a="engine:sdl,port:0,guid:%s,button:1"\n'
+    other = 'player_1_button_a="engine:sdl,port:1,guid:%s,button:1"\n'
+    old_guid = '050000005e040000130b000020050000'
+    cfg_text = ('[Controls]\n' + bound % old_guid + other % old_guid
+                + 'player_0_lstick="engine:sdl,port:0,guid:%s,axis_x:0,'
+                  'deadzone:0.150000"\n' % old_guid)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_config(tmp, cfg_text)
+        check('reads the GUID player 1 is bound to',
+              E.player_one_guid(cfg), old_guid)
+
+        # The pad in the config IS the pad attached: the common case, and the
+        # reason this is safe to call before every launch.
+        E.connected_gamepads = lambda: [{'guid': old_guid, 'name': 'Xbox BT',
+                                         'internal': False}]
+        check('a bound pad that is attached is left alone',
+              E.ensure_player_one_controller(cfg), 'connected')
+        check('and the file is untouched',
+              (Path(tmp) / 'qt-config.ini').read_text(), cfg_text)
+
+        E.connected_gamepads = lambda: []
+        check('with no pad attached there is nothing to bind to',
+              E.ensure_player_one_controller(cfg), 'no-pads')
+
+        E.connected_gamepads = lambda: [deck]
+        check('an absent bound pad is repointed',
+              E.ensure_player_one_controller(cfg), 'ok')
+        after = (Path(tmp) / 'qt-config.ini').read_text()
+        check('player 1 now names the attached pad',
+              after.count(deck['guid']), 2)
+        check('the mapping itself is untouched',
+              'axis_x:0,deadzone:0.150000' in after, True)
+        check('player 2 keeps its own device',
+              other % old_guid in after, True)
+        check('and the original is backed up',
+              (Path(tmp) / 'qt-config.ini.ludo-bak').is_file(), True)
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} failure(s): {', '.join(FAILURES)}")
