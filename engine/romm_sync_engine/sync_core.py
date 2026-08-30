@@ -16365,6 +16365,21 @@ class BiosTrackingManager:
             platform_name: Human-readable platform name (e.g., 'Sony - PlayStation')
         """
         try:
+            # Switch is not a BIOS platform. RomM holds its firmware as
+            # ~325 MB archives (plus prod.keys) under the same /firmware
+            # endpoint every other platform's BIOS comes from, so the generic
+            # path treated them as "required files missing" and downloaded
+            # EVERY set the server had -- 22.5.0 and 17.0.1 both, ~650 MB --
+            # into RetroArch's system directory, where Eden never looks. The
+            # firmware that matters is installed by sync_switch_firmware, into
+            # Eden's NAND, one chosen version at a time.
+            if str(platform_slug).strip().lower() == 'switch':
+                logging.debug("skipping generic BIOS download for Switch; "
+                              "firmware is installed by sync_switch_firmware")
+                with self._lock:
+                    self.platforms_ready.add(platform_slug)
+                return
+
             if not self.retroarch or not self.retroarch.bios_manager:
                 self.log(f"BIOS manager not available")
                 return

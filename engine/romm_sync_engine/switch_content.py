@@ -270,15 +270,26 @@ def install_external(path, dest_dir, info=None, prod_keys=None):
     _forget(title_id, keep_path=str(destination))
 
     if path.resolve() != destination.resolve():
-        try:
-            # Move, not copy: the download landed here on its way to the
-            # folder, and leaving the original beside the base ROM would put
-            # back exactly the game-list pollution the folder exists to avoid.
-            # os.replace would fail across filesystems; shutil.move would not.
-            shutil.move(str(path), str(destination))
-        except OSError as e:
-            log.warning("could not move %s into %s: %s", path.name, target, e)
-            return {'status': 'failed', 'error': str(e)}
+        # The source can legitimately be gone: an earlier pass already moved
+        # this add-on into the folder, and a later sweep sees the same file
+        # named beside the base game and tries again. That is not a failure --
+        # the file is exactly where it belongs -- so fall through to rewrite
+        # the manifest entry rather than warning about a move with nothing to
+        # move. (It logged "could not move ...: No such file or directory" on
+        # every sweep after the first.)
+        if not path.exists() and destination.is_file():
+            log.debug("%s is already in %s; nothing to move", path.name, target)
+        else:
+            try:
+                # Move, not copy: the download landed here on its way to the
+                # folder, and leaving the original beside the base ROM would
+                # put back exactly the game-list pollution the folder exists to
+                # avoid. os.replace fails across filesystems; shutil.move does
+                # not.
+                shutil.move(str(path), str(destination))
+            except OSError as e:
+                log.warning("could not move %s into %s: %s", path.name, target, e)
+                return {'status': 'failed', 'error': str(e)}
 
     manifest = read_manifest()
     manifest[title_id] = {
