@@ -35,6 +35,14 @@ export const getOrphanGames = callable<[], any>("get_orphan_games");
 export const deleteOrphanGame = callable<[number], any>("delete_orphan_game");
 export const getVirtualCollectionsVisible = callable<[], any>("get_virtual_collections_visible");
 export const setVirtualCollectionsVisibleRpc = callable<[boolean], any>("set_virtual_collections_visible");
+// Standalone emulator builds (Eden stable vs nightly). `selected` is '' for
+// automatic; each build's `current` marks what automatic resolves to now.
+export type EmulatorBuild = { path: string; label: string; kind: string; current: boolean };
+export const listEmulatorBuilds = callable<[string], {
+  success: boolean; key?: string; name?: string; builds: EmulatorBuild[];
+  selected: string; shares_state?: boolean;
+}>("list_emulator_builds");
+export const setEmulatorBuild = callable<[string, string], any>("set_emulator_build");
 export const getSyncIndicator = callable<[], any>("get_sync_indicator");
 export const setSyncIndicatorRpc = callable<[boolean], any>("set_sync_indicator");
 // `rom_id` is present only on entries that name a single rom (downloads), and

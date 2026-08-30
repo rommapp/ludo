@@ -1182,6 +1182,87 @@ def _standalone_appimage_dirs():
             home / 'Applications/AppImages', home / 'Downloads', Path('/opt')]
 
 
+# Stems that mark a development build rather than the stable release. Eden ships
+# both as AppImages in the same folder ("eden.appimage", "eden_nightly.appimage"),
+# and they share an app id -- so they share saves, NAND, firmware, keys and
+# qt-config.ini, and switching between them loses nothing.
+_STANDALONE_DEV_MARKERS = ('nightly', 'canary', 'dev', 'early-access', 'ea')
+
+
+def _standalone_build_label(spec, stem):
+    """Human name for one discovered build: "Eden" or "Eden nightly"."""
+    name = spec.get('name') or stem
+    parts = re.split(r'[-_. ]+', stem.lower())
+    for marker in _STANDALONE_DEV_MARKERS:
+        if marker in parts:
+            return f"{name} {marker}"
+    return name
+
+
+def find_standalone_builds(key, spec, settings=None):
+    """Every install of this emulator on the machine, best first.
+
+    find_standalone_executable answers "which one do we launch"; this answers
+    "which ones exist", which is a different question and the one a settings
+    screen has to ask. A machine with both a stable and a nightly Eden has two
+    valid answers and no way to tell from the UI which it got, because the scan
+    below returns whichever sorts first.
+
+    Each entry is {'path', 'label', 'kind', 'current'}: kind is 'flatpak',
+    'appimage' or 'path', and `current` marks the one an unconfigured Ludo would
+    launch right now. The user's override is NOT applied here -- the caller
+    decides what to do with it, and hiding the alternatives behind it would
+    defeat the point.
+    """
+    builds = []
+    seen = set()
+
+    def add(path, label, kind):
+        if path in seen:
+            return
+        seen.add(path)
+        builds.append({'path': path, 'label': label, 'kind': kind,
+                       'current': False})
+
+    app_id_ = spec.get('flatpak_id')
+    if app_id_ and flatpak_app_installed(app_id_):
+        add(f'flatpak:{app_id_}', f"{spec.get('name') or key} (Flatpak)",
+            'flatpak')
+
+    names = tuple(n.lower() for n in spec.get('binaries', ()))
+    for location in _standalone_appimage_dirs():
+        try:
+            if not location.is_dir():
+                continue
+            for entry in sorted(location.iterdir()):
+                low = entry.name.lower()
+                if not low.endswith('.appimage') or _is_own_appimage(entry.name):
+                    continue
+                stem = low[:-len('.appimage')]
+                if not any(stem.startswith(n) for n in names):
+                    continue
+                if entry.is_file() and os.access(entry, os.X_OK):
+                    add(str(entry), _standalone_build_label(spec, stem),
+                        'appimage')
+        except Exception:
+            continue
+
+    for name in spec.get('binaries', ()):
+        found = shutil.which(name)
+        if found:
+            add(found, f"{spec.get('name') or key} ({name} on PATH)", 'path')
+
+    # Mark what an unconfigured Ludo would pick, so the UI can label the
+    # automatic choice with the build it actually resolves to rather than
+    # describing the rule and hoping the user works it out.
+    auto = find_standalone_executable(key, spec, settings=None)
+    for build in builds:
+        if build['path'] == auto:
+            build['current'] = True
+            break
+    return builds
+
+
 def find_standalone_executable(key, spec, settings=None):
     """Locate the emulator for `key`, or '' when it isn't installed.
 
@@ -1194,8 +1275,22 @@ def find_standalone_executable(key, spec, settings=None):
             custom = (settings.get('Emulators', f'{key}_path', '') or '').strip()
         except Exception:
             custom = ''
-        if custom and Path(custom).expanduser().exists():
-            return str(Path(custom).expanduser())
+        if custom:
+            # A flatpak override is an id, not a path -- it has nothing to
+            # stat, so it is checked against the installed flatpaks instead.
+            if custom.startswith('flatpak:'):
+                if flatpak_app_installed(custom.split(':', 1)[1]):
+                    return custom
+            elif Path(custom).expanduser().exists():
+                return str(Path(custom).expanduser())
+            # Fall through rather than refuse. An AppImage renamed by its
+            # updater, or a flatpak since removed, would otherwise turn every
+            # launch into a hard failure over a preference; auto-detection is
+            # the same answer the user had before they expressed one.
+            else:
+                logging.warning(
+                    f"{key}: configured build {custom!r} is gone, "
+                    f"falling back to auto-detection")
 
     app_id_ = spec.get('flatpak_id')
     if app_id_ and flatpak_app_installed(app_id_):

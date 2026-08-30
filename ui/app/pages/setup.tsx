@@ -1,5 +1,5 @@
 import { cloneElement, useEffect, useRef, useState } from "react";
-import { finishOnboarding, getConfig, getRommLogo, getSteamTileStatus, pairDevice, repairEmulatorPaths, saveConfig, setDeviceNameRpc, setLibraryPaths, setSteamTile, testRommConnection } from "../rpc";
+import { EmulatorBuild, finishOnboarding, getConfig, getRommLogo, getSteamTileStatus, listEmulatorBuilds, pairDevice, repairEmulatorPaths, saveConfig, setDeviceNameRpc, setEmulatorBuild, setLibraryPaths, setSteamTile, testRommConnection } from "../rpc";
 import { FileSelectionType, Focusable, Navigation, host, openFilePicker, showModal, toaster, ModalRoot, GamepadButton} from "@ludo/host";
 import { V2 } from "../theme";
 import { FaBoxOpen, FaCheck, FaCheckCircle, FaChevronLeft, FaChevronRight, FaDownload, FaExternalLinkAlt, FaGamepad, FaPlay, FaPuzzlePiece, FaSave, FaSync, FaTimes, FaUndo} from "react-icons/fa";
@@ -27,6 +27,29 @@ type WizMode = 'qr' | 'pair' | 'login';
 export function FoldersSection() {
   const status = useEmulatorStatus();
   const [busy, setBusy] = useState<string | null>(null);
+  // Standalone emulator builds — Eden ships a stable and a nightly AppImage
+  // side by side, and both match the same discovery rule. Asked once per mount:
+  // the answer is a filesystem scan that changes when the user installs
+  // something, not while they are looking at this page.
+  const [builds, setBuilds] = useState<{ list: EmulatorBuild[]; selected: string; name: string }>(
+    { list: [], selected: '', name: 'Eden' });
+  const loadBuilds = () => {
+    listEmulatorBuilds('eden')
+      .then((r) => {
+        if (r?.success) {
+          setBuilds({
+            list: r.builds || [], selected: r.selected || '',
+            // The emulator's own name, from STANDALONE_EMULATORS. "Switch
+            // emulator" described the slot; the row sits in a card that already
+            // names what Ludo found, and naming the thing is what the rows
+            // around it do.
+            name: r.name || 'Eden',
+          });
+        }
+      })
+      .catch(() => { /* the row simply doesn't appear */ });
+  };
+  useEffect(loadBuilds, []);
   if (!status) return null;
 
   const cfg = status.configured_paths || {};
@@ -180,8 +203,41 @@ export function FoldersSection() {
       right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />} />
   );
 
+  // Which Eden build Play uses. A row here rather than a section of its own in
+  // Settings: this is the same question as "which emulator did you find and
+  // where does it live", and it belongs in the card that answers it. Only when
+  // there is a choice — one install is not a decision, and a permanent row
+  // saying "Eden" is furniture to scroll past on a Deck.
+  const chosenBuild = builds.list.find((b) => b.path === builds.selected);
+  const autoBuild = builds.list.find((b) => b.current);
+  const buildRow = builds.list.length > 1 ? (
+    <V2CardRow key="build" icon={<FaGamepad size={15} />} title={builds.name}
+      subtitle={
+        <span style={{ wordBreak: 'break-all' }}>
+          {chosenBuild ? chosenBuild.label : autoBuild ? autoBuild.label : 'Automatic'}
+          <span style={{ color: V2.fgFaint }}>
+            {'  ·  '}{chosenBuild ? 'chosen by you' : 'detected automatically'}
+          </span>
+        </span>
+      }
+      onClick={() => showModal(
+        <EmulatorBuildModal
+          builds={builds.list} selected={builds.selected} name={builds.name}
+          onPick={async (path: string) => {
+            setBuilds((b) => ({ ...b, selected: path }));
+            try {
+              await setEmulatorBuild('eden', path);
+              toaster.toast({ title: builds.name,
+                body: path ? 'Build selected' : 'Back to auto-detect' });
+            } catch { loadBuilds(); }
+          }} />
+      )}
+      right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />} />
+  ) : null;
+
   const rows = [
     emuRow,
+    buildRow,
     row('roms', 'ROM folder', <FaBoxOpen size={15} />, 'set by you'),
     row('saves', 'Save folder', <FaSave size={15} />, 'set by you'),
     row('bios', 'BIOS folder', <FaPuzzlePiece size={15} />, 'set by you'),
@@ -297,6 +353,84 @@ function FolderActionsModal({ label, current, def, isDefault, onChoose, onReset,
               wordBreak: 'break-all',
             }}>{def}</div>
           )}
+        </Focusable>
+      </Focusable>
+    </ModalRoot>
+  );
+}
+
+// Which build of a standalone emulator to launch, in the same chrome as
+// FolderActionsModal — a folder row and this one ask the same shape of
+// question, so they answer it the same way rather than inventing a picker.
+function EmulatorBuildModal({ builds, selected, name, onPick, closeModal }: {
+  builds: EmulatorBuild[]; selected: string; name: string;
+  onPick: (path: string) => void; closeModal?: () => void;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60);
+    return () => clearTimeout(t);
+  }, []);
+  const act = (path: string) => { closeModal?.(); onPick(path); };
+  const auto = builds.find((b) => b.current);
+  return (
+    <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}
+      className="romm-modal-collapse" modalClassName="romm-modal-collapse">
+      <Focusable noFocusRing className="romm-ui"
+        onCancelButton={() => closeModal?.()}
+        onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
+        style={{
+          position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(7,7,15,0.45)',
+          WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
+        }}>
+        <style>{`
+          ${V2_FOCUS_STYLE}
+          .romm-modal-collapse, .romm-modal-collapse > div {
+            background: transparent !important; border: none !important; box-shadow: none !important; padding: 0 !important;
+          }
+          @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }
+        `}</style>
+        <div onClick={() => closeModal?.()} style={{ position: 'absolute', inset: 0 }} />
+        <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
+          position: 'relative', width: '380px', maxWidth: '92vw', boxSizing: 'border-box',
+          fontFamily: V2.font, color: V2.fg, padding: '8px',
+          display: 'flex', flexDirection: 'column',
+          background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
+          WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
+          border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
+          boxShadow: '0 16px 48px rgba(0,0,0,0.55)',
+          maxHeight: '82vh', overflowY: 'auto',
+          animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
+        }}>
+          <div style={{ padding: '8px 10px 10px', minWidth: 0 }}>
+            <div style={{ fontSize: '14px', fontWeight: 700, lineHeight: 1.3 }}>{name}</div>
+            <div style={{ fontSize: '11px', color: V2.fgMuted, marginTop: '3px', lineHeight: 1.4 }}>
+              {/* The one question anybody actually has before switching. */}
+              Every build shares the same saves, firmware and settings.
+            </div>
+          </div>
+          <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
+          {/* Automatic names the build it resolves to, rather than describing
+              the rule and leaving the user to work out which one that is. */}
+          <UserMenuRow icon={selected ? <FaSync size={14} /> : <FaCheck size={14} />}
+            label={auto ? `Automatic — ${auto.label}` : 'Automatic'}
+            onSelect={() => act('')} />
+          {builds.map((b) => (
+            <UserMenuRow key={b.path}
+              icon={selected === b.path ? <FaCheck size={14} /> : <FaGamepad size={14} />}
+              label={b.label} onSelect={() => act(b.path)} />
+          ))}
+          {/* The paths, quietly, under the names they belong to: two AppImages
+              called Eden are told apart by where they are. */}
+          <div style={{ padding: '4px 12px 8px', fontSize: '10.5px', color: V2.fgFaint, lineHeight: 1.5 }}>
+            {builds.map((b) => (
+              <div key={b.path} style={{ wordBreak: 'break-all' }}>
+                {b.label}: {b.kind === 'flatpak' ? b.path.replace('flatpak:', '') : b.path}
+              </div>
+            ))}
+          </div>
         </Focusable>
       </Focusable>
     </ModalRoot>

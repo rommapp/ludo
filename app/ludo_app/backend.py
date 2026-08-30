@@ -68,6 +68,7 @@ try:
         build_sync_status, is_path_validly_downloaded, detect_retrodeck,
         platform_folder_candidates,
         flatpak_app_installed,
+        STANDALONE_EMULATORS, find_standalone_builds,
         _extract_archive, _archive_member_names,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
@@ -7429,6 +7430,54 @@ class LudoBackend:
         except Exception as e:
             logging.error(f"get_romm_artwork error: {e}", exc_info=True)
             return {'success': False, 'art': {}}
+
+    async def list_emulator_builds(self, key='eden'):
+        """Every install of a standalone emulator, plus which one is selected.
+
+        Eden ships a stable and a nightly AppImage side by side, both matching
+        the same discovery rule, and the scan returns whichever sorts first --
+        so a user with both had no way to see which one Play was launching, let
+        alone choose. Returns {builds, selected, shares_state}: `selected` is
+        the configured override or '' for automatic, and each build carries
+        `current`, marking what automatic resolves to right now.
+        """
+        try:
+            spec = STANDALONE_EMULATORS.get(key)
+            if not spec:
+                return {'success': False, 'builds': [], 'selected': ''}
+            builds = await asyncio.to_thread(
+                find_standalone_builds, key, spec, self._settings)
+            selected = ''
+            if self._settings:
+                try:
+                    selected = (self._settings.get(
+                        'Emulators', f'{key}_path', '') or '').strip()
+                except Exception:
+                    selected = ''
+            return {'success': True, 'key': key, 'builds': builds,
+                    'selected': selected,
+                    'name': spec.get('name') or key,
+                    # Both Eden builds carry the same app id, so they share
+                    # saves, NAND, firmware and config. Worth saying on screen:
+                    # "will switching lose my saves" is the obvious worry.
+                    'shares_state': True}
+        except Exception as e:
+            logging.error(f"list_emulator_builds error: {e}", exc_info=True)
+            return {'success': False, 'builds': [], 'selected': ''}
+
+    async def set_emulator_build(self, key, path):
+        """Pin `key` to one build, or pass '' to go back to automatic."""
+        try:
+            if key not in STANDALONE_EMULATORS:
+                return {'success': False, 'message': 'Unknown emulator'}
+            if not self._settings:
+                return {'success': False, 'message': 'Settings unavailable'}
+            self._settings.set('Emulators', f'{key}_path', str(path or ''))
+            logging.info(f"{key} build set to {path or 'automatic'}")
+            return {'success': True}
+        except Exception as e:
+            logging.error(f"set_emulator_build error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
 
     async def get_shortcut_icon_path(self):
         """Filesystem path to the square icon for the Ludo Steam shortcut.
