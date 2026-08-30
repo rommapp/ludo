@@ -1538,10 +1538,12 @@ export function GameDetailPage() {
 
   const doDownload = async () => {
     if (!game) return;
+    // Before the busy/active flags: they repaint the button as "Downloading…",
+    // and nothing is downloading until this modal has been answered.
+    await maybePromptSwitchFirmware(game.rom_id);
     setBusy('download');
     _setDlActive(game.rom_id, true, detail?.name || game.name);
     try {
-      await maybePromptSwitchFirmware(game.rom_id);
       const start = await downloadGame(game.rom_id);
       if (!start?.success) {
         toaster.toast({ title: 'Download failed', body: start?.message || 'Unknown error' });

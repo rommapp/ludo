@@ -564,6 +564,14 @@ class LudoBackend:
                           'detail': '', 'error': None, 'installed': False,
                           'repaired': []}
 
+    # Detached Switch firmware install: the task handle plus the progress the
+    # frontend polls while it runs. Class-level defaults because _stop_sync,
+    # which used to be the only place these were assigned, does not run before
+    # the first install — install_switch_firmware raised AttributeError on a
+    # plugin that had never been torn down, i.e. on every ordinary session.
+    _switch_fw_task = None
+    _switch_fw_progress: dict = None
+
     # In-flight QR device-auth request (see start_qr_pairing): the device_code
     # we poll with, plus its interval and expiry. None when nothing is pending.
     _qr_pairing: dict = None

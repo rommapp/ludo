@@ -419,11 +419,13 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       toaster.toast({ title: 'Offline', body: 'Connect to RomM to download this game.' });
       return;
     }
+    // Before the busy/active flags: they repaint the tile as downloading, and
+    // nothing is downloading until this modal has been answered.
+    await maybePromptSwitchFirmware(game.rom_id);
     setBusy('download');
     setActiveDlRomId(game.rom_id);
     _setDlActive(game.rom_id, true, game.name);
     try {
-      await maybePromptSwitchFirmware(game.rom_id);
       const start = await downloadGame(game.rom_id);
       if (!start?.success) { toaster.toast({ title: 'Download failed', body: start?.message || 'Error' }); return; }
       const res = await awaitDownload(game.rom_id);
@@ -482,11 +484,12 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
         toaster.toast({ title: 'Offline', body: 'Connect to RomM to download this version.' });
         return;
       }
+      // Before the busy/active flags — see doDownload above.
+      await maybePromptSwitchFirmware(selectedRomId);
       setBusy('download');
       setActiveDlRomId(selectedRomId);
       _setDlActive(selectedRomId, true, game.name);
       try {
-        await maybePromptSwitchFirmware(selectedRomId);
         const start = await downloadGame(selectedRomId);
         if (!start?.success) { toaster.toast({ title: 'Download failed', body: start?.message || 'Error' }); return; }
         const res = await awaitDownload(selectedRomId);

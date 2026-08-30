@@ -92,9 +92,12 @@ export async function downloadOne(romId: number, name?: string): Promise<boolean
   if (_dlActive.has(romId)) { // already downloading elsewhere — just wait it out
     return (await awaitDownload(romId)).ok;
   }
+  // Gate first, THEN mark active. The other way round painted the tile as
+  // downloading while the firmware confirm was still on screen — the button
+  // said the transfer had begun before the user had answered whether it should.
+  if (_preDownload) await _preDownload(romId);
   _setDlActive(romId, true, name);
   try {
-    if (_preDownload) await _preDownload(romId);
     const start = await downloadGame(romId);
     if (!start?.success) return false;
     const ok = (await awaitDownload(romId)).ok;
