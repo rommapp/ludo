@@ -10746,6 +10746,15 @@ class AutoSyncManager:
 
         # Upload fingerprints persistence
         self.upload_fingerprints_file = cache_dir() / 'upload_fingerprints.json'
+        # True when no fingerprint cache existed at load — a fresh install or
+        # a wiped state dir. Cleared once a baseline has been seeded.
+        self._fingerprints_cold = False
+        # rom_ids whose local saves the user deleted. The negotiate engine
+        # answers "server has it, client doesn't" with a download, so without
+        # this the next sync would restore exactly what was just deleted.
+        self.save_download_block_file = cache_dir() / 'save_download_block.json'
+        self.save_download_blocked = set()
+        self._load_save_download_block()
         self.upload_fingerprints_file.parent.mkdir(parents=True, exist_ok=True)
         self._load_upload_fingerprints()
 
@@ -10828,6 +10837,13 @@ class AutoSyncManager:
                     # Convert JSON arrays back to tuples
                     self.last_uploaded = {path: tuple(fingerprint) for path, fingerprint in data.items()}
                 logging.debug(f"Loaded {len(self.last_uploaded)} upload fingerprints from cache")
+            else:
+                # No cache file at all: this install has never synced. Nothing
+                # on disk can be called "drift" yet, because there is no
+                # baseline to have drifted from. flush_pending_states reads
+                # this to seed a baseline instead of uploading the whole
+                # states directory. See the comment there.
+                self._fingerprints_cold = True
         except Exception as e:
             logging.debug(f"Could not load upload fingerprints: {e}")
             self.last_uploaded = {}
@@ -10842,6 +10858,58 @@ class AutoSyncManager:
             logging.debug(f"Saved {len(self.last_uploaded)} upload fingerprints to cache")
         except Exception as e:
             logging.debug(f"Could not save upload fingerprints: {e}")
+
+    def _load_save_download_block(self):
+        """Load the set of rom_ids whose saves must not be re-downloaded."""
+        try:
+            if self.save_download_block_file.exists():
+                with open(self.save_download_block_file, 'r') as f:
+                    self.save_download_blocked = {int(r) for r in (json.load(f) or [])}
+                logging.debug(f"Loaded {len(self.save_download_blocked)} save-download blocks")
+        except Exception as e:
+            logging.debug(f"Could not load save-download blocks: {e}")
+            self.save_download_blocked = set()
+
+    def _save_save_download_block(self):
+        try:
+            self.save_download_block_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.save_download_block_file, 'w') as f:
+                json.dump(sorted(self.save_download_blocked), f)
+        except Exception as e:
+            logging.debug(f"Could not persist save-download blocks: {e}")
+
+    def block_save_downloads(self, rom_id):
+        """Stop the negotiate engine restoring this rom's saves from the server.
+
+        Called when the user deletes a game's local saves. The server still
+        holds them — that is the point, they stay restorable from the game's
+        save history — but an unasked-for download would put them straight back
+        on disk, and the deletion would look like it silently failed.
+
+        Lifted by unblock_save_downloads when the game is downloaded again.
+        """
+        try:
+            rom_id = int(rom_id)
+        except (TypeError, ValueError):
+            return
+        if rom_id in self.save_download_blocked:
+            return
+        self.save_download_blocked.add(rom_id)
+        self._save_save_download_block()
+        logging.info(f"save-sync: downloads blocked for rom {rom_id} (saves deleted locally)")
+
+    def unblock_save_downloads(self, rom_id):
+        """Re-admit server saves for a rom — it was downloaded again, so the
+        user wants its save history back."""
+        try:
+            rom_id = int(rom_id)
+        except (TypeError, ValueError):
+            return
+        if rom_id not in self.save_download_blocked:
+            return
+        self.save_download_blocked.discard(rom_id)
+        self._save_save_download_block()
+        logging.info(f"save-sync: downloads re-enabled for rom {rom_id}")
 
     def _record_synced(self, path):
         """Record the current (size, mtime) of a file as its last-synced state.
@@ -11800,6 +11868,20 @@ class AutoSyncManager:
                 # Get timestamp of last shutdown
                 last_shutdown = self.settings.get('AutoSync', 'last_shutdown_time', '')
                 current_time = time.time()
+
+                # A first run with no fingerprint cache has no baseline to
+                # compare against, so "modified in the last 24 hours" would
+                # sweep up files another client just downloaded onto this disk.
+                # Seed the baseline and let the next real write drive a sync.
+                # (flush_pending_states carries the same guard for states and
+                # clears the same flag — whichever runs first wins.)
+                if self._fingerprints_cold:
+                    if self.mark_all_synced():
+                        self._save_upload_fingerprints()
+                    self._fingerprints_cold = False
+                    self.log("📌 First sync on this install — recording current "
+                             "saves as the baseline instead of uploading them")
+                    return
 
                 if not last_shutdown:
                     # First run - scan last 24 hours
@@ -13397,12 +13479,35 @@ class AutoSyncManager:
 
         Runs BEFORE the negotiate baseline so mark_all_synced doesn't first mark
         a still-pending state as synced and hide it.
+
+        A missing fingerprint is only evidence of drift when a baseline exists.
+        On a fresh install the cache is empty, which used to make EVERY state on
+        disk look drifted: one Deck re-uploaded 44 savestates untouched since
+        June the first time it connected. States are outside the /negotiate
+        protocol, so there is no server-side comparison to catch that — the
+        cache is the only thing standing between "no history" and "push
+        everything". So a cold cache seeds the baseline and uploads nothing;
+        real writes after that point are caught by the watcher as usual.
         """
         if not (self.romm_client and self.romm_client.authenticated):
             return
         try:
             save_files = self.retroarch.get_save_files() or {}
-            for entry in save_files.get('states', []):
+            states = save_files.get('states', [])
+
+            if self._fingerprints_cold:
+                seeded = 0
+                for entry in states:
+                    if entry.get('path') and self._record_synced(entry['path']):
+                        seeded += 1
+                self._fingerprints_cold = False
+                if seeded:
+                    self._save_upload_fingerprints()
+                    self.log(f"📌 First sync on this install — treating {seeded} "
+                             f"existing state(s) as already synced")
+                return
+
+            for entry in states:
                 path = entry.get('path')
                 if not path:
                     continue
@@ -13514,6 +13619,28 @@ class AutoSyncManager:
         # Lookup local inventory entry by (rom_id, slot) for upload operations.
         inv_by_key = {(e['rom_id'], e['slot']): e for e in inventory}
         saves_dir = self.retroarch.save_dirs.get('saves')
+
+        # rom_ids that actually have a ROM in the library directory. The server
+        # answers "server has this save, client doesn't" with a download, and
+        # without this that includes every game the user does NOT have — after
+        # a "log out and delete everything" one Deck with zero ROMs on disk
+        # immediately pulled saves back down for three deleted games.
+        #
+        # is_downloaded is a filesystem check against the configured ROM
+        # directory (_resolve_download_path), not a record of what this app
+        # fetched, so a RetroDECK library Ludo never downloaded still counts.
+        #
+        # None — not an empty set — when the library isn't loaded yet: an empty
+        # library would otherwise read as "nothing is installed" and block every
+        # download, which is a far worse failure than the one being fixed.
+        installed_roms = None
+        try:
+            _games = self.get_games() or []
+            if _games:
+                installed_roms = {g.get('rom_id') for g in _games
+                                  if g.get('is_downloaded')}
+        except Exception as e:
+            logging.debug(f"could not resolve installed roms: {e}")
         # Track whether we updated any synced fingerprints so we persist once.
         _fp_dirty = False
         # Save paths whose upload genuinely failed this cycle — excluded from
@@ -13600,6 +13727,23 @@ class AutoSyncManager:
                             _errored_paths.add(str(entry['_path']))
 
                 elif action == 'download':
+                    # The user deleted this game's local saves. The server copy
+                    # survives on purpose, but restoring it here unasked would
+                    # undo the deletion on the very next sync.
+                    if rom_id in self.save_download_blocked:
+                        summary['blocked'] = summary.get('blocked', 0) + 1
+                        logging.info(f"[SYNC-OP] skipping download for rom {rom_id}: "
+                                     f"saves were deleted locally")
+                        continue
+                    # No ROM on this device: a save written here would sit in
+                    # the save tree with nothing able to load it, and would be
+                    # inherited by whoever downloads the game next.
+                    if installed_roms is not None and rom_id not in installed_roms:
+                        summary['skipped_not_installed'] = \
+                            summary.get('skipped_not_installed', 0) + 1
+                        logging.info(f"[SYNC-OP] skipping download for rom {rom_id}: "
+                                     f"not installed on this device")
+                        continue
                     target = self._resolve_download_target(op, saves_dir)
                     if target is None:
                         if self._restore_standalone_save(op, device_id, session_id):
