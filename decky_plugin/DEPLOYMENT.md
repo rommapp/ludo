@@ -16,10 +16,12 @@ The plugin has two components:
   Deck-specific bootstrap, describes this deployment as a `HostProfile`, and subclasses
   `LudoBackend` as `Plugin` because that is the name Decky Loader looks for.
 
-`py_modules/sync_core.py` is a **dev symlink** to `../../src/sync_core.py`. It is resolved to a
-real file during packaging. Never commit the resolved copy — the symlink is intentional.
-`pnpm run package` builds the frontend and a `postpackage` hook **restores the symlink** afterward,
-so the working tree is always left clean.
+Both backend packages are **dev symlinks** into the shared trees —
+`py_modules/ludo_app` → `../../app/ludo_app` and `py_modules/romm_sync_engine` →
+`../../engine/romm_sync_engine`. Packaging dereferences them with `cp -rL`, so real file
+content goes into the zip while the working tree keeps the symlinks. Never commit resolved
+copies. (An older layout also symlinked `py_modules/sync_core.py` to `src/sync_core.py`;
+both are gone — sync_core now lives inside the engine package.)
 
 ---
 
@@ -49,14 +51,15 @@ cp app/ludo_app/*.py "$DEST/py_modules/ludo_app/"
 # Decky entry point change (main.py — rare; bootstrap and HostProfile only):
 cp decky_plugin/main.py "$DEST/main.py"
 
-# Shared sync logic (src/sync_core.py) — DEST has a real copy, not a symlink:
-cp src/sync_core.py "$DEST/py_modules/sync_core.py"
+# Sync engine change (engine/romm_sync_engine/*.py — sync_core, bios_manager, …):
+# DEST has a real copy, not a symlink:
+cp engine/romm_sync_engine/*.py "$DEST/py_modules/romm_sync_engine/"
 ```
 
 Notes:
-- A **full plugin reload** is required for any Python change (`ludo_app/`, `main.py`,
-  `sync_core.py`) — Python is only
-  imported at load). Frontend (`dist/index.js`) also needs a reload to re-evaluate.
+- A **full plugin reload** is required for any Python change (`ludo_app/`,
+  `romm_sync_engine/`, `main.py` — Python is only imported at load). Frontend
+  (`dist/index.js`) also needs a reload to re-evaluate.
 - Backend Python logs land in `~/homebrew/logs/ludo/<timestamp>.log`. Frontend
   `console.*`/toasts do **not**; bridge them to the backend with a temporary `debug_log`
   callable when diagnosing frontend issues.
@@ -67,12 +70,15 @@ Notes:
 ## Build & Package (release zip)
 
 The recipe below is **cwd-independent** — it anchors everything to the repo root via `git`, so
-it works whether you paste it from the repo root or from inside `decky_plugin/`. `pnpm run
-package` builds the frontend and restores the `py_modules/sync_core.py` symlink via its
-`postpackage` hook.
+it works whether you paste it from the repo root or from inside `decky_plugin/`. Plain
+`pnpm run build` compiles the frontend; there is no symlink dance, because the backend
+packages are dereferenced at copy time (`cp -rL`) instead.
 
-> ⚠️ Always run `pnpm run package` in a **subshell** `(cd decky_plugin && …)` — it leaves the
-> shell in `decky_plugin/`, so a bare `cd decky_plugin && pnpm run package` breaks every
+> ⚠️ Don't use `pnpm run package`: its script still copies the deleted `src/sync_core.py`,
+> so it fails outright. It's a stale leftover from the old layout (see Known gotchas).
+
+> ⚠️ Always run the build in a **subshell** `(cd decky_plugin && …)` — a bare
+> `cd decky_plugin && pnpm run build` leaves the shell in `decky_plugin/`, breaking every
 > repo-root-relative `cp` that follows.
 
 ```bash
@@ -80,8 +86,8 @@ package` builds the frontend and restores the `py_modules/sync_core.py` symlink 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-# Step 1: Build frontend (auto-restores the symlink afterward). Subshell keeps cwd at ROOT.
-(cd decky_plugin && pnpm run package)
+# Step 1: Build frontend. Subshell keeps cwd at ROOT.
+(cd decky_plugin && pnpm run build)
 
 # Step 2: Package into the versioned zip.
 # VERSION is derived from decky_plugin/package.json (the single source of truth),
@@ -95,6 +101,9 @@ mkdir -p "${TMP_DIR}/${PLUGIN_NAME}/dist" "${TMP_DIR}/${PLUGIN_NAME}/assets" "${
 cp "${PLUGIN_DIR}/plugin.json" "${PLUGIN_DIR}/package.json" "${PLUGIN_DIR}/LICENSE" "${PLUGIN_DIR}/main.py" "${TMP_DIR}/${PLUGIN_NAME}/"
 cp "${PLUGIN_DIR}/dist/index.js" "${PLUGIN_DIR}/dist/index.js.map" "${TMP_DIR}/${PLUGIN_NAME}/dist/"
 cp -rL "${PLUGIN_DIR}/py_modules" "${TMP_DIR}/${PLUGIN_NAME}/"
+# Strip pyc caches and pip metadata — the plugin only needs importable modules.
+find "${TMP_DIR}/${PLUGIN_NAME}/py_modules" -name '__pycache__' -type d -prune -exec rm -rf {} +
+find "${TMP_DIR}/${PLUGIN_NAME}/py_modules" -maxdepth 1 -name '*.dist-info' -exec rm -rf {} +
 # The artwork is package data of ludo_app, so the `cp -rL py_modules` above
 # already placed it at py_modules/ludo_app/assets/ — where the backend reads
 # it. Only the plugin-list icon is copied to the plugin root.
@@ -106,7 +115,7 @@ mv "$TMP_DIR/$OUT_ZIP" .
 rm -rf "$TMP_DIR"
 
 # Step 3 (optional): sanity-check a fix is actually in the bundled sync_core
-unzip -p "$OUT_ZIP" "${PLUGIN_NAME}/py_modules/sync_core.py" | grep -c "_host_subprocess_env"
+unzip -p "$OUT_ZIP" "${PLUGIN_NAME}/py_modules/romm_sync_engine/sync_core.py" | grep -c "_host_subprocess_env"
 ```
 
 The output zip is at the **repo root**: `Ludo-v<VERSION>-decky.zip` (~11 MB with
@@ -148,9 +157,11 @@ real path, so a bare import from inside `ui/app/` never reaches `decky_plugin/no
 and falls through as an unresolved external. The build still reports success. See `ui/README.md`;
 `rollup.config.js` pins `react-icons` for exactly this reason.
 
-**Why `pnpm run package` and not `pnpm run build`?** `package` runs the build then a
-`postpackage` hook that re-creates the `py_modules/sync_core.py` symlink, so the working tree
-isn't left with a resolved copy. (Plain `build` also works but won't touch the symlink.)
+**Why `pnpm run build` and not `pnpm run package`?** The old `package` script copies
+`src/sync_core.py` over `py_modules/sync_core.py` and a `postpackage` hook restores that
+symlink — a dance for a layout that no longer exists. `src/sync_core.py` is gone (sync_core
+lives in `engine/romm_sync_engine/`), so `package` now fails outright; the dead scripts are
+only kept in `package.json` until someone deletes them.
 
 ---
 
@@ -167,17 +178,16 @@ Decky Loader's installer validates all of these. **Any missing file causes silen
 | `py_modules/ludo_app/` | YES | The backend itself (symlink in dev — must be real files in zip) |
 | `dist/index.js` | YES | Compiled frontend |
 | `dist/index.js.map` | YES | Source map |
-| `py_modules/sync_core.py` | YES | Sync daemon logic (symlink in dev — must be real file in zip) |
-| `py_modules/bios_manager.py` | YES | BIOS management logic (symlink in dev — must be real file in zip) |
+| `py_modules/romm_sync_engine/` | YES | Sync engine package: `sync_core.py`, `bios_manager.py`, title/emulator/save helpers (dev symlink — must be real files in zip) |
 | `py_modules/requests/` | YES | Bundled dependency (not on SteamOS) |
 | `py_modules/watchdog/` | YES | Bundled dependency (not on SteamOS) |
 | `py_modules/PIL/` | YES | Bundled dependency (Pillow for image processing) |
 | `py_modules/pillow.libs/` | YES | Bundled shared libs for Pillow C extensions |
 | `py_modules/qrcode/` | YES | Bundled dependency (QR encoding for device pairing) |
+| `py_modules/psutil/` | YES | Bundled dependency (imported by `romm_sync_engine/sync_core.py`) |
 | `py_modules/urllib3/`, `certifi/`, `charset_normalizer/`, `idna/` | YES | Transitive deps of requests |
 | `assets/logo.png` | NO | Plugin icon shown in Decky's plugin list (the copy the backend serves is `py_modules/ludo_app/assets/logo.png`) |
-| `assets/romm-isotipo.svg` | NO | RomM brand mark shown on the setup-wizard welcome; served pre-connection by `get_romm_logo` (bundled because RomM server assets need auth) |
-| `assets/romm-{grid,hero,logo,header,icon}.png` | NO | RomM-branded Steam library artwork for the optional 'RomM' launcher tile (Steam asset types 0/1/2/3/4). Served by `get_romm_artwork`, painted via `SetCustomArtworkForApp`. Regenerate with `scripts/gen_romm_artwork.py` (needs cairosvg; dev-only). |
+| `py_modules/ludo_app/assets/` | YES | All served artwork, vendored automatically by `cp -rL`: the plugin logo, the RomM brand mark `romm-isotipo.svg` (served pre-connection by `get_romm_logo` because RomM server assets need auth), and the RomM Steam tiles `romm-{grid,hero,logo,header,icon}.png` (served by `get_romm_artwork` for the optional 'RomM' launcher tile, painted via `SetCustomArtworkForApp`; regenerate with `scripts/gen_romm_artwork.py` — needs cairosvg, dev-only). |
 | `bin/7zz` | NO | Static 7-Zip (x64) for `.7z` extraction — SteamOS has no system 7z. `sync_core._find_7z()` resolves `<plugin>/bin/7zz`. Must be `chmod +x`. Without it: `.7z` console ROMs still load via RetroArch, `.7z` PC games won't auto-extract. |
 | `bin/romm-session-host` | NO | Exe behind the "RomM" Steam tile. When a game is picked, the backend `prepare_steam_launch` writes a launch-spec and the frontend RunGame's the tile; Steam launches this script as a tracked game (opening the overlay session) and it `exec`s the resolved emulator argv in-place, so the emulator inherits the Steam overlay on Deck Gaming Mode. Returned by `get_session_host_path`. Must be `chmod +x`. Without it: Play falls back to a direct daemon launch (no working overlay). |
 
@@ -195,20 +205,26 @@ ludo/
     index.js
     index.js.map
   py_modules/
-    sync_core.py        ← real file (symlink dereferenced by cp -rL)
-    bios_manager.py     ← real file (symlink dereferenced by cp -rL)
+    ludo_app/           ← real files (symlink to app/ludo_app, dereferenced by cp -rL);
+                          its assets/ subdir carries all served artwork
+    romm_sync_engine/   ← real files (symlink to engine/romm_sync_engine):
+                          sync_core.py, bios_manager.py and helpers
     requests/
     watchdog/
     PIL/
-    qrcode/
     pillow.libs/
+    qrcode/
+    psutil/
     urllib3/
     certifi/
     charset_normalizer/
     idna/
   assets/
-    logo.png
-    romm-isotipo.svg
+    logo.png            ← plugin-list icon only; all other artwork is served
+                          from py_modules/ludo_app/assets/
+  bin/
+    7zz
+    romm-session-host
 ```
 
 ---
@@ -254,10 +270,14 @@ Then install from `~/Ludo-v1.0.0-decky.zip` on the Deck via Decky Loader.
 - `zip --prefix` is not supported on this system — the packaging command uses a temp dir instead
 - The `_root` flag in `plugin.json` silently blocks ZIP installation (no error shown in UI)
 - `package.json` and `LICENSE` are not used at runtime but are required by the Decky validator
-- The symlinks at `py_modules/sync_core.py` and `py_modules/bios_manager.py` must not be
-  committed as regular files — use `cp -rL` when packaging to dereference them. Using `cp -r`
-  alone copies symlinks as-is, which become broken inside the zip (no error at zip time, but
-  the plugin fails with `ModuleNotFoundError` at load time)
+- The backend packages are dev symlinks (`py_modules/ludo_app` → `app/ludo_app`,
+  `py_modules/romm_sync_engine` → `engine/romm_sync_engine`) and must not be committed as
+  resolved copies — packaging must dereference them with `cp -rL`. Using `cp -r` alone copies
+  symlinks as-is, which become broken inside the zip (no error at zip time, but the plugin
+  fails with `ModuleNotFoundError` at load time)
+- `pnpm run package` / `postpackage` in `decky_plugin/package.json` are stale leftovers from
+  the old `py_modules/sync_core.py` layout — they copy the deleted `src/sync_core.py` and
+  fail. Build with `pnpm run build` instead (the dead scripts can be deleted whenever)
 - Missing `py_modules/requests/` (and other bundled libs) causes `No module named 'requests'`
   on a fresh Decky install — always copy the entire `py_modules/` directory, not just
   `sync_core.py`
