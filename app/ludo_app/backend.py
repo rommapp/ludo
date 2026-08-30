@@ -2317,6 +2317,9 @@ class LudoBackend:
                 'snapshot_fetched_at':     self._snapshot_fetched_at,
                 'pending_saves':           self._count_pending_saves(),
                 'save_activity':           self._save_activity(),
+                # Another Ludo (typically the desktop AppImage in Desktop Mode)
+                # holds the auto-sync lock, so this instance is browsing only.
+                'sync_blocked':            bool(status.get('sync_blocked')),
                 'message':                 message,
                 'details':                 status,
                 'collections':             collections,

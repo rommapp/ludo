@@ -10896,6 +10896,9 @@ class AutoSyncManager:
 
         # Add lock mechanism
         self.lock = AutoSyncLock()
+        # True when another Ludo (the desktop AppImage, or a second plugin
+        # instance) holds the auto-sync lock. Read by build_sync_status.
+        self.blocked_by_other_instance = False
         self.instance_id = f"{'gui' if parent_window else 'daemon'}_{os.getpid()}"
 
     def _load_vmu_owners(self):
@@ -11331,9 +11334,18 @@ class AutoSyncManager:
         
         # Try to acquire lock
         if not self.lock.acquire(self.instance_id):
+            # Both shells set app_id "ludo", so the Decky plugin and the desktop
+            # AppImage share ~/.config/ludo and this lock: on a Deck with both
+            # installed, whichever starts second gets no auto-sync. Correct --
+            # two processes watching the same save files would race each other's
+            # uploads -- but it used to be SILENT, one log line deep, and the UI
+            # went on looking like sync was running. The flag is what lets the
+            # library say so.
             self.log("⚠️ Auto-sync blocked - another instance is already running")
+            self.blocked_by_other_instance = True
             return
-            
+
+        self.blocked_by_other_instance = False
         self.enabled = True
         self.should_stop.clear()
 
@@ -15753,6 +15765,11 @@ def build_sync_status(romm_client, collection_sync, auto_sync, available_games,
         'running':                True,
         'connected':              bool(romm_client and romm_client.authenticated),
         'auto_sync':              bool(auto_sync and auto_sync.enabled),
+        # Another Ludo holds the auto-sync lock (see start_auto_sync). Reported
+        # so the UI can say why saves are not syncing instead of leaving the
+        # user to notice on their own.
+        'sync_blocked':           bool(auto_sync and getattr(
+                                      auto_sync, 'blocked_by_other_instance', False)),
         'game_count':             len(available_games),
         'collections':            collections_list,
         'collection_count':       len(collections_list),

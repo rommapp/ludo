@@ -1163,6 +1163,54 @@ export function OfflineBanner({ status }: { status: any }) {
   );
 }
 
+// Another Ludo has the auto-sync lock, so this one is browsing only.
+//
+// Both shells set app_id "ludo" and therefore share ~/.config/ludo, which is
+// deliberate — the AppImage in Desktop Mode and the plugin in Gaming Mode are
+// one account, one library, one set of settings. What they cannot share is the
+// save watcher: AutoSyncLock hands it to whichever started first, and the other
+// simply doesn't sync. Correct, and until now invisible — the UI went on
+// looking exactly like a working sync.
+//
+// Same chrome as OfflineBanner above rather than a new shape: it answers the
+// same kind of question ("why isn't my library/saves doing the thing"), so it
+// gets the same dot-title-detail row in the same place.
+export function SyncBlockedBanner({ status }: { status: any }) {
+  if (!status?.sync_blocked) return null;
+  const pending = status?.pending_saves || 0;
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: '10px',
+      margin: '0 16px 8px', padding: '8px 12px',
+      background: V2.surface, border: `1px solid ${V2.borderStrong}`,
+      borderRadius: V2.radiusMd, fontSize: '12px',
+    }}>
+      <div style={{
+        width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0,
+        background: V2.warning, boxShadow: `0 0 6px ${V2.warning}`,
+      }} />
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontWeight: 600, color: V2.fg }}>
+          Save sync is running in another Ludo
+        </div>
+        <div style={{ color: V2.fgMuted, marginTop: '1px' }}>
+          {/* Names the fix, not the mechanism. "Close it" is the whole remedy,
+              and nothing is lost either way — the other instance is doing the
+              syncing, and both read the same library. */}
+          Another copy of Ludo is watching your saves — most likely the desktop
+          app. Close it and reopen this one to sync from here. Browsing and
+          downloading work normally.
+        </div>
+        {pending > 0 && (
+          <div style={{ color: V2.brandHover, marginTop: '4px', fontWeight: 600 }}>
+            {pending === 1 ? '1 game waiting to sync' : `${pending} games waiting to sync`}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // Route component for /romm-sync-library. Hosts the tabs page permanently and
 // stacks the inner pages (game grid, game detail, settings family) on top as
 // internal views, so backing out of any of them re-shows the still-mounted
@@ -1485,6 +1533,7 @@ export function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
       <div style={{ height: '8px' }} />
 
       <OfflineBanner status={svcStatus} />
+      <SyncBlockedBanner status={svcStatus} />
       <StaleLibraryBanner status={svcStatus} />
 
       {/* All four panels stay mounted once visited; only the active one is
