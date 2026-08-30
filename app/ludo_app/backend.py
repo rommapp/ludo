@@ -4552,6 +4552,17 @@ class LudoBackend:
             if self._retroarch and hasattr(self._retroarch, 'bios_manager') and self._retroarch.bios_manager:
                 bios_system_dir = self._retroarch.bios_manager.system_dir
 
+            # Snapshot the save/state inventory while sync is still up: the
+            # manager knows where the emulators actually put their saves
+            # (refresh_save_dirs runs during a session), and asking after the
+            # teardown can come back with stale or empty directories.
+            save_inventory = {}
+            if self._retroarch:
+                try:
+                    save_inventory = self._retroarch.get_save_files() or {}
+                except Exception as e:
+                    logging.error(f"Reset: could not list save files: {e}")
+
             self._stop_sync()
             logging.info("Reset: sync stopped")
 
@@ -4636,6 +4647,46 @@ class LudoBackend:
                 except Exception as e:
                     logging.error(f"Reset: BIOS deletion error: {e}", exc_info=True)
 
+            # Delete local saves and savestates.
+            #
+            # "Log out & delete all downloads" hands the device to a different
+            # account, and a save is as much this user's data as the ROM is —
+            # leaving them behind means the next user inherits someone else's
+            # playthroughs, and the save-sync then pushes them to THEIR RomM.
+            #
+            # Scope is what get_save_files() reports: the files Ludo syncs, in
+            # the save and state directories it monitors. The save tree is
+            # shared with RetroDECK, so a blanket rmtree would take saves for
+            # games Ludo never touched — this only removes what it manages.
+            deleted_saves = 0
+            for bucket in ('saves', 'states'):
+                for entry in save_inventory.get(bucket, []):
+                    path = entry.get('path')
+                    if not path:
+                        continue
+                    sp = Path(path)
+                    try:
+                        if sp.is_file():
+                            sp.unlink()
+                            deleted_saves += 1
+                    except Exception as e:
+                        logging.error(f"Reset: failed to delete save {sp}: {e}")
+                        continue
+                    # A state carries sidecars RetroArch wrote next to it: the
+                    # .png thumbnail shown in the restore UI and the .backup
+                    # RetroArch keeps of the last overwrite. Neither is in the
+                    # inventory, and both would outlive the state they describe.
+                    if bucket == 'states':
+                        for sidecar in (sp.with_name(sp.name + '.png'),
+                                        sp.with_name(sp.name + '.backup'),
+                                        sp.with_name(sp.name + '.backup.png')):
+                            try:
+                                if sidecar.is_file():
+                                    sidecar.unlink()
+                            except Exception as e:
+                                logging.debug(f"Reset: could not delete {sidecar}: {e}")
+            logging.info(f"Reset: deleted {deleted_saves} save/state file(s)")
+
             # Clear all collection settings (disable all sync collections)
             if config.has_section('Collections'):
                 config.set('Collections', 'actively_syncing',  '')
@@ -4656,8 +4707,10 @@ class LudoBackend:
             ds['needs_onboarding'] = True
             save_decky_settings(ds)
 
-            logging.info(f"Reset complete: {deleted_roms} ROM(s), {deleted_bios} BIOS file(s) deleted")
-            return {'success': True, 'deleted_roms': deleted_roms, 'deleted_bios': deleted_bios}
+            logging.info(f"Reset complete: {deleted_roms} ROM(s), {deleted_bios} BIOS file(s), "
+                         f"{deleted_saves} save/state file(s) deleted")
+            return {'success': True, 'deleted_roms': deleted_roms,
+                    'deleted_bios': deleted_bios, 'deleted_saves': deleted_saves}
 
         except Exception as e:
             logging.error(f"reset_all_settings error: {e}", exc_info=True)
@@ -4667,9 +4720,10 @@ class LudoBackend:
         """Log out of RomM. Always clears stored credentials and stops sync so
         get_config() reports unconfigured and the setup wizard takes over.
 
-        When wipe_data is True, also deletes downloaded ROMs/BIOS and clears
-        sync state first (the old "reset to new user" behaviour). When False,
-        downloaded files are kept so logging back in is non-destructive.
+        When wipe_data is True, also deletes downloaded ROMs/BIOS, local saves
+        and savestates, and clears sync state first (the old "reset to new
+        user" behaviour). When False, everything on disk is kept so logging
+        back in is non-destructive.
         """
         try:
             if not SYNC_CORE_AVAILABLE:
@@ -4702,7 +4756,8 @@ class LudoBackend:
 
             logging.info(f"Logged out of RomM (wipe_data={wipe_data})")
             _record_activity('account', 'Logged out',
-                             'Downloads deleted' if wipe_data else 'Downloads kept')
+                             'Downloads and saves deleted' if wipe_data
+                             else 'Downloads kept')
             result['success'] = True
             return result
         except Exception as e:
@@ -8014,6 +8069,9 @@ class LudoBackend:
                 platform_slug = g.get('platform_slug') or (g.get('romm_data') or {}).get('platform_slug')
                 file_name = g.get('file_name') or (g.get('romm_data') or {}).get('fs_name')
                 name = g.get('name')
+                # 'name' is the filename stem (save-sync matching keys on it);
+                # the activity feed wants the metadata title.
+                display_name = g.get('display_name') or name
             else:
                 r = self._romm_client.session.get(
                     urljoin(self._romm_client.base_url, f'/api/roms/{rom_id}'), timeout=15)
@@ -8021,6 +8079,7 @@ class LudoBackend:
                 platform_slug = d.get('platform_slug', 'Unknown')
                 file_name = d.get('fs_name') or f"{d.get('name', 'rom')}.rom"
                 name = d.get('name')
+                display_name = name
             if not (platform_slug and file_name):
                 return {'success': False, 'message': 'Could not resolve ROM path'}
             # Existing copies keep their folder; new ones use the ES-DE name.
@@ -8085,6 +8144,14 @@ class LudoBackend:
                     live = idx.get(rom_id) if ok else None
                     parent = (idx.get(self._variant_parent_index().get(rom_id))
                               if ok and not live else None)
+                    if ok:
+                        # Downloading the game again means its save history is
+                        # wanted back; clears any block left by a delete.
+                        try:
+                            if self._auto_sync is not None:
+                                self._auto_sync.unblock_save_downloads(rom_id)
+                        except Exception as e:
+                            logging.debug(f"could not clear save-download block: {e}")
                     if ok and live:
                         live['is_downloaded'] = True
                         live['local_path'] = str(final)
@@ -8191,8 +8258,8 @@ class LudoBackend:
                     _record_activity('error' if (not ok or base_missing) else 'download',
                                      'Base game not downloaded' if base_missing
                                      else ('Downloaded' if ok else 'Download failed'),
-                                     (base_note or name or file_name
-                                      or f'ROM {rom_id}'),
+                                     (base_note or display_name or name
+                                      or file_name or f'ROM {rom_id}'),
                                      rom_id=rom_id)
                 except Exception as e:
                     logging.error(f"download_game worker error: {e}", exc_info=True)
@@ -8226,6 +8293,60 @@ class LudoBackend:
         """Temporary bridge so frontend logs land in the backend log file."""
         logging.info(f"[FE] {msg}")
         return True
+
+    def _delete_saves_for_rom(self, rom_id):
+        """Delete the local saves and savestates attributed to `rom_id`.
+
+        Deleting a game takes its saves with it: a save with no ROM behind it
+        is invisible in the UI, still gets picked up by the save-sync walk, and
+        (worse) is what a later re-download silently inherits — you reinstall a
+        game expecting a fresh start and get someone's month-old playthrough.
+
+        Attribution comes from save_paths_for_rom, which admits orphans on
+        purpose — a game deleted on the server still owns its saves here.
+
+        Anything already synced is still on RomM and restorable from the
+        game's save history; a save that never reached the server is gone.
+        Returns the number of files removed.
+        """
+        if self._auto_sync is None:
+            return 0
+        removed = 0
+        try:
+            paths = self._auto_sync.save_paths_for_rom(rom_id)
+        except Exception as e:
+            logging.error(f"could not resolve saves for rom {rom_id}: {e}")
+            return 0
+        for sp in paths:
+            try:
+                if not sp.is_file():
+                    continue
+                sp.unlink()
+                removed += 1
+            except Exception as e:
+                logging.error(f"could not delete save {sp}: {e}")
+                continue
+            # RetroArch writes these next to a state and they are not in the
+            # save inventory, so they outlive the state unless taken here.
+            for sidecar in (sp.with_name(sp.name + '.png'),
+                            sp.with_name(sp.name + '.backup'),
+                            sp.with_name(sp.name + '.backup.png')):
+                try:
+                    if sidecar.is_file():
+                        sidecar.unlink()
+                except Exception as e:
+                    logging.debug(f"could not delete {sidecar}: {e}")
+        if removed:
+            logging.info(f"deleted {removed} save/state file(s) for rom {rom_id}")
+        # Even with nothing on disk to delete: the server may still hold saves
+        # for this rom, and the negotiate engine treats "server has it, client
+        # doesn't" as a download. Without the block, deleting a game would be
+        # undone by the next sync. Lifted when the game is downloaded again.
+        try:
+            self._auto_sync.block_save_downloads(rom_id)
+        except Exception as e:
+            logging.error(f"could not block save downloads for rom {rom_id}: {e}")
+        return removed
 
     async def delete_game(self, rom_id: int):
         """Delete a single game's local files."""
@@ -8264,20 +8385,29 @@ class LudoBackend:
                     logging.warning(f"could not delete regional variant {p}: {e}")
             if g:
                 g.pop('_variant_downloads', None)
+            # Before the early return below: a game whose ROM file is already
+            # gone can still have saves on disk, and those are exactly the
+            # strays a re-download would inherit.
+            removed_saves = self._delete_saves_for_rom(rom_id)
             if not target or not target.exists():
                 if g:
                     g['is_downloaded'] = False; g['local_path'] = None
-                return {'success': True,
-                        'message': 'Deleted' if removed else 'Nothing to delete'}
+                return {'success': True, 'deleted_saves': removed_saves,
+                        'message': 'Deleted' if (removed or removed_saves)
+                                   else 'Nothing to delete'}
             if target.is_file():
                 target.unlink()
             else:
                 shutil.rmtree(target)
             if g:
                 g['is_downloaded'] = False; g['local_path'] = None
+            name = ((g or {}).get('display_name')
+                    or (g or {}).get('name') or target.name)
             _record_activity('delete', 'Deleted from device',
-                             (g or {}).get('name') or target.name)
-            return {'success': True, 'message': 'Deleted'}
+                             f"{name} — {removed_saves} save(s) removed"
+                             if removed_saves else name)
+            return {'success': True, 'message': 'Deleted',
+                    'deleted_saves': removed_saves}
         except Exception as e:
             logging.error(f"delete_game error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}

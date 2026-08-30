@@ -1269,11 +1269,12 @@ export function SettingsPage() {
             border: `1px solid rgba(255,80,80,0.40)`,
           }}>
             <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.4 }}>
-              You’ll return to the setup wizard either way.
+              You’ll return to the setup wizard either way. Deleting also removes
+              local saves and savestates — anything not already synced to RomM is gone.
             </div>
             <GameActionButton icon={<FaUndo size={14} />} label={loggingOut ? 'Logging out…' : 'Log out (keep downloads)'}
               focusRef={logoutFirstRef} onClick={() => handleLogout(false)} disabled={loggingOut} />
-            <GameActionButton icon={<FaTrash size={14} />} label={loggingOut ? 'Logging out…' : 'Log out & delete all downloads'}
+            <GameActionButton icon={<FaTrash size={14} />} label={loggingOut ? 'Logging out…' : 'Log out & delete downloads and saves'}
               variant="danger" onClick={() => handleLogout(true)} disabled={loggingOut} />
             <GameActionButton icon={<FaTimes size={14} />} label="Cancel"
               onClick={() => setConfirmLogout(false)} disabled={loggingOut} />
