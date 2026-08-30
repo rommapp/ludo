@@ -33,6 +33,11 @@
 
 const fs = require("fs");
 const { spawnSync } = require("child_process");
+
+// Developer logging, same switch the backend uses (LUDO_DEBUG=1 — see
+// backend.py's DEBUG_MODE). The axis ranges are worth having when a controller
+// misbehaves and worth nothing the rest of the time.
+const DEBUG = process.env.LUDO_DEBUG === "1";
 const { findNativePads } = require("./native-pads.cjs");
 
 // GamepadButtonId, as used by the plugin UI (mirrors preload.cjs).
@@ -150,20 +155,21 @@ print(json.dumps(out))
       encoding: "utf8", timeout: 4000,
     });
     if (r.status !== 0 || !r.stdout) {
-      console.error("[pad] axis range query failed for", node,
-                    r.status, (r.stderr || "").slice(0, 200));
+      // Not gated on DEBUG: a failed query silently changes behaviour (the pad
+      // falls back to a guessed range), which is the thing that was hard to see
+      // in the first place.
+      console.warn("[pad] axis range query failed for", node,
+                   r.status, (r.stderr || "").slice(0, 200));
       return null;
     }
     const parsed = JSON.parse(r.stdout);
     const out = {};
     for (const [k, v] of Object.entries(parsed)) out[Number(k)] = v;
     if (!Object.keys(out).length) return null;
-    // One line per pad, because a wrong range here is invisible in the UI and
-    // presents as "the controller drives the menu on its own".
-    console.log("[pad] axis ranges for", node, JSON.stringify(out));
+    if (DEBUG) console.log("[pad] axis ranges for", node, JSON.stringify(out));
     return out;
   } catch (e) {
-    console.error("[pad] axis range query threw for", node, e && e.message);
+    console.warn("[pad] axis range query threw for", node, e && e.message);
     return null;
   }
 }
