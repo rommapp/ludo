@@ -29,7 +29,7 @@ export function QrCode({ matrix, size = 200 }: { matrix: boolean[][]; size?: num
   const quiet = 2;
   const span = n + quiet * 2;
   return (
-    <div style={{ background: '#ffffff', borderRadius: V2.radiusMd, padding: '10px', lineHeight: 0 }}>
+    <div style={{ background: '#ffffff', borderRadius: V2.radiusMd, padding: '8px', lineHeight: 0 }}>
       <svg width={size} height={size} viewBox={`0 0 ${span} ${span}`} shapeRendering="crispEdges"
         role="img" aria-label="Pairing QR code">
         <rect width={span} height={span} fill="#ffffff" />

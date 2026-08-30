@@ -677,6 +677,15 @@ export function SetupWizard() {
 
   const next = () => setStep((s) => Math.min(s + 1, TOTAL - 1));
   const back = () => setStep((s) => Math.max(s - 1, 0));
+  // QR is the one route with nothing left to do once it succeeds: there is no
+  // field to finish and no button the user could press that means anything
+  // other than "next". So take that press for them, after a beat long enough
+  // to read the green line that says it worked.
+  useEffect(() => {
+    if (!(cur === 'connect' && mode === 'qr' && paired)) return;
+    const t = setTimeout(() => next(), 1200);
+    return () => clearTimeout(t);
+  }, [cur, mode, paired]);
   // QR has no field to fill in beyond the URL, so the gate is the approval
   // itself — the step won't advance until the phone comes back.
   const canConnect = mode === 'qr'
@@ -821,7 +830,16 @@ export function SetupWizard() {
                 />
                 <Bumper label="R1" />
               </div>
-              <V2TextField label="RomM URL" value={url} onChange={onField(setUrl)} placeholder="https://romm.example.com" onKb={setKbRoom} focusRef={urlFocusRef} />
+              {/* Hidden while a QR code is live. Editing the URL resets qrArmed
+                  and throws that code away, so the field is not merely useless
+                  there — it is a focus stop whose only effect is to destroy what
+                  the user is currently scanning. It comes back for `idle` and
+                  `error`, which is exactly when the URL is worth touching: a
+                  wrong host fails into the error branch, and "Try again" is only
+                  worth pressing next to a URL you can fix first. */}
+              {!(mode === 'qr' && qrArmed && qr.status !== 'error') && (
+                <V2TextField label="RomM URL" value={url} onChange={onField(setUrl)} placeholder="https://romm.example.com" onKb={setKbRoom} focusRef={urlFocusRef} />
+              )}
               {mode === 'login' ? (
                 <>
                   <V2TextField label="Username" value={username} onChange={onField(setUsername)} onKb={setKbRoom} />
@@ -857,9 +875,22 @@ export function SetupWizard() {
                         : <GameActionButton variant="surface" label="Try again" icon={null} onClick={qrRetry} />}
                     </>
                   ) : (
-                    <>
+                    // Laid out as a row, not a column: the Deck's ~533px viewport
+                    // has to hold the whole step INCLUDING the Back/Next footer,
+                    // and stacking the code, the instruction and the spinner
+                    // under the QR pushed that footer below the fold — the user
+                    // had to scroll to find the buttons. Beside the QR they cost
+                    // no height at all, because the QR is the tallest thing here
+                    // either way.
+                    <div style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      gap: '16px', width: '100%', textAlign: 'left',
+                    }}>
                       {qr.matrix
-                        ? <QrCode matrix={qr.matrix} size={200} />
+                        ? <div style={{
+                            opacity: qr.status === 'approved' ? 0.35 : 1,
+                            transition: 'opacity 0.3s ease', lineHeight: 0,
+                          }}><QrCode matrix={qr.matrix} size={148} /></div>
                         : (
                           // No QR encoder bundled — the flow still works, the
                           // user just opens the URL by hand.
@@ -867,20 +898,47 @@ export function SetupWizard() {
                             {qr.verifyUrl}
                           </div>
                         )}
-                      {/* Only while there is still something to do. Approval is
-                          reported once, by the green line below — this used to
-                          say "Approved!" directly above it, so the same news
-                          arrived twice. */}
-                      {qr.status !== 'approved' && (
-                        <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.6, maxWidth: '380px' }}>
-                          Scan with your phone, then approve on your RomM server.
-                        </div>
-                      )}
+                      {/* Everything that changes between waiting and approved
+                          changes INSIDE this column, and the column is never
+                          taller than the QR beside it. So the step's height is
+                          the QR's height, start to finish: nothing reflows under
+                          the user, and the footer never moves. That is also why
+                          the QR stays mounted after approval — greyed, but
+                          holding its space. */}
+                      <div style={{
+                        display: 'flex', flexDirection: 'column', justifyContent: 'center',
+                        gap: '10px', minWidth: 0, flex: '1 1 auto',
+                      }}>
+                      {qr.status === 'approved' ? (
+                        <>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                            <div className="wiz-check" style={{
+                              width: '30px', height: '30px', flex: 'none', borderRadius: '50%',
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              background: V2.success, color: '#0b1410',
+                              boxShadow: '0 4px 18px rgba(74,222,128,0.35)',
+                            }}>
+                              <FaCheck size={15} />
+                            </div>
+                            <div style={{ fontSize: '17px', fontWeight: 700, color: V2.fg }}>Paired</div>
+                          </div>
+                          <div style={{ fontSize: '12px', color: V2.fg2, lineHeight: 1.5 }}>
+                            {testResult?.message && testResult.message !== 'Paired.'
+                              ? testResult.message
+                              : 'Signed in to your RomM server.'}
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                      {/* Only while there is still something to do. */}
+                      <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.5 }}>
+                        Scan with your phone, then approve on your RomM server.
+                      </div>
                       {/* The code is shown alongside the QR, not instead of it:
                           anyone already signed in on another device can go to
                           /pair/device and type these eight characters. */}
-                      {qr.userCode && qr.status !== 'approved' && (
-                        <div style={{ fontFamily: 'monospace', fontSize: '20px', fontWeight: 700, letterSpacing: '0.24em', color: V2.fg }}>
+                      {qr.userCode && (
+                        <div style={{ fontFamily: 'monospace', fontSize: '18px', fontWeight: 700, letterSpacing: '0.18em', color: V2.fg }}>
                           {qr.userCode}
                         </div>
                       )}
@@ -890,9 +948,15 @@ export function SetupWizard() {
                           Waiting for approval…
                         </div>
                       )}
-                    </>
+                        </>
+                      )}
+                      </div>
+                    </div>
                   )}
-                  {testResult && (
+                  {/* Success is reported inside the panel above now, in the space
+                      the instructions were using. Repeating it here would append
+                      a line — the exact reflow that was shoving the footer down. */}
+                  {testResult && !(qr.status === 'approved' && testResult.success) && (
                     <div style={{ fontSize: '13px', color: testResult.success ? V2.success : V2.danger }}>
                       {testResult.success ? <FaCheck size={11} style={{ verticalAlign: '-1px' }} /> : <FaTimes size={11} style={{ verticalAlign: '-1px' }} />} {testResult.message}
                     </div>
