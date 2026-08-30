@@ -1008,10 +1008,18 @@ export function ToastCover({ romId, hasCover }: { romId: number; hasCover: boole
     }}>
       {/* Height-led, not width-led: the slot is square and box art is 3:4, so
           height is the dimension that runs out first. Letting width follow from
-          the aspect ratio keeps the cover uncropped inside the slot. */}
+          the aspect ratio keeps the cover uncropped inside the slot.
+
+          maxHeight in PIXELS as well as the percentage, because only one of the
+          two hosts gives this a box to fill. Steam's logo slot is a fixed 44x44
+          block, where height:100% resolves; the desktop toaster's .desk-toast-logo
+          sets no size at all (only a max), so a percentage there resolves against
+          nothing and the image fell back to its natural size — several hundred
+          pixels of cover art dragging the toast open. The pixel cap is what that
+          case lands on, and it is a no-op inside Steam's smaller slot. */}
       <img src={uri} style={{
-        height: '100%', width: 'auto', maxWidth: '100%', aspectRatio: '3 / 4',
-        objectFit: 'cover', display: 'block',
+        height: '100%', maxHeight: '72px', width: 'auto', maxWidth: '100%',
+        aspectRatio: '3 / 4', objectFit: 'cover', display: 'block',
         borderRadius: V2.radiusSm, border: '1px solid rgba(255,255,255,0.12)',
       }} />
     </div>
