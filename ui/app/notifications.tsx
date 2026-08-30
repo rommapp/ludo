@@ -34,30 +34,43 @@ export function resetAnnouncementShown() { _annShown = false; }
 // ReactNode rendered inside the host's own tree, so a node that subscribes to
 // the shared status poll re-renders itself in place. That's what lets the count
 // move while the toast stays put.
-function LibraryFetchToastBody() {
+//
+// `snapshot` is the progress payload as it stood when the toast was raised, and
+// it is what the toast falls back to when the live poll hasn't resolved inside
+// the host's tree — without it the body reads "Fetching from RomM…" with no
+// number at all, which is the one thing this notification exists to avoid. It
+// is never more than TOAST_SEGMENT_MS stale, because the toast is re-raised on
+// that cadence with a fresh snapshot each time.
+function LibraryFetchToastBody({ snapshot }: { snapshot?: any }) {
   const st = useServiceStatus();
-  const prog = st?.library_progress;
-  // Per-platform walk: name the platform and count within it, with the
-  // library-wide position alongside. Both numbers are required — the platform
-  // bar alone is nearly useless on a lopsided library (one platform is 79% of
-  // the measured one, so it would read "1 of 13" for most of the sync), and the
-  // library counter alone is the bare number this work exists to replace.
-  // Fixed box. The toast sizes itself to its content, so without this every
-  // digit the counter gains and every platform name of a different length
-  // resizes the whole notification — it visibly jitters for the entire fetch.
-  // A fixed width plus two fixed single-line rows makes the frame constant and
-  // lets only the glyphs inside it change.
+  const prog = st?.library_progress ?? snapshot;
+  // Per-platform walk: count within the platform, named. The library-wide
+  // "platform 3 of 13" position the in-app banner also carries is dropped here
+  // — see the width note below; there is only ever one line to spend.
+  // Steam's toast description is a single nowrap line with overflow:hidden
+  // (class StandardNotificationDescription, read off the Deck's CSS), so
+  // anything past the container's width is CLIPPED FROM THE RIGHT — it does not
+  // wrap and it does not shrink the toast to fit. Two things follow, and both
+  // were wrong before:
+  //
+  //   * a second row is never drawn, so the counter can't live under the name;
+  //   * whatever is rightmost is what disappears, so the counter can't be last
+  //     either — which is why a name-then-count row still showed only the name.
+  //
+  // Hence: count first, name after it. The number is the reason this
+  // notification exists, so it takes the position that cannot be clipped, and
+  // the name ellipsises into whatever room is left.
   const box = (rows: React.ReactNode) => (
     <span style={{
-      display: 'block', width: '210px',
+      display: 'flex', alignItems: 'baseline', gap: '6px', maxWidth: '210px',
       // Proportional digits are individually different widths, so a counter
-      // rendered in them shuffles sideways as it climbs even inside a fixed box.
+      // rendered in them shuffles sideways as it climbs.
       fontVariantNumeric: 'tabular-nums',
     }}>{rows}</span>
   );
   const line = (content: React.ReactNode, extra?: React.CSSProperties) => (
     <span style={{
-      display: 'block', whiteSpace: 'nowrap', overflow: 'hidden',
+      whiteSpace: 'nowrap', overflow: 'hidden',
       textOverflow: 'ellipsis', ...extra,
     }}>{content}</span>
   );
@@ -65,14 +78,9 @@ function LibraryFetchToastBody() {
   if (prog?.platform_name && prog?.platform_total > 0) {
     const pl = (prog.platform_loaded ?? 0).toLocaleString();
     const pt = prog.platform_total.toLocaleString();
-    // Name on its own line so a long one ("Super Nintendo Entertainment
-    // System") ellipsises instead of wrapping and changing the toast's HEIGHT
-    // — the same jitter in the other axis.
     return box(<>
-      {line(prog.platform_name)}
-      {line(<>{`${pl} of ${pt}`}
-        <span style={{ opacity: 0.6 }}>{`  ·  ${prog.platform_index}/${prog.platform_count}`}</span>
-      </>)}
+      {line(`${pl} of ${pt}`, { flex: 'none' })}
+      {line(prog.platform_name, { flex: '1 1 auto', minWidth: 0, opacity: 0.75 })}
     </>);
   }
   if (prog?.total > 0) {
@@ -132,19 +140,28 @@ function SaveSyncToastLogo() {
 // happened to be current when the toast was raised. It is a ReactNode rendered
 // inside the host's own tree though, so the same self-subscribing trick that
 // keeps the body counting keeps the icon in step with the platform.
-function LibraryFetchToastLogo() {
+function LibraryFetchToastLogo({ snapshot }: { snapshot?: any }) {
   const st = useServiceStatus();
-  const slug = st?.library_progress?.platform_slug;
+  // Same fallback as the body, for the same reason: no live status must not
+  // mean no artwork.
+  const slug = (st?.library_progress ?? snapshot)?.platform_slug;
   if (!slug) return null;
   return (
-    // Explicit pixel box, like ToastCover's img. PlatformIcon renders at
-    // width/height 100%, so it has no size of its own — and the logo slot is
-    // `flex: none` with no width, so a percentage there resolves against
-    // nothing and the artwork renders at its natural size, stretching the whole
-    // toast. Wider than tall because platform art is mostly wordmarks;
-    // objectFit: contain does the rest.
+    // Fill the host's logo slot exactly, rather than picking our own box. Both
+    // toasters hand `logo` to a container that already has fixed dimensions —
+    // on Decky it's Steam's StandardLogoDimensions, a 44x44 block div — so a
+    // 52x32 child overflowed it horizontally and sat against its top edge,
+    // which is what "not centred, wrong size" looked like on the Deck.
+    // PlatformIcon renders at width/height 100% with objectFit: contain, so a
+    // square slot fits a wordmark and an icon alike; the padding keeps the
+    // artwork off the slot's edges.
     <div style={{
-      width: '52px', height: '32px', flex: 'none',
+      // 7px, not the 2px this started at: the host's logo slot sits close to
+      // the toast's own edge, so artwork drawn to the slot's full 44px reads as
+      // touching the notification border. The padding is the gap, and shrinking
+      // the art is the point rather than a side effect — a platform wordmark at
+      // 30px sits better beside 13px body text than one at 44px.
+      width: '100%', height: '100%', padding: '7px', boxSizing: 'border-box',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
     }}>
       <PlatformIcon slug={slug} size={28} />
@@ -165,14 +182,25 @@ export let _offSamples = 0;
 
 export let _fetchSamples = 0;
 
-// Not an expected lifetime — the toast is dismissed the moment progress clears.
-// This is the leak guard for a sync that hangs without ever clearing it, so the
-// user isn't left with a permanent notification they can't get rid of.
-export const FETCH_TOAST_MAX_MS = 30 * 60 * 1000;
+// When the CURRENT showing of the fetch toast went up — see TOAST_SEGMENT_MS.
+export let _fetchToastAt = 0;
 
-// Leak guard, exactly like FETCH_TOAST_MAX_MS: a sync that wedges without ever
-// clearing must not leave a notification the user cannot get rid of.
-export const SAVE_TOAST_MAX_MS = 10 * 60 * 1000;
+// How long ONE showing of a sticky toast lasts, and the reason both of them are
+// re-raised rather than parked.
+//
+// `duration` is the only thing that reliably takes a Steam toast off the
+// screen. Every other route — Decky's dismiss(), our own hardDismiss() — is a
+// mutation of the notification store that has to survive an intact handle, a
+// living poll loop, and a frontend that was never re-evaluated underneath it.
+// Any one of those failing used to strand the toast until Steam restarted,
+// because the duration behind it was measured in minutes.
+//
+// So the duration is now the SHORT path, not the backstop: each showing expires
+// on its own, and the poll re-raises it while the work is still running. The
+// worst failure this design has left is a toast that outlives its work by one
+// segment. Long enough not to strobe during a multi-minute library walk, short
+// enough that nobody would call it stuck.
+export const TOAST_SEGMENT_MS = 15 * 1000;
 
 // A save that uploads inside a single poll would otherwise appear and vanish in
 // well under a second, reading as a glitch rather than as an answer. Hold it
@@ -193,6 +221,34 @@ export let _fetchToast: { dismiss: () => void } | null = null;
 export let _saveToast: { dismiss: () => void } | null = null;
 
 export let _saveToastAt = 0;
+
+/**
+ * Take a toast out of Steam's notification state as thoroughly as we can.
+ *
+ * Measured on a Deck over the CEF debugger: Decky's `dismiss()` leaves
+ * m_rgNotificationToasts untouched, and ExpireToast does empty it — but the
+ * popup STAYS ON SCREEN for its full duration either way. So this is tray and
+ * queue hygiene only; TOAST_SEGMENT_MS is what actually bounds what the user
+ * sees, and nothing here should be relied on to take a notification down.
+ *
+ * dismiss() calls RemoveGroupFromTray, which splices the tray array. ExpireToast
+ * pops the on-screen queue; it matches on `notificationID`, which Decky's toast
+ * objects never set (they carry `nNotificationID`), so ours is stamped from
+ * that first — an id of `undefined` would otherwise match every other plugin's
+ * toast in the queue. All of it is private Steam API, hence the blanket catch.
+ */
+function hardDismiss(t: { dismiss: () => void; data?: any } | null) {
+  if (!t) return;
+  try { t.dismiss(); } catch { /* already out of the tray */ }
+  try {
+    const ns = (window as any).NotificationStore;
+    const queued = ns?.m_rgNotificationToasts?.find?.((n: any) => n && n.data === t.data);
+    if (queued) {
+      if (queued.notificationID === undefined) queued.notificationID = queued.nNotificationID;
+      ns.ExpireToast(queued);
+    }
+  } catch { /* private API moved; the duration cap still bounds it */ }
+}
 
 export const checkForNotifications = async () => {
   try {
@@ -235,19 +291,27 @@ export const checkForNotifications = async () => {
       const fetching = st?.library_progress;
       if (fetching) {
         _fetchSamples++;
+        // The showing that's up has expired (or is about to). Drop the stale
+        // handle so the raise below puts a fresh one up — that, not dismissal,
+        // is what keeps the notification on screen for a long walk.
+        if (_fetchToast && Date.now() - _fetchToastAt >= TOAST_SEGMENT_MS) {
+          hardDismiss(_fetchToast);
+          _fetchToast = null;
+        }
         // Two samples (~4s) before raising. An incremental refresh is usually
         // done inside a single tick, and a toast that appears and vanishes is
         // pure noise — only a fetch long enough to be worth narrating gets one.
         if (!_fetchToast && _fetchSamples >= 2) {
+          _fetchToastAt = Date.now();
           _fetchToast = toaster.toast({
             // A scoped walk is an update, not a load — the library is already
             // on screen and only the platforms that moved are being re-read.
             // Snapshotted at push time like the rest of the toast, which is
             // fine: a walk doesn't change kind halfway through.
             title: fetching.platform_name ? 'Updating your library…' : 'Loading your library…',
-            body: <LibraryFetchToastBody />,
-            logo: <LibraryFetchToastLogo />,
-            duration: FETCH_TOAST_MAX_MS,
+            body: <LibraryFetchToastBody snapshot={fetching} />,
+            logo: <LibraryFetchToastLogo snapshot={fetching} />,
+            duration: TOAST_SEGMENT_MS,
             // Silent: this one announces a wait the user didn't ask about, and
             // it can fire on any cold start. The completion toast keeps its chime.
             playSound: false,
@@ -257,7 +321,7 @@ export const checkForNotifications = async () => {
       } else {
         _fetchSamples = 0;
         if (_fetchToast) {
-          try { _fetchToast.dismiss(); } catch { /* already gone */ }
+          hardDismiss(_fetchToast);
           _fetchToast = null;
         }
       }
@@ -281,13 +345,18 @@ export const checkForNotifications = async () => {
       }
       const saving = st?.save_activity?.active && syncPillPref() !== false;
       if (saving) {
+        // Re-raised on expiry, exactly like the fetch toast above.
+        if (_saveToast && Date.now() - _saveToastAt >= TOAST_SEGMENT_MS) {
+          hardDismiss(_saveToast);
+          _saveToast = null;
+        }
         if (!_saveToast) {
           _saveToastAt = Date.now();
           _saveToast = toaster.toast({
             title: 'Uploading save',
             body: <SaveSyncToastBody />,
             logo: <SaveSyncToastLogo />,
-            duration: SAVE_TOAST_MAX_MS,
+            duration: TOAST_SEGMENT_MS,
             // Silent, like the fetch toast: this narrates work the user did not
             // ask about. The completion toast keeps its chime, which is the one
             // they actually need to hear from another room.
@@ -301,8 +370,8 @@ export const checkForNotifications = async () => {
         // Past the floor already: go now. Otherwise let it serve out the rest,
         // with the body having fallen through to "Save uploaded" the moment the
         // activity cleared — so the extra time reads as a result, not a stall.
-        if (held >= SAVE_TOAST_MIN_MS) { try { t.dismiss(); } catch { } }
-        else setTimeout(() => { try { t.dismiss(); } catch { } }, SAVE_TOAST_MIN_MS - held);
+        if (held >= SAVE_TOAST_MIN_MS) hardDismiss(t);
+        else setTimeout(() => hardDismiss(t), SAVE_TOAST_MIN_MS - held);
       }
 
       // First-library-load toast. Fires from here rather than a component
