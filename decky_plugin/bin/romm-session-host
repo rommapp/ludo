@@ -30,11 +30,17 @@ import subprocess
 import sys
 import time
 
-SESSION_DIR = os.path.join(
-    os.path.expanduser("~"),
-    ".config", "romm-retroarch-sync", "session",
-)
-SPEC = os.path.join(SESSION_DIR, "launch-spec.json")
+# Where the backend leaves the spec. There is more than one candidate because
+# the engine's state directory is per-frontend (see romm_sync_engine/paths.py):
+# Ludo writes ~/.config/ludo, the GTK app ~/.config/romm-retroarch-sync. This
+# script hardcoded the GTK path, so once the Decky plugin became Ludo every
+# launch found no spec, logged "bare tile click" and exited 0 — the tile came up
+# and the game never started. Check both and take the freshest.
+SESSION_DIRS = [
+    os.path.join(os.path.expanduser("~"), ".config", app, "session")
+    for app in ("ludo", "romm-retroarch-sync")
+]
+SESSION_DIR = SESSION_DIRS[0]
 LOG = os.path.join(SESSION_DIR, "host.log")
 # How recent the spec must be to count as "this launch" rather than a leftover.
 FRESH_SECONDS = 30
@@ -54,21 +60,39 @@ def _log(msg):
         pass
 
 
+def _newest_spec_path():
+    """The most recently written launch-spec across every candidate directory.
+
+    Newest rather than first-found: if both frontends are installed, the one the
+    user just pressed Play in is the one that wrote last.
+    """
+    best, best_mtime = None, -1.0
+    for d in SESSION_DIRS:
+        path = os.path.join(d, "launch-spec.json")
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            continue
+        if mtime > best_mtime:
+            best, best_mtime = path, mtime
+    return best, best_mtime
+
+
 def _load_fresh_spec():
-    try:
-        st = os.stat(SPEC)
-    except OSError:
+    path, mtime = _newest_spec_path()
+    if not path:
         return None
-    if (time.time() - st.st_mtime) > FRESH_SECONDS:
+    if (time.time() - mtime) > FRESH_SECONDS:
+        _log("spec at %s is %.0fs old -> stale" % (path, time.time() - mtime))
         return None
     try:
-        with open(SPEC, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8") as fh:
             spec = json.load(fh)
     except Exception:
         return None
     # Consume it so a later bare tile click can't re-launch the same game.
     try:
-        os.remove(SPEC)
+        os.remove(path)
     except OSError:
         pass
     argv = spec.get("argv")

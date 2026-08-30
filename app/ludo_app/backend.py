@@ -9666,14 +9666,29 @@ class LudoBackend:
         works). Returns {path} or {path: ''} if the script is missing.
         """
         try:
-            host = Path(__file__).resolve().parent / 'bin' / 'romm-session-host'
-            if host.is_file():
+            # Two layouts, and only the second one is real on a Deck. This
+            # module is py_modules/ludo_app/backend.py inside the plugin, while
+            # the script ships at the PLUGIN ROOT's bin/ -- two levels up, not
+            # beside us. Looking only next to __file__ found nothing, the RPC
+            # answered '', and the launcher fell back to its /bin/true tile:
+            # Steam launched /bin/true, exited immediately, and no game ever
+            # started (the session-host's own log was never even created).
+            here = Path(__file__).resolve()
+            candidates = [here.parent / 'bin' / 'romm-session-host']
+            candidates += [p / 'bin' / 'romm-session-host'
+                           for p in here.parents[1:4]]
+            for host in candidates:
+                if not host.is_file():
+                    continue
                 try:
                     if not os.access(host, os.X_OK):
                         os.chmod(host, 0o755)
                 except Exception:
                     pass
+                logging.debug(f"session-host resolved: {host}")
                 return {'path': str(host)}
+            logging.warning("session-host not found; searched: "
+                            + ', '.join(str(c) for c in candidates))
         except Exception as e:
             logging.error(f"get_session_host_path error: {e}")
         return {'path': ''}
