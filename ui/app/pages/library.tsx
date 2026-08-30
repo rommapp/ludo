@@ -521,6 +521,14 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   const [collections, setCollections] = useState<LibGroup[]>(c0?.collections || []);
   const [loading, setLoading] = useState(!c0);
   const offline = useOffline();
+  // Whether the last payload said the first library fetch is still running, so
+  // an empty Home can tell "you have no games" apart from "the games haven't
+  // arrived yet" — see the empty state. Taken from the library payload itself
+  // rather than from the service-status poll: it is the same answer the retry
+  // below already keys on, it arrives in the same response as the empty rows it
+  // explains, and it cannot be undefined-because-the-poll-hasn't-landed, which
+  // is what made the status-derived version fall through to the wrong message.
+  const [fetching, setFetching] = useState(false);
   // "Resume from the newest save state" (Settings → Gameplay). Cached at module
   // level so returning to Home doesn't re-ask the backend and re-render the row.
   const [resumeStates, setResumeStates] = useState<boolean>(_resumeStatesPref);
@@ -600,6 +608,7 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
         // still renders now rather than waiting on the rest.
         const notReady = h?.library_ready === false
           || p?.library_ready === false || c?.library_ready === false;
+        setFetching(notReady);
         // In-memory cache always advances, so a row that has arrived isn't
         // re-setState'd on every poll; only the durable copy waits.
         setHomeCache(next);
@@ -732,11 +741,24 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
       )}
 
       {continuePlaying.length === 0 && downloaded.length === 0 && recent.length === 0 && platforms.length === 0 && collections.length === 0 && (
-        <div style={{ padding: '16px', color: V2.fgMuted, fontSize: '13px' }}>
-          {offline
-            ? 'No downloaded games yet. Reconnect to browse and download your library.'
-            : 'No games in your library yet.'}
-        </div>
+        // Straight out of the setup wizard the rows are empty because the first
+        // fetch is still running, not because the library is. Saying "no games"
+        // there is wrong for the few seconds it lasts — and it's the first thing
+        // a new user ever reads. While the backend reports a fetch in flight (or
+        // a library that hasn't finished loading), show the skeleton the rest of
+        // the app uses for the same wait; the verdict can keep until it's true.
+        // `fetching` is exactly the condition the loader above re-polls every 3s,
+        // so the skeleton is guaranteed to resolve on its own rather than
+        // latching on a state nothing re-fetches out of.
+        (!offline && fetching)
+          ? <HomeSkeleton />
+          : (
+            <div style={{ padding: '16px', color: V2.fgMuted, fontSize: '13px' }}>
+              {offline
+                ? 'No downloaded games yet. Reconnect to browse and download your library.'
+                : 'No games in your library yet.'}
+            </div>
+          )
       )}
     </div>
   );
