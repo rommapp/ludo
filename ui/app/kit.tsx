@@ -997,15 +997,24 @@ export function ToastCover({ romId, hasCover }: { romId: number; hasCover: boole
   }, [romId]);
   if (!uri) return null;
   return (
-    <img src={uri} style={{
-      // Box art is the fastest way to recognise which game a toast is about,
-      // and at 32px it read as an icon rather than a cover. Height-capped as
-      // well as width-set: the toast is only so tall, and a 3:4 portrait is the
-      // dimension that runs out first.
-      width: '56px', maxHeight: '76px', aspectRatio: '3 / 4',
-      objectFit: 'cover', display: 'block',
-      borderRadius: V2.radiusSm, border: '1px solid rgba(255,255,255,0.12)',
-    }} />
+    // Fit the host's logo slot instead of picking our own box. Both toasters
+    // hand `logo` to a container with fixed dimensions — on Decky that is
+    // Steam's StandardLogoDimensions, a 44x44 block div — so the 56x76 portrait
+    // this used to be spilled out of the notification on both axes. Same
+    // treatment the library toast's platform icon already gets.
+    <div style={{
+      width: '100%', height: '100%', padding: '4px', boxSizing: 'border-box',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }}>
+      {/* Height-led, not width-led: the slot is square and box art is 3:4, so
+          height is the dimension that runs out first. Letting width follow from
+          the aspect ratio keeps the cover uncropped inside the slot. */}
+      <img src={uri} style={{
+        height: '100%', width: 'auto', maxWidth: '100%', aspectRatio: '3 / 4',
+        objectFit: 'cover', display: 'block',
+        borderRadius: V2.radiusSm, border: '1px solid rgba(255,255,255,0.12)',
+      }} />
+    </div>
   );
 }
 

@@ -3,7 +3,7 @@ import { Navigation, toaster } from "@ludo/host";
 import { _pushSaveActivity, useSaveActivity, useServiceStatus} from "./status";
 import { useRef } from "react";
 import { FaCloudUploadAlt } from "react-icons/fa";
-import { PlatformIcon, ToastCover} from "./kit";
+import { PlatformIcon, ToastCover, _gameLabel} from "./kit";
 import { _emuInstall } from "./emulator";
 import { _setSyncPillPref, openGameById, syncPillPref } from "./libcache";
 import { invalidateStateThumbs } from "./tiles";
@@ -103,7 +103,11 @@ function SaveSyncToastBody() {
     : a.games > 1
       ? `${a.games} games`
       : a.game
-        ? a.game
+        // Through _gameLabel: save activity carries the ROM's fs_name, so a
+        // Switch title arrived as "Mario Party Superstars[01006FE013472000][v0]"
+        // — the title ID and version tags read as a stray number glued to the
+        // name. Same helper every list in the app already titles games with.
+        ? _gameLabel(a.game)
         : a.state === 'queued' ? 'Waiting for the save to finish writing' : 'Uploading to RomM';
   // The toast outlives the activity by up to SAVE_TOAST_MIN_MS, and its TITLE
   // is snapshotted at push time and cannot follow. So hold the last real line
@@ -131,8 +135,30 @@ function SaveSyncToastBody() {
 // toast was about something else.
 function SaveSyncToastLogo() {
   const a = useSaveActivity();
-  if (a?.rom_id == null) return <FaCloudUploadAlt size={22} />;
-  return <ToastCover romId={a.rom_id} hasCover />;
+  // Hold the last game we saw, exactly as the body holds its last line and for
+  // the same reason: the toast outlives the activity by up to
+  // SAVE_TOAST_MIN_MS, and when the activity cleared the rom_id went with it —
+  // so the cover the user was looking at flipped back to the generic cloud
+  // partway through, as if the notification had changed subject.
+  const lastRom = useRef<number | null>(null);
+  if (a?.rom_id != null) lastRom.current = a.rom_id;
+  const romId = a?.rom_id ?? lastRom.current;
+  // The glyph needs the same slot-filling wrapper the cover and the platform
+  // icon get. Returned bare it sat against the top-left corner of Steam's
+  // 44x44 logo block instead of in the middle of it, so the toast looked
+  // lopsided for exactly as long as the rom_id was still unknown — which is
+  // the whole settle delay, i.e. most of the time this toast is on screen.
+  if (romId == null) {
+    return (
+      <div style={{
+        width: '100%', height: '100%', padding: '7px', boxSizing: 'border-box',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+        <FaCloudUploadAlt size={22} />
+      </div>
+    );
+  }
+  return <ToastCover romId={romId} hasCover />;
 }
 
 // The toast's logo slot, live. `logo` is snapshotted at push time exactly like

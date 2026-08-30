@@ -11143,7 +11143,14 @@ class AutoSyncManager:
                     if game.get('rom_id') == rom_id:
                         name = game.get('name')
                         if name:
-                            return name
+                            # Through display_game_name, like the completion
+                            # toast already is: the library name carries the
+                            # release tags, so a Switch title read as "Mario
+                            # Party Superstars[01006FE013472000][v0]" and the
+                            # title ID looked like a stray number stuck to the
+                            # name. The two toasts describe one event and now
+                            # spell the game the same way.
+                            return display_game_name(name)
             except Exception:
                 pass
         try:
