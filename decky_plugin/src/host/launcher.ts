@@ -20,6 +20,8 @@ import type { HostLauncher, LauncherHooks } from "./contract";
 const getPluginLogo = callable<[], any>("get_plugin_logo");
 const getRommArtwork = callable<[], any>("get_romm_artwork");
 const getSessionHostPath = callable<[], any>("get_session_host_path");
+const getShortcutIconPath = callable<[], any>("get_shortcut_icon_path");
+const installShortcutIcon = callable<[number], any>("install_shortcut_icon");
 const launchRetrodeckNative = callable<[], { ok: boolean; reason?: string }>("launch_retrodeck");
 
 let _hooks: LauncherHooks | null = null;
@@ -281,6 +283,20 @@ async function ensureRommArtwork(appId: number) {
   try {
     const apps = _sc()?.Apps;
     if (!apps?.SetCustomArtworkForApp) return;
+    // The small square icon, which is NOT one of the artwork asset types: it is
+    // the shortcut's own `icon` field in shortcuts.vdf, a path on disk. Nothing
+    // was ever writing it, so the field stayed empty and Steam drew its grey
+    // placeholder beside "Ludo" in the Steam menu and on Home — while the big
+    // logo above Resume, which IS an asset type, looked perfectly fine.
+    try {
+      const icon = await getShortcutIconPath();
+      if (icon?.path) await apps.SetShortcutIcon?.(appId, icon.path);
+      // And the copy Gaming Mode actually paints from: grid/<appid>_icon.png.
+      // The field alone was not enough — it pointed at the plugin's assets
+      // directory and the placeholder stayed put. Every shortcut on the device
+      // that shows an icon has this file.
+      await installShortcutIcon(appId);
+    } catch (e) { console.error('[RomM] shortcut icon', e); }
     // Steam asset types -> files this build writes:
     //   0 -> {appid}p.png   (portrait capsule)  : grid
     //   1 -> {appid}_hero   (hero background)    : hero

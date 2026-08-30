@@ -7430,6 +7430,70 @@ class LudoBackend:
             logging.error(f"get_romm_artwork error: {e}", exc_info=True)
             return {'success': False, 'art': {}}
 
+    async def get_shortcut_icon_path(self):
+        """Filesystem path to the square icon for the Ludo Steam shortcut.
+
+        Separate from get_romm_artwork because Steam treats it separately: the
+        grid/hero/logo/landscape assets go through SetCustomArtworkForApp, but
+        the small square beside the name in the Steam menu and on Home comes
+        from the shortcut's own `icon` FIELD in shortcuts.vdf, which is a path
+        on disk rather than an uploaded asset. With that field empty Steam draws
+        a grey placeholder square, which is what it has been doing.
+        """
+        try:
+            icon = Path(__file__).parent / "assets" / "romm-icon.png"
+            if icon.is_file():
+                return {'success': True, 'path': str(icon)}
+        except Exception as e:
+            logging.error(f"get_shortcut_icon_path error: {e}", exc_info=True)
+        return {'success': False, 'path': ''}
+
+    async def install_shortcut_icon(self, app_id):
+        """Place the icon where Big Picture actually reads it: grid/<appid>_icon.png.
+
+        Setting the shortcut's `icon` field to a path is necessary and not
+        sufficient. Every non-Steam shortcut on this Deck that DOES show an icon
+        also has a copy in userdata/<user>/config/grid named <appid>_icon.png,
+        and that is the file the Gaming Mode UI paints from -- so pointing the
+        field at the plugin's own assets directory left the grey placeholder
+        exactly where it was. Copy it in under both, and let the field keep
+        naming the source.
+
+        Written to every userdata profile on the machine: which one is signed in
+        is not knowable from here, and a spare copy in an unused profile costs
+        4 KB and confuses nothing.
+        """
+        try:
+            icon = Path(__file__).parent / "assets" / "romm-icon.png"
+            if not icon.is_file():
+                return {'success': False, 'message': 'no icon asset'}
+            try:
+                app_id = int(app_id)
+            except (TypeError, ValueError):
+                return {'success': False, 'message': 'bad app id'}
+            written = []
+            for root in (Path.home() / '.steam' / 'steam' / 'userdata',
+                         Path.home() / '.local' / 'share' / 'Steam' / 'userdata'):
+                if not root.is_dir():
+                    continue
+                for profile in root.iterdir():
+                    grid = profile / 'config' / 'grid'
+                    if not grid.is_dir():
+                        continue
+                    dest = grid / f"{app_id}_icon.png"
+                    try:
+                        shutil.copyfile(icon, dest)
+                        written.append(str(dest))
+                    except OSError as e:
+                        logging.debug(f"could not write {dest}: {e}")
+            if written:
+                logging.info(f"installed shortcut icon for {app_id}: "
+                             f"{len(written)} location(s)")
+            return {'success': bool(written), 'written': written}
+        except Exception as e:
+            logging.error(f"install_shortcut_icon error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
     async def get_romm_logo(self):
         """Return RomM's bundled isotipo (brand mark) as an SVG data URI.
 
