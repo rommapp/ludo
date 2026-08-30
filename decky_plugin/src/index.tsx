@@ -16,7 +16,7 @@
  * reason `src/host/contract.ts` is one.
  */
 import { definePlugin } from "@decky/api";
-import { FaSync } from "react-icons/fa";
+import { FaGamepad } from "react-icons/fa";
 
 import { startApp } from "./app";
 import { QuickAccessPanel, QuickAccessTitle } from "./quick-access";
@@ -27,7 +27,10 @@ export default definePlugin(() => {
     name: "Ludo",
     titleView: <QuickAccessTitle />,
     content: <QuickAccessPanel />,
-    icon: <FaSync />,
+    // The controller, matching the panel's own "Open Ludo" button. A sync
+    // arrow described one job Ludo does in the background; the plugin list is
+    // where the user goes to reach the library.
+    icon: <FaGamepad />,
     onDismount: () => app.stop(),
   };
 });

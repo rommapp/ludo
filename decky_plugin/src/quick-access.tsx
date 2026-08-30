@@ -148,7 +148,7 @@ export function QuickAccessPanel() {
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
             <FaGamepad size={14} />
-            <span>Open RomM</span>
+            <span>Open Ludo</span>
           </div>
         </ButtonItem>
       </PanelSectionRow>
