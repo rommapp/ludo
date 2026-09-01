@@ -44,8 +44,8 @@ Python 3.11+, Node.js 18+, and `pnpm` 9 for the Deck plugin.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e engine -e app --no-deps   # romm-sync-engine isn't on PyPI
-.venv/bin/pip install -e 'app[test]' --no-deps
+.venv/bin/pip install -e engine          # not on PyPI, so install it first
+.venv/bin/pip install -e 'app[test]'     # the editable engine above satisfies it
 ```
 
 Then whichever shell you're working in — `desktop/` and `decky_plugin/` each have

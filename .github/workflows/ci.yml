@@ -1,0 +1,114 @@
+name: CI
+
+# The release workflow is a publication gate: it only fires on a v* tag, and it
+# never runs a test. This is the other half — every push and every pull request
+# runs the three suites, so a regression is found before a tag exists rather
+# than after one has been pushed.
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['v*']        # tagged builds are release.yml's job
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes an in-flight run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python (engine + app)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # the floor both pyprojects declare
+
+      - name: Install the engine and the backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e engine
+          # Not --no-deps: that skips extras too, and pytest lives in [test].
+          # The editable engine above already satisfies romm-sync-engine, which
+          # is not on PyPI, so nothing is fetched for it.
+          pip install -e 'app[test]'
+
+      # NOT pytest: each file is a standalone script with its own check()
+      # harness, so `pytest engine/tests/` collects nothing and exits 0 -- a
+      # green run that tested absolutely nothing. run.sh is the way in.
+      - name: Engine suite
+        run: engine/tests/run.sh
+
+      - name: Backend suite
+        working-directory: app
+        run: pytest
+
+  desktop:
+    name: Desktop (typecheck + host contract + render)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install
+        working-directory: desktop
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: desktop
+        run: npm run typecheck
+
+      # routes.render.test.mjs drives dist/, because dist/ is what ships, and
+      # it skips itself when the build or Playwright is missing. Both are
+      # provided here so it actually runs; the guard below proves it did.
+      - name: Build the UI
+        working-directory: desktop
+        run: npm run build
+
+      - name: Install Chromium
+        working-directory: desktop
+        run: npx playwright install --with-deps chromium
+
+      - name: Tests
+        working-directory: desktop
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee test-output.txt
+
+      # A skipped render suite still exits 0. That is the failure mode the
+      # suite exists to prevent, so treat it as a failure here.
+      - name: Fail if the render suite skipped itself
+        working-directory: desktop
+        run: |
+          if grep -qE "skipping render tests|no build at" test-output.txt; then
+            echo "::error::The render suite skipped itself -- it must run in CI."
+            exit 1
+          fi
+
+  decky:
+    name: Decky plugin (typecheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9              # the version plugin submission CI expects
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: decky_plugin/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: decky_plugin
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: decky_plugin
+        run: pnpm run typecheck

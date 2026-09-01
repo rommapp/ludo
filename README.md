@@ -58,8 +58,8 @@ git clone https://github.com/Covin90/ludo.git && cd ludo
 
 # The shared Python side, installed editable
 python3 -m venv .venv
-.venv/bin/pip install -e engine -e app --no-deps
-.venv/bin/pip install -e 'app[test]' --no-deps
+.venv/bin/pip install -e engine          # not on PyPI, so install it first
+.venv/bin/pip install -e 'app[test]'     # the editable engine above satisfies it
 ```
 
 Then build whichever shell you want — `cd desktop && npm install && npm run electron`
