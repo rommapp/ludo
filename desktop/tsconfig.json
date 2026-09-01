@@ -21,18 +21,19 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noImplicitThis": true,
-    "baseUrl": ".",
     // Mirrors the aliases in vite.config.ts. tsc does not read those, so
     // without these it resolves bare imports by walking up from the shared UI,
     // never reaches desktop/node_modules, and reports phantom implicit-any
     // errors cascading from an unresolved `react`. Keep the two lists in step.
+    // No baseUrl: TypeScript resolves these relative to this file, and baseUrl
+    // is deprecated for removal in 7.0. decky_plugin/tsconfig.json is the same.
     "paths": {
-      "@ludo/host": ["src/host/index.ts"],
+      "@ludo/host": ["./src/host/index.ts"],
       "@ludo/app": ["../ui/app/index.tsx"],
-      "react": ["node_modules/@types/react"],
-      "react-dom": ["node_modules/@types/react-dom"],
-      "react/jsx-runtime": ["node_modules/@types/react/jsx-runtime"],
-      "react-icons/*": ["node_modules/react-icons/*"]
+      "react": ["./node_modules/@types/react"],
+      "react-dom": ["./node_modules/@types/react-dom"],
+      "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime"],
+      "react-icons/*": ["./node_modules/react-icons/*"]
     }
   },
   "include": ["src", "vite.config.ts", "../ui"]

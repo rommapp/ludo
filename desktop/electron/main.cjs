@@ -1,11 +1,12 @@
-// Ludo — Electron desktop shell (Linux + Windows).
+// Ludo — Electron desktop shell. Linux is what ships; the code below keeps
+// Windows paths working, but no Windows build is produced or tested.
 //
-// Replaces the GTK3/WebKit2GTK shell (desktop/app.py). Same lifecycle: spawn the
+// Replaces an earlier GTK3/WebKit2GTK shell. Same lifecycle: spawn the
 // existing Python backend (backend/server.py) on a free localhost port at launch,
 // load a BrowserWindow at it, and stop the backend cleanly on window close — no
 // background daemon. See desktop/README.md for the architecture.
 //
-// Differences from app.py, on purpose:
+// Two deliberate departures from that GTK shell:
 //   • Gamepad input uses Chromium's native Gamepad API (see preload.js), not the
 //     libmanette bridge — that native workaround existed only for a WebKitGTK
 //     Bluetooth-pad bug that Chromium doesn't share.
@@ -163,9 +164,10 @@ let stopNativeInput = null; // teardown for the kernel pad reader (native-input.
 
 // ── Backend lifecycle ────────────────────────────────────────────────────────
 
-// Grab an ephemeral port from the OS and hand it back (same approach as
-// app.py._free_port). Tiny TOCTOU window, but on loopback with a random high
-// port a collision is vanishingly unlikely and a failed bind is loud, not silent.
+// Grab an ephemeral port from the OS and hand it back: bind port 0, read what
+// the kernel assigned, close. Tiny TOCTOU window, but on loopback with a random
+// high port a collision is vanishingly unlikely and a failed bind is loud, not
+// silent.
 function freePort(host = "127.0.0.1") {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -254,7 +256,7 @@ function startBackend(host, port) {
   });
 }
 
-// Stop the backend the way app.py does on window close: cleanly, so the engine's
+// Stop the backend cleanly on window close, so the engine's
 // _unload() runs. server.py's main() calls engine.stop() on KeyboardInterrupt /
 // normal exit, so on POSIX we send SIGINT to trigger that path; Windows has no
 // usable SIGINT-to-child, so we terminate and let the daemon threads die.
@@ -271,7 +273,7 @@ function stopBackend() {
 
 // ── Window ───────────────────────────────────────────────────────────────────
 
-// Reproduce app.py._on_size_allocate: zoom so the 800px design height fills the
+// Zoom so the 800px design height fills the
 // actual content height, re-applied on every resize/(un)fullscreen/monitor move.
 function applyZoom() {
   if (!win) return;
@@ -350,7 +352,7 @@ function createWindow(url, fullscreen) {
   win.on("enter-full-screen", applyZoom);
   win.on("leave-full-screen", applyZoom);
 
-  // F11 toggles fullscreen — matching app.py._on_key. before-input-event fires
+  // F11 toggles fullscreen. before-input-event fires
   // ahead of the renderer, so anything preventDefault'd here never reaches the
   // UI; Escape is the UI's back/cancel key, so the window must not claim it.
   win.webContents.on("before-input-event", (event, input) => {

@@ -1,32 +1,13 @@
 # Ludo — desktop client
 
-A generic build of the sync app (Linux + Windows), for people running RetroArch
-**without** a Steam Deck / Decky. It shares the backend and UI with the Decky
-plugin:
+A generic build of the sync app, for people running RetroArch **without** a
+Steam Deck / Decky. Only Linux is built and shipped (an AppImage); the shell
+source is Windows-portable but no Windows artifact is produced or tested.
 
-- **UI** — `ui/app/`, consumed byte-identically and reached through `@ludo/app`
-  (whose entry is `index.tsx`, now just the route table). It imports its shell
-  through `@ludo/host`, which a Vite alias points at
-  `src/host/` (this shell's adapter) instead of forking the UI. The Decky build
-  points both specifiers at its own side; the contract the adapters satisfy is
-  `ui/host/contract.ts`.
-- **Host capabilities** — the UI never asks which shell it is in. It asks what
-  the shell can do (`host.capabilities.selfUpdate`, `.exit`, `.shortcutTile`,
-  `.toastPlacement`) and calls through `host.app`, `host.keyboard`,
-  `host.launcher` and `host.focus`.
-- **Launcher** — `host.launcher` is the Steam library tile and overlay-session
-  machinery. There is none out here, so `available` is false and the tile
-  methods no-op; a game launches directly instead. Steam integration on a PC is
-  a different mechanism: the backend writes `shortcuts.vdf`
-  (`capabilities.shortcutTile`).
-- **Backend** — `ludo_app.backend.LudoBackend` (in `app/`), on top of the shared
-  `romm_sync_engine` package. Both shells construct the same class; neither
-  imports the other. Decky's `callable` IPC is replaced by HTTP here: this shell's
-  `callable` POSTs to `/api/<method>` and `backend/server.py` dispatches to
-  `backend.<method>(*args)`.
-- **Host profile** — the few facts that differ between shells (version, which
-  release asset the updater pulls, where downloads land) are passed in as a
-  `HostProfile`; see `DESKTOP_HOST` in `backend/server.py`.
+It shares the UI, the backend and the sync engine with the Decky plugin, and
+differs only in the shell around them — see [CONTRIBUTING.md](../CONTRIBUTING.md).
+This shell replaces Decky's `callable` IPC with HTTP: `callable` POSTs to
+`/api/<method>`, and `backend/server.py` dispatches to `backend.<method>(*args)`.
 
 `npm test` runs both suites in `tests/`:
 
@@ -80,11 +61,10 @@ Then open <http://127.0.0.1:8723> (built) or <http://127.0.0.1:5173> (dev).
 
 ## Native window shell (Electron)
 
-`electron/main.cjs` is the desktop window — one codebase for **Linux and
-Windows**. It replaces the old Linux-only GTK3/WebKit2GTK shell (`app.py`, kept
-for reference). Same lifecycle as `app.py`: spawn `backend/server.py` on a free
-localhost port at launch, load a `BrowserWindow` at it, and stop the backend
-cleanly on window close — no background daemon.
+`electron/main.cjs` is the desktop window, replacing an earlier Linux-only
+GTK3/WebKit2GTK shell. It spawns `backend/server.py` on a free localhost port at
+launch, loads a `BrowserWindow` at it, and stops the backend cleanly on window
+close — no background daemon.
 
 ```bash
 npm run electron       # build the UI, then launch the window
@@ -135,7 +115,7 @@ that integration has to keep matching the host driver across updates.
 The shell warns on startup (`[gpu] SOFTWARE RENDERING`) whenever it detects this,
 so check the console before investigating a performance complaint.
 
-What the shell reproduces from `app.py`:
+What the shell does with the window:
 
 - **Zoom-to-fit** — the UI is authored for the Deck's 1280×800 gamepad viewport,
   so `webContents.setZoomFactor` scales the page so the 800px design height fills
@@ -169,14 +149,9 @@ missing either asset.
 
 ## Button-hint legend
 
-`src/host/footer.tsx` rebuilds the Deck's bottom hint bar. Its glyph art comes
-from Kenney's [Input Prompts](https://kenney.nl/assets/input-prompts) pack
-(**CC0** — commercial use fine, attribution not required), inlined as SVG into
-`src/host/glyphs.tsx`. That file is **generated and committed**; regenerate with:
-
-```bash
-node tools/gen-glyphs.mjs ~/Downloads/kenney_input-prompts_1.5
-```
+`src/host/footer.tsx` rebuilds the Deck's bottom hint bar, out of the glyphs in
+`src/host/glyphs.tsx` — a generated, committed file; `tools/gen-glyphs.mjs`
+documents its regeneration and its artwork licence.
 
 The set follows the device last touched (`lastInputKind()`): press the pad and it
 shows that pad's art — `controllerFamily()` picks Xbox / PlayStation / Switch /
@@ -238,8 +213,8 @@ scroll-into-view rather than reimplementing them. Left unhandled they'd fall
 through to Chromium, which scrolls the page without moving focus. They're ignored
 inside text fields (the caret needs them) and when a modifier is held.
 
-The NVIDIA/Wayland `__NV_DISABLE_EXPLICIT_SYNC` workaround from `app.py` is
-deliberately **not** ported — it's a WebKitGTK-specific bug.
+The GTK shell's NVIDIA/Wayland `__NV_DISABLE_EXPLICIT_SYNC` workaround is
+deliberately **not** carried over — it's a WebKitGTK-specific bug.
 
 Installers/AppImage packaging are a separate follow-up.
 
@@ -253,7 +228,7 @@ that launches this shell, mirroring the tile the Decky plugin puts in Big
 Picture. The mechanism differs by necessity: the plugin calls
 `SteamClient.Apps.AddShortcut`, a live API that exists only inside Steam's own
 UI process, while here the backend edits `shortcuts.vdf` directly
-(`add_desktop_tile` / `remove_desktop_tile` in `src/sync_core.py`) and drops the
+(`add_desktop_tile` / `remove_desktop_tile` in `engine/romm_sync_engine/sync_core.py`) and drops the
 bundled RomM artwork into `userdata/<id>/config/grid/`.
 
 Two consequences worth knowing:
@@ -283,5 +258,5 @@ catches up on next launch via the startup pass.
 
 No Steam system bars and no in-Gaming-Mode background sync — those are
 Deck/Decky-native and stay in the plugin. Gamepad *focus navigation* works here
-via the shim; this client targets desktop Linux/Windows with a controller or
+via the shim; this client targets desktop Linux with a controller or
 mouse + keyboard.

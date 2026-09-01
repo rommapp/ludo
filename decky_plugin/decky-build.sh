@@ -44,6 +44,7 @@ TMP_DIR=$(mktemp -d)
 mkdir -p "${TMP_DIR}/${PLUGIN_NAME}/dist"
 mkdir -p "${TMP_DIR}/${PLUGIN_NAME}/py_modules"
 mkdir -p "${TMP_DIR}/${PLUGIN_NAME}/assets"
+mkdir -p "${TMP_DIR}/${PLUGIN_NAME}/bin"
 
 cp "${SCRIPT_DIR}/plugin.json"             "${TMP_DIR}/${PLUGIN_NAME}/"
 cp "${SCRIPT_DIR}/package.json"            "${TMP_DIR}/${PLUGIN_NAME}/"
@@ -65,6 +66,14 @@ rm -rf "${TMP_DIR}/${PLUGIN_NAME}/py_modules/__pycache__" "${TMP_DIR}/${PLUGIN_N
 # backend.py looks. This copy is only for the plugin-root logo Decky Loader
 # shows in its plugin list.
 cp "${SCRIPT_DIR}/py_modules/ludo_app/assets/logo.png" "${TMP_DIR}/${PLUGIN_NAME}/assets/"
+
+# The exe behind the "RomM" Steam tile. Steam launches this as a tracked game so
+# the overlay opens, and it execs the resolved emulator argv in place. Without it
+# in the zip, backend.get_session_host_path() finds nothing and Play falls back
+# to a direct launch with no working overlay -- which is what every release
+# before this shipped, because nothing copied bin/ at all.
+cp "${SCRIPT_DIR}/bin/romm-session-host" "${TMP_DIR}/${PLUGIN_NAME}/bin/"
+chmod +x "${TMP_DIR}/${PLUGIN_NAME}/bin/romm-session-host"
 
 rm -f "$OUT_ZIP"
 (cd "$TMP_DIR" && zip -r "$OUT_ZIP" "${PLUGIN_NAME}/")
