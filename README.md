@@ -49,26 +49,6 @@ directories.
 Ludo updates itself in place from GitHub releases; you do not need to repeat
 this.
 
-## How the repo is laid out
-
-Ludo is **one application**. The interface, the backend and the sync engine are
-each written once and shared; what differs between a Deck and a PC is only the
-shell that hosts them — how the UI is drawn on screen and how it talks to the
-backend. Each directory has its own README with the detail.
-
-| Directory | What lives there |
-| --- | --- |
-| [`ui/`](ui/README.md) | The interface, rendered byte-identically everywhere, plus `host/contract.ts` — the interface it needs *from* its shell. |
-| [`app/`](app/README.md) | `LudoBackend`: every RPC the UI can call. Shell-independent; the facts that differ are passed in as a `HostProfile`. |
-| `engine/` | `romm_sync_engine` — the sync machinery itself. Not Ludo-specific; shared with RomM RetroArch Sync. |
-| [`desktop/`](desktop/README.md) | The PC shell: an Electron window over the backend on localhost. |
-| [`decky_plugin/`](decky_plugin/README.md) | The Steam Deck shell: a Decky Loader plugin, with Steam library-tile and overlay integration. |
-| `scripts/` | Release automation and the `libsigil` build. |
-
-The two shells never import each other. Both satisfy `ui/host/contract.ts`, and
-each build resolves the `@ludo/host` specifier to its own adapter — so the UI
-asks what its shell *can do*, never which shell it is in.
-
 ## Building from source
 
 You need Python 3.11+, Node.js 18+, and `pnpm` 9 for the Deck plugin.
