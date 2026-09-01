@@ -84,8 +84,6 @@ Three things to know:
 
 ## Conventions
 
-- **Conduct** — [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) applies to issues, pull
-  requests and discussions.
 - **Commits** follow Conventional Commits with a scope naming the area:
   `fix(desktop): …`, `feat(sync): …`, `docs: …`.
 - **Both shells stay in step.** A change to `ui/app/` or `app/` reaches the Deck
@@ -99,5 +97,4 @@ Three things to know:
 ## Releasing
 
 One tag builds both artifacts, always at the same version. That is enforced
-rather than agreed, and [RELEASING.md](RELEASING.md) explains why. Notable
-changes go in [CHANGELOG.md](CHANGELOG.md) under `Unreleased`.
+rather than agreed, and [RELEASING.md](RELEASING.md) explains why.

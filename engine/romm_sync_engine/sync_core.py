@@ -14490,11 +14490,6 @@ class AutoSyncManager:
 
         return None
 
-    def upload_saves_for_game_session(self, game_name):
-        """Upload saves for a game that was just closed"""
-        # TODO: Find and upload recent save files for this game
-        self.log(f"📤 Checking for saves to upload for {game_name}")
-    
     def get_platform_slug_from_emulator(self, romm_emulator):
         """Reverse map RetroArch core names to RomM platform slugs"""
         core_to_platform = {
