@@ -98,7 +98,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
-          version: 9              # the version plugin submission CI expects
+          version: 10             # same major release.yml builds with
       - uses: actions/setup-node@v4
         with:
           node-version: '20'

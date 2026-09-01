@@ -74,9 +74,6 @@ it works whether you paste it from the repo root or from inside `decky_plugin/`.
 `pnpm run build` compiles the frontend; there is no symlink dance, because the backend
 packages are dereferenced at copy time (`cp -rL`) instead.
 
-> ⚠️ Don't use `pnpm run package`: its script still copies the deleted `src/sync_core.py`,
-> so it fails outright. It's a stale leftover from the old layout (see Known gotchas).
-
 > ⚠️ Always run the build in a **subshell** `(cd decky_plugin && …)` — a bare
 > `cd decky_plugin && pnpm run build` leaves the shell in `decky_plugin/`, breaking every
 > repo-root-relative `cp` that follows.
@@ -157,12 +154,6 @@ real path, so a bare import from inside `ui/app/` never reaches `decky_plugin/no
 and falls through as an unresolved external. The build still reports success. See `ui/README.md`;
 `rollup.config.js` pins `react-icons` for exactly this reason.
 
-**Why `pnpm run build` and not `pnpm run package`?** The old `package` script copies
-`src/sync_core.py` over `py_modules/sync_core.py` and a `postpackage` hook restores that
-symlink — a dance for a layout that no longer exists. `src/sync_core.py` is gone (sync_core
-lives in `engine/romm_sync_engine/`), so `package` now fails outright; the dead scripts are
-only kept in `package.json` until someone deletes them.
-
 ---
 
 ## Required files in the ZIP
@@ -223,7 +214,6 @@ ludo/
     logo.png            ← plugin-list icon only; all other artwork is served
                           from py_modules/ludo_app/assets/
   bin/
-    7zz
     romm-session-host
 ```
 
@@ -275,9 +265,6 @@ Then install from `~/Ludo-v1.0.0-decky.zip` on the Deck via Decky Loader.
   resolved copies — packaging must dereference them with `cp -rL`. Using `cp -r` alone copies
   symlinks as-is, which become broken inside the zip (no error at zip time, but the plugin
   fails with `ModuleNotFoundError` at load time)
-- `pnpm run package` / `postpackage` in `decky_plugin/package.json` are stale leftovers from
-  the old `py_modules/sync_core.py` layout — they copy the deleted `src/sync_core.py` and
-  fail. Build with `pnpm run build` instead (the dead scripts can be deleted whenever)
 - Missing `py_modules/requests/` (and other bundled libs) causes `No module named 'requests'`
   on a fresh Decky install — always copy the entire `py_modules/` directory, not just
   `sync_core.py`

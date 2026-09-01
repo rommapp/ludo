@@ -228,7 +228,7 @@ that launches this shell, mirroring the tile the Decky plugin puts in Big
 Picture. The mechanism differs by necessity: the plugin calls
 `SteamClient.Apps.AddShortcut`, a live API that exists only inside Steam's own
 UI process, while here the backend edits `shortcuts.vdf` directly
-(`add_desktop_tile` / `remove_desktop_tile` in `src/sync_core.py`) and drops the
+(`add_desktop_tile` / `remove_desktop_tile` in `engine/romm_sync_engine/sync_core.py`) and drops the
 bundled RomM artwork into `userdata/<id>/config/grid/`.
 
 Two consequences worth knowing:
