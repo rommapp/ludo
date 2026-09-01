@@ -1,8 +1,10 @@
 # Ludo — desktop client
 
-A generic build of the sync app (Linux + Windows), for people running RetroArch
-**without** a Steam Deck / Decky. It shares the backend and UI with the Decky
-plugin:
+A generic build of the sync app, for people running RetroArch **without** a
+Steam Deck / Decky. Only Linux is built and shipped (an AppImage); the shell
+source is Windows-portable but no Windows artifact is produced or tested.
+
+It shares the backend and UI with the Decky plugin:
 
 - **UI** — `ui/app/`, consumed byte-identically and reached through `@ludo/app`
   (whose entry is `index.tsx`, now just the route table). It imports its shell
@@ -80,8 +82,7 @@ Then open <http://127.0.0.1:8723> (built) or <http://127.0.0.1:5173> (dev).
 
 ## Native window shell (Electron)
 
-`electron/main.cjs` is the desktop window — one codebase for **Linux and
-Windows**. It replaces the old Linux-only GTK3/WebKit2GTK shell (`app.py`, kept
+`electron/main.cjs` is the desktop window. It replaces the old Linux-only GTK3/WebKit2GTK shell (`app.py`, kept
 for reference). Same lifecycle as `app.py`: spawn `backend/server.py` on a free
 localhost port at launch, load a `BrowserWindow` at it, and stop the backend
 cleanly on window close — no background daemon.
@@ -283,5 +284,5 @@ catches up on next launch via the startup pass.
 
 No Steam system bars and no in-Gaming-Mode background sync — those are
 Deck/Decky-native and stay in the plugin. Gamepad *focus navigation* works here
-via the shim; this client targets desktop Linux/Windows with a controller or
+via the shim; this client targets desktop Linux with a controller or
 mouse + keyboard.

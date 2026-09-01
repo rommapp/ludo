@@ -84,4 +84,4 @@ echo "built: $BUILD_DIR/libsigil.so"
 echo
 echo "Ludo picks this up automatically. To force a specific build instead:"
 echo "  export LUDO_SIGIL_LIB=$BUILD_DIR/libsigil.so"
-echo "  python3 scripts/switch_check.py"
+echo "  python3 scripts/eden_doctor.py"

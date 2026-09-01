@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise the Switch save/firmware paths before any UI exists.
+"""Diagnose Ludo's Eden save and firmware handling from the command line.
 
-    python3 scripts/switch_check.py                    # read-only report
-    python3 scripts/switch_check.py --install-firmware # download + install
-    python3 scripts/switch_check.py --pack-saves       # pack to a temp dir
+    python3 scripts/eden_doctor.py                    # read-only report
+    python3 scripts/eden_doctor.py --install-firmware # download + install
+    python3 scripts/eden_doctor.py --pack-saves       # pack to a temp dir
 
 Read-only by default: it inspects Eden, matches saves against the local ROM
 library, and asks RomM what firmware it holds, without writing anything. The
