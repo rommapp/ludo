@@ -86,3 +86,13 @@ merely agreed.
 [GPL-3.0](LICENSE). Ludo bundles third-party binaries — `libsigil.so` (MPL-2.0)
 and `7zz` (7-Zip License) — each documented, with source and hashes, in the
 `bin/README.md` beside it.
+
+## Trademarks
+
+Ludo is an independent project, not affiliated with or endorsed by Nintendo,
+Valve, Sony, Microsoft, Sega, or any other hardware or software vendor. Console,
+platform and emulator names appear only to describe what Ludo works with. All
+trademarks belong to their respective owners.
+
+Ludo ships no games, no BIOS files, no firmware and no keys — it moves content
+you already have, between your own RomM server and your own machine.
