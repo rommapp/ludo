@@ -8,8 +8,6 @@
 
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
-<img src="assets/screenshots/main_interface.png" alt="Ludo's library view" width="800">
-
 </div>
 
 ## What it is
