@@ -39,8 +39,8 @@ you play.
 `Ludo-v<version>-decky.zip` and install it from Decky's plugin menu. Ludo then
 lives in the Quick Access panel, in Game Mode.
 
-**Linux / Windows PC** — download `Ludo-v<version>-x86_64.AppImage`, make it
-executable, and run it. No install step, no daemon.
+**Linux PC** — download `Ludo-v<version>-x86_64.AppImage`, make it executable,
+and run it. No install step, no daemon.
 
 Either way, the first launch walks you through pairing with your RomM server
 (scan a QR code, or type the address) and pointing Ludo at your RetroArch
