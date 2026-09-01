@@ -61,10 +61,11 @@ Then open <http://127.0.0.1:8723> (built) or <http://127.0.0.1:5173> (dev).
 
 ## Native window shell (Electron)
 
-`electron/main.cjs` is the desktop window. It replaces the old Linux-only GTK3/WebKit2GTK shell (`app.py`, kept
-for reference). Same lifecycle as `app.py`: spawn `backend/server.py` on a free
-localhost port at launch, load a `BrowserWindow` at it, and stop the backend
-cleanly on window close — no background daemon.
+`electron/main.cjs` is the desktop window. It replaces the old Linux-only
+GTK3/WebKit2GTK shell (`app.py`), which stays in the tree as superseded
+reference only — nothing imports it. Same lifecycle as `app.py`: spawn
+`backend/server.py` on a free localhost port at launch, load a `BrowserWindow`
+at it, and stop the backend cleanly on window close — no background daemon.
 
 ```bash
 npm run electron       # build the UI, then launch the window

@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Ludo — desktop window shell.
+"""Ludo — desktop window shell (SUPERSEDED, kept as reference).
+
+This is the old GTK3/WebKit2GTK shell. It is NOT what runs: the desktop app
+ships electron/main.cjs, which reproduces this lifecycle for Linux and is what
+`npm run electron` and the AppImage launch. Nothing imports this file.
+
+It stays in the tree because main.cjs explains itself against it -- the
+zoom-to-fit, free-port and key-handling comments there cite these functions by
+name -- and because the NVIDIA/Wayland workaround here is deliberately not
+ported. Read it for that history; don't develop against it.
 
 Launches the HTTP backend (backend/server.py) in-process on a free localhost
 port, then opens a native WebKitGTK window pointing at it. The engine lives only

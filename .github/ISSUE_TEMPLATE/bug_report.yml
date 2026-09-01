@@ -1,0 +1,53 @@
+name: Bug report
+description: Something in Ludo doesn't work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please don't report security issues here — see [SECURITY.md](https://github.com/Covin90/ludo/blob/dev/SECURITY.md).
+
+  - type: dropdown
+    id: shell
+    attributes:
+      label: Where are you running Ludo?
+      options:
+        - Steam Deck (Decky plugin)
+        - Linux PC (AppImage)
+        - From a source checkout
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Ludo version
+      description: Settings → About, or the release you installed.
+      placeholder: 1.0.0-beta.8
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Anything the console printed. On the desktop build, launch from a
+        terminal to see it. This is automatically formatted as code.
+      render: shell
+
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your setup
+      description: >
+        RomM server version, the emulator involved (RetroArch / Eden) and its
+        version, and your distro if you're on a PC. Skip anything irrelevant.
