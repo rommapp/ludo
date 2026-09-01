@@ -61,11 +61,10 @@ Then open <http://127.0.0.1:8723> (built) or <http://127.0.0.1:5173> (dev).
 
 ## Native window shell (Electron)
 
-`electron/main.cjs` is the desktop window. It replaces the old Linux-only
-GTK3/WebKit2GTK shell (`app.py`), which stays in the tree as superseded
-reference only — nothing imports it. Same lifecycle as `app.py`: spawn
-`backend/server.py` on a free localhost port at launch, load a `BrowserWindow`
-at it, and stop the backend cleanly on window close — no background daemon.
+`electron/main.cjs` is the desktop window, replacing an earlier Linux-only
+GTK3/WebKit2GTK shell. It spawns `backend/server.py` on a free localhost port at
+launch, loads a `BrowserWindow` at it, and stops the backend cleanly on window
+close — no background daemon.
 
 ```bash
 npm run electron       # build the UI, then launch the window
@@ -116,7 +115,7 @@ that integration has to keep matching the host driver across updates.
 The shell warns on startup (`[gpu] SOFTWARE RENDERING`) whenever it detects this,
 so check the console before investigating a performance complaint.
 
-What the shell reproduces from `app.py`:
+What the shell does with the window:
 
 - **Zoom-to-fit** — the UI is authored for the Deck's 1280×800 gamepad viewport,
   so `webContents.setZoomFactor` scales the page so the 800px design height fills
@@ -214,8 +213,8 @@ scroll-into-view rather than reimplementing them. Left unhandled they'd fall
 through to Chromium, which scrolls the page without moving focus. They're ignored
 inside text fields (the caret needs them) and when a modifier is held.
 
-The NVIDIA/Wayland `__NV_DISABLE_EXPLICIT_SYNC` workaround from `app.py` is
-deliberately **not** ported — it's a WebKitGTK-specific bug.
+The GTK shell's NVIDIA/Wayland `__NV_DISABLE_EXPLICIT_SYNC` workaround is
+deliberately **not** carried over — it's a WebKitGTK-specific bug.
 
 Installers/AppImage packaging are a separate follow-up.
 
