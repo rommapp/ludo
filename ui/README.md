@@ -1,18 +1,8 @@
 # ui/
 
-Ludo's interface, and the interface it needs from whatever is hosting it.
-
-- **`app/`** — the app itself. Both shells render this same code.
-- **`host/contract.ts`** — what the app needs from the shell it runs inside.
-  `decky_plugin/src/host/` and `desktop/src/host/` each implement it, and both
-  builds resolve the `@ludo/host` specifier to their own adapter. Nothing in
-  `app/` imports `@decky/*`, and nothing branches on which shell it is in — it
-  asks what the shell can do.
-
-Steam's library-tile machinery and its gamepad-focus internals are behind their
-own seams in that contract (`HostLauncher`, `HostFocus`) rather than being
-flattened into capability flags: both are cohesive subsystems, undocumented and
-version-fragile, and they belong in one adapter each.
+Ludo's interface. `app/` is the app itself, rendered identically by both shells;
+`host/contract.ts` is what it needs *from* whatever is hosting it — see
+[CONTRIBUTING.md](../CONTRIBUTING.md) for how that seam works.
 
 ## app/
 

@@ -4,31 +4,10 @@ A generic build of the sync app, for people running RetroArch **without** a
 Steam Deck / Decky. Only Linux is built and shipped (an AppImage); the shell
 source is Windows-portable but no Windows artifact is produced or tested.
 
-It shares the backend and UI with the Decky plugin:
-
-- **UI** — `ui/app/`, consumed byte-identically and reached through `@ludo/app`
-  (whose entry is `index.tsx`, now just the route table). It imports its shell
-  through `@ludo/host`, which a Vite alias points at
-  `src/host/` (this shell's adapter) instead of forking the UI. The Decky build
-  points both specifiers at its own side; the contract the adapters satisfy is
-  `ui/host/contract.ts`.
-- **Host capabilities** — the UI never asks which shell it is in. It asks what
-  the shell can do (`host.capabilities.selfUpdate`, `.exit`, `.shortcutTile`,
-  `.toastPlacement`) and calls through `host.app`, `host.keyboard`,
-  `host.launcher` and `host.focus`.
-- **Launcher** — `host.launcher` is the Steam library tile and overlay-session
-  machinery. There is none out here, so `available` is false and the tile
-  methods no-op; a game launches directly instead. Steam integration on a PC is
-  a different mechanism: the backend writes `shortcuts.vdf`
-  (`capabilities.shortcutTile`).
-- **Backend** — `ludo_app.backend.LudoBackend` (in `app/`), on top of the shared
-  `romm_sync_engine` package. Both shells construct the same class; neither
-  imports the other. Decky's `callable` IPC is replaced by HTTP here: this shell's
-  `callable` POSTs to `/api/<method>` and `backend/server.py` dispatches to
-  `backend.<method>(*args)`.
-- **Host profile** — the few facts that differ between shells (version, which
-  release asset the updater pulls, where downloads land) are passed in as a
-  `HostProfile`; see `DESKTOP_HOST` in `backend/server.py`.
+It shares the UI, the backend and the sync engine with the Decky plugin, and
+differs only in the shell around them — see [CONTRIBUTING.md](../CONTRIBUTING.md).
+This shell replaces Decky's `callable` IPC with HTTP: `callable` POSTs to
+`/api/<method>`, and `backend/server.py` dispatches to `backend.<method>(*args)`.
 
 `npm test` runs both suites in `tests/`:
 
@@ -170,14 +149,9 @@ missing either asset.
 
 ## Button-hint legend
 
-`src/host/footer.tsx` rebuilds the Deck's bottom hint bar. Its glyph art comes
-from Kenney's [Input Prompts](https://kenney.nl/assets/input-prompts) pack
-(**CC0** — commercial use fine, attribution not required), inlined as SVG into
-`src/host/glyphs.tsx`. That file is **generated and committed**; regenerate with:
-
-```bash
-node tools/gen-glyphs.mjs ~/Downloads/kenney_input-prompts_1.5
-```
+`src/host/footer.tsx` rebuilds the Deck's bottom hint bar, out of the glyphs in
+`src/host/glyphs.tsx` — a generated, committed file; `tools/gen-glyphs.mjs`
+documents its regeneration and its artwork licence.
 
 The set follows the device last touched (`lastInputKind()`): press the pad and it
 shows that pad's art — `controllerFamily()` picks Xbox / PlayStation / Switch /
