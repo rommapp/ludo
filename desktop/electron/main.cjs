@@ -1,4 +1,5 @@
-// Ludo — Electron desktop shell (Linux + Windows).
+// Ludo — Electron desktop shell. Linux is what ships; the code below keeps
+// Windows paths working, but no Windows build is produced or tested.
 //
 // Replaces an earlier GTK3/WebKit2GTK shell. Same lifecycle: spawn the
 // existing Python backend (backend/server.py) on a free localhost port at launch,
