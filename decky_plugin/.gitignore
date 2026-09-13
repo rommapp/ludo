@@ -71,3 +71,12 @@ py_modules/urllib3/
 py_modules/urllib3-*.dist-info/
 py_modules/watchdog/
 py_modules/watchdog-*.dist-info/
+py_modules/psutil/
+py_modules/psutil-*.dist-info/
+# Resolved transitively rather than named in decky-build.sh's DEPS, so they
+# appear (and change) without anyone editing this file: qrcode pulls these.
+py_modules/png.py
+py_modules/pypng-*.dist-info/
+py_modules/typing_extensions.py
+py_modules/typing_extensions-*.dist-info/
+py_modules/*.libs/

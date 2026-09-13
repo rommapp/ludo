@@ -7,33 +7,86 @@ PLUGIN_NAME="ludo"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT_ZIP="${SCRIPT_DIR}/../${PLUGIN_NAME}.zip"
 
-echo "==> Refreshing Pillow for Python 3.11 (Decky Loader's Python)..."
-# Decky Loader is a PyInstaller AppImage running Python 3.11 — NOT the system Python.
-# Pillow's C extensions must match Python 3.11 or they silently fail to import.
-PILLOW_TMP=$(mktemp -d)
-pip download Pillow \
+# ── Vendored Python dependencies ─────────────────────────────────────────────
+# Decky Loader is a PyInstaller AppImage running Python 3.11 — NOT the system
+# Python — and it exposes none of these to plugins, so every one of them has to
+# ride along in py_modules/ (main.py puts that directory on sys.path).
+#
+# This used to refresh Pillow alone and take the rest on faith from whatever the
+# build machine happened to have lying around in py_modules/. Those directories
+# are gitignored, so a clean checkout — which is exactly what CI builds from —
+# had none of them: v1.0.0-beta.1 shipped with PIL and the backend and nothing
+# else. sync_core imports requests, psutil and watchdog at module scope, so the
+# whole engine failed to import on device and the plugin fell back to its
+# "sync_core not available" path. Vendoring them here, from a pinned list rather
+# than from the working tree, is what makes the zip reproducible.
+#
+# Binary wheels (Pillow, psutil, watchdog, charset_normalizer) must match
+# cp311/manylinux or they silently fail to import; --only-binary :all: with an
+# explicit --python-version is what pins that. Transitive deps are resolved
+# rather than listed by hand — qrcode's typing_extensions is the kind of thing
+# --no-deps drops and nobody notices until a QR code fails to draw.
+DEPS=(requests watchdog psutil qrcode Pillow)
+
+echo "==> Vendoring Python deps for Decky's Python 3.11: ${DEPS[*]}"
+WHEEL_TMP=$(mktemp -d)
+trap 'rm -rf "$WHEEL_TMP"' EXIT
+pip download "${DEPS[@]}" \
     --python-version 3.11 \
     --platform manylinux_2_28_x86_64 \
     --only-binary :all: \
-    -d "$PILLOW_TMP" \
+    -d "$WHEEL_TMP" \
     --quiet
-PILLOW_WHL=$(ls "$PILLOW_TMP"/[Pp]illow-*.whl 2>/dev/null | head -1)
-if [ -z "$PILLOW_WHL" ]; then
-    echo "ERROR: Failed to download Pillow wheel for Python 3.11" >&2
-    rm -rf "$PILLOW_TMP"
-    exit 1
-fi
-unzip -q "$PILLOW_WHL" -d "$PILLOW_TMP/extracted"
-rm -rf "${SCRIPT_DIR}/py_modules/PIL" \
-       "${SCRIPT_DIR}/py_modules/pillow.libs" \
-       "${SCRIPT_DIR}/py_modules/pillow-"*.dist-info
-cp -r "$PILLOW_TMP/extracted/PIL"          "${SCRIPT_DIR}/py_modules/PIL"
-cp -r "$PILLOW_TMP/extracted/pillow.libs"  "${SCRIPT_DIR}/py_modules/pillow.libs"
-# dist-info not strictly needed at runtime but keeps the directory consistent
-EXTRACTED_DISTINFO=$(ls -d "$PILLOW_TMP/extracted/pillow-"*.dist-info 2>/dev/null | head -1)
-[ -n "$EXTRACTED_DISTINFO" ] && cp -r "$EXTRACTED_DISTINFO" "${SCRIPT_DIR}/py_modules/"
-rm -rf "$PILLOW_TMP"
-echo "    Pillow $(ls "${SCRIPT_DIR}/py_modules/PIL/_imaging"*.so 2>/dev/null | grep -o 'cpython-[0-9]*') bundled OK"
+
+shopt -s nullglob
+WHEELS=("$WHEEL_TMP"/*.whl)
+[ ${#WHEELS[@]} -gt 0 ] || { echo "ERROR: pip downloaded no wheels" >&2; exit 1; }
+for whl in "${WHEELS[@]}"; do
+    # -o: later wheels never conflict, but re-running the build over an existing
+    # py_modules must overwrite rather than prompt.
+    unzip -q -o "$whl" -d "${SCRIPT_DIR}/py_modules" -x '*.dist-info/RECORD'
+    echo "    $(basename "$whl")"
+done
+shopt -u nullglob
+
+# Prove the vendored tree is complete before it is packaged. The pure-Python
+# packages are imported for real, which is what catches a missing transitive
+# dependency. The cp311 binary wheels can only be imported when the build
+# machine is itself on 3.11 (CI pins that deliberately); anywhere else they are
+# checked as files, since a 3.12 interpreter cannot load a cp311 .so at all.
+for d in PIL pillow.libs psutil; do
+    [ -e "${SCRIPT_DIR}/py_modules/$d" ] || {
+        echo "ERROR: py_modules/$d missing after vendoring" >&2; exit 1; }
+done
+PYTHONPATH="${SCRIPT_DIR}/py_modules" python3 - <<'PYCHECK'
+import sys
+missing = []
+mods = ["requests", "watchdog.observers", "qrcode"]
+if sys.version_info[:2] == (3, 11):
+    mods += ["PIL.Image", "psutil"]
+for mod in mods:
+    try:
+        __import__(mod)
+    except Exception as e:                      # noqa: BLE001 - report, don't raise
+        missing.append(f"{mod}: {e}")
+# Encoding something is the only proof qrcode arrived complete: qr_matrix()
+# swallows an ImportError and returns None, which would ship as a pairing screen
+# with no code on it rather than as a crash.
+try:
+    import qrcode
+    qr = qrcode.QRCode(box_size=1, border=0)
+    qr.add_data("https://example.com/pair/device?user_code=TEST1234")
+    qr.make(fit=True)
+    assert qr.get_matrix()
+except Exception as e:                          # noqa: BLE001
+    missing.append(f"qrcode encode: {e}")
+if missing:
+    print("ERROR: vendored py_modules is incomplete:", file=sys.stderr)
+    for m in missing:
+        print(f"  - {m}", file=sys.stderr)
+    sys.exit(1)
+print("    vendored deps import OK")
+PYCHECK
 
 echo "==> Building frontend..."
 cd "$SCRIPT_DIR"

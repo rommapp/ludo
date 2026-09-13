@@ -51,6 +51,11 @@ jobs:
         with: { node-version: '22' }
       - uses: pnpm/action-setup@v6
         with: { version: 10 }
+      # Decky Loader runs Python 3.11, and decky-build.sh vendors cp311 wheels
+      # into py_modules/. Matching the runner to it lets the build's own check
+      # import those wheels rather than just look for the files.
+      - uses: actions/setup-python@v6
+        with: { python-version: '3.11' }
       - name: Build plugin
         working-directory: decky_plugin
         run: |
