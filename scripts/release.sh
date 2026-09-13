@@ -91,15 +91,15 @@ preflight strict
 # not the newest by date. A version that does not exceed what is already
 # published would be published successfully and then be invisible forever.
 #
-# Ranking uses main.py's own _version_key rather than `sort -V`, which disagrees
+# Ranking uses the shipping _version_key rather than `sort -V`, which disagrees
 # with semver on pre-releases (it ranks 1.0.0-beta.8 above 1.0.0). Borrowing the
 # shipping comparator means this check and the updater can never disagree.
 if TAGS="$(gh release list --limit 100 --json tagName -q '.[].tagName' 2>/dev/null)" \
    && [ -n "$TAGS" ]; then
   VERSION="$VERSION" TAGS="$TAGS" python3 - <<'PY' || exit 1
 import os, sys
-sys.path.insert(0, 'decky_plugin')
-from main import _version_key
+sys.path[:0] = ['app', 'engine']
+from ludo_app.backend import _version_key
 
 version = os.environ['VERSION']
 tags = [t.lstrip('v') for t in os.environ['TAGS'].split() if t.strip()]

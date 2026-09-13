@@ -461,6 +461,21 @@ def _release_asset(rel, suffix):
                  if (a.get('name') or '').endswith(suffix)), None)
 
 
+def _api_headers():
+    """Accept header, plus auth only when a token is in the environment.
+
+    Shipped installs never set one, so end users keep making anonymous reads.
+    It exists for CI and for `scripts/verify-release.sh`, which have to resolve
+    releases on a private repo — GitHub answers an unauthenticated read there
+    with 404, which is indistinguishable from "nothing published".
+    """
+    headers = {'Accept': 'application/vnd.github+json'}
+    token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    return headers
+
+
 def _iter_releases(max_pages=5, per_page=100):
     """Yield non-draft releases, newest pages first.
 
@@ -470,7 +485,7 @@ def _iter_releases(max_pages=5, per_page=100):
     history of the repo.
     """
     import requests
-    headers = {'Accept': 'application/vnd.github+json'}
+    headers = _api_headers()
     for page in range(1, max_pages + 1):
         resp = requests.get(f"{GITHUB_API}/releases", headers=headers,
                             params={'per_page': per_page, 'page': page}, timeout=15)
@@ -509,8 +524,7 @@ def select_release(channel: str, asset_suffix: str):
         # Fast path: GitHub's "latest" is correct whenever it carries the asset.
         try:
             resp = requests.get(f"{GITHUB_API}/releases/latest",
-                                headers={'Accept': 'application/vnd.github+json'},
-                                timeout=15)
+                                headers=_api_headers(), timeout=15)
             resp.raise_for_status()
             rel = resp.json()
             if _release_asset(rel, asset_suffix):

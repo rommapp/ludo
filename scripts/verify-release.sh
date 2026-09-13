@@ -15,13 +15,24 @@ cd "$ROOT"
 VERSION="${1:-$(node -p "require('./desktop/package.json').version")}"
 VERSION="${VERSION#v}"
 
+# On a private repo an unauthenticated read returns 404, which the updater
+# cannot tell apart from "nothing published". Borrow gh's token when there is
+# one so this script works the way CI does; the app itself never sets these.
+if [ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+  GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+  export GH_TOKEN
+fi
+
 # Import the shipping module rather than reimplementing its selection rules,
 # so this tests the code users actually run.
 VERSION="$VERSION" python3 - <<'PY'
 import os, sys, logging
 logging.basicConfig(level=logging.WARNING)
-sys.path.insert(0, 'decky_plugin')
-import main
+# The updater lives in the shared backend; the Decky entry point is only a
+# bootstrap shim. Both dirs go on the path so ludo_app can import the engine
+# without an install step.
+sys.path[:0] = ['app', 'engine']
+from ludo_app import backend
 
 version = os.environ['VERSION']
 channel = 'beta' if '-' in version else 'stable'
@@ -29,12 +40,12 @@ print(f'checking v{version} on the {channel} channel\n')
 
 failures = []
 for suffix in ('-decky.zip', '-x86_64.AppImage'):
-    rel = main.select_release(channel, suffix)
+    rel = backend.select_release(channel, suffix)
     if not rel:
         failures.append(f'{suffix}: updater resolves no release at all')
         print(f'FAIL {suffix}: no release carries this asset')
         continue
-    asset = main._release_asset(rel, suffix)
+    asset = backend._release_asset(rel, suffix)
     tag = rel['tag_name'].lstrip('v')
     status = 'OK  ' if tag == version else 'FAIL'
     print(f'{status} {suffix} -> v{tag} / {asset["name"]} '
