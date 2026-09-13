@@ -777,6 +777,25 @@ class LudoBackend:
     # Internal sync management
     # -----------------------------------------------------------------------
 
+    def _require_settings(self):
+        """Return the settings manager, building it if _start_sync hasn't yet.
+
+        The pairing routes run in the setup wizard, which can reach the backend
+        before the sync managers exist — and _start_sync() returns early (leaving
+        _settings None) whenever sync_core failed to import or a retry thread is
+        already up. Reading settings through here rather than the attribute is
+        what stopped QR pairing from failing with a bare "'NoneType' object has
+        no attribute 'get'" on the wizard's first step. Constructing one is
+        cheap and safe: SettingsManager shares one parser per file process-wide,
+        so this is the same object _start_sync would install.
+        """
+        if self._settings is None:
+            if not SYNC_CORE_AVAILABLE:
+                raise RuntimeError('The sync engine failed to load — '
+                                   'see the Ludo log for the import error.')
+            self._settings = SettingsManager()
+        return self._settings
+
     def _start_sync(self):
         if not SYNC_CORE_AVAILABLE:
             logging.error("sync_core not available, cannot start sync")
@@ -4866,7 +4885,7 @@ class LudoBackend:
         typing a username/password.
         """
         try:
-            url = (url or self._settings.get('RomM', 'url', '')).strip().rstrip('/')
+            url = (url or self._require_settings().get('RomM', 'url', '')).strip().rstrip('/')
             if not url:
                 return {'success': False, 'message': 'RomM URL is required'}
             if not code or not str(code).strip():
@@ -4888,9 +4907,10 @@ class LudoBackend:
         flow — because everything after "we hold a token" is identical.
         """
         try:
-            self._settings.set('RomM', 'url', url)
-            self._settings.set('RomM', 'client_token', token)
-            self._settings.set('RomM', 'auto_connect', 'true')
+            settings = self._require_settings()
+            settings.set('RomM', 'url', url)
+            settings.set('RomM', 'client_token', token)
+            settings.set('RomM', 'auto_connect', 'true')
             # Clear the onboarding flag so get_config() reports configured — pairing
             # is a complete setup path (save_config does the same for password auth).
             ds = load_decky_settings()
@@ -4944,16 +4964,17 @@ class LudoBackend:
         fallback for anyone without a phone handy.
         """
         try:
-            url = (url or self._settings.get('RomM', 'url', '')).strip().rstrip('/')
+            settings = self._require_settings()
+            url = (url or settings.get('RomM', 'url', '')).strip().rstrip('/')
             if not url:
                 return {'success': False, 'message': 'RomM URL is required'}
 
             import socket as _socket
-            name = (self._settings.get('Device', 'device_name', '')
+            name = (settings.get('Device', 'device_name', '')
                     or _socket.gethostname())
             # Reuse the stored device_id when we have one so re-pairing updates
             # the same RomM device rather than littering the user's device list.
-            ident = (self._settings.get('Device', 'device_id', '')
+            ident = (settings.get('Device', 'device_id', '')
                      or f"ludo-{hashlib.sha256(name.encode()).hexdigest()[:24]}")
 
             loop = asyncio.get_event_loop()
@@ -4961,7 +4982,7 @@ class LudoBackend:
                 None,
                 lambda: RomMClient(url).device_auth_init(
                     ident, name,
-                    platform=self._settings.get('Device', 'device_platform', 'SteamOS'),
+                    platform=settings.get('Device', 'device_platform', 'SteamOS'),
                     client_version=self._host.version,
                 ),
             )
