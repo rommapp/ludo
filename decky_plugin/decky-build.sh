@@ -31,9 +31,17 @@ DEPS=(requests watchdog psutil qrcode Pillow)
 echo "==> Vendoring Python deps for Decky's Python 3.11: ${DEPS[*]}"
 WHEEL_TMP=$(mktemp -d)
 trap 'rm -rf "$WHEEL_TMP"' EXIT
+# --platform matches wheel tags literally: it does not imply the older
+# manylinux tags the way a real installer's compatibility check does. Pillow
+# publishes manylinux_2_28, watchdog only manylinux2014, psutil a compound tag
+# carrying manylinux2014 — so all three spellings have to be offered or the
+# resolver reports the package as simply not existing. Pure-Python wheels
+# (py3-none-any) match regardless.
 pip download "${DEPS[@]}" \
     --python-version 3.11 \
     --platform manylinux_2_28_x86_64 \
+    --platform manylinux_2_17_x86_64 \
+    --platform manylinux2014_x86_64 \
     --only-binary :all: \
     -d "$WHEEL_TMP" \
     --quiet
