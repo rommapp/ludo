@@ -18,7 +18,7 @@ cd "$ROOT"
 
 DECKY_PKG="decky_plugin/package.json"
 DESK_PKG="desktop/package.json"
-RELEASE_BRANCH="${RELEASE_BRANCH:-main}"
+RELEASE_BRANCH="${RELEASE_BRANCH:-dev}"
 
 die() { echo "error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }

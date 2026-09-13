@@ -27,7 +27,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with: { ref: '${{ inputs.tag || github.ref }}' }
       - id: v
         run: |
@@ -45,11 +45,11 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with: { ref: '${{ inputs.tag || github.ref }}' }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with: { node-version: '22' }
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with: { version: 10 }
       - name: Build plugin
         working-directory: decky_plugin
@@ -61,7 +61,7 @@ jobs:
       # updater looks for.
       - name: Name the asset
         run: mv ludo.zip "Ludo-v${{ needs.version.outputs.version }}${{ env.DECKY_SUFFIX }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: decky
           path: Ludo-v*${{ env.DECKY_SUFFIX }}
@@ -71,9 +71,9 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with: { ref: '${{ inputs.tag || github.ref }}' }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with: { node-version: '22' }
       - name: Build AppImage
         working-directory: desktop
@@ -82,7 +82,7 @@ jobs:
         run: |
           npm ci
           npm run dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: desktop
           path: desktop/release/Ludo-v*${{ env.DESKTOP_SUFFIX }}
@@ -92,7 +92,7 @@ jobs:
     needs: [version, decky, desktop]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { path: dist, merge-multiple: true }
 
       # Both assets must be present and non-trivial before anything is
@@ -129,9 +129,9 @@ jobs:
     needs: [version, release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with: { ref: '${{ inputs.tag || github.ref }}' }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with: { python-version: '3.11' }
       - name: Resolve both assets through select_release
         env:
