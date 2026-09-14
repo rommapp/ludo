@@ -159,6 +159,7 @@ benchmark_file = CONFIG_DIR / 'fetch_benchmark.json'
 # environment can't change under a running plugin.
 DEBUG_MODE = os.environ.get('LUDO_DEBUG', '') == '1'
 
+
 # Partial-fetch checkpoint. A full library fetch is ~6 minutes at 80k ROMs, and
 # anything that interrupts it — suspend, a network blip, a Decky reload — used to
 # throw away every page already paid for. Pages are appended here as they arrive
@@ -5571,12 +5572,40 @@ class LudoBackend:
                  for k in ('slug', 'fs_slug')} - {''}
         return bool(names & disabled)
 
-    def _platform_sync_off(self, game: dict) -> bool:
-        """Is this library entry's platform switched off?"""
-        disabled = self._disabled_platforms()
+    def _platform_sync_off(self, game: dict, disabled: set = None) -> bool:
+        """Is this entry's platform switched off?
+
+        Takes either a library entry or a raw /api/roms row — both key the
+        platform as `platform_slug`. Pass `disabled` when calling in a loop so
+        the settings file isn't re-read per game.
+        """
+        if disabled is None:
+            disabled = self._disabled_platforms()
         if not disabled:
             return False
-        return str(game.get('platform_slug') or '').strip().lower() in disabled
+        slug = (game.get('platform_slug')
+                or (game.get('romm_data') or {}).get('platform_slug') or '')
+        return str(slug).strip().lower() in disabled
+
+    def _visible_games(self, games=None) -> list:
+        """The library entries the UI is allowed to paint.
+
+        Switching a platform off hides its content everywhere the library is
+        browsed: Home's counts and rows (Continue playing, Recently Downloaded,
+        Recently added), the platform and collection views, and search.
+
+        Hidden, not forgotten. Downloaded games on a switched-off platform stay
+        in `_available_games` (see _preserve_disabled_platform_games) so their
+        files are still accounted for — the Stats page and "delete my games"
+        read the unfiltered list — and flipping the switch back on repaints
+        them immediately, with no refetch.
+        """
+        src = self._available_games if games is None else games
+        disabled = self._disabled_platforms()
+        if not disabled:
+            return list(src or [])
+        return [g for g in (src or [])
+                if not self._platform_sync_off(g, disabled)]
 
     def _preserve_disabled_platform_games(self, new_games: list) -> int:
         """Carry downloaded games on switched-off platforms across a full walk.
@@ -6734,7 +6763,9 @@ class LudoBackend:
             # to them — platforms with nothing downloaded drop out entirely.
             offline = self._is_offline()
             agg = {}
-            for g in (self._available_games or []):
+            # Switched-off platforms drop out of the index entirely — the whole
+            # point of the switch is that their content stops showing up.
+            for g in self._visible_games():
                 if offline and not g.get('is_downloaded'):
                     continue
                 label = self._platform_name_for(g)
@@ -6807,8 +6838,14 @@ class LudoBackend:
                 idx = self._games_index()
                 download_dir = Path(self._settings.get('Download', 'rom_directory',
                                                        _default_roms_dir())).expanduser()
+                # A collection spans platforms, so it is the one view where a
+                # switched-off platform can slip back in through the server's
+                # rows. Same rule as everywhere else.
+                disabled = self._disabled_platforms()
                 games = []
                 for r in roms:
+                    if self._platform_sync_off(r, disabled):
+                        continue
                     rid = r.get('id')
                     local = idx.get(rid)
                     is_downloaded = bool(local and local.get('is_downloaded'))
@@ -6857,7 +6894,7 @@ class LudoBackend:
             # platform
             offline = self._is_offline()
             games = []
-            for g in (self._available_games or []):
+            for g in self._visible_games():
                 if self._platform_name_for(g) != key:
                     continue
                 if offline and not g.get('is_downloaded'):
@@ -6885,7 +6922,7 @@ class LudoBackend:
             # (downloaded-only while offline).
             try:
                 out = []
-                for g in (self._available_games or []):
+                for g in self._visible_games():
                     if offline and not g.get('is_downloaded'):
                         continue
                     sg = self._serialize_game(g)
@@ -6916,9 +6953,13 @@ class LudoBackend:
                 roms = self._romm_client._group_sibling_roms(roms)
                 idx = self._games_index()
                 parents = self._variant_parent_index()
+                # The server searches the whole library, switches and all.
+                disabled = self._disabled_platforms()
                 out = []
                 seen = set()
                 for r in roms:
+                    if self._platform_sync_off(r, disabled):
+                        continue
                     rid = r.get('id')
                     pid = parents.get(rid)
                     if pid and pid != rid and pid in idx:
@@ -6973,7 +7014,7 @@ class LudoBackend:
             # shows only downloaded games, matching the rest of the library.
             ql = q.lower()
             out = []
-            for g in (self._available_games or []):
+            for g in self._visible_games():
                 if offline and not g.get('is_downloaded'):
                     continue
                 if ql in (g.get('name') or '').lower():
@@ -8617,11 +8658,18 @@ class LudoBackend:
             return None
 
         idx = self._games_index()
+        # This row comes from the server, which knows nothing about the local
+        # platform switches — filter its rows the way the local rows are
+        # filtered, or a switched-off platform reappears the moment it's played
+        # on another device.
+        disabled = self._disabled_platforms()
         out = []
         for rom in items:
             # Only games actually played carry a last_played timestamp; the
             # ordering pushes null-played roms to the tail, so stop at the first.
             if not (rom.get('rom_user') or {}).get('last_played'):
+                continue
+            if self._platform_sync_off(rom, disabled):
                 continue
             rid = rom.get('id')
             local = idx.get(rid)
@@ -8653,7 +8701,9 @@ class LudoBackend:
         continue-playing is pulled live from RomM (per-user, cross-device).
         """
         try:
-            games = self._available_games or []
+            # Switched-off platforms are hidden from every Home row, and from
+            # the counts above them so the two agree.
+            games = self._visible_games()
             # ROM count rather than collapsed-entry count, so the Home widget
             # and the Stats page agree with RomM. See _variant_count.
             total = sum(_variant_count(g) for g in games)

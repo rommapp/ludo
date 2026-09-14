@@ -263,6 +263,9 @@ export function usePlatformSync() {
   // platforms back on should cost one walk, not three — and re-fetching under
   // someone who is still flipping switches is the worst possible timing.
   const needsRefresh = useRef(false);
+  // Any flip at all changes what the library is allowed to show, even the ones
+  // that need no fetch — switching a platform off hides its games everywhere.
+  const viewDirty = useRef(false);
 
   const load = async () => {
     // Set on every call, not just the first: the wizard re-runs this once the
@@ -314,6 +317,7 @@ export function usePlatformSync() {
       const r = await setPlatformSync([...next]);
       if (r?.success === false) throw new Error(r.message || 'failed');
       if (r?.needs_refresh) needsRefresh.current = true;
+      viewDirty.current = true;
     } catch {
       // Undo THIS slug only, against whatever the current intent is. Restoring
       // the snapshot taken before this write would also wipe out any toggle the
@@ -328,8 +332,15 @@ export function usePlatformSync() {
   };
 
   useEffect(() => () => {
-    if (!needsRefresh.current) return;
+    if (!needsRefresh.current) {
+      // Nothing to fetch, but the cached rows on Home and in the library still
+      // hold games the user just switched off. Repaint from the backend, which
+      // now filters them out.
+      if (viewDirty.current) { viewDirty.current = false; _broadcastLibRefresh(); }
+      return;
+    }
     needsRefresh.current = false;
+    viewDirty.current = false;
     try {
       refreshFromRomm(false)
         .then(() => _broadcastLibRefresh())
