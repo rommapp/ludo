@@ -8192,7 +8192,7 @@ class RetroArchInterface:
         return [executable] + args
 
     def build_launch_command(self, rom_path, platform_name=None, core_name=None,
-                             entry_slot=None, platform_slug=None):
+                             entry_slot=None, platform_slug=None, regions=None):
         """Resolve the exact emulator argv for a ROM, without launching it.
 
         Returns (cmd_list, error). On success error is None. Shared by both the
@@ -8303,7 +8303,7 @@ class RetroArchInterface:
         # It also shares one memory card between every PS2 game by default,
         # which no save sync can attribute; see _ensure_ps2_memcards.
         try:
-            self._ensure_ps2_bios(rom_path, core_path)
+            self._ensure_ps2_bios(rom_path, core_path, regions)
             self._ensure_ps2_memcards(rom_path, core_path)
         except Exception as e:
             print(f"⚠️  PS2 launch setup skipped: {e}")
@@ -8335,7 +8335,7 @@ class RetroArchInterface:
         'japan': 'J', 'korea': 'J', 'asia': 'H',
     }
 
-    def _ensure_ps2_bios(self, rom_path, core_path):
+    def _ensure_ps2_bios(self, rom_path, core_path, regions=None):
         """Point lrps2 at a BIOS whose region matches the disc.
 
         lrps2 has no region locking ONLY when its Fast Boot option is on. With
@@ -8358,7 +8358,7 @@ class RetroArchInterface:
         """
         if 'pcsx2' not in Path(core_path).name.lower():
             return
-        want = self._ps2_disc_region(rom_path)
+        want = self._ps2_disc_region(rom_path, regions)
         if not want:
             return
         bios = self._pick_ps2_bios(want)
@@ -8415,19 +8415,26 @@ class RetroArchInterface:
             return None
         return Path(cfg_dir) / 'config' / 'LRPS2' / f"{Path(rom_path).stem}.opt"
 
-    def _ps2_disc_region(self, rom_path):
+    def _ps2_disc_region(self, rom_path, regions=None):
         """The region letter a PS2 disc needs ('A'/'E'/'J'/'H'), or ''.
 
-        The disc's own boot serial is the authority: SYSTEM.CNF names the ELF
-        the console runs ("BOOT2 = cdrom0:\\SCUS_974.90;1") and Sony's prefix
-        encodes the territory. title_ids already reads it — through Sigil where
-        that answers, and its own ISO 9660 reader otherwise — so this asks
-        rather than parsing the disc a third time.
+        Three sources, most authoritative first:
 
-        The filename tag is only a fallback, for images title_ids declines
-        (a PS2 .chd today). It is a scene convention rather than something the
-        console reads, so a mislabelled file would pick a BIOS the disc rejects
-        — which is still no worse than the alphabetical guess it replaces.
+        1. The disc's own boot serial. SYSTEM.CNF names the ELF the console
+           runs ("BOOT2 = cdrom0:\\SCUS_974.90;1") and Sony's prefix encodes the
+           territory, so this is what the BIOS itself checks. title_ids already
+           reads it, through Sigil where that answers and its own ISO 9660
+           reader otherwise — but only for an uncompressed image.
+        2. RomM's own `regions` for the ROM. This is the answer for a .chd:
+           the bundled Sigil is 0.1.0-dev, which carries no CHD support at all
+           (no decompressors, no container magic), and decoding CHD here would
+           mean implementing its v5 hunk map — a Huffman-coded format — to
+           recover one letter. The server already identified the dump against a
+           DAT, which is better evidence than anything we could parse.
+        3. The filename tag, last. It is a scene convention rather than
+           something either the console or the server reads, so it is only
+           better than guessing — which is what the alternative, lrps2 picking
+           alphabetically, amounts to.
         """
         try:
             from . import title_ids
@@ -8438,6 +8445,12 @@ class RetroArchInterface:
             region = self.PS2_SERIAL_REGIONS.get(serial[:4].upper())
             if region:
                 return region
+
+        for tag in (regions or []):
+            region = self.PS2_TAG_REGIONS.get(str(tag).strip().lower())
+            if region:
+                return region
+
         name = Path(rom_path).name.lower()
         for tag, region in self.PS2_TAG_REGIONS.items():
             if f'({tag})' in name or f'({tag},' in name:

@@ -9838,7 +9838,11 @@ class LudoBackend:
             entry_slot = self._resume_entry_slot(g, core) if resume else None
             cmd, err = self._retroarch.build_launch_command(
                 Path(launch_path), platform_name, entry_slot=entry_slot,
-                platform_slug=self._platform_slug_for(g))
+                platform_slug=self._platform_slug_for(g),
+                # RomM identified this dump against a DAT, so its regions beat
+                # anything readable from a compressed image; see
+                # _ps2_disc_region, which needs it for a .chd.
+                regions=g.get('regions'))
             if err or not cmd:
                 return {'success': False, 'steam_host': False,
                         'message': err or 'Could not resolve launch command'}

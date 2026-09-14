@@ -25,6 +25,7 @@ memory card between every PS2 game, and keeps those cards three directories
 below the save root where the save scanner never looked.
 """
 
+import struct
 import sys
 import tempfile
 import threading
@@ -81,6 +82,56 @@ class FakeBios:
         # Mirrors the real method: success when SOME file arrived, which is
         # why readiness must come from a re-check rather than this flag.
         return True
+
+
+def _both32(v):
+    return struct.pack('<I', v) + struct.pack('>I', v)
+
+
+def _both16(v):
+    return struct.pack('<H', v) + struct.pack('>H', v)
+
+
+def _dir_record(name, lba, size, is_dir=False):
+    nm = name.encode()
+    rec = bytearray(33 + len(nm))
+    rec[2:10] = _both32(lba)
+    rec[10:18] = _both32(size)
+    rec[25] = 0x02 if is_dir else 0
+    rec[28:32] = _both16(1)
+    rec[32] = len(nm)
+    rec[33:] = nm
+    if len(rec) % 2:
+        rec += b'\x00'
+    rec[0] = len(rec)
+    return bytes(rec)
+
+
+def make_ps2_iso(serial):
+    """A minimal ISO 9660 image carrying a PS2 SYSTEM.CNF.
+
+    Small enough to build in a test, real enough that the production reader
+    parses it: PVD at sector 16, a root directory, and the SYSTEM.CNF whose
+    BOOT2 line names the boot ELF — which is where the region actually comes
+    from.
+    """
+    sector, root_lba, cnf_lba = 2048, 18, 19
+    cnf = f"BOOT2 = cdrom0:\\{serial};1\nVER = 1.01\nVMODE = NTSC\n".encode()
+    root = (_dir_record("\x00", root_lba, sector, True)
+            + _dir_record("\x01", root_lba, sector, True)
+            + _dir_record("SYSTEM.CNF;1", cnf_lba, len(cnf)))
+    pvd = bytearray(sector)
+    pvd[0] = 1
+    pvd[1:6] = b'CD001'
+    pvd[6] = 1
+    pvd[80:88] = _both32(20)
+    pvd[128:132] = _both16(sector)
+    pvd[156:190] = _dir_record("\x00", root_lba, sector, True)[:34]
+    out = bytearray(sector * 20)
+    out[16 * sector:17 * sector] = pvd
+    out[root_lba * sector:root_lba * sector + len(root)] = root
+    out[cnf_lba * sector:cnf_lba * sector + len(cnf)] = cnf
+    return bytes(out)
 
 
 def make_tracker(fake):
@@ -374,6 +425,43 @@ def main():
     check('a small save keeps the short delay', auto._settle_delay(real), 3)
     check('an unreadable path falls back to the default',
           auto._settle_delay(blanks / 'gone.srm'), 3)
+
+    print("\nregion falls back to RomM metadata when the disc cannot be read")
+    # A .chd: the bundled Sigil has no CHD support, so no serial is readable
+    # and an untagged filename says nothing either.
+    chd = Path(tempfile.mkdtemp()) / 'Some PS2 Game.chd'
+    chd.write_bytes(b'MComprHDR' + b'\x00' * 64)
+    check('no source at all -> no guess', ra._ps2_disc_region(chd), '')
+    check('RomM regions answer for a chd',
+          ra._ps2_disc_region(chd, ['USA']), 'A')
+    check('Japan maps to the NTSC-J console',
+          ra._ps2_disc_region(chd, ['Japan']), 'J')
+    check('an unrecognised region is skipped, not guessed',
+          ra._ps2_disc_region(chd, ['Freedonia']), '')
+    check('the first recognised region wins',
+          ra._ps2_disc_region(chd, ['Freedonia', 'Europe']), 'E')
+
+    # A disc whose serial IS readable: the serial outranks everything, because
+    # it is what the console's own BIOS checks.
+    discs = Path(tempfile.mkdtemp())
+    ntsc_u = discs / 'Disc (Europe).iso'      # deliberately mislabelled
+    ntsc_u.write_bytes(make_ps2_iso('SCUS_974.90'))
+    check('SCUS serial reads as America', ra._ps2_disc_region(ntsc_u), 'A')
+    check('the serial beats RomM metadata',
+          ra._ps2_disc_region(ntsc_u, ['Europe']), 'A')
+    check('the serial beats a wrong filename tag',
+          ra._ps2_disc_region(ntsc_u, None), 'A')
+    pal = discs / 'Disc2.iso'
+    pal.write_bytes(make_ps2_iso('SLES_123.45'))
+    check('SLES serial reads as Europe', ra._ps2_disc_region(pal), 'E')
+    jp = discs / 'Disc3.iso'
+    jp.write_bytes(make_ps2_iso('SLPS_250.88'))
+    check('SLPS serial reads as Japan', ra._ps2_disc_region(jp), 'J')
+    # And the filename tag stays the last resort.
+    tagged = chd.with_name('Other Game (Europe).chd')
+    tagged.write_bytes(b'MComprHDR')
+    check('filename tag when there is nothing better',
+          ra._ps2_disc_region(tagged), 'E')
 
     print()
     if FAILURES:
