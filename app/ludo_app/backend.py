@@ -8940,8 +8940,8 @@ class LudoBackend:
             # mark their BIOS optional and are correctly never flagged.
             bios = self._bios_gap(g, platform_name)
             if bios:
-                logging.info(f"{platform_name} core '{bios['core']}' is missing "
-                             f"required BIOS: {bios['missing_bios']}")
+                logging.info(f"{platform_name} core '{self.core_label(bios['core'])}' "
+                             f"is missing required BIOS: {bios['missing_bios']}")
                 bios, bios_fetched = await self._close_bios_gap(g, platform_name, bios)
             else:
                 bios_fetched = []
@@ -8990,6 +8990,15 @@ class LudoBackend:
         return (game.get('platform_slug')
                 or (game.get('romm_data') or {}).get('platform_slug') or '')
 
+    def _core_labels_for(self, cores) -> dict:
+        """{core: display name} for the cores whose .info we can read."""
+        out = {}
+        for c in cores:
+            label = self._core_display_name(c)
+            if label:
+                out[c] = label
+        return out
+
     def _core_gap(self, game: dict, platform_name: str) -> dict:
         """{needs_core, platform_name, platform_slug, candidates, installed_cores}
         when this platform resolves to no core, else {}."""
@@ -9016,6 +9025,11 @@ class LudoBackend:
                 # can be passed straight to download_core().
                 'candidates': info.get('download_candidates') or [],
                 'installed_cores': sorted(ra.get_available_cores().keys()),
+                # {buildbot name: the name RetroArch shows}, so the picker can
+                # offer "LRPS2" rather than the "pcsx2" no RetroArch UI says.
+                'core_labels': self._core_labels_for(
+                    (info.get('download_candidates') or [])
+                    + sorted(ra.get_available_cores().keys())),
                 'can_download': bool(support.get('available')),
                 'download_reason': support.get('reason') or '',
             }
@@ -9026,6 +9040,7 @@ class LudoBackend:
     # Cached {core_name: [(path, desc), ...]} of REQUIRED firmware, parsed from
     # libretro .info files. Empty list = that core needs no BIOS.
     _core_firmware_cache: dict = None
+    _core_label_cache: dict = None
     # {slug: {name, platform_id, files}} from one /api/platforms call.
     _server_firmware_cache: dict = None
     # True when the last _server_firmware call couldn't reach the server at all,
@@ -9103,6 +9118,55 @@ class LudoBackend:
                 if c.is_dir():
                     out.append(c)
         return out
+
+    def _core_display_name(self, core_name: str) -> str:
+        """The name RetroArch shows for a core, or '' if it cannot be read.
+
+        The buildbot filename and the name a user sees are not the same string,
+        and for some cores they share no characters at all: `pcsx2_libretro.so`
+        is "LRPS2" everywhere in RetroArch's own UI, and `mednafen_psx` is
+        "Beetle PSX". Naming the file at someone hunting through a core list
+        sends them looking for something that is not there.
+
+        Read from the .info file rather than a table of our own, which would go
+        stale the first time a core was renamed upstream. `display_name` is
+        "Platform (Core)" by convention, and the parenthetical is the core's own
+        name; anything else is returned whole.
+        """
+        if self._core_label_cache is None:
+            self._core_label_cache = {}
+        if core_name in self._core_label_cache:
+            return self._core_label_cache[core_name]
+        label = ''
+        name = f'{core_name}_libretro.info'
+        try:
+            text = ''
+            f = next((d / name for d in self._info_dirs() if (d / name).is_file()), None)
+            if f:
+                text = f.read_text(encoding='utf-8', errors='replace')
+            else:
+                bundle = _paths.cache_dir() / 'libretro_info.zip'
+                if bundle.exists():
+                    import zipfile
+                    with zipfile.ZipFile(bundle) as z:
+                        member = next((m for m in z.namelist()
+                                       if m.rsplit('/', 1)[-1] == name), None)
+                        if member:
+                            text = z.read(member).decode('utf-8', 'replace')
+            for line in text.splitlines():
+                if line.strip().startswith('display_name'):
+                    value = line.split('=', 1)[1].strip().strip('"')
+                    match = re.search(r'\(([^()]+)\)\s*$', value)
+                    label = (match.group(1) if match else value).strip()
+                    break
+        except Exception as e:
+            logging.debug(f"could not read the display name for {core_name}: {e}")
+        self._core_label_cache[core_name] = label
+        return label
+
+    def core_label(self, core_name: str) -> str:
+        """`_core_display_name`, falling back to the core's own filename."""
+        return self._core_display_name(core_name) or core_name
 
     def _required_firmware_for_core(self, core_name: str):
         """Required firmware for an installed core, or [] if none/unknown.
@@ -9767,8 +9831,8 @@ class LudoBackend:
             bios = self._bios_gap(g, platform_name)
             bios_fetched = []
             if bios:
-                logging.info(f"{platform_name} core '{bios['core']}' is missing "
-                             f"required BIOS: {bios['missing_bios']}")
+                logging.info(f"{platform_name} core '{self.core_label(bios['core'])}' "
+                             f"is missing required BIOS: {bios['missing_bios']}")
                 bios, bios_fetched = await self._close_bios_gap(g, platform_name, bios)
             core = await self._pre_launch_sync(g, launch_path)
             entry_slot = self._resume_entry_slot(g, core) if resume else None

@@ -488,94 +488,71 @@ class BiosManager:
         return status
     
     def download_bios_from_romm(self, platform_name, bios_filename):
-            """Download a specific BIOS file from RomM's firmware API"""
-            if not self.romm_client or not self.romm_client.authenticated:
-                self.log("❌ Not connected to RomM")
-                return False
-            
-            if not self.system_dir:
-                self.log("❌ No system directory found")
-                return False
-            
-            try:
-                from urllib.parse import urljoin
+        """Download a specific BIOS file from RomM's firmware API"""
+        if not self.romm_client or not self.romm_client.authenticated:
+            self.log("❌ Not connected to RomM")
+            return False
 
-                platforms = self._fetch_platforms()
-                if platforms is None:
-                    self.log("❌ Failed to get platforms list from RomM.")
-                    return False
+        if not self.system_dir:
+            self.log("❌ No system directory found")
+            return False
 
-                platform_mappings = {
-                    'Sony - PlayStation': ['PlayStation', 'Sony PlayStation', 'PS1', 'PSX'],
-                    'Sony - PlayStation 2': ['PlayStation 2', 'Sony PlayStation 2', 'PS2'],
-                    'Nintendo - Game Boy Advance': ['Game Boy Advance', 'GBA', 'Nintendo Game Boy Advance'],
-                    'Nintendo - Game Boy': ['Game Boy', 'GB', 'Nintendo Game Boy'],
-                    'Nintendo - Game Boy Color': ['Game Boy Color', 'GBC', 'Nintendo Game Boy Color'],
-                    'Nintendo - Nintendo DS': ['Nintendo DS', 'DS', 'NDS'],
-                    'Nintendo - Nintendo 3DS': ['Nintendo 3DS', '3DS', 'N3DS'],
-                    'Sega - Saturn': ['Sega Saturn', 'Saturn', 'SS'],
-                    'Sega - Dreamcast': ['Sega Dreamcast', 'Dreamcast', 'DC'],
-                    'Sega - Mega-CD - Sega CD': ['Sega CD', 'Mega CD', 'Mega-CD'],
-                    'SNK - Neo Geo': ['Neo Geo', 'NeoGeo', 'Neo-Geo'],
-                    'NEC - PC Engine - TurboGrafx 16': ['PC Engine', 'TurboGrafx', 'TurboGrafx-16', 'TG-16', 'PCE'],
-                    'Atari - 7800': ['Atari 7800', '7800'],
-                    'Atari - Lynx': ['Atari Lynx', 'Lynx']
-                }
-                
-                possible_names = platform_mappings.get(platform_name, [platform_name])
-                
-                for platform in platforms:
-                    platform_name_check = platform.get('name', '')
-                    
-                    if any(name.lower() in platform_name_check.lower() or 
-                        platform_name_check.lower() in name.lower() 
-                        for name in possible_names):
-                        
-                        logging.debug(f"[BIOS] Found platform: {platform_name_check}")
-                        firmware_list = platform.get('firmware', [])
+        try:
+            from urllib.parse import urljoin
 
-                        for firmware in firmware_list:
-                            if firmware.get('file_name') == bios_filename:
-                                firmware_id = firmware.get('id')
-                                logging.debug(f"[BIOS] Found BIOS: {bios_filename} (ID: {firmware_id})")
-
-                                # Construct the download URL using the firmware ID and filename
-                                download_url = f'/api/firmware/{firmware_id}/content/{bios_filename}'
-
-                                # STEP 1: Download the file from the constructed URL
-                                file_response = self.romm_client.session.get(
-                                    urljoin(self.romm_client.base_url, download_url),
-                                    stream=True,
-                                    timeout=60  # Increased timeout for larger files
-                                )
-
-                                # STEP 2: Check for a successful response and write the file
-                                if file_response.status_code == 200:
-                                    download_path = self.bios_target_path(
-                                        platform_name, bios_filename)
-
-                                    with open(download_path, 'wb') as f:
-                                        for chunk in file_response.iter_content(chunk_size=8192):
-                                            f.write(chunk)
-
-                                    logging.debug(f"[BIOS] Downloaded {bios_filename}")
-                                    return True
-                                else:
-                                    logging.warning(f"[BIOS] Download failed with status code: {file_response.status_code}")
-                                    return False
-                        
-                        self.log(f"❌ {bios_filename} not found in {platform_name_check} firmware list on server.")
-                        break # Stop searching after finding the correct platform
-                
+            # Resolve the platform through get_server_firmware_for_platform rather than
+            # matching names again here. This used to carry its own copy of the
+            # alias table and a bidirectional substring test, which resolved
+            # 'Sony - PlayStation 2' to the server's 'PlayStation' (PS1) —
+            # 'playstation' is a substring of 'playstation 2' — then failed to
+            # find the PS2 BIOS in PS1's firmware list and gave up without ever
+            # reaching the real platform. get_server_firmware_for_platform already tries
+            # exact matches before substrings for precisely this reason; one
+            # matcher means that fix cannot be missed here again.
+            firmware_list = self.get_server_firmware_for_platform(platform_name)
+            if not firmware_list:
                 self.log(f"❌ Platform matching '{platform_name}' not found on server.")
                 return False
-                
-            except Exception as e:
-                self.log(f"❌ Download error: {e}")
-                import traceback
-                self.log(traceback.format_exc()) # More detailed error for debugging
+
+            for firmware in firmware_list:
+                if firmware.get('file_name') != bios_filename:
+                    continue
+
+                firmware_id = firmware.get('id')
+                logging.debug(f"[BIOS] Found BIOS: {bios_filename} (ID: {firmware_id})")
+
+                # Construct the download URL using the firmware ID and filename
+                download_url = f'/api/firmware/{firmware_id}/content/{bios_filename}'
+
+                file_response = self.romm_client.session.get(
+                    urljoin(self.romm_client.base_url, download_url),
+                    stream=True,
+                    timeout=60  # Increased timeout for larger files
+                )
+
+                if file_response.status_code == 200:
+                    download_path = self.bios_target_path(
+                        platform_name, bios_filename)
+
+                    with open(download_path, 'wb') as f:
+                        for chunk in file_response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+
+                    logging.debug(f"[BIOS] Downloaded {bios_filename}")
+                    return True
+
+                logging.warning(f"[BIOS] Download failed with status code: {file_response.status_code}")
                 return False
-    
+
+            self.log(f"❌ {bios_filename} not found in the firmware list for '{platform_name}' on server.")
+            return False
+
+        except Exception as e:
+            self.log(f"❌ Download error: {e}")
+            import traceback
+            self.log(traceback.format_exc())  # More detailed error for debugging
+            return False
+
     @staticmethod
     def _is_keys_entry(entry):
         """True when a firmware record is a key file rather than firmware.

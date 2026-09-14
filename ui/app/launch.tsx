@@ -28,9 +28,16 @@ let _rommLastLaunchedRomId: number | null = null;
 /** The rom the last launch was for, for the post-session focus restore. */
 export function lastLaunchedRomId(): number | null { return _rommLastLaunchedRomId; }
 
-function coreLabel(name: string): string {
-  // Buildbot names are like 'mupen64plus_next' — readable enough once the
-  // separators are spaces, and the real identifier still shows underneath.
+// The name RetroArch itself shows for a core, when the backend could read it
+// out of the core's .info. Worth the lookup because the two names can share no
+// characters at all: 'pcsx2' is "LRPS2" in every RetroArch menu, so offering
+// the filename sends someone hunting for a core that is not in the list under
+// that name. The raw identifier still shows underneath either way.
+function coreLabel(name: string, labels?: Record<string, string>): string {
+  const known = labels?.[name];
+  if (known) return known;
+  // No .info to read (an uninstalled core with no cached bundle): buildbot
+  // names like 'mupen64plus_next' are readable enough with spaces.
   return name.replace(/_libretro$/, '').replace(/_/g, ' ');
 }
 
@@ -38,6 +45,7 @@ type CoreGap = {
   platform_name: string;
   platform_slug: string;
   candidates: string[];
+  core_labels?: Record<string, string>;
   installed_cores: string[];
   can_download: boolean;
   download_reason: string;
@@ -62,8 +70,8 @@ function CoreDeadEndActions({ closeModal }: { closeModal?: () => void }) {
 }
 
 // One installable core in the picker: name, what it is, and its state.
-function CoreOption({ core, recommended, busy, disabled, onSelect }:
-  { core: string; recommended?: boolean; busy?: boolean; disabled?: boolean; onSelect: () => void }) {
+function CoreOption({ core, label, recommended, busy, disabled, onSelect }:
+  { core: string; label?: string; recommended?: boolean; busy?: boolean; disabled?: boolean; onSelect: () => void }) {
   const [hot, setHot] = useState(false);
   return (
     <Focusable noFocusRing onActivate={() => !disabled && onSelect()} onClick={() => !disabled && onSelect()}
@@ -81,8 +89,14 @@ function CoreOption({ core, recommended, busy, disabled, onSelect }:
           : <FaDownload size={13} />}
       </div>
       <div style={{ minWidth: 0, flex: '1 1 auto' }}>
-        <div style={{ fontSize: '13.5px', fontWeight: 500, textTransform: 'capitalize' }}>
-          {coreLabel(core)}
+        <div style={{
+          fontSize: '13.5px', fontWeight: 500,
+          // A real display name is already cased the way its authors wrote it
+          // ("PCSX ReARMed"); only the derived-from-filename fallback wants
+          // capitalising.
+          textTransform: label ? 'none' : 'capitalize',
+        }}>
+          {label || coreLabel(core)}
           {recommended && (
             <span style={{
               marginLeft: '7px', fontSize: '9.5px', fontWeight: 800, letterSpacing: '0.04em',
@@ -191,7 +205,7 @@ function MissingCoreModal({ gap, onPlay, closeModal }:
               </div>
               <div style={{ fontSize: '11.5px', color: V2.fgMuted, marginTop: '2px' }}>
                 {done
-                  ? `${coreLabel(done)} is ready — start the game.`
+                  ? `${coreLabel(done, gap.core_labels)} is ready — start the game.`
                   : 'A core is the emulator that actually runs the game.'}
               </div>
             </div>
@@ -230,13 +244,13 @@ function MissingCoreModal({ gap, onPlay, closeModal }:
             </>
           ) : (
             <>
-              <CoreOption core={recommended} recommended busy={busy === recommended}
+              <CoreOption core={recommended} label={gap.core_labels?.[recommended]} recommended busy={busy === recommended}
                 disabled={!!busy} onSelect={() => install(recommended)} />
               {/* One or two alternatives are shorter than the row that would
                   hide them, so show them. Collapse only when the list is long
                   enough that it would bury the recommendation. */}
               {others.length > 0 && others.length <= INLINE_CORES && others.map((c) => (
-                <CoreOption key={c} core={c} busy={busy === c} disabled={!!busy}
+                <CoreOption key={c} core={c} label={gap.core_labels?.[c]} busy={busy === c} disabled={!!busy}
                   onSelect={() => install(c)} />
               ))}
               {others.length > INLINE_CORES && !showAll && (
@@ -245,7 +259,7 @@ function MissingCoreModal({ gap, onPlay, closeModal }:
                   onSelect={() => setShowAll(true)} />
               )}
               {others.length > INLINE_CORES && showAll && others.map((c) => (
-                <CoreOption key={c} core={c} busy={busy === c} disabled={!!busy}
+                <CoreOption key={c} core={c} label={gap.core_labels?.[c]} busy={busy === c} disabled={!!busy}
                   onSelect={() => install(c)} />
               ))}
               <div style={{ height: '1px', background: V2.border, margin: '4px' }} />
@@ -397,6 +411,7 @@ export function offerCoreInstall(r: any, retry: () => void): boolean {
         platform_name: r.platform_name || 'This platform',
         platform_slug: r.platform_slug || '',
         candidates: r.candidates || [],
+        core_labels: r.core_labels || {},
         installed_cores: r.installed_cores || [],
         can_download: !!r.can_download,
         download_reason: r.download_reason || '',

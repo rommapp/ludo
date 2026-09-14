@@ -8298,12 +8298,227 @@ class RetroArchInterface:
         except Exception as e:
             print(f"⚠️  Per-game VMU setup skipped: {e}")
 
+        # lrps2 picks its BIOS alphabetically, which on a multi-region BIOS set
+        # silently boots an NTSC disc on a PAL console; see _ensure_ps2_bios.
+        # It also shares one memory card between every PS2 game by default,
+        # which no save sync can attribute; see _ensure_ps2_memcards.
+        try:
+            self._ensure_ps2_bios(rom_path, core_path)
+            self._ensure_ps2_memcards(rom_path, core_path)
+        except Exception as e:
+            print(f"⚠️  PS2 launch setup skipped: {e}")
+
         # Boot into a state. Appended last so it survives every branch above,
         # and only when a slot was actually resolved — RetroArch fails the
         # launch outright if the entry state file isn't there.
         if entry_slot is not None:
             cmd.extend(['--entryslot', str(int(entry_slot))])
         return cmd, None
+
+    # lrps2's core option naming the BIOS image to boot, and the disc-serial
+    # prefixes that say which region a PS2 game is. Sony's prefixes encode it:
+    # the third and fourth letters are the territory, "US"/"ES"/"PS" and so on.
+    PCSX2_BIOS_OPTION_KEY = 'pcsx2_bios'
+    PS2_SERIAL_REGIONS = {
+        'SCUS': 'A', 'SLUS': 'A', 'PBPX': 'A',              # America
+        'SCES': 'E', 'SLES': 'E', 'SCED': 'E', 'SLED': 'E', # Europe
+        'SCPS': 'J', 'SLPS': 'J', 'SLPM': 'J', 'SCPM': 'J', # Japan
+        'SCKA': 'J', 'SLKA': 'J',                           # Korea -> NTSC
+        'SCAJ': 'H', 'SLAJ': 'H',                           # Asia
+    }
+    # The region tags that appear in ROM filenames, for when the disc cannot be
+    # read (a compressed image, or a serial we do not know).
+    PS2_TAG_REGIONS = {
+        'usa': 'A', 'canada': 'A', 'america': 'A', 'world': 'A',
+        'europe': 'E', 'uk': 'E', 'australia': 'E', 'france': 'E',
+        'germany': 'E', 'italy': 'E', 'spain': 'E',
+        'japan': 'J', 'korea': 'J', 'asia': 'H',
+    }
+
+    def _ensure_ps2_bios(self, rom_path, core_path):
+        """Point lrps2 at a BIOS whose region matches the disc.
+
+        lrps2 has no region locking ONLY when its Fast Boot option is on. With
+        Fast Boot off — RetroDECK's default — the BIOS runs its real boot
+        sequence, checks the disc, and refuses a foreign one: the console boots
+        to the BIOS menu and the game never starts. Nothing reports an error;
+        it looks like the game simply does not work.
+
+        Which BIOS the core picks is otherwise alphabetical, so a library with
+        both a PAL and an NTSC dump boots every game on whichever sorts first
+        ("SCPH-70004..." beats "scph39001.bin" — uppercase sorts before lower).
+        That is decided by filename, not by suitability, and Ludo downloads
+        every BIOS the server holds, so multi-region sets are the normal case
+        rather than an unusual one.
+
+        Written as a per-GAME core-options override, like _ensure_per_game_vmu
+        and for the same reason: the global retroarch-core-options.cfg is a file
+        RetroDECK owns and rewrites. Per-game also means a PAL and an NTSC title
+        in the same library each get the right console.
+        """
+        if 'pcsx2' not in Path(core_path).name.lower():
+            return
+        want = self._ps2_disc_region(rom_path)
+        if not want:
+            return
+        bios = self._pick_ps2_bios(want)
+        if not bios:
+            return
+        # RetroArch keys per-game options by the core's DISPLAY name, which for
+        # this core is its project name (LRPS2) rather than the library
+        # filename (pcsx2_libretro.so) the rest of Ludo matches on.
+        opt_file = self._ps2_option_file(rom_path)
+        if not opt_file:
+            return
+        self._write_core_option(opt_file, self.PCSX2_BIOS_OPTION_KEY, bios)
+
+    # lrps2's option choosing between one card for everything and a card per
+    # game. Its own description is "Use per-content or shared memory cards."
+    PCSX2_SHARED_CARDS_KEY = 'pcsx2_shared_memory_cards'
+
+    def _ensure_ps2_memcards(self, rom_path, core_path):
+        """Give each PS2 game its own memory card instead of a shared one.
+
+        lrps2 defaults to shared cards: "Mcd001.ps2" and "Mcd002.ps2", the same
+        two files for every PS2 game, each an 8 MB container holding every
+        title's saves at once. Nothing can attribute that to a ROM — the name
+        is identical for all of them, and the contents belong to many games —
+        so PS2 saves could never sync while it was on. Turned off, the core
+        writes "<content>.ps2", which is ROM-named and matches like any other
+        save.
+
+        Exactly the flycast situation and the same remedy; see
+        _ensure_per_game_vmu, which flips reicast_per_content_vmus for the
+        identical reason.
+
+        Note the migration caveat flycast also has: saves already written to a
+        shared card stay in that file. It is not deleted, but the game stops
+        reading it, so existing progress needs importing through the BIOS's
+        memory card manager rather than appearing on its own.
+        """
+        if 'pcsx2' not in Path(core_path).name.lower():
+            return
+        opt_file = self._ps2_option_file(rom_path)
+        if not opt_file:
+            return
+        self._write_core_option(opt_file, self.PCSX2_SHARED_CARDS_KEY, 'disabled')
+
+    def _ps2_option_file(self, rom_path):
+        """RetroArch's per-game core-options file for this ROM under lrps2.
+
+        Keyed by the core's DISPLAY name, which for this core is its project
+        name (LRPS2) and not the library filename (pcsx2_libretro.so) that the
+        rest of Ludo matches cores on.
+        """
+        cfg_dir = self.find_retroarch_config_dir()
+        if not cfg_dir:
+            return None
+        return Path(cfg_dir) / 'config' / 'LRPS2' / f"{Path(rom_path).stem}.opt"
+
+    def _ps2_disc_region(self, rom_path):
+        """The region letter a PS2 disc needs ('A'/'E'/'J'/'H'), or ''.
+
+        The disc's own boot serial is the authority: SYSTEM.CNF names the ELF
+        the console runs ("BOOT2 = cdrom0:\\SCUS_974.90;1") and Sony's prefix
+        encodes the territory. title_ids already reads it — through Sigil where
+        that answers, and its own ISO 9660 reader otherwise — so this asks
+        rather than parsing the disc a third time.
+
+        The filename tag is only a fallback, for images title_ids declines
+        (a PS2 .chd today). It is a scene convention rather than something the
+        console reads, so a mislabelled file would pick a BIOS the disc rejects
+        — which is still no worse than the alphabetical guess it replaces.
+        """
+        try:
+            from . import title_ids
+            serial = title_ids.title_id_from_rom(rom_path) or ''
+        except Exception:
+            serial = ''
+        if serial:
+            region = self.PS2_SERIAL_REGIONS.get(serial[:4].upper())
+            if region:
+                return region
+        name = Path(rom_path).name.lower()
+        for tag, region in self.PS2_TAG_REGIONS.items():
+            if f'({tag})' in name or f'({tag},' in name:
+                return region
+        return ''
+
+    def _pick_ps2_bios(self, want_region):
+        """An installed PS2 BIOS image whose console region is `want_region`.
+
+        The region comes out of the image itself, not its filename: a dump can
+        be called anything, and "PS2 Bios 30004R V6 Pal.bin" and
+        "SCPH-70004_BIOS_V12_PAL_200.BIN" follow no shared convention. Every
+        real BIOS carries a ROMVER string ("PS20160AC20020207" — version 1.60,
+        region A for America) within its first pages.
+        """
+        import re
+        if not self.bios_manager or not self.bios_manager.system_dir:
+            return ''
+        system_dir = Path(self.bios_manager.system_dir)
+        # Ludo installs PS2 firmware under pcsx2/bios; RetroDECK symlinks that
+        # back to the system root, so the same file can be seen twice. Keep the
+        # first spelling of each name.
+        seen, candidates = set(), []
+        for folder in (system_dir / 'pcsx2' / 'bios', system_dir):
+            if not folder.is_dir():
+                continue
+            for entry in sorted(folder.iterdir()):
+                if entry.name.lower() in seen or not entry.is_file():
+                    continue
+                # A full BIOS image is 4 MB. Anything else in here is a PS1
+                # BIOS, an .nvm, or some other core's firmware.
+                try:
+                    if entry.stat().st_size != 4 * 1024 * 1024:
+                        continue
+                except OSError:
+                    continue
+                seen.add(entry.name.lower())
+                candidates.append(entry)
+        for entry in candidates:
+            try:
+                with open(entry, 'rb') as f:
+                    head = f.read(0x10000)
+            except OSError:
+                continue
+            match = re.search(rb'PS2(\d{4})([A-Z])([A-Z])(\d{8})', head)
+            if match and match.group(2).decode() == want_region:
+                return entry.name
+        return ''
+
+    @staticmethod
+    def _write_core_option(opt_file, key, value):
+        """Set one key in a RetroArch per-game .opt file, leaving the rest.
+
+        The file is RetroArch's own, and a user may have set other options in
+        it by hand, so this rewrites our key in place rather than the file.
+        """
+        want = f'{key} = "{value}"'
+        try:
+            lines = (opt_file.read_text(encoding='utf-8').splitlines()
+                     if opt_file.exists() else [])
+        except OSError:
+            lines = []
+        out, found = [], False
+        for line in lines:
+            if line.split('=')[0].strip() == key:
+                out.append(want)
+                found = True
+            else:
+                out.append(line)
+        if not found:
+            out.append(want)
+        if out == lines:
+            return False
+        try:
+            opt_file.parent.mkdir(parents=True, exist_ok=True)
+            opt_file.write_text('\n'.join(out) + '\n', encoding='utf-8')
+            print(f"🎮 {opt_file.stem}: {key} = {value}")
+            return True
+        except OSError as e:
+            print(f"⚠️  Could not write {opt_file}: {e}")
+            return False
 
     # The flycast core option that decides where Dreamcast saves live. The core
     # still uses the legacy `reicast_` prefix even though the core is called
@@ -10321,6 +10536,42 @@ class RetroArchInterface:
         
         return None
 
+    # How far below the save directory to look for saves. 3 reaches
+    # "<saves>/ps2/retroarch-core/LRPS2/memcards/" — the deepest layout any
+    # emulator Ludo supports is known to use — without turning the scan into a
+    # walk of everything under a misconfigured save path.
+    SAVE_SCAN_MAX_DEPTH = 4
+
+    @classmethod
+    def _save_scan_dirs(cls, root):
+        """`root` and every directory below it, to SAVE_SCAN_MAX_DEPTH.
+
+        Symlinks are followed (RetroDECK's memcards path IS a symlink, so not
+        following them would miss the very case this exists for) but each real
+        directory is visited once, so a link pointing back up cannot loop.
+        """
+        found, seen = [], set()
+        frontier = [(root, 0)]
+        while frontier:
+            current, depth = frontier.pop()
+            try:
+                key = current.resolve()
+            except OSError:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(current)
+            if depth >= cls.SAVE_SCAN_MAX_DEPTH:
+                continue
+            try:
+                for child in current.iterdir():
+                    if child.is_dir():
+                        frontier.append((child, depth + 1))
+            except OSError:
+                continue
+        return found
+
     def get_save_files(self):
         """Get list of save files in RetroArch directories, including emulator subdirectories"""
         save_files = {}
@@ -10338,13 +10589,16 @@ class RetroArchInterface:
             if directory.exists():
                 files = []
                 
-                # Scan both root directory and emulator subdirectories
-                directories_to_scan = [directory]
-                
-                # Add all subdirectories (emulator cores)
-                for subdir in directory.iterdir():
-                    if subdir.is_dir():
-                        directories_to_scan.append(subdir)
+                # Scan the root and the folders below it. One level covered
+                # the usual "<saves>/<core or game>/" layouts, but not every
+                # core puts its saves there: RetroDECK points lrps2's memory
+                # cards at "<saves>/ps2/retroarch-core/LRPS2/memcards/", three
+                # deep, so PS2 cards were never even discovered — no error, the
+                # files simply did not exist as far as save sync was concerned.
+                # Bounded rather than unlimited: the depth that exists is small
+                # and known, while an unbounded walk would follow a save folder
+                # someone pointed at a whole drive.
+                directories_to_scan = self._save_scan_dirs(directory)
                 
                 for scan_dir in directories_to_scan:
                     for file_path in scan_dir.glob('*'):
@@ -12068,6 +12322,35 @@ class AutoSyncManager:
         self.startup_sync_thread = threading.Thread(target=startup_sync_worker, daemon=True)
         self.startup_sync_thread.start()
 
+    # A save at or above this size waits LARGE_SAVE_SETTLE seconds of quiet
+    # instead of upload_delay before the watcher acts on it.
+    LARGE_SAVE_BYTES = 1024 * 1024
+    LARGE_SAVE_SETTLE = 30
+
+    def _settle_delay(self, file_path):
+        """Seconds of no-change before the watcher treats a save as finished.
+
+        3 seconds suits a kilobyte .srm, which is written in one go. It does
+        not suit a PS2 memory card: the console takes several seconds to write
+        8 MB ("do not remove the Memory Card"), goes quiet mid-write for longer
+        than 3 seconds, and so was uploaded half-finished and then again on
+        completion — two versions off a 10-version budget for one save, and the
+        first of them a state the player never had.
+
+        Waiting longer costs nothing, because this watcher is only the safety
+        net: the primary push happens when the emulator closes, which is
+        unaffected by this delay. Neither reference client needs a number here
+        — argosy syncs on a 6-hour timer and grout only on demand, so neither
+        ever watches a file mid-write — so this one is ours, chosen to comfortably
+        exceed how long a console pauses while writing a memory card.
+        """
+        try:
+            if Path(file_path).stat().st_size >= self.LARGE_SAVE_BYTES:
+                return self.LARGE_SAVE_SETTLE
+        except OSError:
+            pass
+        return self.upload_delay
+
     def start_upload_worker(self):
         """Start background thread to process upload queue"""
         def upload_worker():
@@ -12078,8 +12361,9 @@ class AutoSyncManager:
                     uploads_to_process = []
                     
                     for file_path, change_time in list(self.upload_debounce.items()):
-                        # If file hasn't changed for upload_delay seconds, upload it
-                        if current_time - change_time >= self.upload_delay:
+                        # If the file has been still long enough, upload it.
+                        # The wait is per-file: see _settle_delay.
+                        if current_time - change_time >= self._settle_delay(file_path):
                             uploads_to_process.append(file_path)
                             del self.upload_debounce[file_path]
                     
@@ -12851,6 +13135,18 @@ class AutoSyncManager:
             if standalone_emulator_for_platform(slugs.get(rom_id)):
                 logging.debug(f"skipping RetroArch-side save for standalone "
                               f"platform rom={rom_id}: {path.name}")
+                continue
+
+            # A save with no data in it is not a save. lrps2 creates an 8 MB
+            # PS2 memory card the moment a game boots, long before anything is
+            # written to it, and that blank card uploaded as a real version —
+            # restoring it hands the player an empty card. Argosy guards this
+            # with a 100-byte floor, which a full-size blank memory card sails
+            # straight past; emptiness here is a property of the contents, not
+            # the length.
+            if _is_blank_save(path):
+                logging.debug(f"skipping blank save {path.name} "
+                              f"({stat_size(path)} bytes, no data)")
                 continue
 
             slot, _autocleanup, _limit = RomMClient.get_slot_info(path)
@@ -15584,6 +15880,47 @@ def _is_vmu_save(path):
     return bool(_VMU_SAVE_RE.search(Path(path).name))
 
 
+def stat_size(path):
+    """File size in bytes, or 0 if it cannot be read."""
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return 0
+
+
+def _is_blank_save(path, _chunk=1 << 20):
+    """True when a save file carries no data at all.
+
+    A file made entirely of 0x00 and/or 0xFF is empty whatever the platform:
+    both are what unwritten storage reads back as, and no save format encodes
+    anything in a region that is uniformly one of them. That makes this a
+    content test rather than a format test — it needs no knowledge of memory
+    cards, and it catches the case a size check cannot, an 8 MB PS2 card that
+    a core created and nothing has written to.
+
+    Reads in chunks and stops at the first byte that proves the file is not
+    blank, so the common case — a real save, which usually differs within the
+    first few bytes — costs one chunk rather than a full scan.
+    """
+    try:
+        if not Path(path).is_file():
+            return False
+        with open(path, 'rb') as f:
+            saw_any = False
+            while True:
+                block = f.read(_chunk)
+                if not block:
+                    break
+                saw_any = True
+                if block.translate(None, b'\x00\xff'):
+                    return False
+            # A zero-length file is not "blank data", it is no file at all;
+            # leave that judgment to the callers that check size.
+            return saw_any
+    except OSError:
+        return False
+
+
 def _vmu_port(path):
     """The VMU port a save belongs to ("A1" … "D2"), or '' if it is not a VMU."""
     m = _VMU_SAVE_RE.search(Path(path).name)
@@ -16424,6 +16761,7 @@ class BiosTrackingManager:
                 bios_manager = self.retroarch.bios_manager
 
                 platform_status = {}
+                needs_download = {}
                 for platform_slug, platform_name in platforms_in_library.items():
                     try:
                         normalized_platform = bios_manager.normalize_platform_name(platform_name)
@@ -16445,9 +16783,20 @@ class BiosTrackingManager:
                             'total_required': total_required,
                         }
 
-                        if is_ready:
-                            with self._lock:
+                        # platforms_ready is a skip-list for download_for_games,
+                        # so a stale "ready" is permanent: BIOS uploaded to RomM
+                        # AFTER the first check (which saw an empty firmware
+                        # list and concluded nothing was missing) could never be
+                        # fetched again, and the launch failed with the core
+                        # reporting no BIOS. The scan knows the current truth —
+                        # let it retract as well as grant.
+                        with self._lock:
+                            if is_ready:
                                 self.platforms_ready.add(platform_slug)
+                            else:
+                                self.platforms_ready.discard(platform_slug)
+                        if not is_ready:
+                            needs_download[platform_slug] = platform_name
 
                     except Exception as e:
                         self.log(f"Error scanning BIOS for {platform_name}: {e}")
@@ -16466,6 +16815,16 @@ class BiosTrackingManager:
 
                 ready_count = sum(1 for p in platform_status.values() if p.get('ready', False))
                 self.log(f"BIOS scan complete: {ready_count}/{len(platform_status)} platforms ready")
+
+                # Downloads used to be triggered only by a ROM download, so
+                # firmware uploaded to RomM for a platform already in the
+                # library was found by this scan, reported missing, and then
+                # never fetched — the scan diagnosed the problem and left it.
+                # Fetch what it found; start_platform_downloads re-checks the
+                # in-progress/ready sets, so this cannot double-download.
+                if needs_download:
+                    self.log(f"📥 Fetching BIOS for {len(needs_download)} platform(s) missing firmware")
+                    self.start_platform_downloads(needs_download)
 
             except Exception as e:
                 self.log(f"Error scanning BIOS for library: {e}")
@@ -16513,6 +16872,16 @@ class BiosTrackingManager:
             required_missing = [b for b in missing if b.get('required', False)]
 
             if not required_missing:
+                # "Nothing missing" has two very different causes: every file is
+                # installed, or the server holds no firmware list for this
+                # platform at all. The second is ignorance, not readiness —
+                # treating it as ready cached a permanent skip, so firmware
+                # uploaded to RomM afterwards was never fetched and the platform
+                # launched with no BIOS. Leave it unready; a later scan, once
+                # the server has a list, can settle it.
+                if not present:
+                    self.log(f"ℹ️  Server lists no BIOS for {platform_name} — leaving it unresolved")
+                    return
                 self.log(f"✅ All required BIOS already present for {platform_name}")
                 with self._lock:
                     self.platforms_ready.add(platform_slug)
@@ -16528,11 +16897,19 @@ class BiosTrackingManager:
                 # Re-check to get accurate present count
                 present_after, missing_after = bios_manager.check_platform_bios(normalized_platform)
                 required_missing_after = [b for b in missing_after if b.get('required', False)]
+                # auto_download_missing_bios reports success when it got SOME of
+                # the files, so "success" alone does not mean the platform is
+                # playable. Only the post-download re-check does, and marking a
+                # partially-satisfied platform ready would skip it forever.
+                still_ready = not required_missing_after
                 with self._lock:
-                    self.platforms_ready.add(platform_slug)
+                    if still_ready:
+                        self.platforms_ready.add(platform_slug)
+                    else:
+                        self.platforms_ready.discard(platform_slug)
                     self.download_failures.pop(platform_slug, None)
                     if platform_slug in self.platform_status:
-                        self.platform_status[platform_slug]['ready'] = True
+                        self.platform_status[platform_slug]['ready'] = still_ready
                         self.platform_status[platform_slug]['present'] = len(present_after)
                         self.platform_status[platform_slug]['missing'] = len(required_missing_after)
                         self.platform_status[platform_slug]['total_required'] = len(present_after) + len(required_missing_after)
@@ -16572,8 +16949,19 @@ class BiosTrackingManager:
             if platform_slug and platform_name:
                 platforms_needed[platform_slug] = platform_name
 
-        # Start downloads for platforms not already handled
-        for platform_slug, platform_name in platforms_needed.items():
+        self.start_platform_downloads(platforms_needed)
+
+    def start_platform_downloads(self, platforms_needed):
+        """Spawn a BIOS download thread per platform that still needs one.
+
+        Shared by the ROM-download trigger and the library scan, so both honour
+        the same in-progress/ready guards — a platform can be queued from either
+        side without racing itself into two concurrent downloads.
+
+        Args:
+            platforms_needed: {platform_slug: platform_name}
+        """
+        for platform_slug, platform_name in (platforms_needed or {}).items():
             with self._lock:
                 if (platform_slug in self.downloads_in_progress or
                     platform_slug in self.platforms_ready):
