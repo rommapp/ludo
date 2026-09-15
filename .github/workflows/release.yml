@@ -172,3 +172,27 @@ jobs:
           if failures:
               raise SystemExit(f'updater cannot resolve: {", ".join(failures)}')
           PY
+
+      # The step above reads with a token; a shipped install never has one. On a
+      # private repo GitHub answers an anonymous read with 404, so the release
+      # can verify green here and still be invisible to every user. This is a
+      # notice rather than a failure: repository visibility is not something a
+      # release build should block on, but it must not be silent either.
+      - name: Warn if a shipped install cannot see it
+        run: |
+          VERSION='${{ needs.version.outputs.version }}' python - <<'PY'
+          import os, logging
+          logging.basicConfig(level=logging.WARNING)
+          from ludo_app import backend
+
+          version = os.environ['VERSION']
+          channel = 'beta' if '-' in version else 'stable'
+          missing = [s for s in ('-decky.zip', '-x86_64.AppImage')
+                     if not backend.select_release(channel, s)]
+          if missing:
+              print(f"::warning::anonymous readers (every shipped install) "
+                    f"cannot resolve {', '.join(missing)} for v{version} — "
+                    f"the repository is most likely private")
+          else:
+              print('anonymous readers can see this release')
+          PY
