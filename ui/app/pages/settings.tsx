@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, getScreenshotMode, setScreenshotModeRpc, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
 import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel, V2CardRow} from "../kit";
 import { V2, fmtAgo, fmtBytes } from "../theme";
-import { FaBell, FaBookmark, FaBug, FaCameraRetro, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaInfoCircle, FaLayerGroup, FaPlay, FaRedo, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaWifi, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
+import { FaBell, FaBookmark, FaBug, FaCameraRetro, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaLayerGroup, FaPlay, FaRedo, FaRegWindowMaximize, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaWifi, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
 import { Focusable, Navigation, host } from "@ludo/host";
 import { toaster, notificationPrefs, saveNotificationPrefs, loadNotificationPrefs } from "../toast";
 import { useAutoFocus } from "../shell";
@@ -139,6 +139,45 @@ let _settingsToggles: Record<string, boolean> = (() => {
   try { return JSON.parse(localStorage.getItem('romm:settingsToggles') || '{}'); }
   catch { return {}; }
 })();
+
+/**
+ * Make GitHub's release body readable in the update card.
+ *
+ * CI publishes auto-generated notes, which open with their own "## What's
+ * Changed" heading — directly under the card's "What's new in v…", so the panel
+ * said the same thing twice and then dumped raw markdown under it: literal `##`,
+ * `*` bullets, "by @dependabot[bot] in <full URL>" on every line, and a
+ * **Full Changelog** link. In a 96px fade-out preview that is all noise and no
+ * news.
+ *
+ * So: drop the headings (the card supplies its own), drop the trailing
+ * attribution and link furniture, and leave one plain bullet per change.
+ */
+function _tidyReleaseNotes(raw: string): string {
+  const lines = String(raw).split('\n');
+  const out: string[] = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    if (t.startsWith('#')) {
+      // "New Contributors" is about the project, not about what changed for
+      // the reader — and it is always last, so stop rather than skip.
+      if (/new contributors/i.test(t)) break;
+      // Any other heading ("## What's Changed") is scaffolding: the card
+      // already names the version above this.
+      continue;
+    }
+    // "**Full Changelog**: <url>" and any bare link line.
+    if (/^\*\*Full Changelog\*\*/i.test(t) || /^https?:\/\/\S+$/.test(t)) continue;
+    let item = t.replace(/^[-*+]\s+/, '');
+    // "…thing that changed by @someone in https://github.com/…/pull/16"
+    item = item.replace(/\s+by\s+@[\w-]+(\[bot\])?\s+in\s+https?:\/\/\S+$/i, '');
+    item = item.replace(/\s+in\s+https?:\/\/\S+$/i, '');
+    item = item.replace(/\*\*(.+?)\*\*/g, '$1').replace(/`(.+?)`/g, '$1');
+    if (item) out.push(`• ${item}`);
+  }
+  return out.join('\n');
+}
 
 function _rememberSettingsToggle(key: string, v: boolean) {
   _settingsToggles[key] = v;
@@ -1136,16 +1175,6 @@ export function SettingsPage() {
 
       <RemovedFromRomMSection />
 
-      <V2SettingsSection title="Saves">
-        <V2SettingsRow
-          icon={<FaCloudUploadAlt size={16} />}
-          title="Show saves being uploaded"
-          subtitle="Shows a badge while a save uploads."
-          onClick={() => handleSyncPillToggle(!syncPill)}
-          right={<V2Switch checked={syncPill} />}
-        />
-      </V2SettingsSection>
-
       <V2SettingsSection title="Gameplay">
         <V2SettingsRow
           icon={<FaPlay size={16} />}
@@ -1182,54 +1211,78 @@ export function SettingsPage() {
       )}
 
       <V2SettingsSection title="Notifications">
-        <V2SettingsRow
-          icon={<FaBell size={16} />}
-          title="Show notifications"
-          subtitle="Turn off all notification types"
-          onClick={() => handleNotifsToggle(!notifsOn)}
-          right={<V2Switch checked={notifsOn} />}
-        />
-        {/* Subordinate to the master switch, so it reads as unavailable rather
-            than as a second opinion once everything is muted. */}
-        <V2SettingsRow
-          icon={<FaWifi size={16} />}
-          title="Connection notifications"
-          subtitle={notifsOn
-            ? 'Turn off connection related notifications'
-            : 'All notifications are off'}
-          onClick={() => { if (notifsOn) handleConnNotifsToggle(!connNotifs); }}
-          right={<V2Switch checked={notifsOn && connNotifs} />}
-        />
-      </V2SettingsSection>
-
-      {canPlaceToasts && (
-        <V2SettingsSection title="Notification position">
-          <div style={{
-            display: 'flex', flexDirection: 'column', gap: '12px', padding: '16px',
-            borderRadius: V2.radiusCard, background: V2.surface, border: `1px solid ${V2.border}`,
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
-              <FaInfoCircle size={16} style={{ color: V2.fgMuted, flexShrink: 0 }} />
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 }}>
-                <span style={{ fontSize: '14px', fontWeight: 600 }}>Overlay position</span>
-                <span style={{ fontSize: '12px', color: V2.fgMuted }}>
-                  Which corner notifications appear in.
-                </span>
+        {/* One card, like Library: every row here answers "what is Ludo allowed
+            to interrupt me with", including the upload badge — which is a
+            notification whether or not it is a toast. The position block is the
+            only capability-gated row, so `last` moves depending on it. */}
+        <div style={{
+          display: 'flex', flexDirection: 'column',
+          borderRadius: V2.radiusCard, background: V2.surface,
+          border: `1px solid ${V2.border}`, overflow: 'hidden',
+        }}>
+          <V2CardRow
+            first
+            icon={<FaBell size={16} />}
+            title="Show notifications"
+            subtitle="Turn off all notification types"
+            onClick={() => handleNotifsToggle(!notifsOn)}
+            right={<V2Switch checked={notifsOn} />}
+          />
+          {/* Subordinate to the master switch, so it reads as unavailable
+              rather than as a second opinion once everything is muted. */}
+          <V2CardRow
+            divider
+            icon={<FaWifi size={16} />}
+            title="Connection notifications"
+            subtitle={notifsOn
+              ? 'Turn off connection related notifications'
+              : 'All notifications are off'}
+            onClick={() => { if (notifsOn) handleConnNotifsToggle(!connNotifs); }}
+            right={<V2Switch checked={notifsOn && connNotifs} />}
+          />
+          <V2CardRow
+            divider
+            last={!canPlaceToasts}
+            icon={<FaCloudUploadAlt size={16} />}
+            title="Show saves being uploaded"
+            subtitle="Shows a badge while a save uploads"
+            onClick={() => handleSyncPillToggle(!syncPill)}
+            right={<V2Switch checked={syncPill} />}
+          />
+          {canPlaceToasts && (
+            <div style={{
+              display: 'flex', flexDirection: 'column', gap: '12px',
+              padding: '13px 14px', borderTop: `1px solid ${V2.border}`,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '14px', minWidth: 0 }}>
+                <div style={{
+                  flexShrink: 0, width: '32px', height: '32px', borderRadius: V2.radiusMd,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  background: V2.surfaceHover, color: V2.fgMuted,
+                }}>
+                  <FaRegWindowMaximize size={16} />
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 }}>
+                  <span style={{ fontSize: '14px', fontWeight: 600 }}>Position</span>
+                  <span style={{ fontSize: '12px', color: V2.fgMuted }}>
+                    Which corner notifications appear in
+                  </span>
+                </div>
+              </div>
+              <div style={{ alignSelf: 'flex-start' }}>
+                <V2Segment
+                  options={[
+                    { id: 'top-left', label: 'Top left' },
+                    { id: 'top-right', label: 'Top right' },
+                    { id: 'bottom-left', label: 'Bottom left' },
+                    { id: 'bottom-right', label: 'Bottom right' },
+                  ]}
+                  value={toastPos} onChange={handleToastPos} />
               </div>
             </div>
-            <div style={{ alignSelf: 'flex-start' }}>
-              <V2Segment
-                options={[
-                  { id: 'top-left', label: 'Top left' },
-                  { id: 'top-right', label: 'Top right' },
-                  { id: 'bottom-left', label: 'Bottom left' },
-                  { id: 'bottom-right', label: 'Bottom right' },
-                ]}
-                value={toastPos} onChange={handleToastPos} />
-            </div>
-          </div>
-        </V2SettingsSection>
-      )}
+          )}
+        </div>
+      </V2SettingsSection>
 
       <V2SettingsSection title="Updates">
         <div style={{
@@ -1308,7 +1361,7 @@ export function SettingsPage() {
                   WebkitMaskImage: 'linear-gradient(180deg, black 62%, transparent 100%)',
                   maskImage: 'linear-gradient(180deg, black 62%, transparent 100%)',
                 } as any}>
-                  {String(updateInfo.notes).slice(0, 600)}
+                  {_tidyReleaseNotes(updateInfo.notes).slice(0, 600)}
                 </div>
               </div>
             </>
