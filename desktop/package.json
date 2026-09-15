@@ -1,7 +1,7 @@
 {
   "name": "ludo-desktop",
   "private": true,
-  "version": "1.0.0-beta.1",
+  "version": "1.0.0-beta.2",
   "type": "module",
   "description": "Desktop client \u2014 Access your RomM library and sync your saves and states between RomM and RetroArch",
   "main": "electron/main.cjs",
