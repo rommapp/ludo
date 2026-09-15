@@ -1,6 +1,7 @@
 import { ChangeEvent, useEffect, useState } from "react";
 import { clearCoverCache, getConfig, pairDevice, saveConfig, testRommConnection } from "../rpc";
-import { ButtonItem, FileSelectionType, Navigation, PanelSection, PanelSectionRow, TextField, openFilePicker, staticClasses, toaster } from "@ludo/host";
+import { ButtonItem, FileSelectionType, Navigation, PanelSection, PanelSectionRow, TextField, openFilePicker, staticClasses } from "@ludo/host";
+import { toaster } from "../toast";
 import { FaCheck, FaTimes } from "react-icons/fa";
 import { _coverCacheReset, _coverInflight } from "../media";
 import { QrCode, pickerStart, useQrPairing } from "../pairing";

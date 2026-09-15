@@ -5,7 +5,8 @@ import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _se
 import { _autoFocusFirstRef, _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, V2SearchField, useEtaFromPct, Shimmer} from "../kit";
 import { V2, formatEta, formatSpeed } from "../theme";
-import { Focusable, GamepadButton, Navigation, host, showModal, toaster } from "@ludo/host";
+import { Focusable, GamepadButton, Navigation, host, showModal } from "@ludo/host";
+import { toaster } from "../toast";
 import { FaBookmark, FaCheck, FaChevronRight, FaDownload, FaEllipsisH, FaExclamationTriangle, FaGamepad, FaLayerGroup, FaPlay, FaRegClock, FaSync } from "react-icons/fa";
 import { LibView, NavId, libBack, libNavigate, navExitPlugin, pushLibView, setLibViewHooks } from "../nav";
 import { _groupsCache, _libGamesCache, getHomeCache, getLibGroupHolder, getLibGroupsHolder, getLibLastTab, libCacheSet, libCacheSetDownloaded, persistGroupsCache, persistHomeCache, setHomeCache, setLibGameHolder, setLibGameOrigin, setLibGroupHolder, setLibGroupsHolder, setLibLastTab, _focusedPlatformSubs, _focusedPlatform, libCacheDelete} from "../libcache";

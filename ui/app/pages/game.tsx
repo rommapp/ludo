@@ -1,4 +1,5 @@
-import { Focusable, GamepadButton, ModalRoot, showModal, toaster, Navigation, DialogButton} from "@ludo/host";
+import { Focusable, GamepadButton, ModalRoot, showModal, Navigation, DialogButton } from "@ludo/host";
+import { toaster } from "../toast";
 import { V2, fmtBytes, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
 import { FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaChevronLeft, FaChevronRight} from "react-icons/fa";
 import { useEffect, useRef, useState } from "react";

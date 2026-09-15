@@ -1,6 +1,6 @@
 import { emulatorInstallState, getEmulatorStatus, getPlatformSync, installEmulator, refreshFromRomm, setPlatformSync } from "./rpc";
 import { useEffect, useRef, useState } from "react";
-import { toaster } from "@ludo/host";
+import { toaster } from "./toast";
 import { _broadcastLibRefresh } from "./events";
 import { PlatformIcon, V2SettingsRow, V2Switch } from "./kit";
 import { FaLayerGroup } from "react-icons/fa";

@@ -1,5 +1,6 @@
 import { getSwitchFirmwareProgress, installSwitchFirmware, switchPrereqForRom } from "./rpc";
-import { Focusable, ModalRoot, showModal, toaster, GamepadButton} from "@ludo/host";
+import { Focusable, ModalRoot, showModal, GamepadButton } from "@ludo/host";
+import { toaster } from "./toast";
 import { useEffect, useRef, useState } from "react";
 import { _forceGamepadFocus } from "./shell";
 import { V2_FOCUS_STYLE } from "./focus";

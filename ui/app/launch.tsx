@@ -1,4 +1,5 @@
-import { host, showModal, toaster, Focusable, GamepadButton, ModalRoot} from "@ludo/host";
+import { host, showModal, Focusable, GamepadButton, ModalRoot } from "@ludo/host";
+import { toaster } from "./toast";
 import { libNavigate } from "./nav";
 import { libCacheSetDownloaded } from "./libcache";
 import { launchGame, prepareSteamLaunch, downloadCore, getSyncEpoch, setCoreOverride} from "./rpc";

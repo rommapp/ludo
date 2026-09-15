@@ -4,7 +4,8 @@ import { _dlSucceeded, _setDlActive, awaitDownload, runCollectionBatch, useDownl
 import { V2, roundBtn} from "./theme";
 import { useCollectionSync, useOffline, useSaveActivityFor} from "./status";
 import { deleteCollectionRoms, deleteGame, downloadGame, getLibraryGames, getLocalDiscs, getLocalSiblings, resyncPlatform, toggleCollectionSync, getStateThumbnails} from "./rpc";
-import { Focusable, GamepadButton, Menu, MenuItem, showContextMenu, showModal, toaster, ModalRoot} from "@ludo/host";
+import { Focusable, GamepadButton, Menu, MenuItem, showContextMenu, showModal, ModalRoot } from "@ludo/host";
+import { toaster } from "./toast";
 import { maybePromptSwitchFirmware } from "./firmware";
 import { _libGamesCache, libCacheSetDownloaded, _focusedPlatform, _setFocusedPlatform, libCacheDelete, libCacheDrop, openGameById} from "./libcache";
 import { V2Focus, V2_FOCUS_STYLE} from "./focus";

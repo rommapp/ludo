@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { Focusable, GamepadButton, ModalRoot, host, showModal, toaster } from "@ludo/host";
+import { Focusable, GamepadButton, ModalRoot, host, showModal } from "@ludo/host";
+import { toaster } from "./toast";
 import { V2 } from "./theme";
 import { FaBookmark, FaChartBar, FaCheck, FaChevronDown, FaCog, FaDownload, FaExternalLinkAlt, FaGamepad, FaHome, FaMicrochip, FaPlay, FaPowerOff, FaPuzzlePiece, FaRegClock, FaSearch, FaSync, FaTrash } from "react-icons/fa";
 import { getAccountUsername, getAvatar, getImage, getRetrodeckButtonEnabled, getRetrodeckLogo, refreshFromRomm } from "./rpc";

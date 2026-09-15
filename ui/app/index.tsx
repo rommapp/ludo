@@ -5,7 +5,8 @@
 // — the desktop's main.tsx and the Decky plugin's index.tsx — and the only
 // thing either of them needs to know about the UI.
 
-import { Navigation, toaster, routerHook, host } from "@ludo/host";
+import { Navigation, routerHook, host } from "@ludo/host";
+import { toaster, loadNotificationPrefs } from "./toast";
 import {
   checkForUpdate,
   getCheckOnStartup,
@@ -109,6 +110,12 @@ export function startApp(): { stop: () => void } {
     openLibrary: () => { Navigation.Navigate("/romm-sync-library"); Navigation.CloseSideMenus(); },
     isOwnRoute: (path) => path.startsWith("/romm-sync"),
   });
+
+  // The user's notification switches, pulled once so every toast raised from
+  // here on can consult them synchronously. Not awaited: the defaults are
+  // permissive, so the worst case is that a toast in the first moments of
+  // startup slips through a mute that had not landed yet.
+  loadNotificationPrefs().catch(() => { });
 
   // OS-level connectivity bridge: the Decky frontend runs in a Chromium context,
   // so navigator's online/offline events fire the instant the Deck's network

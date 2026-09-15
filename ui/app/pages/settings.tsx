@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, getScreenshotMode, setScreenshotModeRpc, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
 import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel, V2CardRow} from "../kit";
 import { V2, fmtAgo, fmtBytes } from "../theme";
-import { FaBookmark, FaBug, FaCameraRetro, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaInfoCircle, FaLayerGroup, FaPlay, FaRedo, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
-import { Focusable, Navigation, host, toaster } from "@ludo/host";
+import { FaBell, FaBookmark, FaBug, FaCameraRetro, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaInfoCircle, FaLayerGroup, FaPlay, FaRedo, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaWifi, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
+import { Focusable, Navigation, host } from "@ludo/host";
+import { toaster, notificationPrefs, saveNotificationPrefs, loadNotificationPrefs } from "../toast";
 import { useAutoFocus } from "../shell";
 import { _broadcastLibRefresh } from "../events";
 import { _LS_REOPEN_HOME, _lsAvail} from "../storage";
@@ -497,6 +498,27 @@ export function SettingsPage() {
   // cached pref IS the state, and writing to it re-renders this row and the
   // pill together, so the switch and the thing it controls cannot disagree.
   const syncPill = useSyncPillEnabled();
+
+  // Notifications. The module-level cache in ../toast is the source of truth —
+  // it is what every toast consults — so these mirror it for rendering only.
+  const [notifsOn, setNotifsOn] = useState<boolean>(() => notificationPrefs().enabled);
+  const [connNotifs, setConnNotifs] = useState<boolean>(() => notificationPrefs().connection);
+  useEffect(() => {
+    loadNotificationPrefs()
+      .then((p) => { setNotifsOn(p.enabled); setConnNotifs(p.connection); })
+      .catch(() => { /* keep the permissive defaults */ });
+  }, []);
+  const handleNotifsToggle = async (enabled: boolean) => {
+    setNotifsOn(enabled);
+    const p = await saveNotificationPrefs({ enabled });
+    setNotifsOn(p.enabled);
+    setConnNotifs(p.connection);
+  };
+  const handleConnNotifsToggle = async (connection: boolean) => {
+    setConnNotifs(connection);
+    const p = await saveNotificationPrefs({ connection });
+    setConnNotifs(p.connection);
+  };
   const [autoUpdateLib, setAutoUpdateLib] = useState<boolean>(_settingsToggles.autoUpdateLib ?? true);
   useEffect(() => {
     getLibraryAutoUpdate()
@@ -1159,8 +1181,29 @@ export function SettingsPage() {
         </V2SettingsSection>
       )}
 
+      <V2SettingsSection title="Notifications">
+        <V2SettingsRow
+          icon={<FaBell size={16} />}
+          title="Show notifications"
+          subtitle="Off syncs everything silently — nothing pops up."
+          onClick={() => handleNotifsToggle(!notifsOn)}
+          right={<V2Switch checked={notifsOn} />}
+        />
+        {/* Subordinate to the master switch, so it reads as unavailable rather
+            than as a second opinion once everything is muted. */}
+        <V2SettingsRow
+          icon={<FaWifi size={16} />}
+          title="Connection notifications"
+          subtitle={notifsOn
+            ? 'Tell me when the RomM server is lost or comes back.'
+            : 'All notifications are off.'}
+          onClick={() => { if (notifsOn) handleConnNotifsToggle(!connNotifs); }}
+          right={<V2Switch checked={notifsOn && connNotifs} />}
+        />
+      </V2SettingsSection>
+
       {canPlaceToasts && (
-        <V2SettingsSection title="Notifications">
+        <V2SettingsSection title="Notification position">
           <div style={{
             display: 'flex', flexDirection: 'column', gap: '12px', padding: '16px',
             borderRadius: V2.radiusCard, background: V2.surface, border: `1px solid ${V2.border}`,

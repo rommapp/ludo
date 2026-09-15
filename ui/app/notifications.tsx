@@ -1,5 +1,6 @@
 import { ackLibraryAnnouncement, drainNotifications, getServiceStatus, getSyncIndicator } from "./rpc";
-import { Navigation, toaster } from "@ludo/host";
+import { Navigation } from "@ludo/host";
+import { toaster } from "./toast";
 import { _pushSaveActivity, useSaveActivity, useServiceStatus} from "./status";
 import { useRef } from "react";
 import { FaCloudUploadAlt } from "react-icons/fa";
@@ -303,9 +304,13 @@ export const checkForNotifications = async () => {
                 ? 'Showing your downloaded games — saves sync when you’re back online.'
                 : 'The server isn’t responding — showing your downloaded games.',
               duration: 5000,
+              category: 'connection',
             });
           } else if ((_prevConn === 'offline_cached' || _prevConn === 'disconnected') && conn === 'online') {
-            toaster.toast({ title: 'Back online', body: 'Reconnected to RomM — syncing.', duration: 4000 });
+            toaster.toast({
+              title: 'Back online', body: 'Reconnected to RomM — syncing.',
+              duration: 4000, category: 'connection',
+            });
           }
           _prevConn = conn;
         }

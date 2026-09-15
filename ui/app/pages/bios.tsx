@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { downloadBios, getBiosInventory, getSwitchAddonMode, setSwitchAddonMode, switchFirmwareStatus } from "../rpc";
-import { Focusable, ModalRoot, showModal, toaster } from "@ludo/host";
+import { Focusable, ModalRoot, showModal } from "@ludo/host";
+import { toaster } from "../toast";
 import { V2_FOCUS_STYLE, v2Page } from "../focus";
 import { libBack } from "../nav";
 import { GameActionButton, PlatformIcon, UserMenuRow, V2Segment, V2SettingsRow, V2SettingsSection, MODAL_SCRIM_INSET} from "../kit";

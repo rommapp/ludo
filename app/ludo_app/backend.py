@@ -73,6 +73,7 @@ try:
         _extract_archive, _archive_member_names,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
+        ReachabilityLatch,
         flush_pending_game_toasts as _flush_pending_game_toasts,
         qr_matrix,
     )
@@ -747,25 +748,12 @@ class LudoBackend:
     # shown it, which persists the fact so a plugin reload doesn't re-toast.
     _announce_library: dict = None
 
-    # Reachability latch, distinct from RomMClient.authenticated (which is sticky).
-    # True while the server is responding; flipped False on any connected-branch
-    # failure. A False→True transition triggers an offline save flush. Starts None
-    # so the first successful probe doesn't count as a "reconnect".
-    _online: bool = None
-
-    # Device-level network state, reported by the frontend's navigator
-    # online/offline events. Distinct from _online (server reachability): lets us
-    # tell "the Deck has no internet" (no_network) from "the Deck is online but
-    # the RomM server isn't responding" (server_unreachable). None = unknown.
-    _device_online: bool = None
-
-    # Consecutive failed reachability probes. A single failure is not enough to
-    # go offline: the probe shares the connection with whatever else is running,
-    # and a large download (or a server that is merely busy) makes one 6s GET
-    # time out routinely. Latching on the first miss made the library flip to
-    # downloaded-only mid-session — the platform list would collapse to just the
-    # platforms the user had grabbed something from. See _reachability_loop.
-    _probe_fail_streak: int = 0
+    # Reachability state, distinct from RomMClient.authenticated (which is
+    # sticky — a network drop never flips it). The state machine itself lives in
+    # the engine (ReachabilityLatch) because the Decky plugin in
+    # romm-retroarch-sync drives the identical one; read it through the _latch
+    # property below rather than poking at this directly.
+    _reach: 'ReachabilityLatch' = None
 
     # Coalescing state for _persist_snapshot_throttled.
     _snapshot_timer_lock = threading.Lock()
@@ -811,6 +799,9 @@ class LudoBackend:
         self._syncing_steam_collections = set()
         logging.info("Ludo starting...")
         self._start_sync()
+        # After _start_sync: the settings manager it builds is what the prefs
+        # are read from.
+        self._apply_notification_prefs()
         return await self.get_service_status()
 
     async def _unload(self):
@@ -965,27 +956,41 @@ class LudoBackend:
     # Library snapshot (offline-first persistence)
     # -----------------------------------------------------------------------
 
-    def _note_reachable(self):
-        """Mark the server reachable. On an offline→online edge (was False),
-        flush any save changes made while offline. No-op on the first-ever probe
-        (was None) so startup doesn't masquerade as a reconnect."""
-        was = self._online
-        self._online = True
-        self._probe_fail_streak = 0
-        # The server answering proves the device has network too.
-        self._device_online = True
-        if was is False and self._auto_sync:
-            try:
-                logging.info("Server reachable again — flushing offline save changes")
-                self._auto_sync.flush_after_reconnect()
-            except Exception as e:
-                logging.warning(f"Reconnect save flush failed: {e}")
+    @property
+    def _latch(self):
+        """The reachability state machine (engine-owned; see ReachabilityLatch).
 
-    # Consecutive failed probes needed to declare the server unreachable. At the
-    # loop's 25s cadence this is ~75s of silence — long enough to ride out a
-    # download saturating the link, short enough that a real disconnect is
-    # noticed before the user tries to browse.
-    _PROBE_FAILS_TO_OFFLINE = 3
+        Built lazily so the flush callback can close over the plugin instance.
+        """
+        if LudoBackend._reach is None:
+            LudoBackend._reach = ReachabilityLatch(on_reconnect=self._flush_offline_saves)
+        return LudoBackend._reach
+
+    # Kept as read-only views because a dozen call sites (status payload, cover
+    # fetch, library gating) ask these questions and none of them should be able
+    # to answer them — writes go through the latch so both edges stay debounced.
+    @property
+    def _online(self):
+        return self._latch.online
+
+    @property
+    def _device_online(self):
+        return self._latch.device_online
+
+    def _flush_offline_saves(self):
+        """Push save changes made while offline. The latch calls this on a
+        confirmed offline→online edge, and only on a confirmed one — an
+        unconfirmed reconnect used to start a sync session that then failed on
+        DNS, which is half of what made the false 'Back online' so loud."""
+        if self._auto_sync:
+            self._auto_sync.flush_after_reconnect()
+
+    def _note_reachable(self, confirmed=False):
+        """Mark the server reachable. See ReachabilityLatch.note_success: the
+        offline→online edge needs two consecutive successes unless `confirmed`
+        says the evidence is stronger than a probe. No-op on the first-ever
+        probe so startup doesn't masquerade as a reconnect."""
+        return self._latch.note_success(confirmed=confirmed)
 
     def _reachability_loop(self):
         """Actively probe the server every ~25s and flip the connection state.
@@ -996,11 +1001,15 @@ class LudoBackend:
         client — the retry loop owns (re)connecting from a cold/disconnected
         state. _note_reachable() handles the offline→online save flush.
 
-        Going offline takes _PROBE_FAILS_TO_OFFLINE consecutive misses, not one.
-        The probe competes with active downloads for the connection, so an
-        isolated timeout says nothing about the server being down — and treating
-        it as authoritative filtered the library to downloaded-only, which reads
-        to the user as platforms vanishing at random.
+        Neither edge turns on a single sample, and the latch is what enforces
+        that. The probe shares the connection with active downloads, so an
+        isolated timeout says nothing about the server being down — treating it
+        as authoritative filtered the library to downloaded-only, which reads to
+        the user as platforms vanishing at random. Symmetrically, an isolated
+        SUCCESS while offline says nothing either: a probe loop that runs every
+        25s forever will eventually get one misleading answer out of a captive
+        portal or a half-dead link, and announcing a reconnect on it is what
+        nagged offline users on a loop.
         """
         while not self._stop_event.wait(25):
             try:
@@ -1008,18 +1017,8 @@ class LudoBackend:
                     continue
                 if self._romm_client.is_reachable():
                     self._note_reachable()
-                elif self._online is not False:
-                    self._probe_fail_streak += 1
-                    if self._probe_fail_streak >= self._PROBE_FAILS_TO_OFFLINE:
-                        self._online = False
-                        logging.info(
-                            f"Reachability probe failed {self._probe_fail_streak}× "
-                            f"in a row — server unreachable, going offline")
-                    else:
-                        logging.debug(
-                            f"Reachability probe failed "
-                            f"({self._probe_fail_streak}/{self._PROBE_FAILS_TO_OFFLINE}) "
-                            f"— staying online for now")
+                else:
+                    self._latch.note_failure()
             except Exception as e:
                 logging.debug(f"reachability loop error: {e}")
 
@@ -1030,27 +1029,25 @@ class LudoBackend:
         forwards navigator's online event) so recovery is near-instant instead
         of waiting for the next retry-loop tick. Reconnects if we were never
         authenticated, else does a cheap GET; _note_reachable() handles the
-        offline→online flush. A failure latches _online False.
+        offline→online flush. A failure feeds the latch's normal debounce rather
+        than latching offline outright — a spurious navigator event must not be
+        able to knock a working session offline.
         """
         try:
+            # confirmed=True: this path only runs because the OS said the link
+            # came back, and a real API call succeeded on the back of that. That
+            # is the evidence the probe loop's lone success is not, so it may
+            # reconnect immediately instead of waiting for a second sample.
             if self._romm_client and self._romm_client.authenticated:
                 self._romm_client.get_collections(updated_after=self._last_full_fetch_time)
-                self._note_reachable()
+                self._note_reachable(confirmed=True)
             elif self._connect_to_romm():
-                self._note_reachable()
+                self._note_reachable(confirmed=True)
         except Exception as e:
             # Same debounce as _reachability_loop: a spurious navigator 'online'
             # event mid-session must not be able to knock a working session
             # offline on one failed request.
-            self._probe_fail_streak += 1
-            if self._probe_fail_streak >= self._PROBE_FAILS_TO_OFFLINE:
-                self._online = False
-                logging.info(f"Network probe failed, staying offline: {e}")
-            else:
-                logging.info(
-                    f"Network probe failed "
-                    f"({self._probe_fail_streak}/{self._PROBE_FAILS_TO_OFFLINE}), "
-                    f"not latching offline yet: {e}")
+            self._latch.note_failure(e)
 
     async def notify_network_state(self, online: bool):
         """Frontend bridge for the device's OS-level connectivity (navigator
@@ -1060,12 +1057,11 @@ class LudoBackend:
         kick a background probe rather than assuming reachability.
         """
         try:
-            self._device_online = bool(online)
+            self._latch.set_device_online(online)
             if not online:
                 # No network on the device ⇒ the server is definitionally
                 # unreachable too. Latch both.
-                self._online = False
-                logging.info("Device reports offline — latching offline (no_network)")
+                self._latch.latch_offline("device reports no network")
             else:
                 logging.info("Device reports online — probing RomM")
                 threading.Thread(target=self._probe_now, daemon=True,
@@ -1091,7 +1087,7 @@ class LudoBackend:
         Shared by the Deck plugin (always Linux) and the desktop app (Linux via
         rfkill, Windows via netsh), so it dispatches on the platform.
         """
-        cached, ts = Plugin._radio_probe_cache
+        cached, ts = LudoBackend._radio_probe_cache
         if time.monotonic() - ts < 3.0:
             return cached
         try:
@@ -1102,7 +1098,7 @@ class LudoBackend:
         except Exception as e:
             logging.debug(f"radio probe failed: {e}")
             result = None
-        Plugin._radio_probe_cache = (result, time.monotonic())
+        LudoBackend._radio_probe_cache = (result, time.monotonic())
         return result
 
     def _wifi_radio_blocked_rfkill(self):
@@ -2188,7 +2184,7 @@ class LudoBackend:
             except Exception as e:
                 # Treat any failure in the connected branch as a reachability loss
                 # so the next success triggers an offline→online flush.
-                self._online = False
+                self._latch.latch_offline("retry loop error")
                 logging.error(f"Retry loop error: {e}", exc_info=True)
 
         logging.info("Retry loop exited")
@@ -2985,7 +2981,7 @@ class LudoBackend:
             # Passive reachability latch: a real server call just failed, so the
             # server is unreachable even though authenticated is still sticky-true.
             # Catches the "on Wi-Fi but RomM is down" case the OS can't see.
-            self._online = False
+            self._latch.latch_offline("refresh_from_romm failed")
             logging.error(f"refresh_from_romm error: {e}", exc_info=True)
             return {
                 'success': False,
@@ -3035,6 +3031,72 @@ class LudoBackend:
             return {'success': True, 'enabled': bool(enabled)}
         except Exception as e:
             logging.error(f"set_sync_indicator error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    # -----------------------------------------------------------------------
+    # Notification preferences
+    # -----------------------------------------------------------------------
+    #
+    # Two switches, not one, because the complaints are different. The blanket
+    # one is for people who want their saves synced silently and consider the
+    # whole class of them noise; the connection one is for people who find most
+    # of them useful but are tired of being told about a link going up and down
+    # — which on a handheld that sleeps, wakes and roams is constant, and is the
+    # notification least likely to be worth acting on.
+    # Covin90/romm-retroarch-sync#24.
+
+    def _notifications_on(self) -> bool:
+        """Master switch. Defaults ON — a sync tool that says nothing is worse
+        for most people than one that says too much, and the point of a toast
+        here is that the save DID or did NOT make it off the device."""
+        try:
+            return (self._settings.get('Notifications', 'enabled', 'true') or 'true') != 'false'
+        except Exception:
+            return True
+
+    def _connection_notifications_on(self) -> bool:
+        """Whether the connect/disconnect pair may toast. Independent of the
+        master switch in storage, subordinate to it in effect."""
+        try:
+            return (self._settings.get('Notifications', 'connection', 'true') or 'true') != 'false'
+        except Exception:
+            return True
+
+    def _apply_notification_prefs(self):
+        """Push the master switch down into the engine.
+
+        The frontend gates the toasts it raises itself, but the engine raises
+        its own down two paths the frontend never sees — the drain queue while
+        the app is closed, and RetroArch's on-screen display — so the mute has
+        to be set there too. Called at startup and on every change.
+        """
+        try:
+            from romm_sync_engine.sync_core import set_notifications_enabled
+            set_notifications_enabled(self._notifications_on())
+        except Exception as e:
+            logging.debug(f"could not apply notification prefs: {e}")
+
+    async def get_notification_prefs(self):
+        return {
+            'success':    True,
+            'enabled':    self._notifications_on(),
+            'connection': self._connection_notifications_on(),
+        }
+
+    async def set_notification_prefs(self, enabled: bool = None, connection: bool = None):
+        """Set either switch (or both). Omitted keys are left alone."""
+        try:
+            settings = self._require_settings()
+            if enabled is not None:
+                settings.set('Notifications', 'enabled', 'true' if enabled else 'false')
+            if connection is not None:
+                settings.set('Notifications', 'connection', 'true' if connection else 'false')
+            self._apply_notification_prefs()
+            logging.info(f"Notification prefs: enabled={self._notifications_on()} "
+                         f"connection={self._connection_notifications_on()}")
+            return await self.get_notification_prefs()
+        except Exception as e:
+            logging.error(f"set_notification_prefs error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
     async def get_library_auto_update(self):
@@ -3401,7 +3463,7 @@ class LudoBackend:
                 'status': await self.get_service_status(),
             }
         except Exception as e:
-            self._online = False
+            self._latch.latch_offline("resync_platform failed")
             logging.error(f"resync_platform error: {e}", exc_info=True)
             return {'success': False, 'message': f'Resync failed: {str(e)[:100]}'}
         finally:

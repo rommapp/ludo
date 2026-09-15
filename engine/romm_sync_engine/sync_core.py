@@ -164,6 +164,31 @@ def display_game_name(name):
 _notifications = deque(maxlen=50)
 _notifications_lock = threading.Lock()
 
+# Master mute, set by the host from the user's settings (see
+# set_notifications_enabled). It lives at the queue rather than at each front
+# end because the engine raises toasts down two paths the UI cannot reach —
+# this queue, drained whether or not the app is open, and RetroArch's on-screen
+# display — and "sync my saves totally silently" has to mean both.
+# Covin90/romm-retroarch-sync#24.
+_notifications_enabled = True
+
+
+def set_notifications_enabled(enabled):
+    """Turn engine-raised notifications on or off wholesale.
+
+    Silences the toast queue and the RetroArch OSD. Deliberately does NOT
+    silence the activity feed: the feed is the record you consult afterwards to
+    find out whether a save made it, and muting notifications is a statement
+    about interruptions, not about bookkeeping.
+    """
+    global _notifications_enabled
+    _notifications_enabled = bool(enabled)
+    logging.info(f"Engine notifications {'enabled' if _notifications_enabled else 'muted'}")
+
+
+def notifications_enabled():
+    return _notifications_enabled
+
 
 def push_notification(kind, title, body, rom_id=None, has_cover=False,
                       activity_kind=None):
@@ -178,6 +203,12 @@ def push_notification(kind, title, body, rom_id=None, has_cover=False,
     None when the caller already records its own (richer) activity row, or the
     feed gets the event twice.
     """
+    if not _notifications_enabled:
+        # Still file the activity row — muting is about interruptions, not
+        # about losing the record.
+        if activity_kind:
+            _record_activity(activity_kind, title, body)
+        return
     with _notifications_lock:
         _notifications.append({
             'kind':       kind,
@@ -2559,6 +2590,123 @@ class _FailedResponse:
         pass
 
 
+class ReachabilityLatch:
+    """The offline/online state machine, shared by both front ends.
+
+    It lives in the engine rather than in either host because both hosts had
+    grown their own copy of it and both copies had the same hole: going OFFLINE
+    was debounced (several consecutive failed probes), while going ONLINE was
+    not — one probe that happened to come back was enough to declare the server
+    reachable, announce "Back online" to the user, and kick a save-sync flush
+    that then died on DNS. On a handheld that is genuinely offline that is not a
+    rare race: the probe loop runs every 25s forever, so a single misleading
+    answer (a captive portal, a stale proxy, a router that ACKs then drops) is
+    reached eventually, and the user gets nagged on a loop. See
+    Covin90/romm-retroarch-sync#23.
+
+    So the rule here is symmetry: an edge in EITHER direction needs more than
+    one sample.
+
+    - offline needs ``FAILS_TO_OFFLINE`` consecutive failures. A probe competes
+      with whatever else is using the link (a download saturating it will time
+      one out), so an isolated miss says nothing.
+    - the offline→online edge needs ``OKS_TO_RECONNECT`` consecutive successes,
+      unless the caller passes ``confirmed=True`` for evidence stronger than a
+      probe (the OS reporting the network came back, *and* a real API call
+      succeeding on the back of it).
+
+    Only that one edge is debounced. Coming up from "never determined" (startup)
+    still takes a single success — a fresh connect must report online at once or
+    the UI sits in a fictitious offline state for the length of the debounce.
+
+    The latch also owns ``device_online`` (what the OS last told us about the
+    link). Note that a probe success no longer overwrites it unconditionally:
+    doing so let one flaky answer erase an authoritative "there is no network",
+    after which nothing put it back, because the event that would have — the
+    navigator 'online' event — never fires if the user never toggled the radio.
+    """
+
+    # Consecutive failed probes needed to declare the server unreachable. At the
+    # hosts' 25s cadence this is ~75s of silence — long enough to ride out a
+    # download saturating the link, short enough that a real disconnect is
+    # noticed before the user tries to browse.
+    FAILS_TO_OFFLINE = 3
+
+    # Consecutive successes needed to come back from a latched offline.
+    OKS_TO_RECONNECT = 2
+
+    def __init__(self, on_reconnect=None):
+        # True / False / None, where None means "no probe has landed yet" and
+        # must never be treated as offline — it is the startup state.
+        self.online = None
+        self.device_online = None
+        self._on_reconnect = on_reconnect
+        self._fail_streak = 0
+        self._ok_streak = 0
+
+    def note_success(self, confirmed=False):
+        """Record a probe (or any live request) that succeeded.
+
+        Returns True iff this call produced an offline→online edge, having
+        already run the ``on_reconnect`` callback — that is the moment to flush
+        whatever piled up while offline.
+        """
+        self._fail_streak = 0
+        self._ok_streak += 1
+        was = self.online
+        if was is False and not confirmed and self._ok_streak < self.OKS_TO_RECONNECT:
+            logging.info(
+                f"Server answered while offline ({self._ok_streak}/"
+                f"{self.OKS_TO_RECONNECT}) — waiting for a second success "
+                f"before calling it a reconnect")
+            return False
+        self.online = True
+        # The API answering proves the device has a link too — but only once we
+        # believe the answer.
+        self.device_online = True
+        if was is False:
+            self._ok_streak = 0
+            if self._on_reconnect:
+                try:
+                    logging.info("Server reachable again — flushing offline save changes")
+                    self._on_reconnect()
+                except Exception as e:
+                    logging.warning(f"Reconnect save flush failed: {e}")
+            return True
+        return False
+
+    def note_failure(self, reason=''):
+        """Record a failed probe. Returns True iff this call latched offline."""
+        self._ok_streak = 0
+        if self.online is False:
+            return False
+        self._fail_streak += 1
+        if self._fail_streak >= self.FAILS_TO_OFFLINE:
+            self.online = False
+            logging.info(
+                f"Reachability probe failed {self._fail_streak}x in a row — "
+                f"server unreachable, going offline{': ' + str(reason) if reason else ''}")
+            return True
+        logging.debug(
+            f"Reachability probe failed ({self._fail_streak}/{self.FAILS_TO_OFFLINE}) "
+            f"— staying online for now{': ' + str(reason) if reason else ''}")
+        return False
+
+    def latch_offline(self, reason=''):
+        """Go offline now, no debounce. For evidence that needs none: the OS
+        saying the device has no network at all, or the connected code path
+        raising (which is a failure of a real request, not of a cheap probe)."""
+        self._ok_streak = 0
+        self._fail_streak = self.FAILS_TO_OFFLINE
+        if self.online is not False:
+            self.online = False
+            logging.info(f"Latching offline{': ' + str(reason) if reason else ''}")
+
+    def set_device_online(self, online):
+        """What the OS last said about the link (navigator online/offline)."""
+        self.device_online = bool(online)
+
+
 class RomMClient:
     """Client for interacting with RomM API"""
     
@@ -2944,18 +3092,32 @@ class RomMClient:
         return True
 
     def is_reachable(self, timeout=6):
-        """Cheap connectivity probe: does the server answer right now?
+        """Cheap connectivity probe: does the RomM API answer right now?
 
         A single tiny GET (limit=1) with a short timeout — used by the backend
         reachability loop to detect offline/online without depending on the
-        frontend's navigator events (gamescope often doesn't emit them). Returns
-        True if the server responded at all (any < 500), False on any network
-        error/timeout. Does NOT touch self.authenticated.
+        frontend's navigator events (gamescope often doesn't emit them). Does
+        NOT touch self.authenticated.
+
+        What counts as reachable is deliberately narrow: the *API* must answer,
+        not merely something on the other end of the socket. 401/403 count (the
+        server is up, our token lapsed — the retry loop's problem, not ours),
+        and a 2xx counts only when it carries JSON. That last clause is the
+        whole point: a captive portal — the normal state of a handheld that has
+        joined a hotel/airport wifi but not signed in — happily returns 200
+        text/html for any URL you ask for, which the old `status_code < 500`
+        test read as "RomM is back". Everything else (a redirect landing
+        somewhere else, 5xx, any network error or timeout) is unreachable.
         """
         try:
             r = self.session.get(urljoin(self.base_url, '/api/roms'),
                                   params={'limit': 1}, timeout=timeout)
-            return r.status_code < 500
+            if r.status_code in (401, 403):
+                return True
+            if 200 <= r.status_code < 300:
+                ctype = (r.headers.get('Content-Type') or '').lower()
+                return 'json' in ctype
+            return False
         except Exception:
             return False
 
@@ -8946,6 +9108,9 @@ class RetroArchInterface:
 
     def send_notification(self, message):
         """Send notification to RetroArch using SHOW_MSG command"""
+        if not _notifications_enabled:
+            logging.debug(f"Notifications muted; dropping OSD message: {message}")
+            return False
         try:
             # Use SHOW_MSG instead of NOTIFICATION
             command = f'SHOW_MSG {message}'

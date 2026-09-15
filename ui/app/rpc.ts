@@ -50,6 +50,11 @@ export const listEmulatorBuilds = callable<[string], {
 }>("list_emulator_builds");
 export const setEmulatorBuild = callable<[string, string], any>("set_emulator_build");
 export const getSyncIndicator = callable<[], any>("get_sync_indicator");
+// Notification switches: the master mute and the connect/disconnect pair.
+// The setter takes both, nulls meaning "leave that one alone".
+export const getNotificationPrefs = callable<[], any>("get_notification_prefs");
+export const setNotificationPrefsRpc =
+  callable<[boolean | null, boolean | null], any>("set_notification_prefs");
 export const setSyncIndicatorRpc = callable<[boolean], any>("set_sync_indicator");
 // `rom_id` is present only on entries that name a single rom (downloads), and
 // only on entries written since it was added — older persisted logs lack it.

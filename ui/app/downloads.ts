@@ -8,7 +8,7 @@
 // surface subscribes to _dlListeners.
 
 import { useState, useEffect } from "react";
-import { toaster } from "@ludo/host";
+import { toaster } from "./toast";
 import { downloadGame, getDownloadProgress } from "./rpc";
 import { _broadcastLibRefresh, _broadcastDownloaded } from "./events";
 

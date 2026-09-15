@@ -1,6 +1,7 @@
 import { cloneElement, useEffect, useRef, useState } from "react";
 import { EmulatorBuild, finishOnboarding, getConfig, getRommLogo, getSteamTileStatus, listEmulatorBuilds, pairDevice, repairEmulatorPaths, saveConfig, setDeviceNameRpc, setEmulatorBuild, setLibraryPaths, setSteamTile, testRommConnection } from "../rpc";
-import { FileSelectionType, Focusable, Navigation, host, openFilePicker, showModal, toaster, ModalRoot, GamepadButton} from "@ludo/host";
+import { FileSelectionType, Focusable, Navigation, host, openFilePicker, showModal, ModalRoot, GamepadButton } from "@ludo/host";
+import { toaster } from "../toast";
 import { V2 } from "../theme";
 import { FaBoxOpen, FaCheck, FaCheckCircle, FaChevronLeft, FaChevronRight, FaDownload, FaExternalLinkAlt, FaGamepad, FaPlay, FaPuzzlePiece, FaSave, FaSync, FaTimes, FaUndo} from "react-icons/fa";
 import { libNavigate } from "../nav";
