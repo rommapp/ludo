@@ -1185,7 +1185,7 @@ export function SettingsPage() {
         <V2SettingsRow
           icon={<FaBell size={16} />}
           title="Show notifications"
-          subtitle="Off syncs everything silently — nothing pops up."
+          subtitle="Turn off all notification types"
           onClick={() => handleNotifsToggle(!notifsOn)}
           right={<V2Switch checked={notifsOn} />}
         />
@@ -1195,8 +1195,8 @@ export function SettingsPage() {
           icon={<FaWifi size={16} />}
           title="Connection notifications"
           subtitle={notifsOn
-            ? 'Tell me when the RomM server is lost or comes back.'
-            : 'All notifications are off.'}
+            ? 'Turn off connection related notifications'
+            : 'All notifications are off'}
           onClick={() => { if (notifsOn) handleConnNotifsToggle(!connNotifs); }}
           right={<V2Switch checked={notifsOn && connNotifs} />}
         />
