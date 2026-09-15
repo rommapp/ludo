@@ -360,6 +360,23 @@ def main():
     check('a symlinked dir does not duplicate entries',
           len(seen), len(set(seen)))
 
+    # …and it is the REAL path that is reported, not the alias — whichever
+    # order the filesystem hands the directories back. This passed by luck for
+    # one iterdir order and failed for the other, which is how a green local
+    # run and a red CI run came from the same commit.
+    real_iterdir = Path.iterdir
+    for label, order in (('ascending', sorted),
+                         ('descending', lambda xs: sorted(xs, reverse=True))):
+        Path.iterdir = (lambda self, _o=order, _f=real_iterdir:
+                        iter(_o(list(_f(self)))))
+        try:
+            paths = [f['relative_path'] for f in ra.get_save_files()['saves']]
+        finally:
+            Path.iterdir = real_iterdir
+        card = [r for r in paths if r.endswith('Mcd001.ps2')]
+        check(f'the card is found under its real path ({label})',
+              card, ['ps2/retroarch-core/LRPS2/memcards/Mcd001.ps2'])
+
     # A save folder pointed somewhere enormous must not be walked forever.
     depth_root = Path(tempfile.mkdtemp())
     node = depth_root

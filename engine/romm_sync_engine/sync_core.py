@@ -10562,11 +10562,21 @@ class RetroArchInterface:
         Symlinks are followed (RetroDECK's memcards path IS a symlink, so not
         following them would miss the very case this exists for) but each real
         directory is visited once, so a link pointing back up cannot loop.
+
+        Which *name* a directory is visited under matters, because it becomes
+        the save's relative_path and its emulator attribution. So the real tree
+        is walked to exhaustion first and symlinks only afterwards: a card in
+        "<saves>/ps2/retroarch-core/LRPS2/memcards" reachable both directly and
+        through a link elsewhere is reported under the real path, every time.
+        Without the split, whichever the filesystem happened to hand back first
+        won — the same library reported different paths on different machines.
         """
         found, seen = [], set()
         frontier = [(root, 0)]
-        while frontier:
-            current, depth = frontier.pop()
+        deferred = []
+        while frontier or deferred:
+            # Aliases wait until nothing real is left to walk.
+            current, depth = frontier.pop() if frontier else deferred.pop(0)
             try:
                 key = current.resolve()
             except OSError:
@@ -10578,11 +10588,17 @@ class RetroArchInterface:
             if depth >= cls.SAVE_SCAN_MAX_DEPTH:
                 continue
             try:
-                for child in current.iterdir():
-                    if child.is_dir():
-                        frontier.append((child, depth + 1))
+                # Sorted so the order is the same on every filesystem; reversed
+                # because the frontier is LIFO and would otherwise walk backwards.
+                children = sorted((c for c in current.iterdir() if c.is_dir()),
+                                  reverse=True)
             except OSError:
                 continue
+            for child in children:
+                if child.is_symlink():
+                    deferred.append((child, depth + 1))
+                else:
+                    frontier.append((child, depth + 1))
         return found
 
     def get_save_files(self):
