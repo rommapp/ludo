@@ -29,6 +29,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 from .host import HostProfile
+from .release_token import release_token
 
 # Claim our app identity before anything reads or writes engine state. Ludo
 # keeps ~/.config/ludo; it shares nothing with the GTK app.
@@ -436,7 +437,7 @@ def _detect_multi_disc(local_path, is_downloaded):
 # ---------------------------------------------------------------------------
 # Version + auto-update
 # ---------------------------------------------------------------------------
-GITHUB_OWNER = "Covin90"
+GITHUB_OWNER = "rommapp"
 GITHUB_REPO = "ludo"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
 
@@ -486,16 +487,34 @@ def _release_asset(rel, suffix):
                  if (a.get('name') or '').endswith(suffix)), None)
 
 
-def _api_headers():
-    """Accept header, plus auth only when a token is in the environment.
+def _asset_download_url(asset):
+    """URL `download_update` should fetch this asset from.
 
-    Shipped installs never set one, so end users keep making anonymous reads.
-    It exists for CI and for `scripts/verify-release.sh`, which have to resolve
-    releases on a private repo — GitHub answers an unauthenticated read there
-    with 404, which is indistinguishable from "nothing published".
+    `browser_download_url` is the public one and 404s on a private repo even
+    with a valid token — private assets come from the asset API endpoint with
+    `Accept: application/octet-stream`, which 302s to a signed storage URL.
+    Prefer the API url whenever we have a token so the same code path works
+    before and after the repo opens up; fall back to the browser URL for
+    anonymous reads, where the API endpoint buys nothing.
     """
-    headers = {'Accept': 'application/vnd.github+json'}
-    token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
+    api_url = asset.get('url')
+    if api_url and release_token():
+        return api_url
+    return asset.get('browser_download_url')
+
+
+def _api_headers(accept='application/vnd.github+json'):
+    """Accept header, plus auth whenever a release token is available.
+
+    On a public repo there is no token and every read is anonymous. While the
+    repo is private a release build embeds a read-only one (see
+    release_token.py) — without it GitHub answers an unauthenticated read with
+    404, indistinguishable from "nothing published", and the updater can never
+    offer anything. CI and `scripts/verify-release.sh` override it from the
+    environment.
+    """
+    headers = {'Accept': accept}
+    token = release_token()
     if token:
         headers['Authorization'] = f'Bearer {token}'
     return headers
@@ -4538,7 +4557,13 @@ class LudoBackend:
                 'channel': channel,
                 'prerelease': bool(rel.get('prerelease')),
                 'notes': rel.get('body') or '',
-                'url': asset.get('browser_download_url') if asset else None,
+                'url': _asset_download_url(asset) if asset else None,
+                # Public URL, or None when the asset needs our token. Decky
+                # Loader's utilities/install_plugin fetches the URL itself and
+                # has no credentials of ours, so its one-click route is only
+                # usable while the asset is anonymously downloadable.
+                'loader_url': (asset.get('browser_download_url')
+                               if asset and not release_token() else None),
                 'asset_name': asset.get('name') if asset else None,
             }
         except (requests.ConnectionError, requests.Timeout):
@@ -4554,7 +4579,7 @@ class LudoBackend:
             return {'success': False, 'available': False,
                     'current': self._host.version, 'message': str(e)}
 
-    async def download_update(self, url: str):
+    async def download_update(self, url: str, asset_name: str = None):
         """Download a release zip into the plugin runtime dir. Returns its path."""
         try:
             import requests
@@ -4562,10 +4587,19 @@ class LudoBackend:
                 return {'success': False, 'message': 'No download URL provided'}
             dest_dir = self._host.download_dir
             dest_dir.mkdir(parents=True, exist_ok=True)
-            name = url.split('/')[-1] or 'update.zip'
+            # An asset API url ends in the numeric asset id, not a filename;
+            # the real name came back from check_for_update, so prefer it.
+            name = asset_name or url.split('/')[-1] or 'update.zip'
             dest = dest_dir / name
             logging.info(f"[UPDATE] downloading {url} -> {dest}")
-            with requests.get(url, stream=True, timeout=120) as r:
+            # Only the asset API endpoint needs auth (and octet-stream); a
+            # browser_download_url is public, and signing it would be pointless.
+            # requests drops the Authorization header on the cross-host redirect
+            # to storage, which is exactly right — storage rejects it.
+            headers = ({} if '/releases/assets/' not in url
+                       else _api_headers('application/octet-stream'))
+            with requests.get(url, stream=True, timeout=120,
+                              headers=headers) as r:
                 r.raise_for_status()
                 with open(dest, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=1 << 16):

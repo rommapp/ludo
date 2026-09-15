@@ -149,7 +149,7 @@ export const getPluginVersion = callable<[], string>("get_plugin_version");
 export const getUpdateChannel = callable<[], string>("get_update_channel");
 export const setUpdateChannel = callable<[string], string>("set_update_channel");
 export const checkForUpdate = callable<[string], any>("check_for_update");
-export const downloadUpdate = callable<[string], any>("download_update");
+export const downloadUpdate = callable<[string, string?], any>("download_update");
 // Desktop-only: swaps the running AppImage. No-ops on Decky, which
 // updates through the loader instead.
 export const applyAppImageUpdate = callable<[string], any>("apply_appimage_update");

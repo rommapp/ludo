@@ -117,3 +117,6 @@ sigil-build/
 # interpreter on the machine has the engine dependencies. Not covered by the
 # .venv/ rule above -- that matches the exact name, not this suffixed one.
 engine/.venv-tests/
+
+# Build-time embedded release token (scripts/embed-token.sh)
+app/ludo_app/_token.py
