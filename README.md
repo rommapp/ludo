@@ -8,6 +8,8 @@
 
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
+<img src="assets/screenshots/home.png" alt="Ludo's home screen, showing Continue playing, Recently Downloaded and Recently added rows">
+
 </div>
 
 ## What it is

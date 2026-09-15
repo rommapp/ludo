@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
+import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, getScreenshotMode, setScreenshotModeRpc, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
 import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel, V2CardRow} from "../kit";
 import { V2, fmtAgo, fmtBytes } from "../theme";
-import { FaBookmark, FaBug, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaInfoCircle, FaLayerGroup, FaPlay, FaRedo, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
+import { FaBookmark, FaBug, FaCameraRetro, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaInfoCircle, FaLayerGroup, FaPlay, FaRedo, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
 import { Focusable, Navigation, host, toaster } from "@ludo/host";
 import { useAutoFocus } from "../shell";
 import { _broadcastLibRefresh } from "../events";
@@ -322,6 +322,7 @@ export function RecentActivitySection() {
 export function SettingsPage() {
   const [loggingEnabled, setLoggingEnabled] = useState<boolean>(_settingsToggles.logging ?? true);
   const [debugMode, setDebugMode] = useState<boolean>(_settingsToggles.debug ?? false);
+  const [screenshotMode, setScreenshotMode] = useState<boolean>(_settingsToggles.screenshotMode ?? false);
   const [loading, setLoading] = useState<boolean>(true);
   const [confirmLogout, setConfirmLogout] = useState<boolean>(false);
   const [loggingOut, setLoggingOut] = useState<boolean>(false);
@@ -575,6 +576,27 @@ export function SettingsPage() {
     }
   };
 
+  // Screenshot mode. Every browse list AND the account pill's identity are
+  // served by the backend but cached on this side, so flipping the switch has
+  // to drop both — otherwise the hidden platforms and the real username keep
+  // painting from localStorage until something else refetches.
+  const handleScreenshotModeToggle = async (enabled: boolean) => {
+    setScreenshotMode(enabled);
+    try {
+      const r = await setScreenshotModeRpc(enabled);
+      if (r && r.success === false) throw new Error(r.message || 'failed');
+      _rememberSettingsToggle('screenshotMode', enabled);
+      clearBrowseCaches();
+      clearIdentityCache();
+      // …and tell a mounted top bar to re-read it; its identity fetch runs once
+      // on mount, so without this the real name stays on screen until a remount.
+      try { window.dispatchEvent(new Event('romm:identity')); } catch { /* ignore */ }
+      _broadcastLibRefresh();
+    } catch {
+      setScreenshotMode(!enabled);
+    }
+  };
+
   const handleResumeStatesToggle = async (enabled: boolean) => {
     setResumeStates(enabled);
     _setResumeStatesPref(enabled);
@@ -656,6 +678,11 @@ export function SettingsPage() {
           const dbg = await isDebugMode();
           setDebugMode(dbg);
           _rememberSettingsToggle('debug', dbg);
+          if (dbg) {
+            const hn = await getScreenshotMode();
+            setScreenshotMode(!!hn?.enabled);
+            _rememberSettingsToggle('screenshotMode', !!hn?.enabled);
+          }
         } catch { /* stays hidden */ }
       } catch (error) {
         console.error('Failed to load logging preference:', error);
@@ -1308,6 +1335,13 @@ export function SettingsPage() {
           }
           onClick={timingFetch ? undefined : handleTimeColdFetch}
           disabled={timingFetch}
+        />}
+        {debugMode && <V2SettingsRow
+          icon={<FaCameraRetro size={16} />}
+          title="Screenshot mode"
+          subtitle="Hides Nintendo platforms, games and collections, and shows the account as \u201CUser\u201D with the default avatar. Nothing is renamed, unsynced or deleted."
+          onClick={() => handleScreenshotModeToggle(!screenshotMode)}
+          right={<V2Switch checked={screenshotMode} />}
         />}
       </V2SettingsSection>
 

@@ -199,9 +199,30 @@ export function useNavChrome(): NavChrome {
     // waited for the next launch. Same window-event pattern as 'romm:toastpos'.
     const onRdChange = () => { void readRd(); };
     try { window.addEventListener('romm:rdbutton', onRdChange); } catch { /* ignore */ }
+    // Screenshot mode swaps the account's name and avatar for a generic pair at
+    // the backend, and Settings can flip it with this bar already mounted. One
+    // re-read, no retry loop: unlike the chain above we know the account is
+    // reachable — the toggle's own RPC just came back.
+    const onIdentityChange = () => {
+      void (async () => {
+        try {
+          const acc = await getAccountUsername();
+          if (!alive || !acc?.connected) return;
+          const next: NavIdentity = {
+            username: acc?.username || 'Guest', role: acc?.role || '', avatar: null,
+          };
+          try { next.avatar = (await getAvatar())?.data_uri || null; } catch { }
+          if (!alive) return;
+          setUsername(next.username); setRole(next.role); setAvatar(next.avatar);
+          if (next.username !== 'Guest') writeIdentity(next); else clearIdentityCache();
+        } catch { /* leave the pill as it is */ }
+      })();
+    };
+    try { window.addEventListener('romm:identity', onIdentityChange); } catch { /* ignore */ }
     return () => {
       alive = false;
       try { window.removeEventListener('romm:rdbutton', onRdChange); } catch { /* ignore */ }
+      try { window.removeEventListener('romm:identity', onIdentityChange); } catch { /* ignore */ }
     };
 
     // Declared last (hoisted) so the two chains above read top-to-bottom.

@@ -159,6 +159,30 @@ benchmark_file = CONFIG_DIR / 'fetch_benchmark.json'
 # environment can't change under a running plugin.
 DEBUG_MODE = os.environ.get('LUDO_DEBUG', '') == '1'
 
+# Screenshot mode. Nintendo is the one publisher whose box art and titles can't
+# appear in a screenshot of Ludo that gets published anywhere, so the debug
+# section carries a switch that hides every Nintendo platform — and the games,
+# collections and search results that belong to them — from the browsing UI.
+#
+# A setting rather than an env var (unlike DEBUG_MODE above) because the whole
+# point is to flip it, shoot, and flip it back without relaunching Steam. Hidden
+# behind LUDO_DEBUG=1 so it can't be switched on by a stray tap.
+#
+# Hiding only: nothing is unsynced, deleted or forgotten — the filter sits in the
+# same place as the platform switches (_visible_games) and comes straight back off.
+_NINTENDO_SLUGS = frozenset({
+    'nes', 'famicom', 'fds', 'snes', 'sfam', 'satellaview', 'sufami-turbo',
+    'n64', '64dd', 'gc', 'ngc', 'wii', 'wiiu', 'switch', 'switch-2',
+    'gb', 'gbc', 'gba', 'gba-e-reader', 'nds', 'nintendo-dsi', 'dsi',
+    '3ds', 'n3ds', 'new-nintendo-3ds', 'virtualboy', 'virtual-boy',
+    'g-and-w', 'game-and-watch', 'poke-mini', 'pokemon-mini',
+    'nintendo-playstation', 'super-nes-cd-rom-system',
+})
+
+# Slugs vary by RomM install, so fall back to matching the platform's label.
+_NINTENDO_NAME_HINTS = ('nintendo', 'famicom', 'game boy', 'gameboy', 'wii',
+                        'gamecube', 'virtual boy', 'satellaview', 'pokemon mini',
+                        'pok\u00e9mon mini', 'game & watch', 'game and watch')
 
 # Partial-fetch checkpoint. A full library fetch is ~6 minutes at 80k ROMs, and
 # anything that interrupts it — suspend, a network blip, a Decky reload — used to
@@ -3069,6 +3093,21 @@ class LudoBackend:
             logging.error(f"set_virtual_collections_visible error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
+    async def get_screenshot_mode(self):
+        """Settings ▸ Debug: is screenshot mode on?"""
+        return {'success': True, 'enabled': self._screenshot_mode()}
+
+    async def set_screenshot_mode(self, enabled: bool):
+        """Turn screenshot mode on or off. Masks only; nothing is deleted."""
+        try:
+            self._settings.set('Debug', 'screenshot_mode',
+                               'true' if enabled else 'false')
+            logging.info(f"Screenshot mode set to {bool(enabled)}")
+            return {'success': True, 'enabled': bool(enabled)}
+        except Exception as e:
+            logging.error(f"set_screenshot_mode error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
     async def set_library_auto_update(self, enabled: bool):
         try:
             self._settings.set('Library', 'auto_update', 'true' if enabled else 'false')
@@ -3800,6 +3839,21 @@ class LudoBackend:
     _account_user_refreshing = False
     _ACCOUNT_USER_TTL = 300.0
 
+    # The name and avatar shown for a signed-in account are the one piece of
+    # personal data on screen that isn't a game. Screenshot mode replaces them
+    # at the RPC boundary rather than in the UI, so nothing downstream — the top
+    # bar pill, Settings, the persisted identity cache — has to know.
+    _ANON_USERNAME = 'User'
+
+    def _anon_account(self, payload: dict) -> dict:
+        """Mask the account identity when screenshot mode is on."""
+        if not self._screenshot_mode():
+            return payload
+        # avatar_path empty is how "this user has no avatar" already reads
+        # everywhere downstream, so the fallback initial is what paints — and
+        # it comes from _ANON_USERNAME, not the real name.
+        return {**payload, 'username': self._ANON_USERNAME, 'avatar_path': ''}
+
     def _account_user_payload(self, user):
         """The stable part of get_account_username's answer, cacheable.
         None when the fetch produced nothing worth caching."""
@@ -3870,12 +3924,12 @@ class LudoBackend:
         if cached:
             if time.time() - cached['at'] >= self._ACCOUNT_USER_TTL:
                 asyncio.create_task(self._refresh_account_user_cache())
-            return {**cached['user'], 'connected': True}
+            return {**self._anon_account(cached['user']), 'connected': True}
         try:
             user = await asyncio.to_thread(client.get_current_user)
             payload = self._store_account_user(user)
             if payload:
-                return {**payload, 'connected': True}
+                return {**self._anon_account(payload), 'connected': True}
             # Server unreachable / erroring with nothing cached: "can't answer
             # yet", not signed out — the caller keeps its cached identity.
             return {'username': '', 'connected': False}
@@ -3901,6 +3955,10 @@ class LudoBackend:
     def _get_avatar_blocking(self):
         try:
             import base64
+            # Screenshot mode: no avatar at all, so the pill falls back to the
+            # default initial — the same path a user with no avatar takes.
+            if self._screenshot_mode():
+                return {'data_uri': None}
             client = self._romm_client
             if client is None or not getattr(client, 'authenticated', False):
                 return {'data_uri': None}
@@ -5587,6 +5645,32 @@ class LudoBackend:
                 or (game.get('romm_data') or {}).get('platform_slug') or '')
         return str(slug).strip().lower() in disabled
 
+    def _screenshot_mode(self) -> bool:
+        """Is screenshot mode switched on right now?
+
+        Two things at once, because they serve one purpose — a screenshot that
+        can be published: Nintendo content is hidden from every browse surface,
+        and the signed-in account paints as a generic "User" with the default
+        avatar instead of a real name and face.
+        """
+        if not DEBUG_MODE:
+            return False
+        try:
+            return (self._settings.get('Debug', 'screenshot_mode', 'false')
+                    or 'false').lower() == 'true'
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_nintendo_row(g) -> bool:
+        """Whether a library entry or a raw RomM row belongs to Nintendo."""
+        slug = (g.get('platform_slug')
+                or (g.get('romm_data') or {}).get('platform_slug') or '')
+        if str(slug).lower() in _NINTENDO_SLUGS:
+            return True
+        label = str(g.get('platform') or g.get('platform_name') or '').lower()
+        return any(h in label for h in _NINTENDO_NAME_HINTS)
+
     def _visible_games(self, games=None) -> list:
         """The library entries the UI is allowed to paint.
 
@@ -5602,10 +5686,12 @@ class LudoBackend:
         """
         src = self._available_games if games is None else games
         disabled = self._disabled_platforms()
-        if not disabled:
+        shot = self._screenshot_mode()
+        if not disabled and not shot:
             return list(src or [])
         return [g for g in (src or [])
-                if not self._platform_sync_off(g, disabled)]
+                if not self._platform_sync_off(g, disabled)
+                and not (shot and self._is_nintendo_row(g))]
 
     def _preserve_disabled_platform_games(self, new_games: list) -> int:
         """Carry downloaded games on switched-off platforms across a full walk.
@@ -6701,6 +6787,16 @@ class LudoBackend:
                 # the user may have hundreds they never browse. Smart
                 # collections always show; there are rarely more than a few.
                 show_virtual = self._virtual_collections_visible()
+                # Screenshot mode has no platform to test a collection against —
+                # a collection spans platforms and the index rows carry only a
+                # name and cover mosaic — so match the title instead. Coarse on
+                # purpose: over-hiding costs a tile in a screenshot, under-hiding
+                # costs the thing this switch exists to prevent.
+                shot = self._screenshot_mode()
+
+                def _nin_named(n):
+                    return shot and any(h in (n or '').lower()
+                                            for h in _NINTENDO_NAME_HINTS)
                 # One combined list, like RomM's collections index: regular,
                 # favorite and smart collections interleave (sorted by name),
                 # and smart ones are told apart only by their kind badge.
@@ -6708,7 +6804,7 @@ class LudoBackend:
                 for col in list(self._romm_collections or []) + \
                           list(self._romm_smart_collections or []):
                     name = col.get('name')
-                    if not name:
+                    if not name or _nin_named(name):
                         continue
                     count = col.get('rom_count')
                     if count is None:
@@ -6741,7 +6837,7 @@ class LudoBackend:
                     for col in (self._romm_virtual_collections or []):
                         name = col.get('name')
                         vid = col.get('id')
-                        if not name or not vid:
+                        if not name or not vid or _nin_named(name):
                             continue
                         count = col.get('rom_count')
                         if count is None:
@@ -6842,9 +6938,12 @@ class LudoBackend:
                 # switched-off platform can slip back in through the server's
                 # rows. Same rule as everywhere else.
                 disabled = self._disabled_platforms()
+                shot = self._screenshot_mode()
                 games = []
                 for r in roms:
                     if self._platform_sync_off(r, disabled):
+                        continue
+                    if shot and self._is_nintendo_row(r):
                         continue
                     rid = r.get('id')
                     local = idx.get(rid)
@@ -6955,10 +7054,13 @@ class LudoBackend:
                 parents = self._variant_parent_index()
                 # The server searches the whole library, switches and all.
                 disabled = self._disabled_platforms()
+                shot = self._screenshot_mode()
                 out = []
                 seen = set()
                 for r in roms:
                     if self._platform_sync_off(r, disabled):
+                        continue
+                    if shot and self._is_nintendo_row(r):
                         continue
                     rid = r.get('id')
                     pid = parents.get(rid)

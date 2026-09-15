@@ -34,6 +34,12 @@ export const setLibraryAutoUpdate = callable<[boolean], any>("set_library_auto_u
 export const getOrphanGames = callable<[], any>("get_orphan_games");
 export const deleteOrphanGame = callable<[number], any>("delete_orphan_game");
 export const getVirtualCollectionsVisible = callable<[], any>("get_virtual_collections_visible");
+// Settings ▸ Debug (LUDO_DEBUG=1 only): screenshot mode. Hides every Nintendo
+// platform, game and collection from the browsing UI so a screenshot carries no
+// Nintendo copyright material, and paints the account as a generic "User" with
+// the default avatar. Masking only — nothing is unsynced, renamed or deleted.
+export const getScreenshotMode = callable<[], any>("get_screenshot_mode");
+export const setScreenshotModeRpc = callable<[boolean], any>("set_screenshot_mode");
 export const setVirtualCollectionsVisibleRpc = callable<[boolean], any>("set_virtual_collections_visible");
 // Standalone emulator builds (Eden stable vs nightly). `selected` is '' for
 // automatic; each build's `current` marks what automatic resolves to now.
