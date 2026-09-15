@@ -27,14 +27,14 @@
     "@types/react": "18.3.3",
     "@types/react-dom": "18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "electron": "^33.4.11",
+    "electron": "^39.8.10",
     "electron-builder": "^25.1.8",
     "playwright": "^1.62.1",
     "typescript": "^5.6.2",
     "vite": "^5.4.0"
   },
   "allowScripts": {
-    "electron@33.4.11": true
+    "electron@39.8.10": true
   },
   "build": {
     "appId": "io.github.covin90.ludo",
