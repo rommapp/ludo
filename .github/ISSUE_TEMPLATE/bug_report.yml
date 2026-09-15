@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Please don't report security issues here — see [SECURITY.md](https://github.com/Covin90/ludo/blob/dev/SECURITY.md).
+        Please don't report security issues here — see [SECURITY.md](https://github.com/rommapp/ludo/blob/dev/SECURITY.md).
 
   - type: dropdown
     id: shell

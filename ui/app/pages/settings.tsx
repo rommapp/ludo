@@ -810,7 +810,7 @@ export function SettingsPage() {
         setInstallPct(null);
         setUpdatePhase(`Downloading v${updateInfo.latest}…`);
         setStatusMsg({ kind: 'ok', text: `Downloading v${updateInfo.latest} — this may take a minute.` });
-        const dl = await downloadUpdate(updateInfo.url);
+        const dl = await downloadUpdate(updateInfo.url, updateInfo.asset_name);
         if (!dl?.success) {
           setStatusMsg({ kind: 'err', text: `Download failed — ${dl?.message ?? 'unknown error'}` });
           setUpdatePhase(null);
@@ -848,6 +848,10 @@ export function SettingsPage() {
       try {
         const backend = (window as any).DeckyBackend;
         if (!backend?.call || !backend?.eventListeners?.get) throw new Error('DeckyBackend unavailable');
+        // The loader downloads the URL with its own (absent) credentials, so
+        // it can't fetch an asset that needs our release token. Fall through to
+        // the manual route below, which downloads through OUR backend.
+        if (!updateInfo.loader_url) throw new Error('asset requires authentication');
 
         const PROMPT = 'loader/add_plugin_install_prompt';
         const promptSet: Set<any> | undefined = backend.eventListeners.get(PROMPT);
@@ -919,7 +923,7 @@ export function SettingsPage() {
 
         await backend.call(
           'utilities/install_plugin',
-          updateInfo.url,
+          updateInfo.loader_url,
           'Ludo',
           updateInfo.latest,
           '',
@@ -935,7 +939,7 @@ export function SettingsPage() {
 
       // Fallback: download the zip ourselves and guide the user through Decky's
       // "Install plugin from ZIP" developer flow.
-      const dl = await downloadUpdate(updateInfo.url);
+      const dl = await downloadUpdate(updateInfo.url, updateInfo.asset_name);
       if (!dl?.success) {
         setStatusMsg({ kind: 'err', text: `Download failed — ${dl?.message ?? 'unknown error'}` });
         return;
@@ -1358,8 +1362,8 @@ export function SettingsPage() {
           <div style={{ color: V2.fgMuted, fontSize: '12px' }}>by Covin</div>
           <div style={{ display: 'flex', gap: '10px', marginTop: '6px' }}>
             {[
-              { icon: <FaGithub size={13} />, label: 'GitHub', url: 'https://github.com/Covin90/ludo' },
-              { icon: <FaBug size={13} />, label: 'Report Issue', url: 'https://github.com/Covin90/ludo/issues' },
+              { icon: <FaGithub size={13} />, label: 'GitHub', url: 'https://github.com/rommapp/ludo' },
+              { icon: <FaBug size={13} />, label: 'Report Issue', url: 'https://github.com/rommapp/ludo/issues' },
             ].map(({ icon, label, url }) => (
               <V2Button key={label} variant="tonal" onClick={() => Navigation.NavigateToExternalWeb(url)}>
                 {icon}<span>{label}</span>

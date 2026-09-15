@@ -11,7 +11,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Covin90/ludo.git"
+    "url": "git+https://github.com/rommapp/ludo.git"
   },
   "keywords": [
     "decky",
@@ -23,9 +23,9 @@
   "author": "Hector Eduardo \"Covin\" Silveri",
   "license": "GPL-3.0-or-later",
   "bugs": {
-    "url": "https://github.com/Covin90/ludo/issues"
+    "url": "https://github.com/rommapp/ludo/issues"
   },
-  "homepage": "https://github.com/Covin90/ludo#readme",
+  "homepage": "https://github.com/rommapp/ludo#readme",
   "devDependencies": {
     "@decky/rollup": "^1.0.1",
     "@rollup/plugin-alias": "^6.0.0",
