@@ -187,17 +187,50 @@ function _rememberSettingsToggle(key: string, v: boolean) {
 // The Platforms subtitle is useful status, but its RPC read can queue behind a
 // library fetch. Remember the last rendered answer so revisiting Settings does
 // not briefly fall back to the generic copy before showing the same counts.
+let _platformSummaryKnown = false;
 let _platformSummary = (() => {
-  try { return localStorage.getItem('romm:platformSummary') || ''; }
-  catch { return ''; }
+  try {
+    const value = localStorage.getItem('romm:platformSummary');
+    _platformSummaryKnown = value != null;
+    return value || '';
+  } catch { return ''; }
 })();
 
 function _rememberPlatformSummary(value: string) {
   _platformSummary = value;
+  _platformSummaryKnown = true;
   try {
-    if (value) localStorage.setItem('romm:platformSummary', value);
-    else localStorage.removeItem('romm:platformSummary');
+    // Empty is meaningful: every platform is enabled. Keep the key as a
+    // sentinel so that state is distinguishable from "never fetched".
+    localStorage.setItem('romm:platformSummary', value);
   } catch { /* ignore */ }
+}
+
+function _platformSummaryFrom(r: any): string | null {
+  const rows = r?.platforms || [];
+  if (!r?.success || !rows.length) return null;
+  const on = r?.enabled_count ?? rows.length;
+  return on === rows.length ? ''
+    : `${on} of ${rows.length} platforms syncing · `
+      + `${(r.enabled_roms || 0).toLocaleString()} games`;
+}
+
+let _platformSummaryRequest: Promise<string | null> | null = null;
+
+// Called at app startup and reused by Settings if it is still in flight. This
+// closes the first-visit gap that localStorage cannot cover yet.
+export function primePlatformSummary(): Promise<string | null> {
+  if (!_platformSummaryRequest) {
+    _platformSummaryRequest = getPlatformSync()
+      .then((r) => {
+        const summary = _platformSummaryFrom(r);
+        if (summary != null) _rememberPlatformSummary(summary);
+        return summary;
+      })
+      .catch(() => null)
+      .finally(() => { _platformSummaryRequest = null; });
+  }
+  return _platformSummaryRequest;
 }
 
 export let _updCheckCache: { t: number; channel: string; info: any } | null = null;
@@ -469,7 +502,8 @@ export function SettingsPage() {
   // visit (`_settingsShape`) already answers the question, so repeat visits
   // paint whole on frame one and the live reads only reconcile drift (e.g.
   // RetroDECK uninstalled since). See `shapeTimer` below for the escape hatch.
-  const [shapeReady, setShapeReady] = useState<boolean>(!!_settingsShape);
+  const [shapeReady, setShapeReady] = useState<boolean>(!!_settingsShape && _platformSummaryKnown);
+  const [platformSummary, setPlatformSummary] = useState<string>(_platformSummary);
 
   useEffect(() => {
     // The "Ludo" tile is mandatory and auto-created at plugin load. Reconcile
@@ -485,7 +519,12 @@ export function SettingsPage() {
     // the timer really only covers a busy backend (mid-library-walk), and
     // holding a finished background for 1.5s was worse than a section
     // occasionally arriving a beat later.
-    const shapeTimer = setTimeout(() => setShapeReady(true), 600);
+    const shapeTimer = setTimeout(() => {
+      // A remembered platform answer is already safe to paint. On the very
+      // first visit, let the in-flight request settle instead of exposing the
+      // generic subtitle and visibly replacing it a moment later.
+      if (_platformSummaryKnown) setShapeReady(true);
+    }, 600);
 
     // These reads are independent of each other, so run them together rather
     // than awaiting in a chain; the page's first paint costs one round-trip,
@@ -518,14 +557,18 @@ export function SettingsPage() {
       setTileState(t);
       return t;
     })();
+    const platforms = primePlatformSummary().then((summary) => {
+      if (summary != null) setPlatformSummary(summary);
+      return summary;
+    });
 
-    Promise.all([config, rdBtn, tile].map((p) => p.catch(() => null)))
+    Promise.all([config, rdBtn, tile, platforms].map((p) => p.catch(() => null)))
       .then((res) => {
-        // Positions restored by hand: .map() over the three promises flattens
+        // Positions restored by hand: .map() over these promises flattens
         // them into one union, which tells TypeScript `rd` might be the tile
         // object and `t` a boolean.
         const [rd, btn, t] = res as [boolean | null, boolean | null,
-          { available: boolean; installed: boolean } | null];
+          { available: boolean; installed: boolean } | null, string | null];
         clearTimeout(shapeTimer);
         setShapeReady(true);
         // Remember what this visit learned — but a FAILED read must not
@@ -597,22 +640,6 @@ export function SettingsPage() {
   // Row subtitle for Platforms — only set once something is actually switched
   // off. With everything on there is nothing to report, and the explanatory
   // copy is what a first-time reader needs from that row instead.
-  const [platformSummary, setPlatformSummary] = useState<string>(_platformSummary);
-  useEffect(() => {
-    getPlatformSync()
-      .then((r) => {
-        const rows = r?.platforms || [];
-        const on = r?.enabled_count ?? rows.length;
-        if (!r?.success || !rows.length) return;
-        const summary = on === rows.length ? ''
-          : `${on} of ${rows.length} platforms syncing · `
-            + `${(r.enabled_roms || 0).toLocaleString()} games`;
-        _rememberPlatformSummary(summary);
-        setPlatformSummary(summary);
-      })
-      .catch(() => { /* the row keeps its explanatory subtitle */ });
-  }, []);
-
   const handleSyncPillToggle = async (enabled: boolean) => {
     _setSyncPillPref(enabled);
     try {

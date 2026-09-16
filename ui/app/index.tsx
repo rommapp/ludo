@@ -22,7 +22,7 @@ import { DownloadsPage } from "./pages/downloads";
 import { CoresPage } from "./pages/cores";
 import { ConfigPage } from "./pages/config";
 import { SetupWizard } from "./pages/setup";
-import { SettingsPage } from "./pages/settings";
+import { primePlatformSummary, SettingsPage } from "./pages/settings";
 import { BiosPage } from "./pages/bios";
 import { PlatformsPage } from "./pages/platforms";
 import { GameDetailPage } from "./pages/game";
@@ -116,6 +116,10 @@ export function startApp(): { stop: () => void } {
   // permissive, so the worst case is that a toast in the first moments of
   // startup slips through a mute that had not landed yet.
   loadNotificationPrefs().catch(() => { });
+  // Warm the only Settings value that cannot be known from a local preference.
+  // The first visit reuses this promise, so its first visible frame already has
+  // the platform count instead of repainting the row after navigation.
+  primePlatformSummary().catch(() => { });
 
   // OS-level connectivity bridge: the Decky frontend runs in a Chromium context,
   // so navigator's online/offline events fire the instant the Deck's network
