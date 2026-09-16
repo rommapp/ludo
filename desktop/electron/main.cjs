@@ -20,6 +20,7 @@ const path = require("path");
 const fs = require("fs");
 const { listNativePads } = require("./native-pads.cjs");
 const { startNativeInput } = require("./native-input.cjs");
+const { backendEnv } = require("./backend-env.cjs");
 
 // The name Electron reports for itself — window titles it derives, the shell's
 // window list, notifications. It comes from the packaged package.json, and
@@ -223,7 +224,7 @@ for (const stream of [process.stdout, process.stderr]) {
 // the "[server] listening" line means the URL is loadable.
 function startBackend(host, port) {
   return new Promise((resolve, reject) => {
-    const env = { ...process.env, ROMM_HOST: host, ROMM_PORT: String(port) };
+    const env = backendEnv(process.env, host, port, PACKAGED);
     const child = spawn(pythonExe(), [SERVER_PY], {
       env,
       // Line-buffered pipes so we can watch for the readiness banner.
