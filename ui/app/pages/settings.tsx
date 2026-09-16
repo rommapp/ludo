@@ -184,6 +184,22 @@ function _rememberSettingsToggle(key: string, v: boolean) {
   try { localStorage.setItem('romm:settingsToggles', JSON.stringify(_settingsToggles)); } catch { /* ignore */ }
 }
 
+// The Platforms subtitle is useful status, but its RPC read can queue behind a
+// library fetch. Remember the last rendered answer so revisiting Settings does
+// not briefly fall back to the generic copy before showing the same counts.
+let _platformSummary = (() => {
+  try { return localStorage.getItem('romm:platformSummary') || ''; }
+  catch { return ''; }
+})();
+
+function _rememberPlatformSummary(value: string) {
+  _platformSummary = value;
+  try {
+    if (value) localStorage.setItem('romm:platformSummary', value);
+    else localStorage.removeItem('romm:platformSummary');
+  } catch { /* ignore */ }
+}
+
 export let _updCheckCache: { t: number; channel: string; info: any } | null = null;
 
 export const _UPD_CACHE_MS = 5 * 60 * 1000;
@@ -581,16 +597,18 @@ export function SettingsPage() {
   // Row subtitle for Platforms — only set once something is actually switched
   // off. With everything on there is nothing to report, and the explanatory
   // copy is what a first-time reader needs from that row instead.
-  const [platformSummary, setPlatformSummary] = useState<string>('');
+  const [platformSummary, setPlatformSummary] = useState<string>(_platformSummary);
   useEffect(() => {
     getPlatformSync()
       .then((r) => {
         const rows = r?.platforms || [];
         const on = r?.enabled_count ?? rows.length;
-        if (!r?.success || !rows.length || on === rows.length) return;
-        setPlatformSummary(
-          `${on} of ${rows.length} platforms syncing · `
-          + `${(r.enabled_roms || 0).toLocaleString()} games`);
+        if (!r?.success || !rows.length) return;
+        const summary = on === rows.length ? ''
+          : `${on} of ${rows.length} platforms syncing · `
+            + `${(r.enabled_roms || 0).toLocaleString()} games`;
+        _rememberPlatformSummary(summary);
+        setPlatformSummary(summary);
       })
       .catch(() => { /* the row keeps its explanatory subtitle */ });
   }, []);
