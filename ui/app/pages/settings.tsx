@@ -1258,7 +1258,7 @@ export function SettingsPage() {
                 <div style={{
                   flexShrink: 0, width: '32px', height: '32px', borderRadius: V2.radiusMd,
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  background: V2.surfaceHover, color: V2.fgMuted,
+                  background: V2.surfaceHover, color: V2.brandHover,
                 }}>
                   <FaRegWindowMaximize size={16} />
                 </div>
