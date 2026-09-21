@@ -2531,6 +2531,35 @@ ROM_TRIM_FIELDS = (
 )
 
 
+# RomFileCategory values that are ABOUT the game rather than part of it. A
+# walkthrough or a manual is a document RomM files alongside the ROM, and a
+# screenshot or a soundtrack track is media; none of them is content an
+# emulator can boot. The rest of the categories — dlc, update, patch, mod,
+# translation and friends — are real game files Ludo already downloads.
+NON_GAME_FILE_CATEGORIES = frozenset({
+    'manual', 'walkthrough', 'screenshot', 'soundtrack',
+})
+
+
+def game_files(rom):
+    """A ROM's files, with the documents and media filtered out.
+
+    RomM 5.3.0 attaches a walkthrough to a game as a FILE on the rom, the way
+    manuals already were, so `files` is no longer only the things that make up
+    the game. That matters because file COUNT is what decides whether a ROM is
+    a folder: uploading a walkthrough took a plain single-file game to two
+    files, and it would have started downloading as a folder — handing the
+    emulator a directory where it expects a .nds, plus a .txt it has no use
+    for.
+
+    An absent category means a pre-5.3.0 server, which had no such files to
+    tell apart, so an unlabelled file stays a game file.
+    """
+    return [f for f in (rom.get('files') or [])
+            if str(f.get('category') or 'game').lower()
+            not in NON_GAME_FILE_CATEGORIES]
+
+
 def rom_has_multiple_files(rom):
     """True when a ROM is a folder of files rather than a single one.
 
@@ -4788,8 +4817,9 @@ class RomMClient:
                 print(f"Available ROM fields: {rom_details}")
                 return False, "Could not find filename in ROM details"
         
-            # Check if this is a folder
-            files = rom_details.get('files', [])
+            # Check if this is a folder. Documents attached to the game
+            # (a manual, a walkthrough) are not part of it — see game_files.
+            files = game_files(rom_details)
             files_amount = len(files)
             file_extension = rom_details.get('fs_extension', '')
 
@@ -16597,7 +16627,7 @@ class CollectionSyncManager:
         """Count total files, expanding multi-file ROMs (e.g. multi-disc) by their file count."""
         total = 0
         for rom in roms:
-            files = rom.get('files', [])
+            files = game_files(rom)
             if len(files) > 1:
                 total += len(files)
             else:
@@ -16749,7 +16779,7 @@ class CollectionSyncManager:
         total_collection_size = self._count_rom_files(collection_roms)
 
         for rom in collection_roms:
-            rom_file_count = len(rom.get('files', [])) if len(rom.get('files', [])) > 1 else 1
+            rom_file_count = len(game_files(rom)) if len(game_files(rom)) > 1 else 1
             if rom.get('id') not in added_rom_ids:
                 # This ROM is not newly added, but check if it exists locally to count it
                 platform_slug = rom.get('platform_slug', 'Unknown')
@@ -16795,7 +16825,7 @@ class CollectionSyncManager:
             platform_dir = (existing.parent if existing
                             else download_dir / platform_folder_name(platform_slug))
             local_path = platform_dir / file_name
-            rom_file_count = len(rom.get('files', [])) if len(rom.get('files', [])) > 1 else 1
+            rom_file_count = len(game_files(rom)) if len(game_files(rom)) > 1 else 1
 
             # Create directories
             platform_dir.mkdir(parents=True, exist_ok=True)
@@ -17901,12 +17931,13 @@ class SteamShortcutManager:
         
         # Check for the multi-file flag ('multi' pre-5.3.0)
         if rom_has_multiple_files(rom):
-            files = rom.get('files', [])
+            files = game_files(rom)
             if files:
                 return True, files
-        
-        # Analyze files array for disc patterns
-        files = rom.get('files', [])
+
+        # Analyze files array for disc patterns. Documents attached to the
+        # game are not discs of it — see game_files.
+        files = game_files(rom)
         if len(files) <= 1:
             return False, []
         
