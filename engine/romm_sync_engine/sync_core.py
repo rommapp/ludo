@@ -4829,6 +4829,19 @@ class RomMClient:
             if (files_amount == 1 and file_extension == ''):
                 download_path = download_path / files[0].get('file_name', 'file')
                 print("Single foldered file detected, using download path: " + download_path.__str__())
+                # Ask for that one file by id. Uploading a manual or a
+                # walkthrough converts a single-file game into a FOLDER on the
+                # server to hold the document, so the content endpoint now has
+                # more than one file to serve and answers with a zip of the
+                # whole folder — which this path would then write to a
+                # `.nds`/`.iso` filename and hand to an emulator. Naming the
+                # file makes the server stream it raw, verified against a real
+                # rom: no file_ids gave application/zip at 134,371,188 bytes,
+                # file_ids gave the 134,217,728-byte .nds itself.
+                if not file_ids:
+                    only = files[0].get('id')
+                    if only:
+                        file_ids = [only]
 
             if is_folder:
                 folder_name = rom_details.get('fs_name', filename)
