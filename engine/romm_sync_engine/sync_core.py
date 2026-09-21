@@ -2521,6 +2521,39 @@ ROM_TRIM_FIELDS = (
 )
 
 
+def is_physical_rom(rom):
+    """True for a RomM 5.3.0 "physical game" — a library row with no ROM file.
+
+    5.3.0 lets a user record a game they own on a cartridge or disc but have no
+    dump of, by name or by scanning its barcode. The row is real: it has
+    metadata, a cover, collections, even saves. What it has not got is anything
+    to download, so every path Ludo cares about — the download, the launch, the
+    save pairing that starts from a file on disk — has nothing to work with.
+
+    Rather than let one reach those paths and fail there with whatever error the
+    missing file produces, they are dropped where the library is read. Servers
+    before 5.3.0 have no such column, and the field is absent rather than false;
+    `.get` therefore reads every one of them as a normal game, which is what
+    they are.
+    """
+    return bool(rom.get('is_physical'))
+
+
+def project_rom_rows(items, trim_fields):
+    """Drop physical games and project each row to `trim_fields`.
+
+    Both fetch paths (the single page and the chunked/per-platform walk) share
+    this so the filter cannot be applied to one and forgotten on the other.
+    The projection is rebound rather than mutated in place so the full rows
+    become garbage as each page lands — see ROM_TRIM_FIELDS for why that
+    matters at library scale.
+    """
+    rows = [row for row in items if not is_physical_rom(row)]
+    if trim_fields:
+        rows = [{k: row[k] for k in trim_fields if k in row} for row in rows]
+    return rows
+
+
 # Scopes Ludo asks for in the device-auth flow. Deliberately narrower than the
 # 22 RomM defines: read the library, read/write the assets that ARE the sync
 # (saves and states), read firmware for BIOS, and register this device. No
@@ -3352,10 +3385,8 @@ class RomMClient:
                 data = response.json()
                 items = data.get('items', [])
                 total = data.get('total', 0)
-                if trim_fields:
-                    # Same projection as the chunked path — see ROM_TRIM_FIELDS.
-                    items = [{k: row[k] for k in trim_fields if k in row}
-                             for row in items]
+                # Same projection as the chunked path — see ROM_TRIM_FIELDS.
+                items = project_rom_rows(items, trim_fields)
 
                 if progress_callback:
                     progress_callback('batch', {'items': items, 'total': total, 'offset': offset})
@@ -3424,7 +3455,9 @@ class RomMClient:
                 timeout=30
             )
             if response.status_code == 200:
-                return response.json().get('items', [])
+                # Physical games can match a search by name; they are no more
+                # launchable here than in the gallery. See is_physical_rom.
+                return project_rom_rows(response.json().get('items', []), None)
             print(f"Failed to search ROMs: {response.status_code}")
         except Exception as e:
             print(f"Error searching ROMs: {e}")
@@ -3602,9 +3635,13 @@ class RomMClient:
                 print(f"Failed to get collection ROMs (offset {offset}): "
                       f"{response.status_code}")
                 return roms if roms else []
-            items = response.json().get('items', [])
-            roms.extend(items)
-            if len(items) < page_size:
+            page = response.json().get('items', [])
+            roms.extend(project_rom_rows(page, None))
+            # The raw page decides whether there is another one: filtering
+            # physical games out can shorten a page that was in fact full, and
+            # reading the short result as the end would truncate the
+            # collection at the first page holding one.
+            if len(page) < page_size:
                 return roms
             offset += page_size
 
@@ -4387,12 +4424,10 @@ class RomMClient:
 
                     if response.status_code == 200:
                         items = response.json().get('items', [])
-                        if trim_fields:
-                            # Rebind so the full rows become garbage here, while
-                            # only this page is resident — not after the whole
-                            # library has accumulated. See ROM_TRIM_FIELDS.
-                            items = [{k: row[k] for k in trim_fields if k in row}
-                                     for row in items]
+                        # Rebind so the full rows become garbage here, while
+                        # only this page is resident — not after the whole
+                        # library has accumulated. See ROM_TRIM_FIELDS.
+                        items = project_rom_rows(items, trim_fields)
                         if page_sink:
                             try:
                                 page_sink(offset, items)
@@ -4695,7 +4730,16 @@ class RomMClient:
                 return False, f"Could not get ROM details: HTTP {rom_details_response.status_code}"
             
             rom_details = rom_details_response.json()
-            
+
+            # A physical game has no file to fetch. The library walk filters
+            # these out (see is_physical_rom), so reaching here means the id
+            # came from somewhere else — a stale cache, a collection, a direct
+            # call — and the generic "could not find filename" below would be
+            # a confusing way to say it.
+            if is_physical_rom(rom_details):
+                return False, ("This is a physical game — it has no ROM file "
+                               "on the server to download")
+
             # Try to find the filename in the ROM details
             filename = None
             possible_filename_fields = ['file_name', 'filename', 'fs_name', 'name', 'file', 'path']
