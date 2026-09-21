@@ -8129,7 +8129,14 @@ class LudoBackend:
                 'summary': d.get('summary') or meta.get('summary') or '',
                 'genres': _names(d.get('genres') or meta.get('genres')),
                 'franchises': _names(d.get('franchises') or meta.get('franchises')),
+                # RomM 5.3.0 splits a game's companies into who published it
+                # and who made it; `companies` stays alongside as the union.
+                # A library scanned before 5.3.0 fills only the union, so the
+                # split renders as the single Companies row it always was
+                # rather than as two empty ones.
                 'companies': _names(d.get('companies') or meta.get('companies')),
+                'publishers': _names(d.get('publishers') or meta.get('publishers')),
+                'developers': _names(d.get('developers') or meta.get('developers')),
                 'release_date': d.get('first_release_date') or meta.get('first_release_date'),
                 'rating': meta.get('total_rating') or d.get('total_rating'),
                 # Header chips + Overview extras (RomM GameHeader / OverviewTab).

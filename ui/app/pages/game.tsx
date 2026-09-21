@@ -1633,7 +1633,15 @@ export function GameDetailPage() {
   // Overview "InfoGrid" sections — icon + label + chip items (RomM InfoGrid).
   const infoGrid: { label: string; items: string[]; icon?: any }[] = [];
   if (detail?.genres?.length) infoGrid.push({ label: 'Genres', items: detail.genres });
-  if (detail?.companies?.length) infoGrid.push({ label: 'Companies', items: detail.companies });
+  // RomM 5.3.0 tells publisher and developer apart; before it, and for a
+  // library not yet rescanned, only the combined list is filled. Show whichever
+  // the server can answer rather than two empty rows next to a populated one.
+  if (detail?.publishers?.length || detail?.developers?.length) {
+    if (detail?.developers?.length) infoGrid.push({ label: 'Developers', items: detail.developers });
+    if (detail?.publishers?.length) infoGrid.push({ label: 'Publishers', items: detail.publishers });
+  } else if (detail?.companies?.length) {
+    infoGrid.push({ label: 'Companies', items: detail.companies });
+  }
   if (detail?.franchises?.length) infoGrid.push({ label: 'Franchises', items: detail.franchises });
   if (detail?.collections?.length) infoGrid.push({ label: 'Collections', items: detail.collections });
 
