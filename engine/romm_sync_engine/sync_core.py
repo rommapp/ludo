@@ -14976,6 +14976,18 @@ class AutoSyncManager:
                 owner = self._vmu_owners.get(save_basename)
                 if owner:
                     return owner
+                # The disc header flycast took the name from is a value RomM
+                # 5.3.0 now reads too, so the owner can be known outright
+                # rather than only at the moment of launch — including for a
+                # game this device no longer has, whose VMU would otherwise
+                # wait for a launch that never comes. Tried before the learned
+                # map is written to, so a wrong guess is not what gets
+                # remembered.
+                by_disc = self._rom_id_for_title_id(
+                    _VMU_SAVE_RE.sub('', file_path.name))
+                if by_disc:
+                    self._remember_vmu_owner(save_basename, by_disc)
+                    return by_disc
                 launch = self._active_launch
                 if launch:
                     rom_id, started = launch
@@ -15135,6 +15147,13 @@ class AutoSyncManager:
             return base
 
         text = text.upper()
+
+        # Dreamcast. The product number in a disc's IP.BIN is a fixed-width
+        # field, so RomM stores it space-padded ("T1401D  50"), while flycast
+        # names a VMU image after the same value with the spaces written as
+        # underscores ("T1401D__50.A1.bin"). Both spellings, and any run of
+        # either, collapse to one.
+        text = re.sub(r'[\s_]+', ' ', text.replace('_', ' ')).strip()
 
         # GameCube and Wii, where the two sides do not merely differ in case.
         # RomM stores the four-byte game code as hex ("47503750"); a disc

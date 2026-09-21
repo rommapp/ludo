@@ -80,6 +80,13 @@ def main():
     # mangled into replacement characters.
     check("non-ascii hex left alone", key('00FF00FF'), '00FF00FF')
 
+    # Dreamcast: RomM stores the IP.BIN product number space-padded, flycast
+    # writes the same value with underscores in a VMU's name.
+    check("dreamcast padding folded", key('T1401D  50'), 'T1401D 50')
+    check("flycast underscores fold the same way",
+          key('T1401D__50'), 'T1401D 50')
+    check("disc and vmu agree", key('T1401D  50') == key('T1401D__50'), True)
+
     mgr = manager([
         # A GameCube disc as RomM 5.3.0 actually stores it: the game code
         # in hex. The save that has to find it is a .gci, whose header spells
@@ -116,6 +123,17 @@ def main():
           mgr._rom_id_for_title_id('ZZZZ99'), None)
     check("unidentified rom indexed under nothing",
           44 in (mgr._title_id_index or {}).values(), False)
+
+    # A flycast VMU is named from the disc header and nothing else — not the
+    # ROM's filename, and its folder is the platform. The server's id is what
+    # lets it be attributed without having watched the launch that wrote it.
+    dc = manager([
+        {'rom_id': 55, 'romm_data': {'fs_name': 'Soulcalibur (Europe).chd',
+                                     'title_id': 'T1401D  50',
+                                     'save_target': 'T1401D  50'}},
+    ])
+    check("vmu name resolves to its game",
+          dc._rom_id_for_title_id('T1401D__50'), 55)
 
     # A filename tag is a guess next to a value read from the binary: where
     # both speak, the server's wins.
