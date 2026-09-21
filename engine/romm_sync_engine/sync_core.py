@@ -2518,6 +2518,13 @@ ROM_TRIM_FIELDS = (
     # Region/language flags on the game tile (RomM's Card Flags.vue). Two short
     # string lists per row — cheap next to what the trim already keeps.
     'regions', 'languages',
+    # RomM 5.3.0 reads a game's native identity out of the binary during its
+    # scan and stores it on the ROM: `title_id` is the game's own ID, and
+    # `save_target` is the literal directory name an emulator gives its saves.
+    # Two short strings, and they are what lets a save be paired with a game
+    # this device has never downloaded — see _rom_id_for_title_id. Absent on
+    # older servers, where the trim simply drops them.
+    'title_id', 'save_target',
 )
 
 
@@ -15086,6 +15093,24 @@ class AutoSyncManager:
                 return self._launch_aliases[n]
         return None
 
+    @staticmethod
+    def _title_id_key(value):
+        """The form a title ID is stored and looked up under, or None.
+
+        Case is the whole of it. A title ID is a hex or alphanumeric string
+        that different sources spell differently: RomM's `save_target` is
+        deliberately lowercase for 3DS, Wii and Wii U because that is the case
+        those emulators create the directory in, Eden's save directory is
+        whatever case is on disk, and a GameCube ID read from a disc header is
+        uppercase. They all name the same game, so they are all folded to one
+        case here rather than compared as written. A Switch update or DLC ID
+        folds to the base application, which is where the save lives.
+        """
+        text = str(value or '').strip()
+        if not text:
+            return None
+        return title_ids.base_switch_title_id(text) or text.upper()
+
     def _rom_id_for_title_id(self, title_id):
         """rom_id owning a game-native title ID, or None.
 
@@ -15100,6 +15125,32 @@ class AutoSyncManager:
         """
         if self._title_id_index is None:
             self._title_id_index = {}
+            # TIER 0: what the SERVER read out of the binary. RomM 5.3.0 does
+            # this during its scan and stores `title_id` and `save_target` on
+            # the ROM, which covers the platforms whose ID is legible nowhere
+            # in the filename — a PS2 serial, a GameCube ID, a Switch dump
+            # named plainly. The tiers below can only reach those by reading
+            # the file, so before 5.3.0 a save for a game not downloaded to
+            # this device was unmatchable unless its name happened to carry a
+            # tag. Cheapest tier as well as the widest: the values ride along
+            # on the library rows already fetched.
+            try:
+                for game in (self.get_games() or []):
+                    rom_id = game.get('rom_id')
+                    data = game.get('romm_data') or {}
+                    if not rom_id:
+                        continue
+                    for value in (data.get('title_id'), data.get('save_target')):
+                        key = self._title_id_key(value)
+                        # First writer wins, so a base title claimed here is
+                        # not overwritten by a sibling's save_target.
+                        if key and key not in self._title_id_index:
+                            self._title_id_index[key] = rom_id
+                if self._title_id_index:
+                    logging.debug(f"title-ID index: {len(self._title_id_index)} "
+                                  f"from the server's own binary identities")
+            except Exception as e:
+                logging.debug(f"could not read server title IDs: {e}")
             # The SERVER's filenames first. RomM knows what a ROM is called long
             # before it is downloaded, and a tagged name identifies the title as
             # well as the container does — so this is the only path that can
@@ -15122,6 +15173,12 @@ class AutoSyncManager:
                     # ID; the base entry owns the save.
                     raw = title_ids.raw_switch_tag_in_name(name)
                     rank = 0 if title_ids.switch_kind(raw) == 'base' else 1
+                    # A tier-0 entry was read from the binary by the server and
+                    # is not up for revision by a filename tag: it is absent
+                    # from `ranks`, and a key present in the index without a
+                    # rank is therefore left alone.
+                    if base in self._title_id_index and base not in ranks:
+                        continue
                     if base not in self._title_id_index or rank < ranks[base]:
                         self._title_id_index[base] = rom_id
                         ranks[base] = rank
@@ -15141,17 +15198,18 @@ class AutoSyncManager:
                         # Reuse the name-based tiers to turn the ROM file into a
                         # rom_id. The suffix is irrelevant to them; only the stem
                         # is compared.
-                        if tid in self._title_id_index:
+                        key = self._title_id_key(tid)
+                        if not key or key in self._title_id_index:
                             continue
                         rom_id = self.find_rom_id_for_save_file(
                             path.with_suffix('.srm'))
                         if rom_id:
-                            self._title_id_index[tid] = rom_id
+                            self._title_id_index[key] = rom_id
                     logging.debug(
                         f"title-ID index: {len(self._title_id_index)} ROMs identified")
             except Exception as e:
                 logging.debug(f"could not build the title-ID index: {e}")
-        return self._title_id_index.get(title_id)
+        return self._title_id_index.get(self._title_id_key(title_id))
 
     def sync_before_launch(self, game, core_name=None):
         """Sync saves before launching a specific game.

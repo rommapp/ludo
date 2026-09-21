@@ -6204,6 +6204,12 @@ class LudoBackend:
                 # save-sync matcher maps a launched member back to this parent
                 # ROM. Requires with_files=true in get_roms.
                 'files':           rom.get('files', []),
+                # The game's own identity, as RomM 5.3.0 read it out of the
+                # binary. Carried through because save attribution matches on
+                # it for the emulators that name a save after the game rather
+                # than after its file — see _rom_id_for_title_id in the engine.
+                'title_id':        rom.get('title_id'),
+                'save_target':     rom.get('save_target'),
             },
         }
 
