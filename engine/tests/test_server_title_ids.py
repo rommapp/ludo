@@ -51,8 +51,11 @@ def manager(games):
 
 def main():
     key = AutoSyncManager._title_id_key
-    check("case folded", key('gale01'), 'GALE01')
+    # Case folds, and a 6-character disc id drops its maker code — see the
+    # GameCube checks below.
+    check("case folded", key('slus-20946'), 'SLUS-20946')
     check("whitespace stripped", key('  SLUS-20946 '), 'SLUS-20946')
+    check("psx serial untouched", key('SLES-02896'), 'SLES-02896')
     check("empty is nothing", key(''), None)
     check("none is nothing", key(None), None)
     # An update or add-on names the same game; the save lives under the base.
@@ -61,10 +64,29 @@ def main():
     check("base is itself",
           key('0100152000022000'), '0100152000022000')
 
+    # GameCube and Wii: RomM stores the four-byte game code as hex, a disc
+    # header and a Dolphin .gci give it as ASCII plus the two-character maker
+    # code. Both have to land on one key or a .gci never finds its game.
+    check("server hex folds to the game code", key('47503750'), 'GP7P')
+    check("disc/gci ascii folds to the same key", key('GP7P01'), 'GP7P')
+    check("hex and ascii agree", key('47503750') == key('gp7p01'), True)
+    # Distinct ids stay distinct: the hex decode is reversible, and only the
+    # maker code is dropped.
+    check("different games stay apart", key('47414C45') == key('47503750'), False)
+    # A 16-hex Switch id is not a GameCube id and must not be decoded as one.
+    check("switch id untouched by the gamecube fold",
+          key('0100152000022000'), '0100152000022000')
+    # Hex that decodes to something unprintable is left alone rather than
+    # mangled into replacement characters.
+    check("non-ascii hex left alone", key('00FF00FF'), '00FF00FF')
+
     mgr = manager([
-        # A GameCube disc: the ID is in the header, never in the name.
+        # A GameCube disc as RomM 5.3.0 actually stores it: the game code
+        # in hex. The save that has to find it is a .gci, whose header spells
+        # the same code in ASCII with a maker code after it.
         {'rom_id': 11, 'romm_data': {'fs_name': 'Melee.iso',
-                                     'title_id': 'GALE01'}},
+                                     'title_id': '47414C45',
+                                     'save_target': '47414C45'}},
         # RomM stores save_target in the case the emulator writes.
         {'rom_id': 22, 'romm_data': {'fs_name': 'Zelda.wbfs',
                                      'title_id': '0001000248414641',
@@ -75,8 +97,11 @@ def main():
         {'rom_id': 44, 'romm_data': {'fs_name': 'No Identity.sfc'}},
     ])
 
-    check("gamecube id matches", mgr._rom_id_for_title_id('GALE01'), 11)
-    check("gci header case matches", mgr._rom_id_for_title_id('gale01'), 11)
+    check("gci header id matches the server's hex",
+          mgr._rom_id_for_title_id('GALE01'), 11)
+    check("gci header case ignored", mgr._rom_id_for_title_id('gale01'), 11)
+    check("a locally-read hex id matches too",
+          mgr._rom_id_for_title_id('47414C45'), 11)
     check("save_target matches its own case",
           mgr._rom_id_for_title_id('0001000248414641'), 22)
     check("plain switch dump matches",

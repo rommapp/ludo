@@ -15129,7 +15129,32 @@ class AutoSyncManager:
         text = str(value or '').strip()
         if not text:
             return None
-        return title_ids.base_switch_title_id(text) or text.upper()
+
+        base = title_ids.base_switch_title_id(text)
+        if base:
+            return base
+
+        text = text.upper()
+
+        # GameCube and Wii, where the two sides do not merely differ in case.
+        # RomM stores the four-byte game code as hex ("47503750"); a disc
+        # header and a Dolphin .gci give the same code as ASCII followed by the
+        # two-character maker code ("GP7P01"). Both fold to the game code.
+        #
+        # The hex decode is reversible, so distinct ids stay distinct. Dropping
+        # the maker code is not: it identifies the publisher, not the game, so
+        # two ids differing only there are the same title and folding them
+        # together is the point.
+        if len(text) == 8:
+            try:
+                decoded = bytes.fromhex(text).decode('ascii')
+            except (ValueError, UnicodeDecodeError):
+                decoded = ''
+            if len(decoded) == 4 and decoded.isalnum():
+                return decoded.upper()
+        if len(text) == 6 and text.isalnum():
+            return text[:4]
+        return text
 
     def _rom_id_for_title_id(self, title_id):
         """rom_id owning a game-native title ID, or None.
