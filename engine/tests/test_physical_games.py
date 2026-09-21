@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from romm_sync_engine.sync_core import (  # noqa: E402
-    ROM_TRIM_FIELDS, is_physical_rom, project_rom_rows,
+    ROM_TRIM_FIELDS, is_physical_rom, project_rom_rows, rom_has_multiple_files,
 )
 
 FAILURES = []
@@ -65,6 +65,20 @@ def main():
     check("no trim keeps the whole row",
           sorted(project_rom_rows([page[0]], None)[0]),
           sorted(page[0]))
+
+    # 5.3.0 renamed `multi` to `has_multiple_files` and dropped the old name
+    # from the row outright, so both spellings have to be read.
+    check("5.2.x flag read", rom_has_multiple_files({'multi': True}), True)
+    check("5.3.0 flag read",
+          rom_has_multiple_files({'has_multiple_files': True}), True)
+    check("5.3.0 flag false",
+          rom_has_multiple_files({'has_multiple_files': False}), False)
+    # A 5.3.0 row carries no `multi` at all; a stale cached row may carry both,
+    # and the newer name is the one to believe.
+    check("new name wins over a stale old one",
+          rom_has_multiple_files({'multi': True, 'has_multiple_files': False}),
+          False)
+    check("neither flag is a single file", rom_has_multiple_files({}), False)
 
     check("empty page is empty", project_rom_rows([], ROM_TRIM_FIELDS), [])
     check("all-physical page is empty",

@@ -2506,7 +2506,10 @@ def _safe_page_limit(limit):
 # reads off the returned rows.
 ROM_TRIM_FIELDS = (
     'id', 'name', 'fs_name', 'fs_name_no_ext', 'fs_extension', 'fs_size_bytes',
-    'platform_id', 'platform_slug', 'files', 'multi',
+    'platform_id', 'platform_slug', 'files',
+    # 'multi' through 5.2.x, 'has_multiple_files' from 5.3.0 — see
+    # rom_has_multiple_files. Both are carried so one trim serves both.
+    'multi', 'has_multiple_files',
     # RomM 5.1.0 has no `platform_name` — it is platform_display_name /
     # platform_custom_name. main.py still reads 'platform_name', which has
     # therefore always been None; carrying the real ones means the trim isn't
@@ -2526,6 +2529,23 @@ ROM_TRIM_FIELDS = (
     # older servers, where the trim simply drops them.
     'title_id', 'save_target',
 )
+
+
+def rom_has_multiple_files(rom):
+    """True when a ROM is a folder of files rather than a single one.
+
+    The flag was `multi` up to 5.2.x and is `has_multiple_files` from 5.3.0;
+    the older name is gone from the row entirely rather than deprecated in
+    place. Both are read, so one client serves both servers.
+
+    Every caller already falls back to counting `files`, so a server answering
+    to neither name is handled rather than mishandled — but the count alone
+    cannot see a folder holding exactly one file, which is the case the flag
+    exists for.
+    """
+    if rom.get('has_multiple_files') is not None:
+        return bool(rom.get('has_multiple_files'))
+    return bool(rom.get('multi'))
 
 
 def is_physical_rom(rom):
@@ -4773,7 +4793,7 @@ class RomMClient:
             files_amount = len(files)
             file_extension = rom_details.get('fs_extension', '')
 
-            is_folder = rom_details.get('multi', False) or \
+            is_folder = rom_has_multiple_files(rom_details) or \
                     files_amount > 1
             
             if (files_amount == 1 and file_extension == ''):
@@ -17843,8 +17863,8 @@ class SteamShortcutManager:
             if discs:
                 return True, discs
         
-        # Check for multi flag
-        if rom.get('multi', False):
+        # Check for the multi-file flag ('multi' pre-5.3.0)
+        if rom_has_multiple_files(rom):
             files = rom.get('files', [])
             if files:
                 return True, files
