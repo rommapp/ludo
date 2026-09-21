@@ -5510,6 +5510,15 @@ class RomMClient:
     def get_saves_by_device(self, device_id, save_type='saves', rom_id=None, limit=100, slot=None):
         """Get saves/states filtered by device ID
 
+        No caller in Ludo: the launch-time pre-query that used this was removed
+        once it turned out to feed nothing but a log line. Kept because this
+        module is shared verbatim with romm-retroarch-sync.
+
+        `device_id` only filters `saves`. /api/states declares no such
+        parameter (measured against 5.3.0, and the same in 5.2.0), and unknown
+        query params are dropped silently, so a states call answers with every
+        state for the scope regardless of the device asked for.
+
         Args:
             device_id: The device ID to filter by
             save_type: Type of save ('saves' or 'states')
@@ -15486,40 +15495,16 @@ class AutoSyncManager:
                     except Exception as _e:
                         self.log(f"   Region-sibling restore skipped ({rsib.get('id')}): {_e}")
 
-            # Check if we have device-aware sync data to skip unnecessary downloads
-            device_saves_to_skip = set()
-            device_states_to_skip = set()
-
-            if self.parent_window and self.parent_window.device_id:
-                # Query saves uploaded from this device to avoid re-downloading them (optimistic sync)
-                try:
-                    device_saves = self.romm_client.get_saves_by_device(
-                        self.parent_window.device_id,
-                        save_type='saves',
-                        rom_id=rom_id,
-                        limit=50
-                    )
-                    device_saves_to_skip = {s.get('id') for s in device_saves if s.get('id')}
-                    
-                    for save in device_saves:
-                        self.log(f"   Save ID: {save.get('id')}, file: {save.get('file_name')}, updated: {save.get('updated_at')}")
-
-                    device_states = self.romm_client.get_saves_by_device(
-                        self.parent_window.device_id,
-                        save_type='states',
-                        rom_id=rom_id,
-                        limit=50
-                    )
-                    device_states_to_skip = {s.get('id') for s in device_states if s.get('id')}
-                    
-                    for state in device_states:
-                        self.log(f"   State ID: {state.get('id')}, file: {state.get('file_name')}, updated: {state.get('updated_at')}")
-
-                    if device_saves_to_skip or device_states_to_skip:
-                        self.log(f"🔄 Optimistic sync: {len(device_saves_to_skip)} saves, {len(device_states_to_skip)} states already on device")
-                except Exception as e:
-                    print(f"Could not query device saves: {e}")
-                    # Continue without optimistic sync
+            # No "optimistic sync" pre-query here. It used to ask the server
+            # which saves and states THIS device had uploaded, to skip
+            # re-downloading them — but the skip is decided per asset further
+            # down, from the `device_syncs` the row itself carries plus the
+            # local file's existence, and deliberately not from an
+            # uploaded-by-this-device set (another device may have uploaded a
+            # newer version of the same id). The two queries fed nothing but a
+            # log line, and the states one could not even answer the question
+            # asked: /api/states takes no device_id, so it returned every state
+            # for the rom and reported them all as "already on device".
 
             # Get user preference for overwrite behavior
             overwrite_behavior = self.parent_window.get_overwrite_behavior() if self.parent_window else "Smart (prefer newer)"
@@ -15832,8 +15817,9 @@ class AutoSyncManager:
 
                     # Only skip download if the local file actually exists AND
                     # the API confirms this device has the current version.
-                    # Do NOT skip based on device_saves_to_skip — that only tracks
-                    # what this device uploaded and misses newer versions from other devices.
+                    # Never skip on "this device uploaded it": that misses a
+                    # newer version another device has since uploaded under the
+                    # same id.
                     skip = False
                     if final_path and final_path.exists():
                         device_id = self.settings.get('Device', 'device_id', '') or None
@@ -15962,8 +15948,14 @@ class AutoSyncManager:
                             self.log(f"  [DEBUG] state final_path={final_path}")
 
                     # Skip logic — only skip if API confirms this device has current version.
-                    # Do NOT skip based on device_states_to_skip (uploaded-by-this-device set):
-                    # another device may have uploaded a newer version of the same state ID.
+                    # Same rule as the saves above: an uploaded-by-this-device
+                    # set is not a reason to skip, because another device may
+                    # have uploaded a newer version of the same state id.
+                    #
+                    # For a state this never fires either way: StateSchema
+                    # carries no device_syncs (only SaveSchema does), so the
+                    # fast path below cannot confirm anything and every state
+                    # falls through to should_download_file's comparison.
                     skip = False
                     if final_path and final_path.exists():
                         device_id = self.settings.get('Device', 'device_id', '') or None
