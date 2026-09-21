@@ -8048,7 +8048,13 @@ class LudoBackend:
                 'completionist_count':   hltb_src.get('completionist_count'),
                 'all_styles':            hltb_src.get('all_styles'),
                 'all_styles_count':      hltb_src.get('all_styles_count'),
-            } if hltb_src else None
+            } if any(hltb_src.get(k) for k in
+                     ('main_story', 'main_plus_extra',
+                      'completionist', 'all_styles')) else None
+            # Keyed on the DURATIONS, not on hltb_metadata being present: a
+            # match can carry a review score and a popularity rank with no
+            # times behind them, and the strip renders nothing from those —
+            # which would leave a "How long to beat" heading over a gap.
 
             # ── Age ratings (RomM AgeRatingBadges) ───────────────────────────
             # Resolve each merged rating string to {category, rating, icon_url},
