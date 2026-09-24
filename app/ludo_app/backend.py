@@ -26,7 +26,7 @@ import shutil
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 from .host import HostProfile
 from .release_token import release_token
@@ -329,6 +329,9 @@ _NON_GAME_EXTS = (
     '.m3u', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp',
     '.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra',
     '.state', '.auto', '.txt', '.nfo', '.xml', '.dat', '.json', '.cue',
+    # Document formats RomM accepts for manuals and walkthroughs. They sit in
+    # the game's own folder on the server, so one can arrive beside a ROM.
+    '.pdf', '.md', '.html', '.htm',
     # An in-flight download. download_rom removes its own .part on failure,
     # but a killed process cannot — and a half-written ROM listed as a game is
     # exactly the impersonation the .part name exists to prevent.
@@ -8180,6 +8183,77 @@ class LudoBackend:
             }
         except Exception as e:
             logging.error(f"get_game_detail error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    # Walkthroughs are read in the app, so they cross the websocket whole. A
+    # text guide is tens of KB; the cap is for a PDF that is really a scan.
+    _DOCUMENT_MAX_BYTES = 32 * 1024 * 1024
+
+    async def get_rom_document(self, rom_id: int, file_id: int):
+        """One of a game's documents (a walkthrough), for the Media tab viewer.
+
+        The frontend cannot authenticate to RomM, so the backend fetches the
+        bytes. Returns {'kind': 'text'|'html'|'pdf', 'name', and 'text' or
+        'data_uri'}. Text is decoded here rather than inlined as base64 so the
+        viewer can render it as-is.
+        """
+        try:
+            if not (self._romm_client and self._romm_client.authenticated):
+                return {'success': False, 'message': 'Not connected to RomM'}
+            client = self._romm_client
+            base = client.base_url
+
+            def _fetch():
+                r = client.session.get(urljoin(base, f'/api/roms/{rom_id}'), timeout=15)
+                if r.status_code != 200:
+                    return None, None, f'HTTP {r.status_code}'
+                d = r.json()
+                f = next((x for x in (d.get('files') or []) if x.get('id') == file_id), None)
+                if not f:
+                    return None, None, 'Document not found'
+                name = f.get('file_name') or f.get('fs_name') or ''
+                # The per-file endpoint first; the rom content endpoint named
+                # by file id is the one downloads already prove works, so it
+                # backs up a server that lacks the former.
+                attempts = [
+                    (f'/api/romsfiles/{file_id}/content/{quote(name)}', None),
+                    (f'/api/roms/{rom_id}/content/{quote(d.get("fs_name") or name)}',
+                     {'file_ids': file_id}),
+                ]
+                last = 'no response'
+                for path, params in attempts:
+                    resp = client.session.get(urljoin(base, path), params=params,
+                                              timeout=60, stream=True)
+                    if resp.status_code != 200:
+                        last = f'HTTP {resp.status_code}'
+                        resp.close()
+                        continue
+                    buf = bytearray()
+                    for chunk in resp.iter_content(65536):
+                        buf.extend(chunk)
+                        if len(buf) > self._DOCUMENT_MAX_BYTES:
+                            resp.close()
+                            return None, name, 'Document is too large to open here'
+                    return bytes(buf), name, None
+                return None, name, last
+
+            data, name, err = await asyncio.to_thread(_fetch)
+            if data is None:
+                return {'success': False, 'message': err}
+            ext = Path(name).suffix.lower()
+            if ext == '.pdf' or data[:5] == b'%PDF-':
+                b64 = base64.b64encode(data).decode('ascii')
+                return {'success': True, 'kind': 'pdf', 'name': name,
+                        'data_uri': f'data:application/pdf;base64,{b64}'}
+            try:
+                text = data.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                # Old GameFAQs guides are often Latin-1 / CP437-era text.
+                text = data.decode('latin-1')
+            kind = 'html' if ext in ('.html', '.htm') else 'text'
+            return {'success': True, 'kind': kind, 'name': name, 'text': text}
+        except Exception as e:
+            logging.error(f"get_rom_document error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
     async def switch_prereq_for_rom(self, rom_id: int):

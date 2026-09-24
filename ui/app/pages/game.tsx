@@ -1,7 +1,7 @@
-import { Focusable, GamepadButton, ModalRoot, showModal, Navigation, DialogButton } from "@ludo/host";
+import { Focusable, GamepadButton, ModalRoot, showModal, Navigation } from "@ludo/host";
 import { toaster } from "../toast";
 import { V2, fmtBytes, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
-import { FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaChevronLeft, FaChevronRight} from "react-icons/fa";
+import { FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
 import { useEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
 import { deleteGame, downloadGame, getGameDetail, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns} from "../rpc";
@@ -11,6 +11,9 @@ import { _dlSucceeded, _setDlActive, awaitDownload, useDownloadProgress, useIsDo
 import { maybePromptSwitchFirmware } from "../firmware";
 import { libBack, libNavigate } from "../nav";
 import { GameCover } from "../media";
+import { DocumentViewer } from "../reader";
+import { ScreenshotViewer } from "../shots";
+import { viewerOpen } from "../glass";
 import { MdVerified } from "react-icons/md";
 import { getLibGameHolder, getLibGameOrigin, libCacheSetDownloaded, openGameById} from "../libcache";
 import { cannotLaunch, runLaunch } from "../launch";
@@ -65,104 +68,6 @@ function HashChip({ label, value }: { label: string; value: string | null | unde
   );
 }
 
-// Fullscreen screenshot lightbox — RCarousel equivalent. L1/R1 or the
-// on-screen arrows page through; A/B close.
-function ScreenshotLightbox({ paths, index, closeModal }:
-  { paths: string[]; index: number; closeModal?: () => void; }) {
-  const [i, setI] = useState(index);
-  const uri = useRommImage(paths[i]);
-  const go = (d: -1 | 1) => setI((p) => (p + d + paths.length) % paths.length);
-  const onButtonDown = (evt: any) => {
-    const b = evt?.detail?.button;
-    if (b === GamepadButton.BUMPER_LEFT) go(-1);
-    else if (b === GamepadButton.BUMPER_RIGHT) go(1);
-  };
-  const multi = paths.length > 1;
-
-  // Sample the left/right edge luminance of the current shot so each arrow can
-  // flip to a light or dark scrim and stay legible over the image behind it.
-  // true = that edge is dark → use a light scrim with a dark icon.
-  const [edgeDark, setEdgeDark] = useState<{ left: boolean; right: boolean }>({ left: true, right: true });
-  useEffect(() => {
-    if (!uri) { setEdgeDark({ left: true, right: true }); return; }
-    let alive = true;
-    const img = new Image();
-    img.onload = () => {
-      try {
-        const w = 64, h = Math.max(1, Math.round(64 * img.height / Math.max(1, img.width)));
-        const c = document.createElement('canvas');
-        c.width = w; c.height = h;
-        const ctx = c.getContext('2d');
-        if (!ctx) return;
-        ctx.drawImage(img, 0, 0, w, h);
-        const lum = (x0: number) => {
-          const d = ctx.getImageData(x0, 0, Math.max(1, Math.round(w * 0.18)), h).data;
-          let s = 0, n = 0;
-          for (let k = 0; k < d.length; k += 4) { s += 0.2126 * d[k] + 0.7152 * d[k + 1] + 0.0722 * d[k + 2]; n++; }
-          return n ? s / n : 0;
-        };
-        if (alive) setEdgeDark({ left: lum(0) < 140, right: lum(Math.round(w * 0.82)) < 140 });
-      } catch { /* canvas may be tainted; keep default */ }
-    };
-    img.src = uri;
-    return () => { alive = false; };
-  }, [uri]);
-
-  // Circular scrim arrow matching the Home CardRow chevrons, but with the
-  // scrim/icon inverted on bright screenshot edges for contrast.
-  const arrowStyle = (side: 'left' | 'right'): any => {
-    const dark = side === 'left' ? edgeDark.left : edgeDark.right;
-    return {
-      position: 'absolute', [side]: '8px', zIndex: 2,
-      minWidth: '36px', width: '36px', height: '36px', padding: 0, borderRadius: '50%',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: dark ? 'rgba(255,255,255,0.4)' : 'rgba(0,0,0,0.4)',
-      color: dark ? '#07070f' : V2.fg2,
-      border: dark ? '1px solid rgba(0,0,0,0.2)' : `1px solid ${V2.border}`,
-      backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)',
-      boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
-      transition: 'background 0.2s ease, color 0.2s ease',
-    };
-  };
-  return (
-    <ModalRoot onCancel={closeModal} onEscKeypress={closeModal}>
-      <Focusable noFocusRing onButtonDown={onButtonDown}
-        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }}>
-        <div style={{
-          position: 'relative', width: '100%', display: 'flex',
-          alignItems: 'center', justifyContent: 'center',
-        }}>
-          {multi && (
-            <DialogButton onClick={() => go(-1)} style={arrowStyle('left')}>
-              <FaChevronLeft size={15} />
-            </DialogButton>
-          )}
-          {uri ? (
-            <img src={uri} style={{
-              maxWidth: '100%', maxHeight: '70vh', objectFit: 'contain',
-              borderRadius: V2.radiusMd, boxShadow: V2.elev2,
-            }} />
-          ) : (
-            <div style={{
-              width: '100%', aspectRatio: '16 / 9', borderRadius: V2.radiusMd,
-              background: V2.surface, display: 'flex', alignItems: 'center',
-              justifyContent: 'center', color: V2.fgMuted, fontSize: '12px',
-            }}>Loading…</div>
-          )}
-          {multi && (
-            <DialogButton onClick={() => go(1)} style={arrowStyle('right')}>
-              <FaChevronRight size={15} />
-            </DialogButton>
-          )}
-        </div>
-        {multi && (
-          <div style={{ fontSize: '12px', color: V2.fgMuted }}>{i + 1} / {paths.length}</div>
-        )}
-      </Focusable>
-    </ModalRoot>
-  );
-}
-
 function AgeRatingBadge({ item }: { item: { category: string; rating: string; icon_url: string | null } }) {
   const [failed, setFailed] = useState(false);
   const label = item.category ? `${item.category}: ${item.rating}` : item.rating;
@@ -192,7 +97,8 @@ function AgeRatingBadge({ item }: { item: { category: string; rating: string; ic
 const FILE_CATEGORY_LABEL: Record<string, string> = {
   game: 'Game', dlc: 'DLC', update: 'Update', mod: 'Mod', patch: 'Patch',
   demo: 'Demo', manual: 'Manual', hack: 'Hack', prototype: 'Prototype',
-  translation: 'Translation',
+  translation: 'Translation', walkthrough: 'Walkthrough', screenshot: 'Screenshot',
+  soundtrack: 'Soundtrack',
 };
 
 function HashChipRow({ crc, md5, sha1 }: { crc?: string | null; md5?: string | null; sha1?: string | null }) {
@@ -222,10 +128,10 @@ const PROVIDERS: { key: string; name: string; color: string; logo: string; url: 
 ];
 
 // One 16:9 screenshot thumbnail — opens the lightbox on activate.
-function ScreenshotThumb({ paths, index }: { paths: string[]; index: number; }) {
+function ScreenshotThumb({ paths, index, title }: { paths: string[]; index: number; title?: string; }) {
   const uri = useRommImage(paths[index]);
   const [focused, setFocused] = useState(false);
-  const open = () => showModal(<ScreenshotLightbox paths={paths} index={index} />);
+  const open = () => showModal(<ScreenshotViewer paths={paths} index={index} title={title} />);
   return (
     <Focusable noFocusRing
       onActivate={open}
@@ -472,7 +378,7 @@ function ProviderCard({ p, id }: { p: typeof PROVIDERS[number]; id: any }) {
 // then the file's own hashes. No path or modified date — RomM shows neither.
 function FileRow({ f }: { f: any }) {
   const cat = String(f?.category || '').toLowerCase();
-  const catLabel = FILE_CATEGORY_LABEL[cat] || (cat ? cat : '');
+  const catLabel = FILE_CATEGORY_LABEL[cat] || (cat ? cat[0].toUpperCase() + cat.slice(1) : '');
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', gap: '8px',
@@ -607,14 +513,83 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
   );
 }
 
+// The documents RomM files on a game that are read rather than booted. RomM
+// 5.3.0 stores a walkthrough as a file on the rom with category 'walkthrough'
+// and shows it under the Media tab; so does this page.
+function walkthroughsOf(detail: any): any[] {
+  return (detail?.files || []).filter((f: any) =>
+    String(f?.category || '').toLowerCase() === 'walkthrough' && !f.missing);
+}
+
+const DOC_KIND: Record<string, string> = {
+  txt: 'Text', md: 'Markdown', markdown: 'Markdown', html: 'Web page', htm: 'Web page', pdf: 'PDF',
+};
+
+// One walkthrough, as a row in the Media tab — opens the reader on activate.
+function WalkthroughRow({ romId, file }: { romId: number; file: any }) {
+  const open = () => showModal(<DocumentViewer romId={romId} file={file} />);
+  const name = String(file.name || '');
+  const dot = name.lastIndexOf('.');
+  const title = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
+  const kind = DOC_KIND[ext] || ext.toUpperCase();
+  const [focused, setFocused] = useState(false);
+  return (
+    <Focusable noFocusRing onActivate={open} onClick={open}
+      onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}
+      onMouseEnter={() => setFocused(true)} onMouseLeave={() => setFocused(false)}
+      style={{
+        display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 14px',
+        // Border as longhands so V2Focus.row's borderColor hands back cleanly
+        // on blur (a `border` shorthand here left a white outline behind).
+        background: V2.surface, borderWidth: '1px', borderStyle: 'solid', borderColor: V2.border,
+        borderRadius: V2.radiusLg,
+        cursor: 'pointer', transition: 'transform 0.18s ease, box-shadow 0.18s ease',
+        ...V2Focus.row(focused),
+      }}>
+      <FaBook size={16} style={{ color: V2.fgFaint, flexShrink: 0 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: '13px', fontWeight: 600, color: V2.fg, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{title}</div>
+        <div style={{ fontSize: '11.5px', color: V2.fgMuted }}>
+          {[kind, file.size ? fmtBytes(file.size) : null].filter(Boolean).join(' · ')}
+        </div>
+      </div>
+    </Focusable>
+  );
+}
+
+// Media tab (RomM MediaTab): walkthroughs above the screenshot grid.
+function MediaTab({ romId, detail }: { romId: number; detail: any }) {
+  const guides = walkthroughsOf(detail);
+  const shots: string[] = detail?.screenshots || [];
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+      {guides.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '6px 6px 0' }}>
+          <SectionHeading icon={<FaBook size={12} />}>Walkthroughs</SectionHeading>
+          <Focusable noFocusRing style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            {guides.map((f) => <WalkthroughRow key={f.id} romId={romId} file={f} />)}
+          </Focusable>
+        </div>
+      )}
+      {shots.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          {guides.length > 0 && <div style={{ padding: '0 6px' }}><SectionHeading icon={<FaImages size={12} />}>Screenshots</SectionHeading></div>}
+          <ScreenshotGrid paths={shots} title={detail?.name} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Responsive grid of screenshot thumbnails (RomM ScreenshotsTab).
-function ScreenshotGrid({ paths }: { paths: string[]; }) {
+function ScreenshotGrid({ paths, title }: { paths: string[]; title?: string; }) {
   return (
     <Focusable noFocusRing style={{
       display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
       gap: '10px', padding: '6px 6px 4px',
     }}>
-      {paths.map((p, i) => <ScreenshotThumb key={p || i} paths={paths} index={i} />)}
+      {paths.map((p, i) => <ScreenshotThumb key={p || i} paths={paths} index={i} title={title} />)}
     </Focusable>
   );
 }
@@ -1654,7 +1629,7 @@ export function GameDetailPage() {
   // Tab strip — Files only when the server reported files (RomM hides empty tabs).
   const tabList: { id: string; label: string }[] = [{ id: 'overview', label: 'Overview' }];
   if (detail?.files?.length) tabList.push({ id: 'files', label: 'Files' });
-  if (detail?.screenshots?.length) tabList.push({ id: 'screenshots', label: 'Screenshots' });
+  if (detail?.screenshots?.length || walkthroughsOf(detail).length) tabList.push({ id: 'media', label: 'Media' });
   tabList.push({ id: 'save-data', label: 'Save Data' });
   if (detail?.achievements?.length) tabList.push({ id: 'achievements', label: 'Achievements' });
   tabList.push({ id: 'metadata', label: 'Metadata' });
@@ -1700,6 +1675,7 @@ export function GameDetailPage() {
     }, d));
   };
   const onButtonDown = (evt: any) => {
+    if (viewerOpen()) return;   // the viewer on top owns the pad
     const b = evt?.detail?.button;
     if (b === GamepadButton.BUMPER_LEFT) cycleTab(-1);
     else if (b === GamepadButton.BUMPER_RIGHT) cycleTab(1);
@@ -1976,8 +1952,8 @@ export function GameDetailPage() {
                   <FilesTab detail={detail} />
                 </div>
               </div>
-            ) : tab === 'screenshots' ? (
-              <ScreenshotGrid paths={detail?.screenshots || []} />
+            ) : tab === 'media' ? (
+              <MediaTab romId={game.rom_id} detail={detail} />
             ) : tab === 'save-data' ? (
               <SaveDataTab romId={game.rom_id} />
             ) : tab === 'metadata' ? (

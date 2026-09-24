@@ -21,6 +21,7 @@ export default defineConfig({
       { find: /^react-dom$/, replacement: resolve(__dirname, "node_modules/react-dom") },
       { find: /^react\/jsx-runtime$/, replacement: resolve(__dirname, "node_modules/react/jsx-runtime") },
       { find: /^react-icons\//, replacement: resolve(__dirname, "node_modules/react-icons") + "/" },
+      { find: /^pdfjs-dist(\/.*)?$/, replacement: resolve(__dirname, "node_modules/pdfjs-dist") + "$1" },
     ],
   },
   server: {

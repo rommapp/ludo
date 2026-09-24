@@ -150,3 +150,21 @@ export function FooterLegend() {
     </div>
   );
 }
+
+// The pad button for an action, drawn inline beside an on-screen control so
+// the control doubles as its own legend (a "Sections" button that shows Ⓐ).
+// Follows the legend's device choice: the connected pad's own glyph while a pad
+// is driving, nothing at all on keyboard and mouse, where the control is simply
+// clicked.
+export function ButtonGlyph({ slot }: { slot: "ok" | "cancel" | "secondary" | "options" | "start" | "select" }) {
+  const [set, setSet] = useState<GlyphSet>(() => pickSet());
+  useEffect(() => {
+    const resync = () => setSet(pickSet());
+    resync();
+    const off = onControllerFamilyChange(resync);
+    return () => { off(); };
+  }, []);
+  if (set === "kbm") return null;
+  const b = GAMEPAD_SLOTS[set][slot];
+  return b ? <Glyph set={set} name={b.name} title={b.title} /> : null;
+}

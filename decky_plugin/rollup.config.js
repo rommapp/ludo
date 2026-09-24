@@ -26,7 +26,14 @@ export default deckyPlugin({
                 // (desktop/vite.config.ts pins the same packages, for the
                 // mirror-image reason.)
                 { find: /^react-icons\//, replacement: resolve(import.meta.dirname, "node_modules/react-icons") + "/" },
+                { find: /^pdfjs-dist(\/.*)?$/, replacement: resolve(import.meta.dirname, "node_modules/pdfjs-dist") + "$1" },
             ],
         }),
     ],
+    // Decky loads dist/index.js alone, so everything must live in it: the PDF
+    // reader's lazily imported pdf.js would otherwise be split into chunk
+    // files next to it that nothing is known to serve.
+    output: {
+        inlineDynamicImports: true,
+    },
 });

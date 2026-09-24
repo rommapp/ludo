@@ -1,4 +1,5 @@
 import { LibGame, LibGroup } from "../types";
+import { viewerOpen } from "../glass";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { deleteCollectionRoms, getConfig, getDownloadProgress, getHomeData, getLibraryGames, getLibraryGroups, getResumeStateEnabled, getServiceStatus, repairEmulatorPaths, searchGames, toggleCollectionSync, checkLibraryStale, refreshFromRomm} from "../rpc";
 import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _setResumeStatesPref, _stateThumbListeners, _stateThumbs, _tileElsByRomId, loadStateThumbs} from "../tiles";
@@ -1474,6 +1475,7 @@ export function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   const platformY = active === 'platforms' && !!focusedPlatform;
 
   const onButtonDown = (evt: any) => {
+    if (viewerOpen()) return;   // the viewer on top owns the pad
     const b = evt?.detail?.button;
     if (b === GamepadButton.BUMPER_LEFT) cycle(-1);
     else if (b === GamepadButton.BUMPER_RIGHT) cycle(1);
@@ -1997,6 +1999,7 @@ export function LibraryGamesPage() {
   };
 
   const onButtonDown = (evt: any) => {
+    if (viewerOpen()) return;   // the viewer on top owns the pad
     const b = evt?.detail?.button;
     if (b === GamepadButton.BUMPER_LEFT) cycle(-1);
     else if (b === GamepadButton.BUMPER_RIGHT) cycle(1);

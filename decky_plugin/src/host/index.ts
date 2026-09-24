@@ -28,6 +28,7 @@ export {
   Menu,
   MenuItem,
 } from "@decky/ui";
+export { ButtonGlyph } from "./glyph";
 
 // ── Services ────────────────────────────────────────────────────────────────
 // Decky's IPC, toaster, router and file picker are already the shape Ludo wants.

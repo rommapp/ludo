@@ -33,7 +33,8 @@
       "react": ["./node_modules/@types/react"],
       "react-dom": ["./node_modules/@types/react-dom"],
       "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime"],
-      "react-icons/*": ["./node_modules/react-icons/*"]
+      "react-icons/*": ["./node_modules/react-icons/*"],
+      "pdfjs-dist": ["./node_modules/pdfjs-dist"]
     }
   },
   "include": ["src", "vite.config.ts", "../ui"]

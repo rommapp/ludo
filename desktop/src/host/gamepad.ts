@@ -838,6 +838,21 @@ const H_COALESCE_MS = 140;
 
 type DirName = "up" | "down" | "left" | "right";
 
+const DIR_BUTTON: Record<DirName, number> = {
+  up: GamepadButtonId.DIR_UP, down: GamepadButtonId.DIR_DOWN,
+  left: GamepadButtonId.DIR_LEFT, right: GamepadButtonId.DIR_RIGHT,
+};
+
+// One d-pad step (or held-repeat tick). Steam reports d-pad presses to
+// onButtonDown as DIR_* buttons before it navigates, and a Focusable that
+// wants the d-pad for itself — a scrolling reader — claims the press by
+// stopping propagation. Mirror that, so the shared UI behaves the same in both
+// shells; anything that does not claim it gets the spatial move as before.
+function step(dir: DirName, smooth: boolean, isRepeat: boolean) {
+  if (routeButton("down", DIR_BUTTON[dir], isRepeat)) return;
+  move(dir, smooth);
+}
+
 function dedicatedFor(btn: number): keyof FocusHandlers | undefined {
   if (btn === GamepadButtonId.CANCEL) return "onCancelButton";
   if (btn === GamepadButtonId.SECONDARY) return "onSecondaryButton";
@@ -1124,9 +1139,9 @@ export function startGamepad() {
       const horizontal = dir === "left" || dir === "right";
       const smooth = !(horizontal && now - lastHMove < H_COALESCE_MS);
       if (horizontal) lastHMove = now;
-      move(dir, smooth);
+      step(dir, smooth, false);
       delayTimer = setTimeout(() => {
-        repeatTimer = setInterval(() => move(dir, false), REPEAT_INTERVAL);
+        repeatTimer = setInterval(() => step(dir, false, true), REPEAT_INTERVAL);
       }, REPEAT_DELAY);
     }
   }

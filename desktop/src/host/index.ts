@@ -28,6 +28,7 @@ export {
   Menu,
   MenuItem,
 } from "./kit";
+export { ButtonGlyph } from "./footer";
 
 // ── Services ────────────────────────────────────────────────────────────────
 export {
