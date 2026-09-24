@@ -90,9 +90,12 @@ knowing when changing anything near it:
   python-build-standalone release and installs the engine into it. Bumping that
   pin changes the interpreter every user gets on their next update — treat it as
   a release-worthy change, not a build detail.
-* **Size is the cheap smoke test.** A healthy image is ~170 MB; CI's >1 MB floor
-  only catches catastrophic failures. If an image comes out dramatically smaller,
-  the runtime almost certainly failed to bundle.
+* **Size is the cheap smoke test.** A healthy image is ~150 MiB (~158 MB); CI's
+  >1 MB floor only catches catastrophic failures. If an image comes out
+  dramatically smaller, the runtime almost certainly failed to bundle. If it
+  comes out bigger, check `desktop/package.json`: everything under
+  `dependencies` is copied into the image whole, and the renderer needs none of
+  it (Vite bundles what it uses). That is how beta.6 grew 22 MiB from pdf.js.
 
 ---
 
