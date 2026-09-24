@@ -153,7 +153,7 @@ let _settingsToggles: Record<string, boolean> = (() => {
  * So: drop the headings (the card supplies its own), drop the trailing
  * attribution and link furniture, and leave one plain bullet per change.
  */
-function _tidyReleaseNotes(raw: string): string {
+function _tidyReleaseNotes(raw: string, skipCatchUp = false): string {
   const lines = String(raw).split('\n');
   const out: string[] = [];
   for (const line of lines) {
@@ -163,6 +163,10 @@ function _tidyReleaseNotes(raw: string): string {
       // "New Contributors" is about the project, not about what changed for
       // the reader — and it is always last, so stop rather than skip.
       if (/new contributors/i.test(t)) break;
+      // "## Also new since v…" repeats earlier releases for updaters whose
+      // card shows only the newest one. This card lists those releases itself
+      // when it can, so there it would say everything twice.
+      if (skipCatchUp && /^#+\s*also new since/i.test(t)) break;
       // Any other heading ("## What's Changed") is scaffolding: the card
       // already names the version above this.
       continue;
@@ -187,11 +191,15 @@ function _tidyReleaseNotes(raw: string): string {
 // backend could list them, else just the one it installs. A release with an
 // empty body is dropped rather than shown as a bare version heading.
 function _updateNotes(info: any): { version: string; notes: string }[] {
-  const all: { version: string; notes: string }[] =
-    Array.isArray(info?.history) && info.history.length
-      ? info.history
-      : [{ version: info?.latest, notes: info?.notes || '' }];
-  return all.filter((e) => _tidyReleaseNotes(e.notes || '').trim());
+  const listed = Array.isArray(info?.history) && info.history.length > 0;
+  const all: { version: string; notes: string }[] = listed
+    ? info.history
+    : [{ version: info?.latest, notes: info?.notes || '' }];
+  // With the releases listed one by one, a release's own catch-up section
+  // ("Also new since…") is redundant; with only the newest, it is the point.
+  return all
+    .map((e) => ({ version: e.version, notes: _tidyReleaseNotes(e.notes || '', listed) }))
+    .filter((e) => e.notes.trim());
 }
 
 function _rememberSettingsToggle(key: string, v: boolean) {
@@ -1435,7 +1443,7 @@ export function SettingsPage() {
                           textTransform: 'uppercase', color: V2.fgFaint, marginBottom: '2px',
                         }}>v{e.version}</div>
                       )}
-                      {_tidyReleaseNotes(e.notes)}
+                      {e.notes}
                     </div>
                   ))}
                 </div>

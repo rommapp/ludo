@@ -161,6 +161,12 @@ no internals, no ticket-style detail. The shape:
 - Don't mention controller or keyboard-and-mouse support. Every feature has
   it; saying so for one implies the others lack it.
 - Drop any section with nothing in it.
+- When a release follows another closely, users may skip the one in between.
+  From beta.7 on the update panel lists every skipped release itself, but an
+  older install shows only the newest release's notes. Cover that with a last
+  section, `## Also new since v<older version>`, repeating the skipped
+  releases' highlights. The new panel skips everything from that heading on,
+  so the heading must start with "Also new since".
 - For a platform on the desktop only (or the Deck only), start the line with
   "Desktop:" or "Deck:".
 
