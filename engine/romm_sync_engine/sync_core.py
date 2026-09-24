@@ -13209,7 +13209,12 @@ class AutoSyncManager:
             if not target_dir or not target_dir.is_dir():
                 return None, None
             stems = self._state_stems_for_game(game)
-            mode = self.retroarch.get_save_subdir_mode('states')
+            # Content mode names the folder after the ROM's parent directory.
+            # Only a game in a folder of its own gets a folder of its own; a flat
+            # ROM's parent is the platform folder, so its states share states/snes
+            # with every other game there.
+            own_folder = (self.retroarch.get_save_subdir_mode('states') == 'content'
+                          and self._content_dir_for_game(game) is not None)
             newest, newest_mtime, slot = None, -1.0, None
             for f in target_dir.glob('*.state*'):
                 if not f.is_file():
@@ -13217,11 +13222,14 @@ class AutoSyncManager:
                 match = next((s for s in stems if f.name.startswith(s + '.state')), None)
                 if match is not None:
                     tail = f.name[len(match):]
-                elif mode == 'content':
-                    # A per-content folder holds THIS game's states and nothing
+                elif own_folder:
+                    # A folder of the game's own holds its states and nothing
                     # else, so a name we can't predict is still ours — a state
                     # made on another device, from a dump of the same game under
-                    # a different file name, is the case that matters.
+                    # a different file name, is the case that matters. In a
+                    # shared platform folder the same rule claimed the newest
+                    # state of ANY game there, and every flat game without one of
+                    # its own showed that game's screenshot in Continue playing.
                     tail = f.name[f.name.lower().rindex('.state'):]
                 else:
                     continue
