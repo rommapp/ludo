@@ -1450,7 +1450,13 @@ export function SettingsPage() {
                           {sec.title && (
                             <div style={{ fontWeight: 600, color: V2.fg, fontSize: '11.5px', marginBottom: '1px' }}>{sec.title}</div>
                           )}
-                          {sec.items.map((it) => `• ${it}`).join('\n')}
+                          {/* A real list: the bullets sit indented under the
+                              section label, and a wrapped item hangs, its
+                              second line starting under the text, not under
+                              the bullet. */}
+                          <ul style={{ margin: 0, paddingLeft: '1.3em', whiteSpace: 'normal' }}>
+                            {sec.items.map((it, j) => <li key={j} style={{ margin: '1px 0' }}>{it}</li>)}
+                          </ul>
                         </div>
                       ))}
                     </div>
