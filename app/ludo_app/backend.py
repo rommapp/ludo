@@ -6745,6 +6745,16 @@ class LudoBackend:
                 if len(games) > 1:
                     return [{'name': f.name, 'path': str(f),
                              'is_m3u': False, 'is_region': True} for f in games]
+                if len(games) == 1:
+                    # One game in a folder of its own. RomM calls this a
+                    # nested single file, and uploading a manual or a
+                    # walkthrough CREATES one out of a plain single-file game,
+                    # because the document needs a folder to live in. Nothing
+                    # to pick between, so it is the launch target itself —
+                    # without this the folder resolved to nothing and the game
+                    # could not be booted at all.
+                    return [{'name': games[0].name, 'path': str(games[0]),
+                             'is_m3u': False, 'is_region': False}]
             # Float the .m3u to the top so it is the default "all discs" entry.
             discs.sort(key=lambda d: (not d['is_m3u'], d['name'].lower()))
             return discs
