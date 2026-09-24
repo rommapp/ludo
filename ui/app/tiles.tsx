@@ -588,17 +588,22 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
     <Focusable noFocusRing className="romm-gt-wrap"
       {...({ focusable: focusable !== false } as any)}
       ref={setRefs}
-      onActivate={() => {
+      onActivate={(e: any) => {
         // A press that started on an overlay sub-button (Details / Delete) must
         // not also activate the cover — Steam routes the tap to this parent
         // Focusable since the sub-buttons are plain divs.
         if (subPress.current) { subPress.current = false; return; }
+        // A real mouse click on the cover opens the game, as RomM's card does;
+        // launching takes the Play button in the middle. The desktop host
+        // routes clicks here too, and only a pointer click carries a click
+        // count — the pad's A arrives as a synthetic click with detail 0.
+        if (typeof e?.detail === 'number' && e.detail > 0) { onOpen(game); return; }
         // Multi games drive launch from the release handler (onBtnUp) so a hold
         // can open the picker without the press-edge activation launching first.
         if (isMulti) { longFired.current = false; return; }
         primary();
       }}
-      onClick={primary}
+      onClick={() => onOpen(game)}
       onButtonDown={onBtnDown}
       onButtonUp={onBtnUp}
       onSecondaryButton={() => onOpen(game)}
