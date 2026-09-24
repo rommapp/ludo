@@ -597,6 +597,31 @@ def select_release(channel: str, asset_suffix: str):
                key=lambda r: _version_key(r.get('tag_name') or r.get('name') or ''))
 
 
+def release_notes_between(channel: str, asset_suffix: str,
+                          current: str, latest: str):
+    """Notes of every release an update from `current` to `latest` passes.
+
+    [{'version', 'notes'}], newest first: each release on `channel` above
+    `current` and up to `latest`, by the same rules select_release picks by
+    (channel, and carrying `asset_suffix`), so a skipped half-release is not
+    listed either. The update card shows only the release it would install
+    otherwise, and someone jumping two betas never hears what the one in the
+    middle brought.
+    """
+    lo, hi = _version_key(current), _version_key(latest)
+    out = []
+    for r in _iter_releases():
+        if channel != 'beta' and r.get('prerelease'):
+            continue
+        if not _release_asset(r, asset_suffix):
+            continue
+        v = (r.get('tag_name') or r.get('name') or '').lstrip('v')
+        if lo < _version_key(v) <= hi:
+            out.append({'version': v, 'notes': r.get('body') or ''})
+    out.sort(key=lambda e: _version_key(e['version']), reverse=True)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # The backend
 # ---------------------------------------------------------------------------
@@ -4614,6 +4639,18 @@ class LudoBackend:
                 f"latest={latest} prerelease={bool(rel.get('prerelease'))} "
                 f"asset={'yes' if asset else 'MISSING'} available={available}")
 
+            # Every release the update passes, not only the one it installs.
+            # One more listing call, and only when there is something to
+            # install; if it fails the card falls back to `notes` alone.
+            history = []
+            if available:
+                try:
+                    history = await asyncio.to_thread(
+                        release_notes_between, channel, asset_suffix,
+                        self._host.version, latest)
+                except Exception as e:
+                    logging.info(f"[UPDATE] release history unavailable: {e}")
+
             return {
                 'success': True,
                 'available': available,
@@ -4622,6 +4659,7 @@ class LudoBackend:
                 'channel': channel,
                 'prerelease': bool(rel.get('prerelease')),
                 'notes': rel.get('body') or '',
+                'history': history,
                 'url': _asset_download_url(asset) if asset else None,
                 # Public URL, or None when the asset needs our token. Decky
                 # Loader's utilities/install_plugin fetches the URL itself and

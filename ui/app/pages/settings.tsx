@@ -169,6 +169,10 @@ function _tidyReleaseNotes(raw: string): string {
     }
     // "**Full Changelog**: <url>" and any bare link line.
     if (/^\*\*Full Changelog\*\*/i.test(t) || /^https?:\/\/\S+$/.test(t)) continue;
+    // The release's one-line summary, bold end to end ("**Fixes on top of
+    // v1.0.0-beta.6.**"). The card already heads each release with its
+    // version, so as a bullet it reads like a change that isn't one.
+    if (/^\*\*[^*]+\*\*$/.test(t)) continue;
     let item = t.replace(/^[-*+]\s+/, '');
     // "…thing that changed by @someone in https://github.com/…/pull/16"
     item = item.replace(/\s+by\s+@[\w-]+(\[bot\])?\s+in\s+https?:\/\/\S+$/i, '');
@@ -177,6 +181,17 @@ function _tidyReleaseNotes(raw: string): string {
     if (item) out.push(`• ${item}`);
   }
   return out.join('\n');
+}
+
+// The notes the update card shows: every release the update passes when the
+// backend could list them, else just the one it installs. A release with an
+// empty body is dropped rather than shown as a bare version heading.
+function _updateNotes(info: any): { version: string; notes: string }[] {
+  const all: { version: string; notes: string }[] =
+    Array.isArray(info?.history) && info.history.length
+      ? info.history
+      : [{ version: info?.latest, notes: info?.notes || '' }];
+  return all.filter((e) => _tidyReleaseNotes(e.notes || '').trim());
 }
 
 function _rememberSettingsToggle(key: string, v: boolean) {
@@ -1395,18 +1410,34 @@ export function SettingsPage() {
               Downloaded to: {updateInfo.downloadedPath}
             </div>
           )}
-          {updateInfo?.available && !!updateInfo.notes && !updating && (
+          {updateInfo?.available && _updateNotes(updateInfo).length > 0 && !updating && (
             <>
               <div style={{ height: '1px', background: V2.border }} />
               <div style={{ fontSize: '12px', color: V2.fg2, lineHeight: 1.5 }}>
-                <div style={{ fontWeight: 600, color: V2.fg, marginBottom: '4px' }}>What's new in v{updateInfo.latest}</div>
-                {/* Fade-out mask instead of a hard clip, so truncation reads as intentional */}
+                <div style={{ fontWeight: 600, color: V2.fg, marginBottom: '6px' }}>
+                  {_updateNotes(updateInfo).length > 1
+                    ? `What's new since v${updateInfo.current}`
+                    : `What's new in v${updateInfo.latest}`}
+                </div>
+                {/* Every release the update passes, newest first, each under its
+                    own version, shown in full. Not in a scroll box of its own:
+                    that is unreachable with the pad (it is not a focus stop), so
+                    the card grows instead and the page scroll carries it. */}
                 <div style={{
-                  whiteSpace: 'pre-wrap', maxHeight: '96px', overflow: 'hidden',
-                  WebkitMaskImage: 'linear-gradient(180deg, black 62%, transparent 100%)',
-                  maskImage: 'linear-gradient(180deg, black 62%, transparent 100%)',
-                } as any}>
-                  {_tidyReleaseNotes(updateInfo.notes).slice(0, 600)}
+                  whiteSpace: 'pre-wrap',
+                  display: 'flex', flexDirection: 'column', gap: '10px',
+                }}>
+                  {_updateNotes(updateInfo).map((e) => (
+                    <div key={e.version}>
+                      {_updateNotes(updateInfo).length > 1 && (
+                        <div style={{
+                          fontSize: '10.5px', fontWeight: 700, letterSpacing: '0.08em',
+                          textTransform: 'uppercase', color: V2.fgFaint, marginBottom: '2px',
+                        }}>v{e.version}</div>
+                      )}
+                      {_tidyReleaseNotes(e.notes)}
+                    </div>
+                  ))}
                 </div>
               </div>
             </>
