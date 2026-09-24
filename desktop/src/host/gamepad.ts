@@ -1197,12 +1197,16 @@ export function startGamepad() {
   // Fall back the same way the legend picks its target, then to the open modal
   // (a modal with bHideCloseIcon has no other way out), then to the page's
   // outermost cancel handler, which is the "go back" one.
+  // An open modal owns Escape outright: focus or the last hover can still be
+  // on the page BEHIND it (the row the mouse clicked to open it), and a walk
+  // from there reached the page's go-back and navigated under the modal.
   function cancelStart(): HTMLElement {
-    const a = document.activeElement as HTMLElement | null;
-    if (a && a !== document.body && document.contains(a)) return a;
-    if (hovered && document.contains(hovered)) return hovered;
     const modals = document.querySelectorAll<HTMLElement>(".desk-modal");
     const modal = modals[modals.length - 1];
+    const a = document.activeElement as HTMLElement | null;
+    const inside = (el: HTMLElement) => !modal || modal.contains(el);
+    if (a && a !== document.body && document.contains(a) && inside(a)) return a;
+    if (hovered && document.contains(hovered) && inside(hovered)) return hovered;
     if (modal) return modal;
     for (const [el, h] of registry) {
       if (h.onCancelButton && document.contains(el) && isVisible(el)) return el;
