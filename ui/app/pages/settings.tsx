@@ -153,10 +153,11 @@ let _settingsToggles: Record<string, boolean> = (() => {
  * So: drop the headings (the card supplies its own), drop the trailing
  * attribution and link furniture, and leave one plain bullet per change.
  */
-function _tidyReleaseNotes(raw: string, skipCatchUp = false): string {
-  const lines = String(raw).split('\n');
-  const out: string[] = [];
-  for (const line of lines) {
+type NoteSection = { title: string | null; items: string[] };
+
+function _tidyReleaseNotes(raw: string, skipCatchUp = false): NoteSection[] {
+  const out: NoteSection[] = [{ title: null, items: [] }];
+  for (const line of String(raw).split('\n')) {
     const t = line.trim();
     if (!t) continue;
     if (t.startsWith('#')) {
@@ -167,8 +168,9 @@ function _tidyReleaseNotes(raw: string, skipCatchUp = false): string {
       // card shows only the newest one. This card lists those releases itself
       // when it can, so there it would say everything twice.
       if (skipCatchUp && /^#+\s*also new since/i.test(t)) break;
-      // Any other heading ("## What's Changed") is scaffolding: the card
-      // already names the version above this.
+      // Any other heading ("Highlights", "Fixes") starts a section; the card
+      // shows it as a small label, and drops it if nothing follows.
+      out.push({ title: t.replace(/^#+\s*/, ''), items: [] });
       continue;
     }
     // "**Full Changelog**: <url>" and any bare link line.
@@ -182,15 +184,15 @@ function _tidyReleaseNotes(raw: string, skipCatchUp = false): string {
     item = item.replace(/\s+by\s+@[\w-]+(\[bot\])?\s+in\s+https?:\/\/\S+$/i, '');
     item = item.replace(/\s+in\s+https?:\/\/\S+$/i, '');
     item = item.replace(/\*\*(.+?)\*\*/g, '$1').replace(/`(.+?)`/g, '$1');
-    if (item) out.push(`• ${item}`);
+    if (item) out[out.length - 1].items.push(item);
   }
-  return out.join('\n');
+  return out.filter((sec) => sec.items.length);
 }
 
 // The notes the update card shows: every release the update passes when the
 // backend could list them, else just the one it installs. A release with an
 // empty body is dropped rather than shown as a bare version heading.
-function _updateNotes(info: any): { version: string; notes: string }[] {
+function _updateNotes(info: any): { version: string; sections: NoteSection[] }[] {
   const listed = Array.isArray(info?.history) && info.history.length > 0;
   const all: { version: string; notes: string }[] = listed
     ? info.history
@@ -198,8 +200,8 @@ function _updateNotes(info: any): { version: string; notes: string }[] {
   // With the releases listed one by one, a release's own catch-up section
   // ("Also new since…") is redundant; with only the newest, it is the point.
   return all
-    .map((e) => ({ version: e.version, notes: _tidyReleaseNotes(e.notes || '', listed) }))
-    .filter((e) => e.notes.trim());
+    .map((e) => ({ version: e.version, sections: _tidyReleaseNotes(e.notes || '', listed) }))
+    .filter((e) => e.sections.length);
 }
 
 function _rememberSettingsToggle(key: string, v: boolean) {
@@ -1443,7 +1445,14 @@ export function SettingsPage() {
                           textTransform: 'uppercase', color: V2.fgFaint, marginBottom: '2px',
                         }}>v{e.version}</div>
                       )}
-                      {e.notes}
+                      {e.sections.map((sec, k) => (
+                        <div key={k} style={{ marginTop: sec.title && k > 0 ? '6px' : 0 }}>
+                          {sec.title && (
+                            <div style={{ fontWeight: 600, color: V2.fg, fontSize: '11.5px', marginBottom: '1px' }}>{sec.title}</div>
+                          )}
+                          {sec.items.map((it) => `• ${it}`).join('\n')}
+                        </div>
+                      ))}
                     </div>
                   ))}
                 </div>
