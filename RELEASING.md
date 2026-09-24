@@ -116,6 +116,55 @@ test suite, so this is the real safety net:
 
 ---
 
+## Release notes
+
+CI publishes with GitHub's generated notes (a list of PRs, which is empty or
+dependabot-only for most betas). Replace them once the release is up:
+
+```bash
+gh release edit v1.0.0-beta.8 --notes-file notes.md
+```
+
+The notes are read by users, in the in-app update panel as well as on GitHub,
+so they say what changed for them, not how. Keep them short: one line per item,
+no internals, no ticket-style detail. The shape:
+
+```markdown
+**<One line: what this release is about>, on top of v<previous version>.**
+
+## Highlights
+
+* **<Feature>.** <One or two sentences: what it is and why you'd use it.>
+
+## What's Changed
+
+* <Smaller changes, one line each. Group related ones into a single line,
+  e.g. "Added compatibility with RomM 5.3.0." rather than a line per fix.>
+
+## Fixes
+
+* <What was wrong and what happens now, one line each.>
+
+**Full Changelog**: https://github.com/rommapp/ludo/compare/v<previous>...v<this>
+```
+
+- **Highlights** are only the headline features, usually one to three. A
+  release with none leaves the section out.
+- Say what a feature does, not how to operate it: no button names or
+  controls ("L1/R1 to browse"). The app shows its own button hints.
+- Name what the user gains, not what the screen looks like. "Your reading
+  position saved" stays; "a row of dots to jump between shots" does not. If
+  "redesigned" already covers it, stop there.
+- Don't mention controller or keyboard-and-mouse support. Every feature has
+  it; saying so for one implies the others lack it.
+- Drop any section with nothing in it.
+- For a platform on the desktop only (or the Deck only), start the line with
+  "Desktop:" or "Deck:".
+
+v1.0.0-beta.6 is the reference example.
+
+---
+
 ## When something goes wrong
 
 **CI failed after the tag was pushed.** The tag exists but nothing was published,
