@@ -30,6 +30,48 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import queue
 from collections import defaultdict, deque, OrderedDict
+import struct
+import zipfile as _zipfile
+
+
+# RomM zips a game folder on the fly, and some of those archives carry an extra
+# field whose declared length runs past the end of the record (seen as 0x7075,
+# the Info-ZIP Unicode path, in rommapp/ludo#19). CPython refuses the WHOLE
+# archive over it -- "Corrupt extra field 7075" -- although nothing in that
+# field is needed: the entry's name, sizes and offsets live elsewhere, and a
+# ZIP64 field ahead of it is still read. So on that one error, decode again
+# with the extra data cut at the last well-formed field. A sound archive never
+# reaches the fallback and behaves exactly as before.
+def _install_lenient_zip_extra():
+    orig = _zipfile.ZipInfo._decodeExtra
+    if getattr(orig, '_ludo_lenient', False):
+        return
+
+    def _decodeExtra(self, *args, **kwargs):
+        try:
+            return orig(self, *args, **kwargs)
+        except _zipfile.BadZipFile as e:
+            if 'extra field' not in str(e):
+                raise
+            extra, end = self.extra, 0
+            while end + 4 <= len(extra):
+                _tp, ln = struct.unpack('<HH', extra[end:end + 4])
+                if end + 4 + ln > len(extra):
+                    break
+                end += 4 + ln
+            logging.warning(f"zip entry {self.filename!r}: ignoring malformed "
+                            f"extra field ({e})")
+            saved, self.extra = self.extra, extra[:end]
+            try:
+                return orig(self, *args, **kwargs)
+            finally:
+                self.extra = saved
+
+    _decodeExtra._ludo_lenient = True
+    _zipfile.ZipInfo._decodeExtra = _decodeExtra
+
+
+_install_lenient_zip_extra()
 from contextlib import contextmanager
 
 # Recent-activity feed (Decky Settings UI). Optional so the desktop app —
