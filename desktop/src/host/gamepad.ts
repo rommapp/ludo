@@ -475,6 +475,12 @@ function dedupe(els: HTMLElement[]): HTMLElement[] {
 function focusAndReveal(el: HTMLElement, horizontal = false, smooth = true) {
   try { el.focus({ preventScroll: true } as any); }
   catch { el.focus(); }
+  // A Left/Right inside a card row centres the tile with our own animator, not
+  // scrollIntoView's smooth scroll: a fresh press mid-animation restarted the
+  // native scroll from wherever it had got to, with a new ease-in, so tapping
+  // Right quickly made the row stutter back and forth under the cursor.
+  const row = horizontal ? rowScroller(el) : null;
+  if (row) { revealInRow(row, el, smooth); return; }
   try {
     el.scrollIntoView({
       block: "nearest",
@@ -484,6 +490,58 @@ function focusAndReveal(el: HTMLElement, horizontal = false, smooth = true) {
   } catch {
     try { el.scrollIntoView(); } catch { /* ignore */ }
   }
+}
+
+// The nearest ancestor that actually scrolls horizontally (a Home card row).
+function rowScroller(el: HTMLElement): HTMLElement | null {
+  for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+    const ox = getComputedStyle(p).overflowX;
+    if ((ox === "auto" || ox === "scroll") && p.scrollWidth > p.clientWidth + 1) return p;
+  }
+  return null;
+}
+
+// Per-row animation state: where the row is heading and the frame driving it.
+// Retargeting mid-flight only moves `target`; the running frame keeps easing
+// from the row's current position, so rapid presses glide instead of
+// restarting.
+const _rowAnims = new WeakMap<HTMLElement, { target: number; raf: number; last: number }>();
+
+function revealInRow(row: HTMLElement, el: HTMLElement, smooth: boolean) {
+  const rr = row.getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  // Tile position in the row's content — independent of any in-flight scroll.
+  const left = r.left - rr.left + row.scrollLeft;
+  const max = row.scrollWidth - row.clientWidth;
+  const target = Math.max(0, Math.min(max, left + r.width / 2 - row.clientWidth / 2));
+  const cur = _rowAnims.get(row);
+  if (!smooth) {
+    if (cur) cancelAnimationFrame(cur.raf);
+    _rowAnims.delete(row);
+    row.scrollLeft = target;
+    return;
+  }
+  if (cur) { cur.target = target; return; }
+  const anim = { target, raf: 0, last: performance.now() };
+  _rowAnims.set(row, anim);
+  const step = (now: number) => {
+    const dt = Math.min(64, now - anim.last);
+    anim.last = now;
+    const pos = row.scrollLeft;
+    const diff = anim.target - pos;
+    if (Math.abs(diff) < 0.5) {
+      row.scrollLeft = anim.target;
+      _rowAnims.delete(row);
+      return;
+    }
+    // Exponential ease-out (~90ms time constant): frame-rate independent and
+    // seamless to retarget.
+    row.scrollLeft = pos + diff * (1 - Math.exp(-dt / 90));
+    // The browser rounds scrollLeft; if it didn't budge, finish the move.
+    if (row.scrollLeft === pos) { row.scrollLeft = anim.target; _rowAnims.delete(row); return; }
+    anim.raf = requestAnimationFrame(step);
+  };
+  anim.raf = requestAnimationFrame(step);
 }
 
 // focusAndReveal with the Deck's navigation tick. Used by move()'s landing
