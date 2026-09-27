@@ -3049,6 +3049,14 @@ class LudoBackend:
         except Exception:
             return True
 
+    async def game_running(self):
+        """Whether an emulator is up, so the desktop shell can hold its
+        toasts: its window is behind the game, where a toast is only heard."""
+        try:
+            return {'running': bool(getattr(self._auto_sync, 'game_running', False))}
+        except Exception:
+            return {'running': False}
+
     async def get_sync_indicator(self):
         return {'success': True, 'enabled': self._sync_indicator()}
 

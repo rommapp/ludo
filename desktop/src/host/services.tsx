@@ -16,8 +16,39 @@ export { callable };
 
 // ── Toasts ──────────────────────────────────────────────────────────────────
 
+// While a game is running this window sits behind it, so a toast here is a
+// chime over the game and a card nobody sees. Saves are already announced in
+// RetroArch itself then (see _emit_game_sync_toast in the engine), so:
+//  - the "Uploading save" indicator is dropped; the upload is over by the time
+//    the game closes, and RetroArch said so when it finished;
+//  - every other toast is held, and shown once the game closes.
+// Desktop only: on SteamOS, Decky's toasts are Steam's own and show over games.
+const gameRunning = callable<[], { running: boolean }>("game_running");
+const SAVE_INDICATOR = "Uploading save";
+let playing = false;
+let held: ToastOpts[] = [];
+
+async function watchGame() {
+  try {
+    const running = !!(await gameRunning())?.running;
+    if (playing && !running) {
+      const queued = held;
+      held = [];
+      queued.forEach((opts, i) => window.setTimeout(() => pushToast(opts), i * 300));
+    }
+    playing = running;
+  } catch { /* backend not up yet; try again next tick */ }
+}
+window.setInterval(watchGame, 2000);
+
 export const toaster = {
-  toast: (opts: ToastOpts) => pushToast(opts),
+  toast: (opts: ToastOpts) => {
+    if (!playing) return pushToast(opts);
+    if (opts.title === SAVE_INDICATOR) return { data: opts, dismiss: () => {} };
+    held.push(opts);
+    // A caller that dismisses before the game ends never had anything to say.
+    return { data: opts, dismiss: () => { held = held.filter((o) => o !== opts); } };
+  },
 };
 
 // ── File picker ─────────────────────────────────────────────────────────────

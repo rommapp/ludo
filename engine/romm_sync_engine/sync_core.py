@@ -11492,6 +11492,8 @@ class AutoSyncManager:
         self.retroarch_monitor = None
         self.current_retroarch_game = None
         self.retroarch_running = False
+        # RetroArch or Eden up right now, for the desktop shell's toasts.
+        self.game_running = False
 
         # Bumped after every completed session save-sync. The UI has no other
         # way to learn that a play session ended and changed what the server
@@ -12213,6 +12215,7 @@ class AutoSyncManager:
                     # on the next app start. Closing the emulator is the moment
                     # the save is both final and worth confirming to the user.
                     eden_running = emulator_saves.eden_is_running()
+                    self.game_running = bool(retroarch_running or eden_running)
                     if eden_running != eden_was_running:
                         if eden_running:
                             self.log("🎮 Eden launched")
