@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
-from . import eden_config, emulator_saves, switch_content, title_ids
+from . import eden_config, emulator_saves, ps2_memcard, switch_content, title_ids
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -13534,12 +13534,22 @@ class AutoSyncManager:
                 continue
 
             slot, _autocleanup, _limit = RomMClient.get_slot_info(path)
-            content_hash = RomMClient.compute_content_hash(path)
             stat = path.stat()
             updated_at = _dt.datetime.fromtimestamp(
                 entry.get('modified') or stat.st_mtime,
                 tz=_dt.timezone.utc,
             ).isoformat()
+            # A PS2 game's own card goes up as the game's save folders, zipped
+            # the way Argosy uploads them, so the two can restore each other's
+            # saves. The card stays the thing that changed; the zip is what
+            # the server sees.
+            upload_path, file_name = path, entry['name']
+            if slugs.get(rom_id) == 'ps2' and path.suffix.lower() == '.ps2':
+                packed = self._pack_ps2_card(path, rom_id)
+                if packed is None:
+                    continue
+                upload_path, file_name = packed, packed.name
+            content_hash = RomMClient.compute_content_hash(upload_path)
 
             # Use the RomM core name (e.g. "Mupen64Plus-Next"), not the raw save
             # folder name (e.g. "n64"). get_save_files()' retroarch_emulator is
@@ -13565,14 +13575,14 @@ class AutoSyncManager:
 
             inventory.append({
                 'rom_id': rom_id,
-                'file_name': entry['name'],
+                'file_name': file_name,
                 'slot': slot,
                 'emulator': emulator,
                 'content_hash': content_hash,
                 'updated_at': updated_at,
-                'file_size_bytes': stat.st_size,
+                'file_size_bytes': upload_path.stat().st_size,
                 # Local-only fields (stripped before negotiate; used by the executor)
-                '_path': entry['path'],
+                '_path': str(upload_path),
                 '_autocleanup': _autocleanup,
                 '_autocleanup_limit': _limit,
             })
@@ -13610,6 +13620,122 @@ class AutoSyncManager:
             else:
                 best[k] = e
         return list(best.values())
+
+    def _pack_ps2_card(self, card_path, rom_id):
+        """The game's save from its PS2 card, as an Argosy-shaped zip, or None.
+
+        Written into our cache, never beside the card. export_zip is
+        deterministic -- entry order and timestamps come from the card -- so an
+        untouched card re-packs to the same bytes and the same content hash.
+        None when the card cannot be read or holds no single game's save;
+        such a card is left out of the upload rather than sent whole.
+        """
+        try:
+            card = ps2_memcard.Card.open(card_path)
+            save_id = ps2_memcard.card_save_id(card)
+            data = ps2_memcard.export_zip(card, save_id) if save_id else None
+        except (ps2_memcard.CardError, OSError) as e:
+            logging.debug(f"[PS2] not uploading {Path(card_path).name}: {e}")
+            return None
+        if not data:
+            logging.debug(f"[PS2] {Path(card_path).name} holds no single game's save")
+            return None
+        out = cache_dir() / 'ps2_saves' / str(rom_id) / f"{save_id}.zip"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        for stale in out.parent.glob('*.zip'):
+            if stale != out:
+                stale.unlink(missing_ok=True)
+        if not out.is_file() or out.read_bytes() != data:
+            out.write_bytes(data)
+        return out
+
+    def _platform_slug_of(self, rom_id):
+        for g in (self.get_games() or []):
+            if g.get('rom_id') == rom_id:
+                return (g.get('platform_slug')
+                        or (g.get('romm_data') or {}).get('platform_slug'))
+        return None
+
+    def _is_ps2_zip_op(self, op):
+        """A server save that is a PS2 game's folders rather than a whole card."""
+        return (str(op.get('file_name') or '').lower().endswith('.zip')
+                and self._platform_slug_of(op.get('rom_id')) == 'ps2')
+
+    def _ps2_card_path(self, op, saves_dir):
+        """Where this game's LRPS2 card is, or would be created.
+
+        An existing card already matched to the game wins. Otherwise the core
+        names the card after the file it booted, so the stem comes from the
+        last launch, then from the ROM itself, and the folder follows
+        RetroArch's own sorting setting. The server save's emulator label is
+        no guide here: a zip from Argosy carries its emulator's name.
+        """
+        rom_id = op.get('rom_id')
+        for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
+            path = Path(entry['path'])
+            if path.suffix.lower() == '.ps2' and self.rom_id_for_save(path) == rom_id:
+                return path
+        game = next((g for g in (self.get_games() or [])
+                     if g.get('rom_id') == rom_id), None)
+        local = Path((game or {}).get('local_path') or '')
+        if local.is_dir():
+            discs = sorted((f for f in local.iterdir() if f.is_file()),
+                           key=lambda f: f.stat().st_size, reverse=True)
+            local = discs[0] if discs else local
+        stem = self._launch_stems.get(rom_id) or (local.stem if local.name else None)
+        if not stem or not saves_dir:
+            return None
+        folder = Path(saves_dir)
+        mode = self.retroarch.get_save_subdir_mode('saves')
+        if mode == 'core':
+            folder = folder / 'LRPS2'  # the core's display name, not pcsx2
+        elif mode == 'content' and local.name:
+            folder = folder / local.parent.name
+        return folder / f"{stem}.ps2"
+
+    def _restore_ps2_save(self, op, device_id, session_id):
+        """Put a PS2 save zip from the server into the game's own card.
+
+        Only the game's folders are replaced; the card keeps anything else on
+        it, and the previous card is kept as "<card>.backup". Deferred while
+        RetroArch runs: the core holds the card open and would write its own
+        copy back over this one.
+        """
+        file_name = op.get('file_name') or ''
+        if self.is_retroarch_running():
+            self.log(f"ℹ️ Save-sync: RetroArch is running; {file_name} will "
+                     f"restore once it is closed.")
+            return False
+        saves_dir = (self.retroarch.save_dirs or {}).get('saves')
+        card_path = self._ps2_card_path(op, saves_dir)
+        if not card_path:
+            self.log(f"⚠️ Save-sync: no memory card location for {file_name}")
+            return False
+
+        staged = cache_dir() / 'incoming_saves' / file_name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if not self.romm_client.download_save_by_id(
+                op.get('save_id'), 'saves', staged,
+                device_id=device_id, session_id=session_id):
+            return False
+        try:
+            data = staged.read_bytes()
+            ids = ps2_memcard.zip_save_ids(data)
+            if len(ids) != 1:
+                self.log(f"⚠️ Save-sync: {file_name} holds "
+                         f"{'no' if not ids else 'several'} PS2 game saves; "
+                         f"not restoring it")
+                return False
+            card_path.parent.mkdir(parents=True, exist_ok=True)
+            folders = ps2_memcard.restore_zip(str(card_path), data, ids.pop())
+        except (ps2_memcard.CardError, _zipfile.BadZipFile, OSError) as e:
+            self.log(f"⚠️ Save-sync: could not restore {file_name}: {e}")
+            return False
+        finally:
+            staged.unlink(missing_ok=True)
+        self.log(f"✅ Restored {', '.join(folders)} into {card_path.name}")
+        self._record_synced(str(card_path))
+        return True
 
     def _eden_inventory_entries(self):
         """Inventory rows for Eden's Switch saves, packed one zip per game.
@@ -14719,6 +14845,8 @@ class AutoSyncManager:
         deliberate no-op that leaves BOTH sides untouched, so the next sync
         sees the same operation and can apply it once the obstacle is gone.
         """
+        if self._is_ps2_zip_op(op):
+            return self._restore_ps2_save(op, device_id, session_id)
         file_name = op.get('file_name') or ''
         # is_switch_title_id is the save-directory test specifically: Eden files
         # a save under the BASE title, never an update or DLC id.
@@ -14826,6 +14954,9 @@ class AutoSyncManager:
         leaving the emulator without the save and the failure invisible.
         """
         if self._is_standalone_emulator(op.get('emulator')):
+            return None
+        # A PS2 save zip is folders to merge into a card, not a file to drop.
+        if self._is_ps2_zip_op(op):
             return None
         # The op's emulator is the SERVER save's label, which a buggy or
         # foreign upload can set to anything ('switch' instead of 'eden'). The
