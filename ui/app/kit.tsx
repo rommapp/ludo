@@ -803,21 +803,53 @@ export function V2SettingsRow({ icon, title, subtitle, onClick, right, danger, d
   );
 }
 
-// Small pill switch in the V2 palette (the row owns activation).
-export function V2Switch({ checked }: { checked: boolean }) {
+// RomM's toggle, ported from frontend/src/v2/lib/forms/RSwitch/RSwitch.vue:
+// an iOS-style 36x20 track with a 14px knob that slides on a spring, with the
+// brand track's inner sheen and glow and a squash while pressed. Shared by
+// every switch so they all feel the same; the row around it owns activation.
+const RSWITCH_CSS = `
+  .r-switch--on .r-switch__track{box-shadow:inset 0 1px 0 rgba(255,255,255,0.18),0 0 12px rgba(139,116,232,0.38)}
+  .r-switch:not(.r-switch--disabled){cursor:pointer}
+  .r-switch--disabled{cursor:not-allowed;opacity:0.55}
+  .r-switch > div:hover .r-switch__knob,.r-switch:hover:not(.r-switch--disabled) .r-switch__knob{box-shadow:0 2px 4px rgba(0,0,0,0.28),0 0 0 5px rgba(255,255,255,0.10)}
+  .r-switch--on:hover .r-switch__knob,.r-switch--on:hover:not(.r-switch--disabled) .r-switch__knob{box-shadow:0 2px 4px rgba(0,0,0,0.28),0 0 0 5px rgba(139,116,232,0.22)}
+  .r-switch:active:not(.r-switch--disabled) .r-switch__knob{transform:translateX(0) scaleX(1.35);transition:transform 110ms cubic-bezier(0.22,1,0.36,1)}
+  .r-switch--on:active:not(.r-switch--disabled) .r-switch__knob{transform:translateX(16px) scaleX(1.35);transition:transform 110ms cubic-bezier(0.22,1,0.36,1)}
+  @media(prefers-reduced-motion:reduce){.r-switch__track,.r-switch__knob{transition:none!important}.r-switch:active .r-switch__knob{transform:translateX(0) scaleX(1)!important}.r-switch--on:active .r-switch__knob{transform:translateX(16px) scaleX(1)!important}}
+`;
+
+export function RSwitchTrack({ checked, disabled }: { checked: boolean; disabled?: boolean }) {
   return (
-    <div style={{
-      width: '40px', height: '22px', borderRadius: V2.radiusPill, flexShrink: 0,
-      background: checked ? V2.brand : 'rgba(255,255,255,0.18)',
-      transition: 'background 0.15s', position: 'relative',
-    }}>
-      <div style={{
-        position: 'absolute', top: '2px', left: checked ? '20px' : '2px',
-        width: '18px', height: '18px', borderRadius: '50%', background: '#fff',
-        transition: 'left 0.15s',
-      }} />
-    </div>
+    <>
+      {/* The sheen, glow, hover halo and press squash can't be inline styles. */}
+      <style>{RSWITCH_CSS}</style>
+      <div className={`r-switch${checked ? ' r-switch--on' : ''}${disabled ? ' r-switch--disabled' : ''}`}
+        style={{ display: 'inline-flex', alignItems: 'center', flexShrink: 0 }}>
+        <span className="r-switch__track" style={{
+          position: 'relative', flexShrink: 0, borderRadius: '999px', overflow: 'hidden',
+          width: '36px', height: '20px',
+          background: checked ? V2.brand : V2.borderStrong,
+          transition: 'background 260ms cubic-bezier(0.45,0.05,0.55,0.95), box-shadow 260ms cubic-bezier(0.45,0.05,0.55,0.95)',
+        }}>
+          <span className="r-switch__knob" style={{
+            position: 'absolute', top: '3px', left: '3px', width: '14px', height: '14px',
+            // White in both states: on the brand track a dark knob reads as
+            // unlit/disabled, the opposite of what "on" should look like.
+            borderRadius: '50%', background: V2.fg,
+            transform: checked ? 'translateX(16px) scaleX(1)' : 'translateX(0) scaleX(1)',
+            transformOrigin: checked ? 'right center' : 'left center',
+            transition: 'transform 340ms cubic-bezier(0.34,1.56,0.64,1), background 200ms cubic-bezier(0.22,1,0.36,1)',
+            boxShadow: '0 1px 2px rgba(0,0,0,0.22)',
+          }} />
+        </span>
+      </div>
+    </>
   );
+}
+
+// The switch for V2 rows, which own activation themselves.
+export function V2Switch({ checked }: { checked: boolean }) {
+  return <RSwitchTrack checked={checked} />;
 }
 
 // RomM SettingsSection chrome: a header bar (surface bg, rounded-top only) over

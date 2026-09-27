@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, getScreenshotMode, setScreenshotModeRpc, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
-import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel, V2CardRow} from "../kit";
+import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel, V2CardRow, RSwitchTrack} from "../kit";
 import { V2, fmtAgo, fmtBytes } from "../theme";
 import { FaBell, FaBookmark, FaBug, FaCameraRetro, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaLayerGroup, FaPlay, FaRedo, FaRegWindowMaximize, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaWifi, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
 import { Focusable, Navigation, host } from "@ludo/host";
@@ -1572,10 +1572,7 @@ export function SettingsPage() {
   );
 }
 
-// RomSwitch — React port of RomM's frontend/src/v2/lib/forms/RSwitch/RSwitch.vue.
-// An iOS-style 36×20px track with a 14px knob that slides on toggle, with the
-// brand-purple background, inner sheen, outer glow, spring easing and active
-// press squash that define the RomM v2 toggle's feel.
+// RomSwitch — a labelled row around RomM's toggle (RSwitchTrack in kit.tsx).
 export function RomSwitch({ checked, onChange, disabled, label, description }:
   { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string; description?: string }) {
   const [focused, setFocused] = useState(false);
@@ -1604,13 +1601,7 @@ export function RomSwitch({ checked, onChange, disabled, label, description }:
         ...V2Focus.flat(focused && !disabled),
       }}
     >
-      <div className={`r-switch${checked ? ' r-switch--on' : ''}${disabled ? ' r-switch--disabled' : ''}`} style={{ display: 'inline-flex', alignItems: 'center', background: 'transparent', border: 'none', padding: 0 }}>
-        <span className="r-switch__track" style={{ position: 'relative', flexShrink: 0, borderRadius: '999px', background: checked ? V2.brand : V2.borderStrong, overflow: 'hidden', width: '36px', height: '20px', transition: 'background 260ms cubic-bezier(0.45,0.05,0.55,0.95), box-shadow 260ms cubic-bezier(0.45,0.05,0.55,0.95)' }}>
-          <span className="r-switch__knob" style={{ position: 'absolute', top: '3px', left: '3px', // White in both states: on the brand-purple track a dark knob reads as
-// unlit/disabled, which is the opposite of what "on" should look like.
-borderRadius: '50%', background: V2.fg, width: '14px', height: '14px', transform: checked ? 'translateX(16px) scaleX(1)' : 'translateX(0) scaleX(1)', transformOrigin: checked ? 'right center' : 'left center', transition: 'transform 340ms cubic-bezier(0.34,1.56,0.64,1), background 200ms cubic-bezier(0.22,1,0.36,1)', boxShadow: '0 1px 2px rgba(0,0,0,0.22)' }} />
-        </span>
-      </div>
+      <RSwitchTrack checked={checked} disabled={disabled} />
       {(label || description) && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', flex: '1 1 auto', minWidth: 0 }}>
           {label && <span style={{ fontSize: '14px', fontWeight: 500, color: V2.fg }}>{label}</span>}
@@ -1620,21 +1611,5 @@ borderRadius: '50%', background: V2.fg, width: '14px', height: '14px', transform
       {inner}
     </Focusable>
   );
-  // The scoped <style> block carries the box-shadow sheen/glow + hover halo +
-  // active-press squash that can't be expressed as inline styles.
-  return (
-    <>
-      <style>{`
-        .r-switch--on .r-switch__track{box-shadow:inset 0 1px 0 rgba(255,255,255,0.18),0 0 12px rgba(139,116,232,0.38)}
-        .r-switch:not(.r-switch--disabled){cursor:pointer}
-        .r-switch--disabled{cursor:not-allowed;opacity:0.55}
-        .r-switch > div:hover .r-switch__knob,.r-switch:hover:not(.r-switch--disabled) .r-switch__knob{box-shadow:0 2px 4px rgba(0,0,0,0.28),0 0 0 5px rgba(255,255,255,0.10)}
-        .r-switch--on:hover .r-switch__knob,.r-switch--on:hover:not(.r-switch--disabled) .r-switch__knob{box-shadow:0 2px 4px rgba(0,0,0,0.28),0 0 0 5px rgba(139,116,232,0.22)}
-        .r-switch:active:not(.r-switch--disabled) .r-switch__knob{transform:translateX(0) scaleX(1.35);transition:transform 110ms cubic-bezier(0.22,1,0.36,1)}
-        .r-switch--on:active:not(.r-switch--disabled) .r-switch__knob{transform:translateX(16px) scaleX(1.35);transition:transform 110ms cubic-bezier(0.22,1,0.36,1)}
-        @media(prefers-reduced-motion:reduce){.r-switch__track,.r-switch__knob{transition:none!important}.r-switch:active .r-switch__knob{transform:translateX(0) scaleX(1)!important}.r-switch--on:active .r-switch__knob{transform:translateX(16px) scaleX(1)!important}}
-      `}</style>
-      {row(null)}
-    </>
-  );
+  return row(null);
 }
