@@ -79,8 +79,10 @@ _SWITCH_TITLE_RE = re.compile(r'^01[0-9A-F]{11}000$', re.IGNORECASE)
 # "[0100152000022000]" as scene-named dumps and RomM's own filenames carry it.
 # This is the fallback when Sigil is absent: NSP/XCI store the real ID in an
 # NCA header encrypted under a key we do not have, so without Sigil the
-# filename is the only place the ID is legible.
-_SWITCH_TAG_RE = re.compile(r'[\[\(\s]([0-9A-F]{16})[\]\)\s]', re.IGNORECASE)
+# filename is the only place the ID is legible. The ID may also START the
+# name: Ludo uploads an Eden save as "<title id>.zip", and RomM stores it as
+# "0100965017338000 [2026-08-29_21-10-37].zip".
+_SWITCH_TAG_RE = re.compile(r'(?:^|[\[\(\s])([0-9A-F]{16})[\]\)\s]', re.IGNORECASE)
 
 # Any Switch title: a base game, an update, or a DLC add-on. Narrower tests
 # come from _switch_kind below.

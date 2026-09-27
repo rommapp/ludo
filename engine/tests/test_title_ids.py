@@ -153,6 +153,14 @@ def main():
         check('raw tag is reported un-normalised',
               T.raw_switch_tag_in_name('X [01006FE013472800].nsp'),
               '01006FE013472800')
+        # Ludo's own Eden upload, as RomM stores it: the title ID starts the
+        # name and a timestamp follows. It used to read as "no Switch title".
+        check('Eden save named by RomM keeps its title',
+              T.raw_switch_tag_in_name('0100965017338000 [2026-08-29_21-10-37].zip'),
+              '0100965017338000')
+        check('a hex run inside a word is still not a tag',
+              T.raw_switch_tag_in_name('x0100965017338000 [2026-08-29_21-10-37].zip'),
+              None)
 
         index = T.index_roms([roms])
         check('index collapses to distinct base titles', len(index), 3)
