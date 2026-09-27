@@ -16033,6 +16033,29 @@ class AutoSyncManager:
                                  f"not RetroArch's")
                         continue
 
+                    # A PS2 save zip is the game's card folders, not a file:
+                    # converted to a RetroArch name it lands as a stray
+                    # "BASCUS-97490.srm" the core never reads. Merge it into
+                    # the game's card instead, unless this device already
+                    # holds that version.
+                    if (_platform_slug == 'ps2'
+                            and original_filename.lower().endswith('.zip')):
+                        device_id = self.settings.get('Device', 'device_id', '') or None
+                        current = any(
+                            sync.get('device_id') == device_id and sync.get('is_current')
+                            for sync in (latest_save.get('device_syncs') or []))
+                        if current:
+                            skipped_count += 1
+                        else:
+                            downloads_attempted += 1
+                            if self._restore_ps2_save(
+                                    {'rom_id': rom_id, 'file_name': original_filename,
+                                     'save_id': latest_save.get('id'),
+                                     'emulator': romm_emulator},
+                                    device_id, None):
+                                downloads_successful += 1
+                        continue
+
                     # Compute local path to check if file exists before skipping
                     final_path = None
                     emulator_save_dir = None
