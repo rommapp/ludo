@@ -11455,6 +11455,11 @@ class AutoSyncManager:
         # upload sites themselves. See save_activity.
         self._activity_uploads = []
         self._activity_lock = threading.Lock()
+        # PS2 card path -> the save zip last synced for it, and packed zip ->
+        # its card. A card's mtime moves whenever the core flushes it, changed
+        # or not, so "is this card pending" is asked of its contents.
+        self._ps2_synced = {}
+        self._ps2_zip_card = {}
         # save path -> rom_id, memoized against the games list — see
         # rom_id_for_save. Shared by the inventory build and the live indicator.
         self._rom_match_cache = {}
@@ -11648,6 +11653,13 @@ class AutoSyncManager:
         persists once per cycle).
         """
         try:
+            card = getattr(self, '_ps2_zip_card', {}).get(str(path))
+            if card:
+                # A PS2 zip reconciled: its card is in sync as of this save.
+                try:
+                    self.__dict__.setdefault('_ps2_synced', {})[card] = Path(path).read_bytes()
+                except OSError:
+                    pass
             st = Path(path).stat()
             fp = (st.st_size, st.st_mtime)
             key = str(path)
@@ -11851,6 +11863,12 @@ class AutoSyncManager:
     def _activity_pending(self, path):
         """Does this queued file actually differ from what we last uploaded?"""
         try:
+            synced = getattr(self, '_ps2_synced', {}).get(str(path))
+            if synced is not None:
+                # A PS2 card: pending only if the game's save on it changed.
+                card = ps2_memcard.Card.open(path)
+                save_id = ps2_memcard.card_save_id(card)
+                return (ps2_memcard.export_zip(card, save_id) if save_id else None) != synced
             st = Path(path).stat()
             return self.last_uploaded.get(str(path)) != (st.st_size, st.st_mtime)
         except Exception:
@@ -13647,6 +13665,7 @@ class AutoSyncManager:
                 stale.unlink(missing_ok=True)
         if not out.is_file() or out.read_bytes() != data:
             out.write_bytes(data)
+        self.__dict__.setdefault('_ps2_zip_card', {})[str(out)] = str(card_path)
         return out
 
     def _platform_slug_of(self, rom_id):
@@ -13735,6 +13754,9 @@ class AutoSyncManager:
             staged.unlink(missing_ok=True)
         self.log(f"✅ Restored {', '.join(folders)} into {card_path.name}")
         self._record_synced(str(card_path))
+        restored = self._pack_ps2_card(card_path, op.get('rom_id'))
+        if restored:
+            self._record_synced(str(restored))
         return True
 
     def _eden_inventory_entries(self):
@@ -15995,6 +16017,14 @@ class AutoSyncManager:
                         self._save_member_key(_s.get('file_name', '')), []).append(_s)
                 saves_to_process = [get_latest_file(grp, "save")
                                     for grp in saves_by_member.values()]
+                # A PS2 game has ONE card, uploaded as a zip now and as a raw
+                # ".ps2" before. Grouped by name, the two formats looked like
+                # two members, and the newest raw card was weighed against the
+                # card on its own -- a stale one could overwrite it even with
+                # a newer zip on the server. One latest across both.
+                if _platform_slug == 'ps2':
+                    saves_to_process = [get_latest_file(
+                        [x for x in user_saves if isinstance(x, dict)], "save")]
                 saves_to_process = [s for s in saves_to_process if s]
 
                 for latest_save in saves_to_process:
@@ -16044,6 +16074,20 @@ class AutoSyncManager:
                         current = any(
                             sync.get('device_id') == device_id and sync.get('is_current')
                             for sync in (latest_save.get('device_syncs') or []))
+                        # The upload that made this version does not always
+                        # count as "current" for its own device, so compare
+                        # contents too: a card already holding the server's
+                        # save needs nothing, and restoring it anyway rewrote
+                        # the card and set off another sync mid-game.
+                        if not current and latest_save.get('content_hash'):
+                            card = self._ps2_card_path(
+                                {'rom_id': rom_id, 'file_name': original_filename},
+                                save_base_dir)
+                            packed = (self._pack_ps2_card(card, rom_id)
+                                      if card and card.is_file() else None)
+                            current = bool(packed) and (
+                                RomMClient.compute_content_hash(packed)
+                                == latest_save.get('content_hash'))
                         if current:
                             skipped_count += 1
                         else:

@@ -13,9 +13,11 @@ other's saves. Asserted here, with the network and the game list stubbed:
   * a PS2 zip from the server is routed away from the plain-file download;
   * a restore merges into an existing card, and when there is none, creates
     the card where the core will look for it;
-  * a restore waits while RetroArch runs, and refuses a zip for several games.
+  * a restore waits while RetroArch runs, and refuses a zip for several games;
+  * a card the core rewrote without changing the save is not "pending".
 """
 import io
+import os
 import sys
 import tempfile
 import zipfile
@@ -118,6 +120,20 @@ def main():
         check('an untouched card packs to the same bytes',
               m._pack_ps2_card(card, 7).read_bytes() == first, True)
 
+        # The upload indicator asks whether a queued card differs from what
+        # was synced. The core rewrites the card with a new mtime whether or
+        # not the save changed, so that has to be a question of contents.
+        m = manager(tmp, games, [card])
+        m.last_uploaded = {}
+        m._record_synced = AutoSyncManager._record_synced.__get__(m)
+        m._record_synced(str(m._pack_ps2_card(card, 7)))
+        os.utime(card, (1, 1))
+        check('a card rewritten unchanged is not pending', m._activity_pending(str(card)), False)
+        M.restore_zip(str(card), zip_of({'BASCUS-97490LV5RG_09/data': b'new slot'}), 'SCUS-97490')
+        check('a card whose save changed is pending', m._activity_pending(str(card)), True)
+        card.unlink()
+        card = card_with(saves / 'Rogue Galaxy (USA).ps2', SAVE, 'BASCUS-97490')
+
         two = card_with(tmp / 'Two.ps2', {**SAVE, 'BASLUS-20152SYS/icon.sys': b'x'},
                         'BASCUS-97490')
         M.restore_zip(str(two), zip_of({'BASLUS-20152SYS/icon.sys': b'x'}), 'SLUS-20152')
@@ -148,7 +164,8 @@ def main():
         check('the newer save replaced the old one',
               got['BASCUS-97490LV5RG_00']['BASCUS-97490LV5RG_00'], b'newer' * 100)
         check('a slot the server added is there too', 'BASCUS-97490LV5RG_01' in got, True)
-        check('the card is recorded as synced', m.synced, [str(card)])
+        check('the card and its packed save are recorded as synced', m.synced,
+              [str(card), str(tmp / 'cache' / 'ps2_saves' / '7' / 'BASCUS-97490.zip')])
         check('the old card is kept as .backup',
               Path(str(card) + '.backup').is_file(), True)
 
