@@ -13578,13 +13578,14 @@ class AutoSyncManager:
             })
 
         eden_entries = self._eden_inventory_entries()
-        if eden_entries:
+        if emulator_saves.eden_data_dirs():
             # Keys ride along with an ordinary Switch pass: ~14 KB, needed
             # before Eden can start anything, and useless to defer behind a
             # prompt. Firmware does not -- see sync_switch_firmware, which
             # stays a prompted action because it is ~340 MB written into
-            # another application's system tree. Guarded so a key fetch can
-            # never fail an inventory build.
+            # another application's system tree. Not gated on having saves:
+            # a new setup has none, and it is the one that needs keys most.
+            # Guarded so a key fetch can never fail an inventory build.
             try:
                 self.ensure_switch_keys()
             except Exception as e:
@@ -13762,7 +13763,9 @@ class AutoSyncManager:
         bios = getattr(self.retroarch, 'bios_manager', None)
         if not bios:
             return {'installed': 0, 'status': 'no-bios-manager'}
-        if emulator_saves.eden_keys_dir() is None:
+        # Eden's data folder, not its keys/ folder: a fresh Eden has no keys/
+        # yet, and that is exactly the install that needs them.
+        if not emulator_saves.eden_data_dirs():
             return {'installed': 0, 'status': 'no-emulator'}
         return self._sync_switch_keys(bios, progress=progress)
 

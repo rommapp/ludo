@@ -191,7 +191,9 @@ export function BiosDetailModal({ slug, platformName, seed, onChanged, closeModa
         // are ~14 KB, Eden cannot start a game without them, and they sync
         // with an ordinary Switch pass.
         const avail = await switchFirmwareStatus();
-        if (avail && avail.available === false && avail.file_name) {
+        // Up-to-date firmware is not the whole answer: the installer also
+        // fetches prod.keys, so run it anyway while the keys are missing.
+        if (avail && avail.available === false && avail.file_name && avail.keys_installed) {
           toaster.toast({ title: 'Switch firmware', body: 'Already up to date' });
           return;
         }

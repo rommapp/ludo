@@ -273,8 +273,10 @@ master_key_source = ''' + b'c' * 32 + b'''
         entry = {'file_name': 'ProdKeys.NET-v22.5.0.zip',
                  'md5_hash': 'ABCD1234' * 4}
 
-        check('not current before anything is recorded',
-              E.keys_are_current(entry, extra_data_dir=data), False)
+        # Keys on disk with no marker were put there by the user, through
+        # Eden or by hand (rommapp/ludo#22): installed, and theirs to manage.
+        check('keys the user installed count as current',
+              E.keys_are_current(entry, extra_data_dir=data), True)
         E.write_keys_marker(entry['file_name'], entry['md5_hash'])
         check('current once recorded',
               E.keys_are_current(entry, extra_data_dir=data), True)

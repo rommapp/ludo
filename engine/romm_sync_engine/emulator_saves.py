@@ -386,7 +386,12 @@ def keys_are_current(entry, extra_data_dir=None):
         # Nothing to compare against: a key file already on disk is good
         # enough, since re-installing an 11 KB file has no cost worth a guess.
         return True
-    return bool(marker) and marker.get('md5') == expected
+    if not marker:
+        # Keys on disk that Ludo never installed: the user put them there,
+        # through Eden or by hand (rommapp/ludo#22). They are the user's to
+        # manage, so they count as installed and are not overwritten.
+        return True
+    return marker.get('md5') == expected
 
 
 def firmware_is_current(entry, extra_data_dir=None):
