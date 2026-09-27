@@ -8265,7 +8265,17 @@ class RetroArchInterface:
     def get_core_override(self, system_slug):
         if not system_slug:
             return ''
-        return (self.settings.get('CoreOverrides', system_slug, '') or '').strip()
+        # The settings page pins under the RomM slug ('pico'); the ROM's
+        # folder is the ES-DE name ('pico8').
+        # Accept either spelling, the exact key first. Only RomM slug → folder:
+        # a folder can hold several platforms (psx holds PocketStation too),
+        # so launches pass the RomM slug rather than guessing it back.
+        for key in (system_slug, ES_DE_FOLDER_BY_SLUG.get(system_slug)):
+            if key:
+                pinned = (self.settings.get('CoreOverrides', key, '') or '').strip()
+                if pinned:
+                    return pinned
+        return ''
 
     def set_core_override(self, system_slug, core_key):
         """Pin (or clear, when core_key is falsy) the core for a system slug."""
@@ -8395,14 +8405,17 @@ class RetroArchInterface:
                 wanted.append(c)
         return [c for c in wanted if c not in installed and c in index]
 
-    def suggest_core_for_platform(self, platform_name, system_slug=None):
-        """Suggest best core for a platform"""
+    def suggest_core_for_platform(self, platform_name, system_slug=None,
+                                  platform_slug=None):
+        """Suggest best core for a platform. `platform_slug` is the RomM slug,
+        which the settings page pins under; `system_slug` the ROM's folder."""
         available_cores = self.get_available_cores()
 
         print(f"🎮 Looking for core for platform: '{platform_name}'")
 
         # 1) Explicit user override wins over everything.
-        override = self.get_core_override(system_slug)
+        override = (self.get_core_override(platform_slug)
+                    or self.get_core_override(system_slug))
         if override and override in available_cores:
             print(f"✅ Using user core override for '{system_slug}': {override}")
             return override, available_cores[override]
@@ -8477,6 +8490,9 @@ class RetroArchInterface:
             'mega drive': ['genesis_plus_gx', 'blastem', 'picodrive'],
             'nintendo ds': ['desmume', 'melonds', 'melondsds'],
             'nds': ['desmume', 'melonds', 'melondsds'],
+            # Not bare 'pico': that would also match the Sega Pico.
+            'pico-8': ['retro8'],
+            'pico8': ['retro8'],
     }
 
     def standalone_emulator_status(self, platform_name, platform_slug=None):
@@ -8554,7 +8570,8 @@ class RetroArchInterface:
         # core choice can win over our generic guesses.
         if not core_name and platform_name:
             core_name, _ = self.suggest_core_for_platform(
-                platform_name, system_slug=self._system_slug_from_path(rom_path))
+                platform_name, system_slug=self._system_slug_from_path(rom_path),
+                platform_slug=platform_slug)
             if not core_name:
                 # Name what's missing rather than just "none found": the caller
                 # surfaces this, and the core downloader can install it.
