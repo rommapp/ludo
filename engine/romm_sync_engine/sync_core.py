@@ -8623,7 +8623,8 @@ class RetroArchInterface:
         # RetroArch has run once — so the FIRST session after an install always
         # went without them. --appendconfig layers a small file over the
         # config for this run, which needs no config to already exist.
-        overlay = self._launch_overlay_config()
+        overlay = self._launch_overlay_config(
+            None if 'retrodeck' in self.retroarch_executable.lower() else core_path)
         if overlay:
             cmd.extend(['--appendconfig', overlay])
 
@@ -9038,8 +9039,14 @@ class RetroArchInterface:
             return ''
         return self.MENU_TOGGLE_L3_R3
 
-    def _launch_overlay_config(self):
+    def _launch_overlay_config(self, core_path=None):
         """Write the per-launch config overlay and return its path, or ''.
+
+        `core_path` is the host path of the core being launched. When it lies
+        outside RetroArch's configured libretro_directory, the overlay points
+        libretro_directory at the core's folder: RetroArch up to 1.22.2 then
+        has no core_info for the running core and segfaults answering our
+        GET_STATUS (fixed upstream in libretro/RetroArch#18585).
 
         Lives in RetroArch's own config directory rather than Ludo's: the
         flatpak can always read its own tree, while $HOME/.config/ludo depends
@@ -9058,6 +9065,9 @@ class RetroArchInterface:
                      '# over its own configuration for this session only.',
                      'network_cmd_enable = "true"',
                      f'network_cmd_port = "{self.port}"']
+            core_dir = self._core_dir_override(core_path)
+            if core_dir:
+                lines.append(f'libretro_directory = "{core_dir}"')
             combo = self._menu_toggle_combo()
             if combo:
                 lines.append(f'input_menu_toggle_gamepad_combo = "{combo}"')
@@ -9065,6 +9075,25 @@ class RetroArchInterface:
             return str(overlay)
         except Exception as e:
             print(f"⚠️  Could not write the launch config overlay: {e}")
+            return ''
+
+    def _core_dir_override(self, core_path):
+        """The core's folder when it is not RetroArch's libretro_directory, else ''."""
+        if not core_path:
+            return ''
+        try:
+            core_dir = Path(core_path).expanduser().resolve().parent
+            configured = self.get_retroarch_config_setting('libretro_directory', '') or ''
+            configured = configured.strip()
+            if configured and configured not in (':', 'default'):
+                cfg = Path(configured.replace(':\\', '').replace(':/', '')).expanduser()
+                if not cfg.is_absolute():
+                    cfg_dir = self.find_retroarch_config_dir()
+                    cfg = Path(cfg_dir) / cfg if cfg_dir else cfg
+                if cfg.resolve() == core_dir:
+                    return ''
+            return str(core_dir)
+        except Exception:
             return ''
 
     @staticmethod
@@ -9928,6 +9957,8 @@ class RetroArchInterface:
             # Native installations
             Path.home() / '.config/retroarch/cores',
             Path('/usr/lib/libretro'),
+            # Fedora, openSUSE and other lib64 distros
+            Path('/usr/lib64/libretro'),
             Path('/usr/local/lib/libretro'),
             Path('/usr/lib/x86_64-linux-gnu/libretro'),
             
