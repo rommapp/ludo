@@ -338,6 +338,12 @@ _NON_GAME_EXTS = (
     '.part',
 )
 
+# Extensions in _NON_GAME_EXTS that are ALSO real ROM formats: .md is a
+# Markdown manual but also the standard Mega Drive/Genesis cartridge dump.
+# They are skipped only when the folder or archive holds another game file;
+# when they are all there is, they are the game.
+_AMBIGUOUS_GAME_EXTS = ('.md',)
+
 # Disc dumps that describe their own tracks: the descriptor is the thing to
 # boot, and every other file in the folder belongs to it. Excludes .m3u, which
 # RomM also emits for multi-FILE regional ROMs that are not discs at all.
@@ -373,6 +379,9 @@ def _list_standalone_games(folder):
         if ext.startswith('.state'):
             continue
         games.append(f)
+    if not games:
+        games = [f for f in folder.rglob('*')
+                 if f.is_file() and f.suffix.lower() in _AMBIGUOUS_GAME_EXTS]
     return sorted(games, key=lambda x: x.name.lower())
 
 
@@ -4238,7 +4247,8 @@ class LudoBackend:
         exts = [Path(m).suffix.lower() for m in members]
         if any(e in self._DISC_IMAGE_EXTS for e in exts):
             return True
-        launchable = [e for e in exts if e not in _NON_GAME_EXTS]
+        launchable = ([e for e in exts if e not in _NON_GAME_EXTS]
+                      or [e for e in exts if e in _AMBIGUOUS_GAME_EXTS])
         return len(launchable) > 1
 
     def _maybe_unzip_download(self, dest: Path, rom_id: int = None) -> Path:
