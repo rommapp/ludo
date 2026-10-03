@@ -14,7 +14,8 @@ import logging
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
-from . import eden_config, emulator_saves, ps2_memcard, switch_content, title_ids
+from . import (eden_config, emulator_saves, gamecube_saves, ps2_memcard,
+               switch_content, title_ids)
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -10927,7 +10928,12 @@ class RetroArchInterface:
     # "<saves>/ps2/retroarch-core/LRPS2/memcards/" — the deepest layout any
     # emulator Ludo supports is known to use — without turning the scan into a
     # walk of everything under a misconfigured save path.
-    SAVE_SCAN_MAX_DEPTH = 4
+    #
+    # Five since GameCube: the libretro Dolphin core puts its user directory
+    # in the save directory RetroArch hands it, and keeps a game's .gci files
+    # four levels under that ("User/GC/USA/Card A") -- five from the root once
+    # RetroArch sorts saves per core ("dolphin-emu/") or per content.
+    SAVE_SCAN_MAX_DEPTH = 5
 
     @classmethod
     def _save_scan_dirs(cls, root):
@@ -11682,6 +11688,14 @@ class AutoSyncManager:
         persists once per cycle).
         """
         try:
+            # A GameCube unit reconciled: each of its GCIs is in sync too, or
+            # the file watcher reads every one of them as still pending.
+            for member in getattr(self, '_gci_zip_members', {}).get(str(path), ()):
+                try:
+                    mst = Path(member).stat()
+                    self.last_uploaded[str(member)] = (mst.st_size, mst.st_mtime)
+                except OSError:
+                    pass
             card = getattr(self, '_ps2_zip_card', {}).get(str(path))
             if card:
                 # A PS2 zip reconciled: its card is in sync as of this save.
@@ -13550,6 +13564,7 @@ class AutoSyncManager:
                      for g in (self.get_games() or [])}
         except Exception as e:
             logging.debug(f"could not map platforms for the inventory: {e}")
+        gci_units = set()
         for entry in save_files.get('saves', []):
             path = Path(entry['path'])
             rom_id = self.rom_id_for_save(path)
@@ -13597,6 +13612,19 @@ class AutoSyncManager:
                 if packed is None:
                     continue
                 upload_path, file_name = packed, packed.name
+            # A GameCube game's GCIs are one save, packed the way Argosy packs
+            # them; the unit is reported once, dated by its newest member.
+            if path.suffix.lower() == gamecube_saves.GCI_SUFFIX:
+                members = gamecube_saves.unit_members(path)
+                unit = (str(path.parent), gamecube_saves.game_code(path))
+                if unit in gci_units:
+                    continue
+                gci_units.add(unit)
+                upload_path = self._pack_gci_unit(members, rom_id)
+                file_name = upload_path.name
+                updated_at = _dt.datetime.fromtimestamp(
+                    max(m.stat().st_mtime for m in members),
+                    tz=_dt.timezone.utc).isoformat()
             content_hash = RomMClient.compute_content_hash(upload_path)
 
             # Use the RomM core name (e.g. "Mupen64Plus-Next"), not the raw save
@@ -13697,6 +13725,112 @@ class AutoSyncManager:
             out.write_bytes(data)
         self.__dict__.setdefault('_ps2_zip_card', {})[str(out)] = str(card_path)
         return out
+
+    def _pack_gci_unit(self, members, rom_id):
+        """A GameCube game's GCIs as the artifact the server sees.
+
+        One GCI travels as itself. Several are zipped into our cache, written
+        only when the bytes change, so an unchanged unit keeps the file -- and
+        the fingerprint -- it had.
+        """
+        members = list(members)
+        if len(members) == 1:
+            return members[0]
+        code = gamecube_saves.game_code(members[0]) or 'gci'
+        out = cache_dir() / 'gci_saves' / str(rom_id) / f"{code}.zip"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fresh = gamecube_saves.pack(members, out.with_suffix('.zip.part'))
+        if out.is_file() and out.read_bytes() == fresh.read_bytes():
+            fresh.unlink()
+        else:
+            os.replace(fresh, out)
+        self.__dict__.setdefault('_gci_zip_members', {})[str(out)] = [str(m) for m in members]
+        return out
+
+    def _gci_unit_hash(self, rom_id):
+        """The content hash of this game's GCIs as they would upload, or None."""
+        for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
+            path = Path(entry['path'])
+            if (path.suffix.lower() == gamecube_saves.GCI_SUFFIX
+                    and self.rom_id_for_save(path) == rom_id):
+                return RomMClient.compute_content_hash(
+                    self._pack_gci_unit(gamecube_saves.unit_members(path), rom_id))
+        return None
+
+    def _is_gci_op(self, op):
+        """A server save that is a GameCube game's GCIs, raw or zipped."""
+        name = str(op.get('file_name') or '').lower()
+        return (name.endswith(('.gci', '.zip'))
+                and _platform_of(self._game_for_rom(op.get('rom_id'))) == 'gamecube')
+
+    def _gci_card_dir(self, rom_id, code, saves_dir):
+        """Where Dolphin reads this game's GCIs: its card folder.
+
+        The folder already holding the game's GCIs wins. Otherwise the core's
+        user directory is the save directory RetroArch hands it -- per core,
+        per content or flat, as RetroArch is sorting -- plus "User".
+        """
+        for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
+            path = Path(entry['path'])
+            if (path.suffix.lower() == gamecube_saves.GCI_SUFFIX
+                    and gamecube_saves.game_code(path) == code):
+                return path.parent
+        if not saves_dir:
+            return None
+        base = Path(saves_dir)
+        mode = self.retroarch.get_save_subdir_mode('saves')
+        if mode == 'core':
+            base = base / 'dolphin-emu'
+        elif mode == 'content':
+            game = self._game_for_rom(rom_id) or {}
+            base = base / (self._content_dir_for_game(game)
+                           or platform_folder_name(game.get('platform_slug')) or 'gc')
+        return gamecube_saves.card_dir(base / 'User', code)
+
+    def _restore_gci_save(self, op, device_id, session_id):
+        """Put a GameCube save from the server into the game's card folder.
+
+        Deferred (False) while RetroArch runs: Dolphin reads the folder when
+        a game boots and writes it back as it plays.
+        """
+        if self.is_retroarch_running():
+            self.log("ℹ️ Save-sync: RetroArch is running; the GameCube save "
+                     "will restore once it is closed.")
+            return False
+        file_name = op.get('file_name') or 'save.gci'
+        staged = cache_dir() / 'incoming_saves' / Path(file_name).name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if not self.romm_client.download_save_by_id(
+                op.get('save_id'), 'saves', staged,
+                device_id=device_id, session_id=session_id):
+            return False
+        try:
+            members = gamecube_saves.incoming_members(staged)
+            codes = {d[:4].decode('ascii', 'replace').upper() for _n, d in members}
+            if len(codes) != 1:
+                self.log(f"⚠️ Save-sync: {file_name!r} is not one GameCube game's save")
+                return False
+            code = codes.pop()
+            target = self._gci_card_dir(op.get('rom_id'), code,
+                                        self.retroarch.save_dirs.get('saves'))
+            if target is None:
+                return False
+            # A lone GCI is uploaded under the uploader's ROM name; on the
+            # card it gets Dolphin's own, read off its header.
+            written = gamecube_saves.restore(
+                staged, target, code, backup_dir=cache_dir() / 'save_backups',
+                name=gamecube_saves.dolphin_name(members[0][1]),
+                only_same=(len(members) == 1 and not _zipfile.is_zipfile(staged)
+                           and gamecube_saves.is_dolphin_name(file_name)))
+        except (ValueError, OSError, _zipfile.BadZipFile) as e:
+            self.log(f"⚠️ Save-sync: could not restore {file_name!r}: {e}")
+            return False
+        finally:
+            staged.unlink(missing_ok=True)
+        unit = self._pack_gci_unit(written, op.get('rom_id'))
+        self._record_synced(str(unit))
+        self.log(f"✅ Restored {len(written)} GameCube save file(s) for {code}")
+        return True
 
     def _platform_slug_of(self, rom_id):
         for g in (self.get_games() or []):
@@ -14916,6 +15050,8 @@ class AutoSyncManager:
         """
         if self._is_ps2_zip_op(op):
             return self._restore_ps2_save(op, device_id, session_id)
+        if self._is_gci_op(op):
+            return self._restore_gci_save(op, device_id, session_id)
         file_name = op.get('file_name') or ''
         # is_switch_title_id is the save-directory test specifically: Eden files
         # a save under the BASE title, never an update or DLC id.
@@ -15024,8 +15160,9 @@ class AutoSyncManager:
         """
         if self._is_standalone_emulator(op.get('emulator')):
             return None
-        # A PS2 save zip is folders to merge into a card, not a file to drop.
-        if self._is_ps2_zip_op(op):
+        # A PS2 save zip is folders to merge into a card, not a file to drop;
+        # a GameCube save is files for a card folder only its restore finds.
+        if self._is_ps2_zip_op(op) or self._is_gci_op(op):
             return None
         # The op's emulator is the SERVER save's label, which a buggy or
         # foreign upload can set to anything ('switch' instead of 'eden'). The
@@ -16185,7 +16322,10 @@ class AutoSyncManager:
                 # two members, and the newest raw card was weighed against the
                 # card on its own -- a stale one could overwrite it even with
                 # a newer zip on the server. One latest across both.
-                if _platform_slug == 'ps2':
+                # Same for GameCube: a game's GCIs are one save, whether a
+                # client uploaded them zipped, as one raw GCI, or (Ludo before
+                # it packed them) one row per GCI.
+                if _platform_slug == 'ps2' or _platform_of(game) == 'gamecube':
                     saves_to_process = [get_latest_file(
                         [x for x in user_saves if isinstance(x, dict)], "save")]
                 saves_to_process = [s for s in saves_to_process if s]
@@ -16260,6 +16400,24 @@ class AutoSyncManager:
                                      'save_id': latest_save.get('id'),
                                      'emulator': romm_emulator},
                                     device_id, None):
+                                downloads_successful += 1
+                        continue
+
+                    if (_platform_of(game) == 'gamecube'
+                            and original_filename.lower().endswith(('.gci', '.zip'))):
+                        device_id = self.settings.get('Device', 'device_id', '') or None
+                        op = {'rom_id': rom_id, 'file_name': original_filename,
+                              'save_id': latest_save.get('id'), 'emulator': romm_emulator}
+                        current = any(
+                            sync.get('device_id') == device_id and sync.get('is_current')
+                            for sync in (latest_save.get('device_syncs') or []))
+                        if not current and latest_save.get('content_hash'):
+                            current = self._gci_unit_hash(rom_id) == latest_save.get('content_hash')
+                        if current:
+                            skipped_count += 1
+                        else:
+                            downloads_attempted += 1
+                            if self._restore_gci_save(op, device_id, None):
                                 downloads_successful += 1
                         continue
 
