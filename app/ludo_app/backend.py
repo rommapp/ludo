@@ -5666,9 +5666,18 @@ class LudoBackend:
             if entry is None:
                 return {'success': False, 'message': f'Version {save_id} not found'}
 
+            # A save is restored under the name RetroArch reads it by here,
+            # not the uploader's ("autosave.srm", or another device's ROM).
+            local_name = None
+            if save_type == 'saves' and self._auto_sync:
+                try:
+                    local_name = self._auto_sync._local_save_name(
+                        rom_id, entry.get('file_name', ''), entry.get('slot'))
+                except Exception as e:
+                    logging.debug(f"could not name the restored save locally: {e}")
             result = self._retroarch.restore_save_version(
                 self._romm_client, None, entry, save_type, as_copy,
-                log=lambda m: logging.info(m))
+                log=lambda m: logging.info(m), local_name=local_name)
             if result.get('success'):
                 _record_activity('save',
                                  'State restored' if save_type == 'states' else 'Save restored',

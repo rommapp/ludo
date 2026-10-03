@@ -42,6 +42,7 @@ def check(label, got, want):
 
 class _Retro:
     emulator_directory_map = {}
+    save_dirs = {}
 
     def convert_to_retroarch_filename(self, name, kind, target_dir, slot=None):
         return sync_core.RetroArchInterface.convert_to_retroarch_filename(
@@ -155,6 +156,93 @@ def main():
         check('target: a VMU keeps flycast\'s name',
               target(1, 'T1401D__50.A1.bin', slot='vmu-a1'),
               saves / 'T1401D__50.A1.bin')
+
+        # ── the name a save goes up under ─────────────────────────────
+        # Argosy finds a game's autosave by name: its ROM's, "argosy-latest"
+        # or "autosave". Ours rarely equals its ROM's, so ours is "autosave".
+        games += [{'rom_id': 7, 'platform_slug': 'ps2', 'local_path': str(sfc)}]
+        m = manager(games)
+        check('autosave goes up as "autosave"',
+              m._upload_name(1, saves / 'Chrono Trigger (USA) (Rev 1).srm', 'autosave'),
+              'autosave.srm')
+        check('the extension is the artifact\'s',
+              m._upload_name(7, Path('/c/BASCUS-97490.zip'), 'autosave'), 'autosave.zip')
+        check('a VMU port keeps its name',
+              m._upload_name(1, saves / 'T1401D__50.B1.bin', 'vmu-b1'), None)
+        check('a named channel keeps its name',
+              m._upload_name(1, saves / 'Boss.srm', 'Before the boss'), None)
+        check('a regional ROM keeps the region in the name',
+              m._upload_name(4, saves / 'Pokemon HeartGold (Spain).sav', 'autosave'), None)
+        check('our own "autosave" download lands under our name',
+              m._local_save_stem(1, 'autosave [2026-09-30_10-00-00].srm'),
+              'Chrono Trigger (USA) (Rev 1)')
+
+        # Through the real background sync: the upload carries the name.
+        sent = {}
+
+        def upload(rom_id, kind, path, **kw):
+            sent[rom_id] = kw.get('upload_name') or Path(path).name
+            return True
+        m = manager(games)
+        local_save = saves / 'Chrono Trigger (USA) (Rev 1).srm'
+        local_save.write_bytes(b'sram' * 64)
+        m.romm_client = type('C', (), {
+            'authenticated': True,
+            'negotiate_sync': staticmethod(lambda dev, inv: ('s1', [
+                {'action': 'upload', 'rom_id': 1, 'slot': 'autosave'}])),
+            'upload_save': staticmethod(upload),
+            'complete_sync_session': staticmethod(lambda *a, **k: True),
+        })()
+        m.settings = type('S', (), {'get': lambda self, *a: 'dev-1'})()
+        m.build_sync_inventory = lambda: [{
+            'rom_id': 1, 'slot': 'autosave', 'file_name': local_save.name,
+            '_path': str(local_save),
+            '_upload_name': m._upload_name(1, local_save, 'autosave')}]
+        m.log = lambda *a, **k: None
+        m.save_download_blocked = set()
+        m.last_uploaded = {}
+        m._activity_upload = lambda *a, **k: __import__('contextlib').nullcontext()
+        m._save_upload_fingerprints = lambda *a, **k: None
+        m.mark_all_synced = lambda *a, **k: None
+        m._notify_sync_result = lambda *a, **k: None
+        m.run_negotiated_save_sync()
+        check('the background sync uploads as "autosave"', sent.get(1), 'autosave.srm')
+
+        # Version restore names the file as RetroArch reads it here.
+        retro = sync_core.RetroArchInterface.__new__(sync_core.RetroArchInterface)
+        retro.save_dirs = {'saves': str(saves)}
+        retro.get_save_files = lambda: {'saves': [{'name': local_save.name,
+                                                   'path': str(local_save)}]}
+        retro.get_save_subdir_mode = lambda kind: 'flat'
+        entry = {'file_name': 'autosave [2026-09-30_10-00-00].srm', 'slot': 'autosave'}
+        check('version restore keeps this device\'s name',
+              retro.resolve_restore_dest(None, entry, 'saves', local_name=m._local_save_name(
+                  1, entry['file_name'], 'autosave')),
+              (saves, local_save.name))
+
+        # An Eden save named by its ROM (Argosy) or "autosave" (Ludo) names no
+        # title; the ROM's own ID from RomM's scan does.
+        unpacked = {}
+        sync_core.emulator_saves.eden_is_running = lambda: False
+        sync_core.emulator_saves.unpack_save = lambda staged, tid, **kw: (
+            unpacked.setdefault('tid', tid) and {'files': 1, 'backup': Path('b')})
+        sync_core.cache_dir = lambda: tmp / 'cache'
+        m = manager([{'rom_id': 9, 'platform_slug': 'switch',
+                      'romm_data': {'title_id': '010093801237C800'}}])
+        m.log = lambda *a, **k: None
+        m.settings = type('S', (), {'get': lambda self, *a: ''})()
+
+        def fetch(save_id, kind, target, **kw):
+            import zipfile as _z
+            with _z.ZipFile(target, 'w') as z:
+                z.writestr('010093801237C000/save.bin', b'x')
+            return True
+        m.romm_client = type('C', (), {'download_save_by_id': staticmethod(fetch)})()
+        m._restore_standalone_save({'rom_id': 9, 'save_id': 3,
+                                    'file_name': 'Metroid Dread [2026-09-30_10-00-00].zip'},
+                                   'dev-1', 's1')
+        check('an untagged Switch save restores under the ROM\'s title',
+              unpacked.get('tid'), '010093801237C000')
 
     print()
     if FAILURES:

@@ -5853,7 +5853,7 @@ class RomMClient:
             logging.warning(f"Error completing sync session {session_id}: {e}")
             return False
 
-    def upload_save(self, rom_id, save_type, file_path, emulator=None, device_id=None, overwrite=False, slot=None, autocleanup=False, autocleanup_limit=None, session_id=None):
+    def upload_save(self, rom_id, save_type, file_path, emulator=None, device_id=None, overwrite=False, slot=None, autocleanup=False, autocleanup_limit=None, session_id=None, upload_name=None):
         """Upload save file using RomM naming convention with timestamps"""
         if not self.ensure_authenticated():
             return False
@@ -5900,10 +5900,13 @@ class RomMClient:
             # timestamp of ours only produced the double-stamped
             # "X [2026-08-04 00-20-51-351] [2026-08-03_22-20-51].bin" — ours in
             # local time, the server's in UTC, for one instant.
-            romm_filename = file_path.name
-            upload_stem = (file_path.name[:-len('.state.auto')]
-                           if file_path.name.lower().endswith('.state.auto')
-                           else file_path.stem)
+            # ``upload_name`` stands in for the file's own name; see
+            # AutoSyncManager._upload_name for why a game's autosave travels
+            # as "autosave.<ext>".
+            romm_filename = upload_name or file_path.name
+            upload_stem = (romm_filename[:-len('.state.auto')]
+                           if romm_filename.lower().endswith('.state.auto')
+                           else Path(romm_filename).stem)
             logging.debug(f"Upload filename: {romm_filename}")
 
             try:
@@ -11046,7 +11049,7 @@ class RetroArchInterface:
         
         return save_files
 
-    def resolve_restore_dest(self, game, entry, save_type, as_copy=False):
+    def resolve_restore_dest(self, game, entry, save_type, as_copy=False, local_name=None):
         """Resolve the local destination (dir, filename) for a restored version.
 
         Mirrors the on-disk naming RetroArch expects. For an as-copy state it
@@ -11057,8 +11060,12 @@ class RetroArchInterface:
         file_name = entry.get('file_name', '')
         slot = entry.get('slot') or RomMClient.get_slot_info(file_name)[0]
         tgt_name = self.convert_to_retroarch_filename(file_name, save_type, '/tmp', slot=slot)
+        # The name this device reads the save under, when the caller knows it
+        # (AutoSyncManager._local_save_name): the server's is the uploader's.
+        if local_name:
+            tgt_name = local_name
 
-        base = re.sub(r'\s*\[.*?\]', '', Path(file_name).stem)
+        base = re.sub(r'\s*\[.*?\]', '', Path(tgt_name if local_name else file_name).stem)
         local = (self.get_save_files() or {}).get(save_type, [])
         candidates = [f for f in local if f.get('name', '').startswith(base)]
         exact = [f for f in candidates if f.get('name') == tgt_name]
@@ -11087,7 +11094,7 @@ class RetroArchInterface:
         return dest_dir, tgt_name
 
     def restore_save_version(self, romm_client, game, entry, save_type,
-                             as_copy=False, log=None):
+                             as_copy=False, log=None, local_name=None):
         """Restore a server save/state version to local disk.
 
         Backs up the current file (in-place restore only), downloads the chosen
@@ -11105,7 +11112,8 @@ class RetroArchInterface:
             else:
                 logging.info(msg)
         try:
-            dest_dir, tgt_name = self.resolve_restore_dest(game, entry, save_type, as_copy)
+            dest_dir, tgt_name = self.resolve_restore_dest(game, entry, save_type, as_copy,
+                                                           local_name=local_name)
             if not dest_dir or not tgt_name:
                 return {'success': False, 'dest': None, 'tgt_name': None,
                         'error': 'Could not determine restore location (download the game first).'}
@@ -13027,7 +13035,7 @@ class AutoSyncManager:
                     device_id=device_id, slot=slot, overwrite=True,
                     autocleanup=entry.get('_autocleanup', False),
                     autocleanup_limit=entry.get('_autocleanup_limit'),
-                    session_id=session_id,
+                    session_id=session_id, upload_name=entry.get('_upload_name'),
                 ) is True:
                     summary['uploaded'] += 1
                     summary['_per_game'][rom_id]['up'] += 1
@@ -13659,6 +13667,7 @@ class AutoSyncManager:
                 'file_size_bytes': upload_path.stat().st_size,
                 # Local-only fields (stripped before negotiate; used by the executor)
                 '_path': str(upload_path),
+                '_upload_name': self._upload_name(rom_id, upload_path, slot),
                 '_autocleanup': _autocleanup,
                 '_autocleanup_limit': _limit,
             })
@@ -14790,7 +14799,7 @@ class AutoSyncManager:
                             emulator=entry.get('emulator'), device_id=device_id,
                             slot=slot, autocleanup=entry.get('_autocleanup', False),
                             autocleanup_limit=entry.get('_autocleanup_limit'),
-                            session_id=session_id,
+                            session_id=session_id, upload_name=entry.get('_upload_name'),
                         )
                         if ok is True:
                             summary['uploaded'] += 1
@@ -14910,7 +14919,7 @@ class AutoSyncManager:
                                 device_id=device_id, slot=slot, overwrite=True,
                                 autocleanup=entry.get('_autocleanup', False),
                                 autocleanup_limit=entry.get('_autocleanup_limit'),
-                                session_id=session_id,
+                                session_id=session_id, upload_name=entry.get('_upload_name'),
                             ) is True:
                                 summary['uploaded'] += 1
                                 _bump(rom_id, 'up')
@@ -15065,6 +15074,16 @@ class AutoSyncManager:
             # way; only the spelling differs.
             tag = title_ids.raw_switch_tag_in_name(file_name)
             title_id = title_ids.base_switch_title_id(tag) if tag else ''
+            # Argosy names a save after its ROM file, tag or not, and Ludo
+            # uploads as "autosave.zip". The ROM's own ID, read by RomM's scan,
+            # says the same thing the name was being asked for.
+            if not title_id:
+                data = (self._game_for_rom(op.get('rom_id')) or {}).get('romm_data') or {}
+                for value in (data.get('title_id'), data.get('save_target')):
+                    title_id = title_ids.base_switch_title_id(str(value or '').strip())
+                    if title_id:
+                        break
+                title_id = title_id or ''
             if not title_id:
                 self.log(f"⚠️ Save-sync: {file_name!r} names no Switch title; "
                          f"not restoring it")
@@ -15602,6 +15621,30 @@ class AutoSyncManager:
             return converted
         stem = self._local_save_stem(rom_id, server_file_name, game)
         return stem + Path(converted).suffix if stem is not None else None
+
+    def _upload_name(self, rom_id, path, slot):
+        """The name a save is uploaded under, or None for its own.
+
+        A game's autosave goes up as "autosave.<ext>". Argosy recognises a
+        game's autosave on the server by its name, and only three spellings
+        pass for every copy of a game: its own ROM's name, "argosy-latest" and
+        "autosave" (SaveSyncApiClient.isLatestSaveFileName). Ludo's own name
+        for the game is often not Argosy's -- a zip extracted here, a revision
+        tag -- so a save named after it was found only while it was the lone
+        save on the server. Ludo needs no name to place a download any more
+        (see _local_save_name), so the name can serve Argosy.
+
+        Kept as it is: anything outside the autosave slot (VMU ports, named
+        channels), and a ROM of several games, where the name is the only thing
+        saying which region's save it is.
+        """
+        if not _is_battery_save_slot(slot):
+            return None
+        game = self._game_for_rom(rom_id) or {}
+        members, _content = _content_stems(game.get('local_path'))
+        if len(members) > 1 and _platform_of(game) not in ('dreamcast', 'gamecube', 'ps2'):
+            return None
+        return f"{AUTOSAVE_UPLOAD_STEM}{Path(path).suffix.lower()}"
 
     def _game_for_rom(self, rom_id):
         try:
@@ -16974,6 +17017,10 @@ def _flycast_card_id(product_number):
     """A product number as flycast spells it in a VMU filename."""
     return ''.join('_' if c in ' /\\:*?|<>' else c for c in str(product_number).strip())
 
+
+# The stem every client reads as "this game's autosave" (Argosy's
+# AUTOSAVE_SLOT_NAME); see AutoSyncManager._upload_name.
+AUTOSAVE_UPLOAD_STEM = 'autosave'
 
 # The slot port A1 used before it became the autosave; see get_slot_info.
 _LEGACY_VMU_A1_SLOT = 'vmu-a1'
