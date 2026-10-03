@@ -1,78 +1,69 @@
 #!/usr/bin/env bash
-# Build libsigil.so for Ludo, without cmake.
+# Build libsigil.so for Ludo.
 #
-# argosy-sigil (https://github.com/rommforge/argosy-sigil, MPL-2.0) reads the
-# game-native title ID out of a ROM. Ludo uses it for the containers its own
-# reader cannot open — above all Switch NSP/XCI, whose ID lives in an NCA header
-# encrypted under a key from prod.keys.
+# argosy-sigil (https://github.com/rommapp/argosy-sigil, MPL-2.0) reads the
+# game-native title ID out of a ROM, and names the save files an emulator keeps
+# for it. Argosy, the Android RomM client, uses the same library for both, which
+# is the point of bundling it: two clients that read a game's identity the same
+# way agree on which save is whose.
 #
-# The upstream build wants cmake. This builds the subset Ludo actually uses with
-# nothing but gcc, which is what an immutable/atomic desktop tends to have. 3DS
-# and Wii U are omitted (they need zstd) and stubbed out below.
+# The full upstream build: every extractor (3DS and Wii U included), the CHD,
+# CSO, zip and ZArchive readers, and the save-unit resolver. Its dependencies
+# (zlib, zstd, lzma, libchdr, tiny-AES-c) are vendored as submodules and linked
+# statically, so the result still needs nothing but libc.
 #
 #   ./scripts/build_sigil.sh [build-dir]     # default: ./sigil-build
 #
-# Then point Ludo at the result:
+# Then point Ludo at the result, or let it pick up the copy installed into the
+# engine package:
 #   export LUDO_SIGIL_LIB=<build-dir>/libsigil.so
 set -euo pipefail
 
+# The commit Ludo is built and tested against. Bump deliberately: the version
+# string upstream reports has read "0.1.0-dev" for every build so far, so this
+# is the only record of which code is bundled.
+SIGIL_REPO="${SIGIL_REPO:-https://github.com/rommapp/argosy-sigil}"
+SIGIL_COMMIT="${SIGIL_COMMIT:-8a3b008}"
+
+# Resolved before any cd: "$0" may be relative.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${1:-$PWD/sigil-build}"
 SRC_DIR="$BUILD_DIR/argosy-sigil"
 
-command -v gcc >/dev/null || { echo "gcc is required"; exit 1; }
-command -v git >/dev/null || { echo "git is required"; exit 1; }
+for tool in gcc git cmake; do
+  command -v "$tool" >/dev/null || { echo "$tool is required"; exit 1; }
+done
 
 mkdir -p "$BUILD_DIR"
 if [ ! -d "$SRC_DIR/.git" ]; then
   echo "==> cloning argosy-sigil"
-  git clone --depth 1 https://github.com/rommforge/argosy-sigil "$SRC_DIR"
+  git clone "$SIGIL_REPO" "$SRC_DIR"
 fi
 cd "$SRC_DIR"
-
-echo "==> fetching tiny-AES-c (AES-XTS for NCA headers)"
-git submodule update --init --depth 1 third_party/tiny-AES-c
-
-# sigil.c dispatches to every platform extractor, so the two we exclude still
-# have to resolve at link time. They return the same code the library uses for a
-# format it was not built with.
-cat > stubs.c <<'STUB'
-/* 3DS and Wii U need zstd; this build omits them. */
-#include "sigil.h"
-#include "sigil_internal.h"
-int sigil_extract_3ds(const sigil_io *io, const char *hint,
-                      const sigil_options *opts, sigil_result *out)
-{ (void)io; (void)hint; (void)opts; (void)out; return SIGIL_ERR_UNSUPPORTED_FORMAT; }
-int sigil_extract_wiiu(const sigil_io *io, const char *hint,
-                       const sigil_options *opts, sigil_result *out)
-{ (void)io; (void)hint; (void)opts; (void)out; return SIGIL_ERR_UNSUPPORTED_FORMAT; }
-STUB
+git fetch --quiet origin
+git checkout --quiet "$SIGIL_COMMIT"
+echo "==> argosy-sigil $(git rev-parse --short HEAD)"
+git submodule update --init --depth 1
 
 echo "==> compiling"
-# ECB and CTR are tiny-AES-c's feature switches: XTS is built on ECB, and the
-# CNMT reader needs CTR. CBC is unused.
-gcc -shared -fPIC -O2 -std=c99 \
-  -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -D_FILE_OFFSET_BITS=64 \
-  -DSIGIL_EXPORTS -DSIGIL_WITH_SWITCH=1 -DSIGIL_WITH_FILENAME=1 \
-  -DECB=1 -DCTR=1 -DCBC=0 \
-  -Iinclude -Isrc -Ithird_party/tiny-AES-c \
-  src/sigil.c src/aes_xts.c src/cnf_parser.c src/filename.c src/io_file.c \
-  src/io_raw_cd.c src/iso9660.c src/ps2.c src/ps3.c src/psp.c src/psvita.c \
-  src/psx.c src/sfo_parser.c src/switch_cnmt.c src/switch_keys.c \
-  src/switch_nca.c src/switch_nsp.c src/switch_xci.c src/wii.c src/xbox360.c \
-  stubs.c third_party/tiny-AES-c/aes.c \
-  -o "$BUILD_DIR/libsigil.so"
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DSIGIL_BUILD_SHARED=ON -DSIGIL_BUILD_CLI=OFF -DSIGIL_BUILD_TESTS=ON >/dev/null
+cmake --build build -j"$(nproc)" >/dev/null 2>&1
+echo "==> upstream unit tests"
+(cd build && ctest --output-on-failure | grep -E 'tests passed|tests failed')
 
-if nm -D --undefined-only "$BUILD_DIR/libsigil.so" | grep -q sigil_; then
-  echo "!! unresolved sigil symbols remain:"
-  nm -D --undefined-only "$BUILD_DIR/libsigil.so" | grep sigil_
+LIB="$(readlink -f build/libsigil.so)"
+if ldd "$LIB" | grep -vqE 'linux-vdso|libc\.so|ld-linux'; then
+  echo "!! libsigil.so links more than libc:"
+  ldd "$LIB"
   exit 1
 fi
+cp "$LIB" "$BUILD_DIR/libsigil.so"
 
 # Install into the engine package, which is where a shipped build lives: both
 # the Decky zip and the desktop app carry romm_sync_engine wholesale, so a file
 # there reaches users without either build script changing. title_ids finds it
 # with no env var set. See engine/romm_sync_engine/bin/README.md.
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUNDLE_DIR="$REPO_ROOT/engine/romm_sync_engine/bin"
 if [ -d "$BUNDLE_DIR" ]; then
   cp "$BUILD_DIR/libsigil.so" "$BUNDLE_DIR/libsigil.so"
@@ -80,7 +71,8 @@ if [ -d "$BUNDLE_DIR" ]; then
 fi
 
 echo
-echo "built: $BUILD_DIR/libsigil.so"
+echo "built: $BUILD_DIR/libsigil.so ($(git rev-parse --short HEAD))"
+echo "  glibc floor: $(objdump -T "$BUILD_DIR/libsigil.so" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
 echo
 echo "Ludo picks this up automatically. To force a specific build instead:"
 echo "  export LUDO_SIGIL_LIB=$BUILD_DIR/libsigil.so"

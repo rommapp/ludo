@@ -8767,15 +8767,11 @@ class RetroArchInterface:
 
         1. The disc's own boot serial. SYSTEM.CNF names the ELF the console
            runs ("BOOT2 = cdrom0:\\SCUS_974.90;1") and Sony's prefix encodes the
-           territory, so this is what the BIOS itself checks. title_ids already
-           reads it, through Sigil where that answers and its own ISO 9660
-           reader otherwise — but only for an uncompressed image.
-        2. RomM's own `regions` for the ROM. This is the answer for a .chd:
-           the bundled Sigil is 0.1.0-dev, which carries no CHD support at all
-           (no decompressors, no container magic), and decoding CHD here would
-           mean implementing its v5 hunk map — a Huffman-coded format — to
-           recover one letter. The server already identified the dump against a
-           DAT, which is better evidence than anything we could parse.
+           territory, so this is what the BIOS itself checks. title_ids reads
+           it through Sigil, from an .iso, a .chd or a zipped image alike.
+        2. RomM's own `regions` for the ROM, for a disc Sigil cannot read. The
+           server identified the dump against a DAT, which is better evidence
+           than a filename.
         3. The filename tag, last. It is a scene convention rather than
            something either the console or the server reads, so it is only
            better than guessing — which is what the alternative, lrps2 picking
@@ -8783,7 +8779,7 @@ class RetroArchInterface:
         """
         try:
             from . import title_ids
-            serial = title_ids.title_id_from_rom(rom_path) or ''
+            serial = title_ids.title_id_from_rom(rom_path, platform='ps2') or ''
         except Exception:
             serial = ''
         if serial:
