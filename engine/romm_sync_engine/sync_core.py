@@ -14720,6 +14720,12 @@ class AutoSyncManager:
                                      f"not installed on this device")
                         continue
                     target = self._resolve_download_target(op, saves_dir)
+                    if target is DEFER_DOWNLOAD:
+                        summary['deferred'] = summary.get('deferred', 0) + 1
+                        logging.info(f"[SYNC-OP] deferring {op.get('file_name')!r} "
+                                     f"for rom {rom_id}: no local name for it until "
+                                     f"the game is launched")
+                        continue
                     if target is None:
                         if self._restore_standalone_save(op, device_id, session_id):
                             summary['downloaded'] += 1
@@ -14784,6 +14790,11 @@ class AutoSyncManager:
                             except Exception:
                                 pass
                         target = self._resolve_download_target(op, saves_dir)
+                        if target is None or target is DEFER_DOWNLOAD:
+                            # Nowhere RetroArch reads to put it yet; the
+                            # conflict stands until the game is launched.
+                            summary['deferred'] = summary.get('deferred', 0) + 1
+                            continue
                         if self.romm_client.download_save_by_id(
                             op.get('save_id'), 'saves', target,
                             device_id=device_id, session_id=session_id):
@@ -15035,6 +15046,13 @@ class AutoSyncManager:
         local_name = self.retroarch.convert_to_retroarch_filename(
             op.get('file_name', ''), 'saves', target_dir, op.get('slot')
         )
+        # A game's battery save is read under this device's name for the
+        # game, not the uploader's; see _local_save_stem.
+        if _is_battery_save_slot(op.get('slot')) and not _is_vmu_save(local_name):
+            stem = self._local_save_stem(op.get('rom_id'), op.get('file_name', ''))
+            if stem is None:
+                return DEFER_DOWNLOAD
+            local_name = stem + Path(local_name).suffix
         return target_dir / local_name
 
     def find_rom_id_for_save_file(self, file_path, include_orphans=False):
@@ -15422,6 +15440,48 @@ class AutoSyncManager:
                 self._launch_aliases.popitem(last=False)
         except Exception as e:
             logging.debug(f"could not record launch alias: {e}")
+
+    def _local_save_stem(self, rom_id, server_file_name, game=None):
+        """The stem RetroArch will read this game's battery save under, here.
+
+        A server save is named after the ROM on whichever device uploaded it.
+        Argosy names a game's autosave after ITS ROM file, and the same game is
+        routinely called something else on this device: RomM serves it as
+        "Game.zip", Ludo extracts "Game (USA) (Rev 1).sfc" out of that, and
+        RetroArch saves under the booted file. Written under the uploader's
+        name, the save sits beside the game and is never loaded.
+
+        So the uploader's name is kept only when it names something RetroArch
+        boots here -- the content being launched, or another file of this ROM,
+        which is what a regional variant's save looks like. Otherwise the save
+        takes this device's content stem: the file last launched, else the ROM
+        itself when it is one file.
+
+        Returns None when neither is known: a folder ROM not launched this
+        session, holding nothing the name matches. (A game this library does
+        not have keeps the uploader's name -- there is nothing else to use.) Guessing a member there
+        could put one region's save on another, so the caller defers, and the
+        pre-launch sync -- which runs after the launch is noted -- places it.
+        """
+        base = re.sub(r'\s*\[[\d\-\s:_]+\]', '', Path(server_file_name or '').stem).strip()
+        if game is None:
+            try:
+                game = next((g for g in (self.get_games() or [])
+                             if g.get('rom_id') == rom_id), None)
+            except Exception:
+                game = None
+        if not game:
+            # Not a game of this library (or the library is not loaded): there
+            # is nothing here to name it after, so the uploader's name stands.
+            return base or None
+        stems = getattr(self, '_launch_stems', None) or {}
+        launched = stems.get(rom_id) or stems.get(game.get('rom_id'))
+        members, content = _content_stems(game.get('local_path'))
+        if launched:
+            members.add(launched)
+        if base and base.lower() in {n.lower() for n in members}:
+            return base
+        return launched or content
 
     def _rom_id_for_launch_alias(self, *names):
         """rom_id for any of these on-disk names, or None."""
@@ -16039,12 +16099,21 @@ class AutoSyncManager:
                 # member file, so pick the latest of EACH member (not one global
                 # latest) — restoring every region's save under its own filename.
                 # Single-file ROMs collapse to a single member (unchanged).
+                # Grouped by the name each save will have HERE: another
+                # client's save for this game is named after its own ROM file,
+                # and keyed by that it was a second "member" whose download
+                # landed on the same file as ours, in whatever order.
                 saves_by_member = {}
                 for _s in user_saves:
                     if not isinstance(_s, dict):
                         continue
+                    _fn = _s.get('file_name', '')
+                    _stem = (self._local_save_stem(rom_id, _fn, game)
+                             if _is_battery_save_slot(_s.get('slot'))
+                             and not _is_vmu_save(_fn) else None)
                     saves_by_member.setdefault(
-                        self._save_member_key(_s.get('file_name', '')), []).append(_s)
+                        _stem.lower() if _stem else self._save_member_key(_fn),
+                        []).append(_s)
                 saves_to_process = [get_latest_file(grp, "save")
                                     for grp in saves_by_member.values()]
                 # A PS2 game has ONE card, uploaded as a zip now and as a raw
@@ -16154,6 +16223,11 @@ class AutoSyncManager:
                             retroarch_filename = self.retroarch.convert_to_retroarch_filename(
                                 original_filename, 'saves', emulator_save_dir
                             )
+                            if (_is_battery_save_slot(latest_save.get('slot'))
+                                    and not _is_vmu_save(retroarch_filename)):
+                                _stem = self._local_save_stem(rom_id, original_filename, game)
+                                if _stem:
+                                    retroarch_filename = _stem + Path(retroarch_filename).suffix
                             final_path = emulator_save_dir / retroarch_filename
 
                     # Only skip download if the local file actually exists AND
@@ -16612,6 +16686,67 @@ def _is_blank_save(path, _chunk=1 << 20):
             return saw_any
     except OSError:
         return False
+
+
+# Mirrors app/ludo_app/backend.py's _LAUNCHABLE_DISC_EXTS / _NON_GAME_EXTS /
+# _DISC_DESCRIPTOR_EXTS, which decide what a ROM folder boots as.
+_DISC_IMAGE_EXTS = ('.chd', '.cue', '.iso', '.pbp', '.ccd', '.gdi', '.cdi', '.nrg')
+_DISC_DESCRIPTOR_EXTS = ('.cue', '.gdi', '.ccd', '.nrg')
+_NON_GAME_EXTS = (
+    '.m3u', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp',
+    '.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra', '.rtc',
+    '.state', '.auto', '.txt', '.nfo', '.xml', '.dat', '.json', '.cue',
+    '.pdf', '.md', '.html', '.htm', '.part', '.backup',
+)
+
+
+def _content_stems(local_path):
+    """(names RetroArch may save this ROM under, the one it will) for a ROM.
+
+    RetroArch names a save after the file it boots. A single-file ROM is that
+    file -- a zip RetroArch opens itself included. A folder is what Ludo
+    extracted an archive into, or a multi-file ROM, and it boots as:
+
+      * a disc set (an .m3u beside two or more images): the playlist;
+      * a disc dump (.cue/.gdi/.ccd/.nrg and its tracks): the descriptor;
+      * otherwise its game files -- one, in the ordinary extracted-zip case,
+        or one per region, where nothing says which will boot.
+
+    The second value is None when that last case leaves a choice.
+    """
+    local = Path(local_path or '')
+    if not local.name:
+        return set(), None
+    try:
+        if local.is_file():
+            return {local.stem}, local.stem
+        if not local.is_dir():
+            return set(), None
+        files = [f for f in local.rglob('*') if f.is_file()]
+    except OSError:
+        return set(), None
+    ext = lambda f: f.suffix.lower()
+    playlists = [f for f in files if ext(f) == '.m3u']
+    images = [f for f in files if ext(f) in _DISC_IMAGE_EXTS]
+    if playlists and len(images) >= 2:
+        chosen = playlists
+    elif any(ext(f) in _DISC_DESCRIPTOR_EXTS for f in files):
+        chosen = [f for f in files if ext(f) in _DISC_DESCRIPTOR_EXTS]
+    else:
+        chosen = [f for f in files
+                  if ext(f) not in _NON_GAME_EXTS and not ext(f).startswith('.state')]
+    stems = {f.stem for f in chosen}
+    return stems, (next(iter(stems)) if len(stems) == 1 else None)
+
+
+# _resolve_download_target's answer for a save it cannot name yet: distinct
+# from None, which routes a save to the standalone restore path.
+DEFER_DOWNLOAD = object()
+
+
+def _is_battery_save_slot(slot):
+    """A game's primary save's slot, as get_slot_info assigns it."""
+    return slot in (None, '', 'autosave')
 
 
 def _vmu_port(path):
