@@ -14017,6 +14017,10 @@ class AutoSyncManager:
                 'file_name': packed.name,
                 'slot': 'autosave',
                 'emulator': 'Eden',
+                # The name Argosy reads as the game's autosave; the title ID
+                # travels inside the pack ("<title id>/…"), which is where a
+                # restore reads it from when the name does not carry it.
+                '_upload_name': f'{AUTOSAVE_UPLOAD_STEM}.zip',
                 'content_hash': RomMClient.compute_content_hash(packed),
                 'updated_at': updated_at,
                 'file_size_bytes': stat.st_size,
@@ -15084,18 +15088,16 @@ class AutoSyncManager:
                     if title_id:
                         break
                 title_id = title_id or ''
-            if not title_id:
-                self.log(f"⚠️ Save-sync: {file_name!r} names no Switch title; "
-                         f"not restoring it")
-                return False
+            # Still nothing: the pack itself says, once downloaded -- both
+            # Ludo and Argosy nest a save under its title-ID folder.
 
         # Check before spending the transfer. unpack_save checks again and is
         # the authoritative one -- Eden can start while the download runs --
         # but without this a restore attempted with Eden open pays for the
         # whole save every sync just to be refused at the end.
         if emulator_saves.eden_is_running():
-            self.log(f"ℹ️ Save-sync: Eden is running; {title_id} will restore "
-                     f"once it is closed.")
+            self.log(f"ℹ️ Save-sync: Eden is running; {title_id or file_name} will "
+                     f"restore once it is closed.")
             return False
 
         staged = cache_dir() / 'incoming_saves' / file_name
@@ -15115,6 +15117,13 @@ class AutoSyncManager:
                      f"bare .srm, not an Eden save pack — likely a stray upload from "
                      f"a mislabelled sync. Delete it in RomM so the real save can "
                      f"become the slot's latest.")
+            staged.unlink(missing_ok=True)
+            return False
+        if not title_id:
+            title_id = emulator_saves.pack_title_id(staged) or ''
+        if not title_id:
+            self.log(f"⚠️ Save-sync: {file_name!r} names no Switch title; "
+                     f"not restoring it")
             staged.unlink(missing_ok=True)
             return False
 

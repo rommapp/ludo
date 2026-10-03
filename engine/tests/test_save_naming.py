@@ -243,6 +243,26 @@ def main():
                                    'dev-1', 's1')
         check('an untagged Switch save restores under the ROM\'s title',
               unpacked.get('tid'), '010093801237C000')
+        # And with no ID on the ROM either (RomM before 5.3): the pack's own
+        # "<title id>/" folder names it -- our "autosave.zip" uploads included.
+        unpacked.clear()
+        m.get_games = lambda: [{'rom_id': 9, 'platform_slug': 'switch'}]
+        m._restore_standalone_save({'rom_id': 9, 'save_id': 4,
+                                    'file_name': 'autosave [2026-09-30_10-00-00].zip'},
+                                   'dev-1', 's1')
+        check('an "autosave.zip" restores under the title its pack is nested in',
+              unpacked.get('tid'), '010093801237C000')
+        eden_save = tmp / 'eden' / '010093801237C000'
+        eden_save.mkdir(parents=True)
+        (eden_save / 'save.bin').write_bytes(b'progress')
+        sync_core.emulator_saves.find_eden_saves = lambda **kw: [
+            {'title_id': '010093801237C000', 'path': eden_save, 'modified': 1.0e9}]
+        m._rom_id_for_title_id = lambda tid: 9
+        rows = m._eden_inventory_entries()
+        check('Eden uploads as "autosave.zip"',
+              [r.get('_upload_name') for r in rows], ['autosave.zip'])
+        check('...with the title ID inside the pack',
+              sync_core.emulator_saves.pack_title_id(rows[0]['_path']), '010093801237C000')
 
     print()
     if FAILURES:
