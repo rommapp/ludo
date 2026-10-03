@@ -14,8 +14,8 @@ import logging
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
-from . import (eden_config, emulator_saves, gamecube_saves, ps2_memcard,
-               switch_content, title_ids)
+from . import (eden_config, emulator_saves, folder_saves, gamecube_saves,
+               ps2_memcard, switch_content, title_ids)
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -13672,6 +13672,7 @@ class AutoSyncManager:
                 '_autocleanup_limit': _limit,
             })
 
+        inventory.extend(self._folder_inventory_entries())
         eden_entries = self._eden_inventory_entries()
         if emulator_saves.eden_data_dirs():
             # Keys ride along with an ordinary Switch pass: ~14 KB, needed
@@ -13931,6 +13932,205 @@ class AutoSyncManager:
         if restored:
             self._record_synced(str(restored))
         return True
+
+    # ── folder saves: PSP and 3DS (see folder_saves) ─────────────────────────
+
+    # The folder RetroArch gives a core's saves under per-core sorting, and the
+    # one Citra and Azahar each make inside it: their libretro library names.
+    _PSP_CORE_DIR = 'PPSSPP'
+    _N3DS_CORE_DIRS = ('Citra', 'Azahar')
+
+    def _folder_save_roots(self):
+        base = (self.retroarch.save_dirs or {}).get('saves')
+        return [Path(base)] if base else []
+
+    def _pack_folder_unit(self, kind, rom_id, key, pack):
+        """``pack(destination)`` into our cache, rewritten only when it changes."""
+        out = cache_dir() / 'folder_saves' / kind / str(rom_id) / f"{key.replace('/', '_')}.zip"
+        fresh = pack(out.with_suffix('.zip.part'))
+        if fresh is None:
+            return None
+        if out.is_file() and out.read_bytes() == fresh.read_bytes():
+            fresh.unlink()
+        else:
+            os.replace(fresh, out)
+        return out
+
+    def _folder_units(self):
+        """[(platform, rom_id, key, packer, folders)] for every PSP and 3DS save here."""
+        units = []
+        roots = self._folder_save_roots()
+        for savedata in folder_saves.psp_savedata_dirs(roots):
+            for serial, folders in folder_saves.psp_units(savedata).items():
+                rom_id = self._rom_id_for_title_id(serial)
+                if rom_id:
+                    units.append(('psp', rom_id, serial,
+                                  lambda d, f=folders: folder_saves.psp_pack(f, d), folders))
+        for sd_root in folder_saves.n3ds_sd_roots(roots):
+            for tid, unit in folder_saves.n3ds_units(sd_root).items():
+                rom_id = self._rom_id_for_title_id(tid)
+                if rom_id:
+                    units.append(('3ds', rom_id, tid,
+                                  lambda d, u=unit: folder_saves.n3ds_pack(u, d),
+                                  [unit['data'], unit['extdata']]))
+        return units
+
+    def _folder_inventory_entries(self):
+        """Inventory rows for PSP and 3DS saves, one zip per game.
+
+        Their saves are folders, which get_save_files -- a walk for save-file
+        extensions -- never reports. Packed the way Argosy packs them; see
+        folder_saves.
+        """
+        entries = []
+        try:
+            units = self._folder_units()
+        except Exception as e:
+            logging.debug(f"folder-save discovery failed: {e}")
+            return entries
+        for kind, rom_id, key, pack, folders in units:
+            try:
+                packed = self._pack_folder_unit(kind, rom_id, key, pack)
+            except Exception as e:
+                self.log(f"⚠️ Could not pack the {kind.upper()} save for {key}: {e}")
+                continue
+            if packed is None:
+                continue
+            entries.append({
+                'rom_id': rom_id,
+                'file_name': packed.name,
+                'slot': 'autosave',
+                'emulator': 'ppsspp' if kind == 'psp' else 'citra',
+                'content_hash': RomMClient.compute_content_hash(packed),
+                'updated_at': datetime.datetime.fromtimestamp(
+                    folder_saves.unit_newest(folders), tz=datetime.timezone.utc).isoformat(),
+                'file_size_bytes': packed.stat().st_size,
+                '_path': str(packed),
+                '_upload_name': f'{AUTOSAVE_UPLOAD_STEM}.zip',
+                '_autocleanup': True,
+                '_autocleanup_limit': 10,
+            })
+        return entries
+
+    def _is_folder_op(self, op):
+        """A server save that is a PSP or 3DS game's save folders."""
+        return (str(op.get('file_name') or '').lower().endswith('.zip')
+                and _platform_of(self._game_for_rom(op.get('rom_id'))) in ('psp', '3ds'))
+
+    def _rom_save_id(self, rom_id, platform):
+        """The game's own save id: RomM's scan of it, else Sigil reading the ROM."""
+        game = self._game_for_rom(rom_id) or {}
+        data = game.get('romm_data') or {}
+        for value in (data.get('save_target'), data.get('title_id')):
+            if value:
+                return str(value).strip()
+        local = Path(game.get('local_path') or '')
+        files = [local] if local.is_file() else (
+            sorted((f for f in local.rglob('*') if f.is_file()),
+                   key=lambda f: f.stat().st_size, reverse=True)[:3] if local.is_dir() else [])
+        for rom in files:
+            found = title_ids.identify(rom, platform=platform)
+            if found:
+                return found['save_id']
+        return None
+
+    def _folder_save_base(self, rom_id, core_dir):
+        """The save directory RetroArch hands this game's core, as it sorts saves."""
+        base = (self.retroarch.save_dirs or {}).get('saves')
+        if not base:
+            return None
+        base = Path(base)
+        mode = self.retroarch.get_save_subdir_mode('saves')
+        if mode == 'core':
+            return base / core_dir
+        if mode == 'content':
+            game = self._game_for_rom(rom_id) or {}
+            return base / (self._content_dir_for_game(game)
+                           or platform_folder_name(game.get('platform_slug')) or core_dir)
+        return base
+
+    def _psp_savedata_for(self, rom_id, serial):
+        """The SAVEDATA folder this game's save goes in."""
+        dirs = folder_saves.psp_savedata_dirs(self._folder_save_roots())
+        for savedata in dirs:
+            if folder_saves.psp_folders(savedata, serial):
+                return savedata
+        if dirs:
+            return dirs[0]
+        base = self._folder_save_base(rom_id, self._PSP_CORE_DIR)
+        return base / 'PSP' / 'SAVEDATA' if base else None
+
+    def _n3ds_unit_for(self, rom_id, title_id):
+        """The data/extdata folders this title's save goes in."""
+        sd_roots = folder_saves.n3ds_sd_roots(self._folder_save_roots())
+        key = self._title_id_key(title_id)
+        for sd_root in sd_roots:
+            for tid, unit in folder_saves.n3ds_units(sd_root).items():
+                if tid == key:
+                    return unit
+        if sd_roots:
+            sd_root = sd_roots[0]
+        else:
+            base = self._folder_save_base(rom_id, self._N3DS_CORE_DIRS[0])
+            if not base:
+                return None
+            sd_root = base / self._N3DS_CORE_DIRS[0] / 'sdmc' / 'Nintendo 3DS'
+        id1 = sd_root / folder_saves.N3DS_ID / folder_saves.N3DS_ID
+        return folder_saves.n3ds_unit(id1, key)
+
+    def _restore_folder_save(self, op, device_id, session_id):
+        """Put a PSP or 3DS save zip from the server into the emulator's folders.
+
+        Deferred (False) while RetroArch runs: the core holds the save open
+        and writes it back as it plays.
+        """
+        if self.is_retroarch_running():
+            self.log("ℹ️ Save-sync: RetroArch is running; the save will restore "
+                     "once it is closed.")
+            return False
+        rom_id = op.get('rom_id')
+        platform = _platform_of(self._game_for_rom(rom_id))
+        file_name = Path(op.get('file_name') or 'save.zip').name
+        staged = cache_dir() / 'incoming_saves' / file_name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if not self.romm_client.download_save_by_id(
+                op.get('save_id'), 'saves', staged,
+                device_id=device_id, session_id=session_id):
+            return False
+        backups = cache_dir() / 'save_backups'
+        try:
+            if not _zipfile.is_zipfile(staged):
+                raise ValueError('not a zip')
+            if platform == 'psp':
+                serial = (folder_saves.psp_serial_of_zip(staged)
+                          or (self._rom_save_id(rom_id, 'psp') or '')[:9])
+                savedata = self._psp_savedata_for(rom_id, serial) if serial else None
+                if not savedata:
+                    raise ValueError('no serial or save folder for it')
+                restored = folder_saves.psp_restore(staged, savedata, serial, backups)
+                what = f"{len(restored)} PSP save folder(s) for {serial}"
+            else:
+                tid = self._rom_save_id(rom_id, '3ds')
+                unit = self._n3ds_unit_for(rom_id, tid) if tid else None
+                if not unit:
+                    raise ValueError('no title id for it')
+                restored = folder_saves.n3ds_restore(staged, unit, backups)
+                what = f"3DS {' + '.join(restored)} for {self._title_id_key(tid)}"
+        except (ValueError, OSError, _zipfile.BadZipFile) as e:
+            self.log(f"⚠️ Save-sync: could not restore {file_name!r}: {e}")
+            return False
+        finally:
+            staged.unlink(missing_ok=True)
+        self.log(f"✅ Restored {what}")
+        return True
+
+    def _folder_unit_hash(self, rom_id):
+        """The content hash of this game's PSP/3DS save as it would upload, or None."""
+        for kind, rid, key, pack, _folders in self._folder_units():
+            if rid == rom_id:
+                packed = self._pack_folder_unit(kind, rid, key, pack)
+                return RomMClient.compute_content_hash(packed) if packed else None
+        return None
 
     def _eden_inventory_entries(self):
         """Inventory rows for Eden's Switch saves, packed one zip per game.
@@ -15065,6 +15265,8 @@ class AutoSyncManager:
             return self._restore_ps2_save(op, device_id, session_id)
         if self._is_gci_op(op):
             return self._restore_gci_save(op, device_id, session_id)
+        if self._is_folder_op(op):
+            return self._restore_folder_save(op, device_id, session_id)
         file_name = op.get('file_name') or ''
         # is_switch_title_id is the save-directory test specifically: Eden files
         # a save under the BASE title, never an update or DLC id.
@@ -15190,7 +15392,7 @@ class AutoSyncManager:
             return None
         # A PS2 save zip is folders to merge into a card, not a file to drop;
         # a GameCube save is files for a card folder only its restore finds.
-        if self._is_ps2_zip_op(op) or self._is_gci_op(op):
+        if self._is_ps2_zip_op(op) or self._is_gci_op(op) or self._is_folder_op(op):
             return None
         # The op's emulator is the SERVER save's label, which a buggy or
         # foreign upload can set to anything ('switch' instead of 'eden'). The
@@ -15767,6 +15969,11 @@ class AutoSyncManager:
             return base
 
         text = text.upper()
+
+        # 3DS. RomM's save_target is the save's path below the title root,
+        # "00040000/00033500", and its title_id the same 16 hex unsplit.
+        if re.fullmatch(r'[0-9A-F]{8}/[0-9A-F]{8}', text):
+            return text.replace('/', '')
 
         # Dreamcast. The product number in a disc's IP.BIN is a fixed-width
         # field, so RomM stores it space-padded ("T1401D  50"), while flycast
@@ -16377,7 +16584,7 @@ class AutoSyncManager:
                 # Same for GameCube: a game's GCIs are one save, whether a
                 # client uploaded them zipped, as one raw GCI, or (Ludo before
                 # it packed them) one row per GCI.
-                if _platform_slug == 'ps2' or _platform_of(game) == 'gamecube':
+                if _platform_slug == 'ps2' or _platform_of(game) in ('gamecube', 'psp', '3ds'):
                     saves_to_process = [get_latest_file(
                         [x for x in user_saves if isinstance(x, dict)], "save")]
                 saves_to_process = [s for s in saves_to_process if s]
@@ -16452,6 +16659,24 @@ class AutoSyncManager:
                                      'save_id': latest_save.get('id'),
                                      'emulator': romm_emulator},
                                     device_id, None):
+                                downloads_successful += 1
+                        continue
+
+                    if (_platform_of(game) in ('psp', '3ds')
+                            and original_filename.lower().endswith('.zip')):
+                        device_id = self.settings.get('Device', 'device_id', '') or None
+                        op = {'rom_id': rom_id, 'file_name': original_filename,
+                              'save_id': latest_save.get('id'), 'emulator': romm_emulator}
+                        current = any(
+                            sync.get('device_id') == device_id and sync.get('is_current')
+                            for sync in (latest_save.get('device_syncs') or []))
+                        if not current and latest_save.get('content_hash'):
+                            current = self._folder_unit_hash(rom_id) == latest_save.get('content_hash')
+                        if current:
+                            skipped_count += 1
+                        else:
+                            downloads_attempted += 1
+                            if self._restore_folder_save(op, device_id, None):
                                 downloads_successful += 1
                         continue
 
@@ -17019,7 +17244,8 @@ def _platform_of(game):
     """A library entry's platform, folded to one spelling per console."""
     slug = str((game or {}).get('platform_slug')
                or ((game or {}).get('romm_data') or {}).get('platform_slug') or '').lower()
-    return {'dc': 'dreamcast', 'ngc': 'gamecube', 'gc': 'gamecube'}.get(slug, slug)
+    return {'dc': 'dreamcast', 'ngc': 'gamecube', 'gc': 'gamecube',
+            'n3ds': '3ds', 'nintendo-3ds': '3ds'}.get(slug, slug)
 
 
 def _flycast_card_id(product_number):
