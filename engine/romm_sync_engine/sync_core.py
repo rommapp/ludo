@@ -5727,16 +5727,16 @@ class RomMClient:
         # saves, not copies — reporting them all as "autosave" made the dedupe
         # below treat three of the four as stale and drop them, and the server's
         # single autosave row alternated between whichever card was touched
-        # last. Every port gets its own slot, named after the port.
+        # last. Every port but A1 gets its own slot, named after the port.
         #
-        # Port A1 briefly kept "autosave" on the theory that it would pair with
-        # other clients' primary save. It wouldn't: grout and argosy were both
-        # read (Aug 2026) and neither has any concept of a VMU — no flycast
-        # per-content cards, no Dreamcast save handling at all — so there was
-        # nothing on the other side to meet, and the exception only made port A
-        # the odd one out in the slot list.
+        # Port A1 is the game's "autosave": Argosy (Oct 2026, its
+        # DreamcastSaveHandler) syncs exactly that card, "<product id>.A1.bin",
+        # in exactly that slot, so this is where the two meet. Ludo used
+        # "vmu-a1" before Argosy had any Dreamcast support; those rows are
+        # superseded, never downloaded over the autosave (see
+        # _LEGACY_VMU_A1_SLOT).
         port = _vmu_port(file_path)
-        if port:
+        if port and port != 'A1':
             return f"vmu-{port.lower()}", True, 10
 
         if suffix:
@@ -14719,6 +14719,12 @@ class AutoSyncManager:
                         logging.info(f"[SYNC-OP] skipping download for rom {rom_id}: "
                                      f"not installed on this device")
                         continue
+                    # Port A1 syncs as the autosave now. An old "vmu-a1" row
+                    # holds an earlier copy of the same card, and restoring it
+                    # would overwrite the newer one.
+                    if slot == _LEGACY_VMU_A1_SLOT:
+                        summary['skipped_legacy'] = summary.get('skipped_legacy', 0) + 1
+                        continue
                     target = self._resolve_download_target(op, saves_dir)
                     if target is DEFER_DOWNLOAD:
                         summary['deferred'] = summary.get('deferred', 0) + 1
@@ -15043,16 +15049,12 @@ class AutoSyncManager:
             if mapped:
                 target_dir = target_dir / mapped
         target_dir.mkdir(parents=True, exist_ok=True)
-        local_name = self.retroarch.convert_to_retroarch_filename(
-            op.get('file_name', ''), 'saves', target_dir, op.get('slot')
-        )
         # A game's battery save is read under this device's name for the
-        # game, not the uploader's; see _local_save_stem.
-        if _is_battery_save_slot(op.get('slot')) and not _is_vmu_save(local_name):
-            stem = self._local_save_stem(op.get('rom_id'), op.get('file_name', ''))
-            if stem is None:
-                return DEFER_DOWNLOAD
-            local_name = stem + Path(local_name).suffix
+        # game, not the uploader's; see _local_save_name.
+        local_name = self._local_save_name(
+            op.get('rom_id'), op.get('file_name', ''), op.get('slot'))
+        if local_name is None:
+            return DEFER_DOWNLOAD
         return target_dir / local_name
 
     def find_rom_id_for_save_file(self, file_path, include_orphans=False):
@@ -15440,6 +15442,70 @@ class AutoSyncManager:
                 self._launch_aliases.popitem(last=False)
         except Exception as e:
             logging.debug(f"could not record launch alias: {e}")
+
+    def _local_save_name(self, rom_id, server_file_name, slot, game=None):
+        """The filename a server save is written under on this device.
+
+        None when it cannot be told yet (see _local_save_stem). Only a game's
+        battery save is renamed; a named channel or a VMU port keeps what the
+        uploader -- this client, for those -- called it.
+        """
+        converted = self.retroarch.convert_to_retroarch_filename(
+            server_file_name, 'saves', '/tmp', slot)
+        if not _is_battery_save_slot(slot):
+            return converted
+        if game is None:
+            game = self._game_for_rom(rom_id)
+        # A Dreamcast game's autosave is its port A1 card, whatever the
+        # uploader named it: Argosy uploads "<its rom name>.bin" and restores
+        # "<product id>.A1.bin", which is the name flycast reads.
+        if _platform_of(game) == 'dreamcast':
+            return self._dreamcast_card_name(rom_id, game, 'A1')
+        if _is_vmu_save(converted):
+            return converted
+        stem = self._local_save_stem(rom_id, server_file_name, game)
+        return stem + Path(converted).suffix if stem is not None else None
+
+    def _game_for_rom(self, rom_id):
+        try:
+            return next((g for g in (self.get_games() or [])
+                         if g.get('rom_id') == rom_id), None)
+        except Exception:
+            return None
+
+    def _dreamcast_card_name(self, rom_id, game, port):
+        """The file flycast reads this game's VMU in ``port`` from.
+
+        With per-content VMUs on (see _ensure_per_game_vmu) flycast writes
+        "<product number>.<port>.bin", the product number from the disc's
+        IP.BIN with its reserved characters made underscores. A card already
+        on disk for the game names it best. Otherwise Sigil reads the number
+        off the disc, zipped or not, which is the id Argosy names its cards by
+        too. Failing both, the content name: flycast reads "<content>.<port>
+        .bin" when no id-named card exists, and writes the id-named one after.
+        """
+        suffix = f'.{port}.bin'
+        try:
+            for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
+                path = Path(entry['path'])
+                if (path.name.upper().endswith(suffix.upper())
+                        and self.rom_id_for_save(path) == rom_id):
+                    return path.name
+        except Exception:
+            pass
+        local = Path((game or {}).get('local_path') or '')
+        candidates = [local] if local.is_file() else (
+            sorted((f for f in local.rglob('*') if f.is_file()
+                    and f.suffix.lower() in ('.chd', '.cdi', '.iso', '.bin', '.zip')),
+                   key=lambda f: f.stat().st_size, reverse=True)
+            if local.is_dir() else [])
+        for rom in candidates[:4]:
+            found = title_ids.identify(rom, platform='dreamcast')
+            if found:
+                return _flycast_card_id(found['save_id']) + suffix
+        stems = getattr(self, '_launch_stems', None) or {}
+        stem = stems.get(rom_id) or _content_stems(local)[1]
+        return stem + suffix if stem else None
 
     def _local_save_stem(self, rom_id, server_file_name, game=None):
         """The stem RetroArch will read this game's battery save under, here.
@@ -16108,11 +16174,9 @@ class AutoSyncManager:
                     if not isinstance(_s, dict):
                         continue
                     _fn = _s.get('file_name', '')
-                    _stem = (self._local_save_stem(rom_id, _fn, game)
-                             if _is_battery_save_slot(_s.get('slot'))
-                             and not _is_vmu_save(_fn) else None)
+                    _name = self._local_save_name(rom_id, _fn, _s.get('slot'), game)
                     saves_by_member.setdefault(
-                        _stem.lower() if _stem else self._save_member_key(_fn),
+                        _name.lower() if _name else self._save_member_key(_fn),
                         []).append(_s)
                 saves_to_process = [get_latest_file(grp, "save")
                                     for grp in saves_by_member.values()]
@@ -16220,14 +16284,11 @@ class AutoSyncManager:
                         else:
                             emulator_save_dir = save_base_dir
                         if emulator_save_dir:
-                            retroarch_filename = self.retroarch.convert_to_retroarch_filename(
-                                original_filename, 'saves', emulator_save_dir
-                            )
-                            if (_is_battery_save_slot(latest_save.get('slot'))
-                                    and not _is_vmu_save(retroarch_filename)):
-                                _stem = self._local_save_stem(rom_id, original_filename, game)
-                                if _stem:
-                                    retroarch_filename = _stem + Path(retroarch_filename).suffix
+                            retroarch_filename = (
+                                self._local_save_name(rom_id, original_filename,
+                                                      latest_save.get('slot'), game)
+                                or self.retroarch.convert_to_retroarch_filename(
+                                    original_filename, 'saves', emulator_save_dir))
                             final_path = emulator_save_dir / retroarch_filename
 
                     # Only skip download if the local file actually exists AND
@@ -16742,6 +16803,22 @@ def _content_stems(local_path):
 # _resolve_download_target's answer for a save it cannot name yet: distinct
 # from None, which routes a save to the standalone restore path.
 DEFER_DOWNLOAD = object()
+
+
+def _platform_of(game):
+    """A library entry's platform, folded to one spelling per console."""
+    slug = str((game or {}).get('platform_slug')
+               or ((game or {}).get('romm_data') or {}).get('platform_slug') or '').lower()
+    return {'dc': 'dreamcast', 'ngc': 'gamecube', 'gc': 'gamecube'}.get(slug, slug)
+
+
+def _flycast_card_id(product_number):
+    """A product number as flycast spells it in a VMU filename."""
+    return ''.join('_' if c in ' /\\:*?|<>' else c for c in str(product_number).strip())
+
+
+# The slot port A1 used before it became the autosave; see get_slot_info.
+_LEGACY_VMU_A1_SLOT = 'vmu-a1'
 
 
 def _is_battery_save_slot(slot):
