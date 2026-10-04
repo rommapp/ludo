@@ -214,6 +214,18 @@ def main():
                (fid1 / 'extdata' / '00000000' / '00000335' / 'Quota.dat').is_file()),
               (True, True))
 
+        # Version restore routes the same saves through these restores.
+        m = manager(saves)
+        m.get_games = lambda: [{'rom_id': 1, 'platform_slug': 'psp'},
+                               {'rom_id': 3, 'platform_slug': 'snes'},
+                               {'rom_id': 4, 'platform_slug': 'switch'}]
+        check('a PSP zip is a packed save',
+              m.is_packed_save_op({'rom_id': 1, 'file_name': 'autosave.zip'}), True)
+        check('a Switch pack is a packed save',
+              m.is_packed_save_op({'rom_id': 4, 'file_name': 'autosave.zip'}), True)
+        check('an .srm is a plain file',
+              m.is_packed_save_op({'rom_id': 3, 'file_name': 'autosave.srm'}), False)
+
         try:
             F.psp_restore(argosy_zip(tmp / 'w.zip', {'ULJM05500DATA/x': b'x'}),
                           savedata, 'ULUS10064')

@@ -14012,6 +14012,13 @@ class AutoSyncManager:
             })
         return entries
 
+    def is_packed_save_op(self, op):
+        """A server save that unpacks into an emulator's tree, not a plain file."""
+        return (self._is_ps2_zip_op(op) or self._is_gci_op(op) or self._is_folder_op(op)
+                or self._is_standalone_emulator(op.get('emulator'))
+                or bool(standalone_emulator_for_platform(
+                    None, _platform_of(self._game_for_rom(op.get('rom_id'))))))
+
     def _is_folder_op(self, op):
         """A server save that is a PSP or 3DS game's save folders."""
         return (str(op.get('file_name') or '').lower().endswith('.zip')
