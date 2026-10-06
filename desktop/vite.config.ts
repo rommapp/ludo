@@ -28,7 +28,11 @@ export default defineConfig({
     port: 5173,
     // The Python backend serves the RPC endpoints this shell's `callable` hits.
     proxy: {
-      "/api": { target: "http://127.0.0.1:8723", changeOrigin: true },
+      // ROMM_PORT: the backend's port, when it isn't the default (try-dev.sh
+      // runs one on its own port so an installed Ludo can stay open).
+      "/api": { target: `http://127.0.0.1:${process.env.ROMM_PORT || "8723"}`, changeOrigin: true },
+      // UI sounds come off the local Steam install, also via the backend.
+      "/sounds": { target: `http://127.0.0.1:${process.env.ROMM_PORT || "8723"}`, changeOrigin: true },
     },
   },
   build: {
