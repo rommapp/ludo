@@ -2,15 +2,16 @@ import { Focusable, GamepadButton, ModalRoot, showModal, Navigation } from "@lud
 import { toaster } from "../toast";
 import { V2, fmtBytes, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
 import { FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
-import { deleteGame, downloadGame, getGameDetail, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns} from "../rpc";
+import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns} from "../rpc";
 import { _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, PlatformIcon, V2Button, V2SettingsRow, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage} from "../kit";
 import { _dlSucceeded, _setDlActive, awaitDownload, useDownloadProgress, useIsDownloading, downloadOne} from "../downloads";
 import { maybePromptSwitchFirmware } from "../firmware";
 import { libBack, libNavigate } from "../nav";
-import { GameCover } from "../media";
+import { GameCover, _coverCache, _coverCacheSet } from "../media";
+import { NAV_ENTER_FIRST } from "../scrub";
 import { DocumentViewer } from "../reader";
 import { ScreenshotViewer } from "../shots";
 import { viewerOpen } from "../glass";
@@ -44,15 +45,19 @@ function shortHash(v: string): string {
 }
 
 function HashChip({ label, value }: { label: string; value: string | null | undefined }) {
+  const [focused, setFocused] = useState(false);
   if (!value) return null;
   const copy = () => {
     try { navigator.clipboard?.writeText(value); toaster.toast({ title: `${label} copied`, body: value }); } catch { /* ignore */ }
   };
   return (
-    <Focusable noFocusRing onActivate={copy} onClick={copy} style={{
+    <Focusable noFocusRing onActivate={copy} onClick={copy}
+      onFocus={() => setFocused(true)} onBlur={() => setFocused(false)} style={{
       display: 'inline-flex', alignItems: 'center', gap: '8px', maxWidth: '100%',
-      background: V2.surface, border: `1px solid ${V2.borderStrong}`,
+      background: V2.surface, border: `1px solid ${focused ? V2.brand : V2.borderStrong}`,
       borderRadius: V2.radiusChip, overflow: 'hidden', cursor: 'pointer', fontSize: '11px',
+      transition: 'border-color 0.15s ease, box-shadow 0.15s ease',
+      ...V2Focus.flat(focused),
     }}>
       <span style={{
         alignSelf: 'stretch', display: 'flex', alignItems: 'center', padding: '3px 8px',
@@ -685,7 +690,13 @@ function useSmoothNumber(target: number | null, active: boolean): number {
   return Math.round(val);
 }
 
-export function MetadataTab({ detail }: { detail: any }) {
+export function MetadataTab({ detail, onRefresh }: { detail: any; onRefresh?: () => Promise<void> }) {
+  const [refreshing, setRefreshing] = useState(false);
+  const refresh = async () => {
+    if (!onRefresh || refreshing) return;
+    setRefreshing(true);
+    try { await onRefresh(); } finally { setRefreshing(false); }
+  };
   const providers = detail?.providers || {};
   const ordered = [...PROVIDERS].sort((a, b) => {
     const av = providers[a.key] ? 1 : 0, bv = providers[b.key] ? 1 : 0;
@@ -696,6 +707,7 @@ export function MetadataTab({ detail }: { detail: any }) {
     ['CRC', hashes.crc], ['MD5', hashes.md5], ['SHA1', hashes.sha1], ['RA', hashes.ra],
   ];
   const copy = (v: string) => { try { navigator.clipboard?.writeText(v); toaster.toast({ title: 'Copied', body: v }); } catch { /* ignore */ } };
+  const [hashFocus, setHashFocus] = useState<string | null>(null);
   const heading = (txt: string) => (
     <div style={{ fontSize: '13px', fontWeight: 600, color: V2.fg }}>{txt}</div>
   );
@@ -720,10 +732,13 @@ export function MetadataTab({ detail }: { detail: any }) {
           {hashRows.map(([label, val]) => (
             <Focusable key={label} noFocusRing
               onActivate={() => val && copy(val)} onClick={() => val && copy(val)}
+              onFocus={() => setHashFocus(label)} onBlur={() => setHashFocus((c) => c === label ? null : c)}
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '4px 10px',
-                background: V2.surface, border: `1px solid ${V2.borderStrong}`, borderRadius: V2.radiusChip,
+                background: V2.surface, border: `1px solid ${hashFocus === label ? V2.brand : V2.borderStrong}`, borderRadius: V2.radiusChip,
                 fontSize: '11.5px', cursor: val ? 'pointer' : 'default',
+                transition: 'border-color 0.15s ease, box-shadow 0.15s ease',
+                ...V2Focus.flat(hashFocus === label),
               }}>
               <span style={{ fontWeight: 700, color: V2.fgFaint, letterSpacing: '0.06em' }}>{label}</span>
               <span style={{ fontFamily: 'monospace', color: val ? V2.fg2 : V2.fgFaint }}>
@@ -750,7 +765,15 @@ export function MetadataTab({ detail }: { detail: any }) {
       </div>
       {/* Provider links */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-        {heading('Metadata sources')}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+          {heading('Metadata sources')}
+          {onRefresh && (
+            <V2Button onClick={refresh} disabled={refreshing}>
+              <FaSync size={11} />
+              {refreshing ? 'Refreshing…' : 'Refresh metadata'}
+            </V2Button>
+          )}
+        </div>
         <Focusable noFocusRing style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '10px' }}>
           {ordered.map((p) => <ProviderCard key={p.key} p={p} id={providers[p.key]} />)}
         </Focusable>
@@ -1266,7 +1289,7 @@ export function SaveDataTab({ romId }: { romId: number }) {
   );
 
   if (loading) {
-    return <div style={{ color: V2.fgMuted, fontSize: '12px', padding: '12px 0' }}>Loading save data…</div>;
+    return <div data-tab-loading style={{ color: V2.fgMuted, fontSize: '12px', padding: '12px 0' }}>Loading save data…</div>;
   }
 
   const total = saves.length + states.length;
@@ -1436,9 +1459,31 @@ export function GameDetailPage() {
   // could park focus on the page's invisible root Focusable.
   const ctaRef = useAutoFocus(true, game?.rom_id);
 
-  const load = async () => {
+  // Bumped after a metadata refresh so the cover remounts and refetches.
+  const [coverGen, setCoverGen] = useState(0);
+  const refreshMeta = async () => {
+    if (!game) return;
+    const rid = game.rom_id;
+    const res = await refreshGameMetadata(rid);
+    if (!res?.success) {
+      toaster.toast({ title: 'Refresh failed', body: res?.message || 'Could not reach RomM' });
+      return;
+    }
+    for (const lg of [false, true]) {
+      const k = `cover:${rid}:${lg}`;
+      if (_coverCache.has(k)) { _coverCacheSet(k, null); _coverCache.delete(k); }
+    }
+    if (res.has_cover) game.has_cover = true;
+    await load(true);
+    setCoverGen((n) => n + 1);
+    toaster.toast({ title: 'Metadata refreshed', body: game.name || '' });
+  };
+
+  // quiet: refetch in place. Showing the loader unmounts the tab body, which
+  // drops gamepad focus from whatever was focused there onto the next control.
+  const load = async (quiet = false) => {
     if (!game) { setLoading(false); return; }
-    setLoading(true);
+    if (!quiet) setLoading(true);
     const rid = game.rom_id;
     try {
       const res = await getGameDetail(rid);
@@ -1643,36 +1688,92 @@ export function GameDetailPage() {
   // CTA only if it died with the old tab's unmount, and each attempt bails
   // once focus is inside the content so the user is never fought.
   const tabContentRef = useRef<HTMLDivElement | null>(null);
-  const tabFocusSeq = useRef(0);
+  // First LEAF focusable in the tab body: containers (noFocusRing grids/lists)
+  // also carry tabindex, but focusing them paints no highlight.
+  const tabLeaf = (): HTMLElement | null => {
+    const host = tabContentRef.current;
+    if (!host) return null;
+    const nodes = Array.from(host.querySelectorAll('[tabindex]')) as HTMLElement[];
+    return nodes.find((n) => n.tabIndex >= 0 && !n.querySelector('[tabindex]')) || null;
+  };
+  // Hand focus to the new tab in the same frame it renders, before paint. The
+  // old body unmounting takes focus with it; left to the retry ladder, focus
+  // would sit on the Play button until the first timer fired.
+  // Only when focus was in the old body (tabFollow): focus parked up on Play or
+  // the other header actions stays put, as a bumper shouldn't move the cursor.
+  const tabFollow = useRef(false);
+  // Elements we put focus on during a switch. Focus sitting on one of these
+  // (or lost because one unmounted) is still ours to move; focus anywhere else
+  // means the user moved it, and the switch stops steering.
+  const tabPlaced = useRef<Set<Element>>(new Set());
+  const tabWatch = useRef<(() => void) | null>(null);
+  const placeTabFocus = (el: HTMLElement) => { tabPlaced.current.add(el); _forceGamepadFocus(el); };
+  useEffect(() => () => tabWatch.current?.(), []);
+  useLayoutEffect(() => {
+    // A new tab opens at its top. The page scroller otherwise keeps the old
+    // tab's depth (deep in a save list), dropping the new one mid-way down.
+    for (let el = tabContentRef.current?.parentElement; el; el = el.parentElement) {
+      if (el.scrollTop > 0 && /(auto|scroll)/.test(getComputedStyle(el).overflowY)) { el.scrollTop = 0; break; }
+    }
+    if (!tabFollow.current) return;
+    const leaf = tabLeaf();
+    if (leaf) placeTabFocus(leaf);
+  }, [tab]);
   const cycleTab = (dir: -1 | 1) => {
     const i = tabList.findIndex((t) => t.id === tab);
     const ni = (i < 0 ? 0 : i + dir + tabList.length) % tabList.length;
+    const host = tabContentRef.current;
+    const cur0: any = _gpFocusEl();
+    // Focus outside the tab body (Play, Delete…) isn't touched by the switch:
+    // leave it where the user put it, as a bumper shouldn't move the cursor.
+    tabFollow.current = !!host && (!cur0 || !cur0.isConnected || host.contains(cur0));
+    tabWatch.current?.();
+    tabPlaced.current = new Set();
     setTab(tabList[ni].id);
-    const seq = ++tabFocusSeq.current;
-    // The ladder stretches to ~3s because Save Data mounts its content only
-    // after a fetch. Two guards keep it polite: it stops for good once focus
-    // is inside the content, and it stops if the user has meanwhile driven
-    // focus somewhere else themselves (any connected element that is neither
-    // where focus was at switch time nor a spot we parked it on).
-    const initial: any = _gpFocusEl();
-    let parked: any = null;
-    [60, 180, 400, 750, 1200, 2000, 3000].forEach((d) => setTimeout(() => {
-      try {
-        if (seq !== tabFocusSeq.current) return;      // superseded by a newer switch
-        const host = tabContentRef.current;
-        if (!host) return;
-        const cur: any = _gpFocusEl();
-        if (cur && cur.isConnected && host.contains(cur)) { tabFocusSeq.current++; return; }  // landed — done
-        if (cur && cur.isConnected && cur !== initial && cur !== parked) { tabFocusSeq.current++; return; }  // user moved — don't fight
-        // First LEAF focusable: containers (noFocusRing grids/lists) also carry
-        // tabindex, but focusing them paints no highlight — skip to their first
-        // real item.
-        const nodes = Array.from(host.querySelectorAll('[tabindex]')) as HTMLElement[];
-        const leaf = nodes.find((n) => !n.querySelector('[tabindex]'));
-        if (leaf) { _forceGamepadFocus(leaf); return; }
-        if ((!cur || !cur.isConnected) && ctaRef.current) { parked = ctaRef.current; _forceGamepadFocus(parked); }
-      } catch { /* ignore */ }
-    }, d));
+    if (!tabFollow.current || !host) return;
+    // Hold focus on the tab body itself across the switch: it outlives every
+    // tab, so focus never falls back to the header while content mounts.
+    placeTabFocus(host);
+    // Content can arrive late (Save Data fetches first) and in stages (a
+    // "Loading…" row replaced by the real list), so follow the body's
+    // DOM for a few seconds rather than polling: each change re-homes focus
+    // before paint, so the shell never gets to drop it on the header.
+    // Up to Play; if Play can't take focus (disabled — no emulator), the next
+    // action in its row (Delete…) instead.
+    const leaveTabBody = () => {
+      const cta = ctaRef.current;
+      if (cta) _forceGamepadFocus(cta);
+      if (_gpFocusEl() !== host || !cta) return;
+      const row = Array.from(cta.parentElement?.querySelectorAll('[tabindex]') || []) as HTMLElement[];
+      const next = row.find((n) => n !== cta && n.tabIndex >= 0 && !n.querySelector('[tabindex]'));
+      if (next) _forceGamepadFocus(next);
+    };
+    const settle = () => {
+      const cur: any = _gpFocusEl();
+      const lost = !cur || !cur.isConnected || cur === document.body;
+      if (!lost && !tabPlaced.current.has(cur)) { stop(); return; }   // user moved
+      const leaf = tabLeaf();
+      if (leaf) { if (leaf !== cur) placeTabFocus(leaf); return; }
+      // Nothing to land on and nothing on the way (no data-tab-loading row):
+      // this tab simply has no controls, so go up to Play rather than leave
+      // the cursor invisible on the tab body.
+      if (!host.querySelector('[data-tab-loading]')) { stop(); leaveTabBody(); }
+    };
+    const mo = new MutationObserver(settle);
+    // Attributes and text too: React can turn the loading row into the
+    // result in place (same <div>, data-tab-loading dropped, text swapped).
+    mo.observe(host, { childList: true, subtree: true, characterData: true,
+                       attributes: true, attributeFilter: ['data-tab-loading', 'tabindex'] });
+    // Give up after a while: a fetch that never resolves shouldn't keep
+    // focus invisibly parked on the tab body.
+    const timer = setTimeout(() => {
+      const cur: any = _gpFocusEl();
+      stop();
+      if (!tabLeaf() && (!cur || cur === host || !cur.isConnected)) leaveTabBody();
+    }, 8000);
+    const stop = () => { mo.disconnect(); clearTimeout(timer); if (tabWatch.current === stop) tabWatch.current = null; };
+    tabWatch.current = stop;
+    requestAnimationFrame(() => { if (tabWatch.current === stop) settle(); });
   };
   const onButtonDown = (evt: any) => {
     if (viewerOpen()) return;   // the viewer on top owns the pad
@@ -1692,7 +1793,7 @@ export function GameDetailPage() {
         {/* Cover */}
         <div style={{ flex: '0 0 220px', maxWidth: '220px' }}>
           <div style={{ boxShadow: V2.elev2, borderRadius: V2.radiusLg, overflow: 'hidden' }}>
-            <GameCover romId={game.rom_id} hasCover={game.has_cover || !!detail?.has_cover} large
+            <GameCover key={coverGen} romId={game.rom_id} hasCover={game.has_cover || !!detail?.has_cover} large
               radius={V2.radiusLg} onLoaded={setBgUri} />
           </div>
         </div>
@@ -1765,7 +1866,9 @@ export function GameDetailPage() {
           {/* Actions — RomM GameActions ribbon: an emphasized white pill for the
               primary CTA (Download when absent, Play when present) + circular
               surface icon buttons for the secondary actions (Delete). */}
-          <Focusable noFocusRing flow-children="horizontal" style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
+          {/* Entered from anywhere (Up from the tabs), focus lands on the
+              primary action — Play/Download — never on Delete beside it. */}
+          <Focusable noFocusRing flow-children="horizontal" {...NAV_ENTER_FIRST} style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
             {!isDownloaded ? (
               <GameActionButton variant="emphasized" focusRef={ctaRef} disabled={!!busy || downloading} onClick={doDownload}
                 progress={downloading ? (dlPct ?? 0) : undefined}
@@ -1850,9 +1953,9 @@ export function GameDetailPage() {
             <Bumper label="L1" />
             <Bumper label="R1" />
           </div>
-          <div ref={tabContentRef} style={{ paddingTop: '14px' }}>
+          <div ref={tabContentRef} tabIndex={-1} data-focus-hold style={{ paddingTop: '14px', outline: 'none' }}>
             {loading ? (
-              <div style={{ color: V2.fgMuted, fontSize: '12px' }}>Loading details…</div>
+              <div data-tab-loading style={{ color: V2.fgMuted, fontSize: '12px' }}>Loading details…</div>
             ) : tab === 'overview' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '30px' }}>
                 {/* 1. Summary */}
@@ -1957,7 +2060,7 @@ export function GameDetailPage() {
             ) : tab === 'save-data' ? (
               <SaveDataTab romId={game.rom_id} />
             ) : tab === 'metadata' ? (
-              <MetadataTab detail={detail} />
+              <MetadataTab detail={detail} onRefresh={refreshMeta} />
             ) : (
               <AchievementsTab achievements={detail?.achievements || []} />
             )}

@@ -168,3 +168,17 @@ export function ButtonGlyph({ slot }: { slot: "ok" | "cancel" | "secondary" | "o
   const b = GAMEPAD_SLOTS[set][slot];
   return b ? <Glyph set={set} name={b.name} title={b.title} /> : null;
 }
+
+// Whether the bumper hints (L1/R1) should name their keyboard keys instead:
+// Q/E stand in for the bumpers (see BUMPER_KEYS in gamepad.ts), so while the
+// keyboard is driving, a hint saying "L1" points at a button nobody is holding.
+export function useKeyboardBumpers(): boolean {
+  const [kbm, setKbm] = useState(() => pickSet() === "kbm");
+  useEffect(() => {
+    const resync = () => setKbm(pickSet() === "kbm");
+    resync();
+    const off = onControllerFamilyChange(resync);
+    return () => { off(); };
+  }, []);
+  return kbm;
+}

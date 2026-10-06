@@ -87,6 +87,10 @@ export const Focusable = forwardRef(function Focusable(
     // Steam layout hint with no web equivalent — drop it so React doesn't warn
     // about an unknown DOM attribute.
     "flow-children": _flowChildren,
+    // Steam's NavEntryPositionPreferences: which child focus lands on when it
+    // enters this container from outside. Carried as an attribute for move()
+    // (gamepad.ts), which honours FIRST (0); the others match its geometry.
+    navEntryPreferPosition,
     ...rest
   } = props;
 
@@ -213,6 +217,7 @@ export const Focusable = forwardRef(function Focusable(
       }}
       onBlur={onGamepadBlur}
       onFocus={onGamepadFocus}
+      data-nav-entry={navEntryPreferPosition}
       {...rest}
     >
       {children}

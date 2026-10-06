@@ -100,6 +100,10 @@ export function scrubGlimpse(letter: string) { _scrubGlimpse?.(letter); }
 // the enum but doesn't export it at runtime). Spread as any: not in decky's
 // FocusableProps typing, but Steam's Focusable forwards it into m_Properties.
 export const NAV_MAINTAIN_X = { navEntryPreferPosition: 2 } as any;
+// Entering the container lands on its FIRST child (0 =
+// NavEntryPositionPreferences.FIRST), e.g. a primary button ahead of the
+// secondary ones beside it.
+export const NAV_ENTER_FIRST = { navEntryPreferPosition: 0 } as any;
 
 export let _scrubFocusTs = 0;
 

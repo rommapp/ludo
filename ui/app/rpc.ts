@@ -106,6 +106,7 @@ export const getImage = callable<[string], any>("get_image");
 export const clearCoverCache = callable<[], any>("clear_cover_cache");
 export const searchGames = callable<[string], any>("search_games");
 export const getGameDetail = callable<[number], any>("get_game_detail");
+export const refreshGameMetadata = callable<[number], any>("refresh_game_metadata");
 export const getRomDocument = callable<[number, number], any>("get_rom_document");
 export const getRaEarned = callable<[number], any>("get_ra_earned");
 export const downloadGame = callable<[number], any>("download_game");

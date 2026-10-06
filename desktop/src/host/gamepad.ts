@@ -405,6 +405,11 @@ function restoreFocus(): "restored" | "waiting" | "gone" {
 function focusIsUseful(): boolean {
   const a = document.activeElement as HTMLElement | null;
   if (!a || a === document.body || !document.contains(a)) return false;
+  // A deliberate holding spot (data-focus-hold): the app parked focus there
+  // while the content it's waiting for mounts, and will move it on itself.
+  // Not a nav target, but not stranded either — reseeding would yank focus
+  // somewhere else just before the app places it.
+  if (a.hasAttribute("data-focus-hold")) return isVisible(a);
   return a.matches(FOCUS_SELECTOR) && isVisible(a);
 }
 
@@ -744,6 +749,32 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
       if (s < bridgeScore) { bridgeScore = s; bridge = t; }
     }
     if (bridge) best = bridge;
+  }
+
+  // Entering a container that asks for its FIRST child (Steam's
+  // navEntryPreferPosition = NavEntryPositionPreferences.FIRST, carried as
+  // data-nav-entry="0") lands there, whichever child is geometrically nearest:
+  // the game page's action row always takes focus on Play, not on Delete just
+  // because the tab item you came from sat under it.
+  // Nothing ahead by geometry (an item far right of the action row, which sits
+  // over on the left): a container that declared an entry point in that
+  // direction is still a destination — the nearest one wins.
+  if (!best && !horizontal) {
+    let near = Infinity;
+    document.querySelectorAll<HTMLElement>('[data-nav-entry="0"]').forEach((box) => {
+      if (box.contains(active) || !isVisible(box)) return;
+      const r = box.getBoundingClientRect();
+      const gap = dir === "up" ? ar.top - r.bottom : r.top - ar.bottom;
+      const first = targets.find((t) => box.contains(t));
+      if (gap >= -1 && gap < near && first) { near = gap; best = first; }
+    });
+  }
+  if (best) {
+    const box = best.closest('[data-nav-entry="0"]');
+    if (box && !box.contains(active)) {
+      const first = targets.find((t) => box.contains(t));
+      if (first) best = first;
+    }
   }
 
   // Entering a segmented control (Stable/Beta, the notification-corner picker)
@@ -1247,6 +1278,10 @@ export function startGamepad() {
   const ARROWS: Record<string, DirName> = {
     ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
   };
+  const BUMPER_KEYS: Record<string, number> = {
+    q: GamepadButtonId.BUMPER_LEFT, Q: GamepadButtonId.BUMPER_LEFT,
+    e: GamepadButtonId.BUMPER_RIGHT, E: GamepadButtonId.BUMPER_RIGHT,
+  };
   // Arrows currently held, newest last. A held set (rather than a single value)
   // is what makes roll-over work: press Left, then Right without releasing Left,
   // and releasing Left must leave Right still repeating instead of stopping dead.
@@ -1305,6 +1340,19 @@ export function startGamepad() {
       }
       return;
     }
+    // Q/E are the keyboard's L1/R1 (tab and section cycling). Text fields
+    // keep the letters; a held key doesn't auto-cycle, as a bumper doesn't.
+    const bumper = BUMPER_KEYS[e.key];
+    if (bumper !== undefined) {
+      const t = e.target as HTMLElement | null;
+      if (e.ctrlKey || e.altKey || e.metaKey || e.shiftKey || (t && isEditable(t))) return;
+      e.preventDefault();
+      if (e.repeat) return;
+      enterGamepadMode("keyboard");
+      ensureFocusInOverlay();
+      routeButton("down", bumper, false, undefined, cancelStart());
+      return;
+    }
     const dir = ARROWS[e.key];
     if (!dir) return;
     // Leave browser/OS shortcuts (and text selection) alone.
@@ -1328,6 +1376,12 @@ export function startGamepad() {
   }, true);
 
   window.addEventListener("keyup", (e) => {
+    const bumper = BUMPER_KEYS[e.key];
+    if (bumper !== undefined) {
+      const t = e.target as HTMLElement | null;
+      if (!(t && isEditable(t))) routeButton("up", bumper, false, undefined, cancelStart());
+      return;
+    }
     const dir = ARROWS[e.key];
     if (dir) releaseArrow(dir);
   }, true);

@@ -7576,6 +7576,42 @@ class LudoBackend:
             logging.error(f"clear_cover_cache error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
+    async def refresh_game_metadata(self, rom_id: int):
+        """Re-read one game from RomM and drop its cached art, so a stray game
+        whose cover never loaded (or changed on the server) gets a fresh shot
+        without wiping the whole cover cache."""
+        if not (self._romm_client and self._romm_client.authenticated):
+            return {'success': False, 'message': 'Not connected to RomM'}
+        try:
+            r = await asyncio.to_thread(
+                self._romm_client.session.get,
+                urljoin(self._romm_client.base_url, f'/api/roms/{rom_id}'), timeout=15)
+            if r.status_code != 200:
+                return {'success': False, 'message': f'HTTP {r.status_code}'}
+            d = r.json()
+            small, large = d.get('path_cover_small'), d.get('path_cover_large')
+            # Patch the library row in place so tiles see the new art paths.
+            for g in (self._available_games or []):
+                if g.get('rom_id') == rom_id:
+                    g['cover_path'] = small
+                    g['cover_path_large'] = large
+                    if 'has_cover' in g:
+                        g['has_cover'] = bool(small)
+            self._cover_paths.pop(rom_id, None)
+            for lg in (False, True):
+                self._cover_cache.pop((rom_id, lg), None)
+                for key in (f"covt2:{rom_id}:{lg}", f"cover:{rom_id}:{lg}"):
+                    stem = hashlib.sha1(key.encode()).hexdigest()
+                    for f in self._cover_dir().glob(stem + '.*'):
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
+            return {'success': True, 'has_cover': bool(small or large)}
+        except Exception as e:
+            logging.error(f"refresh_game_metadata error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
     async def get_game_cover(self, rom_id: int, large: bool = False):
         """Return a base64 data URI for a game's cover art (cached).
 

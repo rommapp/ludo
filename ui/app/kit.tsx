@@ -8,7 +8,7 @@
 // re-deriving what a focusable thing has to do.
 
 import { useState, useEffect, useRef, forwardRef, type Ref, ChangeEvent} from "react";
-import { Focusable, TextField, GamepadButton, ModalRoot} from "@ludo/host";
+import { Focusable, TextField, GamepadButton, ModalRoot, useKeyboardBumpers} from "@ludo/host";
 import { V2, fmtBytes, formatEta, formatSpeed } from "./theme";
 import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { _forceGamepadFocus, _summonVirtualKeyboard, _dismissVirtualKeyboard } from "./shell";
@@ -354,7 +354,12 @@ export function CollectionSyncStatusRow({ col }: { col: any }) {
 
 // Bumper keycap hint (L1 / R1) flanking the nav pill — signals that the
 // shoulder buttons page through the tabs.
+// On a keyboard the bumpers are Q/E, so the hint names the key instead.
+const BUMPER_KEY: Record<string, string> = { L1: 'Q', R1: 'E' };
+
 export function Bumper({ label }: { label: string }) {
+  const kbd = useKeyboardBumpers();
+  if (kbd && BUMPER_KEY[label]) label = BUMPER_KEY[label];
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
