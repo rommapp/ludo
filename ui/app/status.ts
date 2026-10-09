@@ -124,18 +124,42 @@ export function _subscribeStatus(listener: () => void): () => void {
 // network state flips so the UI reflects it without waiting for the next tick.
 export function refreshStatusNow() { _colSyncTick(); }
 
+// Re-renders only when THIS collection's state changes. The tick rebuilds every
+// entry each 1.5s, and forcing on every tick re-rendered all ~400 mounted
+// collection tiles (Home + Collections tab) — a periodic hitch that landed in
+// the middle of D-pad scroll animations.
 export function useCollectionSync(name: string): ColSyncState | undefined {
   const [, force] = useState(0);
-  useEffect(() => _subscribeStatus(() => force((n) => n + 1)), []);
-  return _colSync.get(name);
+  const value = _colSync.get(name);
+  // What this render showed; compared against on each tick (and once on
+  // subscribe, in case a tick landed between render and effect).
+  const rendered = useRef('');
+  rendered.current = JSON.stringify(value ?? null);
+  useEffect(() => {
+    const check = () => {
+      if (JSON.stringify(_colSync.get(name) ?? null) !== rendered.current) force((n) => n + 1);
+    };
+    check();
+    return _subscribeStatus(check);
+  }, [name]);
+  return value;
 }
 
 // True when the server isn't reachable (cached-offline or disconnected) — used
 // by tiles to dim/disable download actions that would just fail offline.
 export function useOffline(): boolean {
   const [, force] = useState(0);
-  useEffect(() => _subscribeStatus(() => force((n) => n + 1)), []);
-  return _connState === 'offline_cached' || _connState === 'disconnected';
+  const isOffline = () => _connState === 'offline_cached' || _connState === 'disconnected';
+  const value = isOffline();
+  const rendered = useRef(value);
+  rendered.current = value;
+  useEffect(() => {
+    // Only when it flips — see useCollectionSync.
+    const check = () => { if (isOffline() !== rendered.current) force((n) => n + 1); };
+    check();
+    return _subscribeStatus(check);
+  }, []);
+  return value;
 }
 
 // Full service status from the shared poll (one poller for the whole UI).

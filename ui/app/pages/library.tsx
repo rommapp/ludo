@@ -1,6 +1,6 @@
 import { LibGame, LibGroup } from "../types";
 import { viewerOpen } from "../glass";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { deleteCollectionRoms, getConfig, getDownloadProgress, getHomeData, getLibraryGames, getLibraryGroups, getResumeStateEnabled, getServiceStatus, repairEmulatorPaths, searchGames, toggleCollectionSync, checkLibraryStale, refreshFromRomm} from "../rpc";
 import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _setResumeStatesPref, _stateThumbListeners, _stateThumbs, _tileElsByRomId, loadStateThumbs} from "../tiles";
 import { _autoFocusFirstRef, _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
@@ -652,6 +652,18 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   // focus grab must refire on each return to the tab, not just on mount.
   const firstRef = useAutoFocus(visible && !loading && firstList !== null, firstList);
 
+  // Stable open handlers for the memo'd Platform/Collection tiles. Focusing any
+  // cover sets the page background (onBg), which re-renders this panel; inline
+  // arrows here were new on every render, so every platform and collection tile
+  // (~190 on a big library, each with a 4-image mosaic) re-rendered on every
+  // D-pad press. The ref keeps them pointing at the current lists.
+  const openLatest = useRef({ onOpenGroup, platforms, collections });
+  openLatest.current = { onOpenGroup, platforms, collections };
+  const openPlatform = useCallback((grp: LibGroup) =>
+    openLatest.current.onOpenGroup('platform', grp, openLatest.current.platforms), []);
+  const openCollection = useCallback((grp: LibGroup) =>
+    openLatest.current.onOpenGroup('collection', grp, openLatest.current.collections), []);
+
   if (loading) return <HomeSkeleton />;
   return (
     <div style={{ paddingTop: '8px' }}>
@@ -708,7 +720,7 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
         <CardRow icon={<FaGamepad size={16} />} title="Platforms" count={platforms.length}>
           {platforms.map((g, i) => (
             <div key={g.key} style={{ width: '150px', flexShrink: 0 }}>
-              <PlatformTile group={g} onOpen={(grp) => onOpenGroup('platform', grp, platforms)}
+              <PlatformTile group={g} onOpen={openPlatform}
                 focusRef={firstList === 'pf' && i === 0 ? firstRef : undefined} focusable={visible} />
             </div>
           ))}
@@ -723,7 +735,7 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
         <CardRow icon={<FaLayerGroup size={15} />} title="Collections" count={ownCollections.length}>
           {ownCollections.map((g, i) => (
             <div key={g.key} style={{ width: '132px', flexShrink: 0 }}>
-              <CollectionTile group={g} onOpen={(grp) => onOpenGroup('collection', grp, collections)}
+              <CollectionTile group={g} onOpen={openCollection}
                 focusRef={firstList === 'cl' && i === 0 ? firstRef : undefined} focusable={visible} />
             </div>
           ))}
@@ -735,7 +747,7 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
         <CardRow icon={<FaLayerGroup size={15} />} title="Virtual collections" count={virtualCollections.length}>
           {virtualCollections.map((g, i) => (
             <div key={g.key} style={{ width: '132px', flexShrink: 0 }}>
-              <CollectionTile group={g} onOpen={(grp) => onOpenGroup('collection', grp, collections)}
+              <CollectionTile group={g} onOpen={openCollection}
                 focusRef={firstList === 'vc' && i === 0 ? firstRef : undefined} focusable={visible} />
             </div>
           ))}
@@ -834,7 +846,14 @@ export function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
   const lastKey = heldGroup && heldGroup.mode === mode ? heldGroup.group.key : null;
   const focusKey = (lastKey && groups.some((g) => g.key === lastKey)) ? lastKey : (groups[0]?.key ?? null);
   const firstGroupRef = useAutoFocus(visible && !loading && groups.length > 0, `${mode}:${focusKey}`);
-  const openGroup = (g: LibGroup) => onOpenGroup(mode, g, groups);
+  // Stable (see HomePanel's openPlatform): the memo'd tiles skip re-rendering
+  // when the panel re-renders around them.
+  const openGroupLatest = useRef({ onOpenGroup, mode, groups });
+  openGroupLatest.current = { onOpenGroup, mode, groups };
+  const openGroup = useCallback((g: LibGroup) => {
+    const l = openGroupLatest.current;
+    l.onOpenGroup(l.mode, g, l.groups);
+  }, []);
 
   // ---- L2/R2 letter scrubbing -------------------------------------------
   // Displayed order (regular/favorite/smart share one section, virtual has
@@ -847,9 +866,20 @@ export function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
   // Every tile registers its DOM node so the jump can (a) locate the currently
   // focused tile via .gpfocus containment and (b) force focus onto the target.
   const tileEls = useRef(new Map<string, any>());
-  const tileRef = (key: string, autoKey: string | null) => (el: any) => {
-    if (el) tileEls.current.set(key, el); else tileEls.current.delete(key);
-    if (key === autoKey) firstGroupRef.current = el;
+  // Cached per (key, autoKey): a fresh callback ref each render would make
+  // React detach/reattach it and defeat the tiles' memo on every re-render.
+  const tileRefCache = useRef(new Map<string, (el: any) => void>());
+  const tileRef = (key: string, autoKey: string | null) => {
+    const k = `${key}\0${autoKey ?? ''}`;
+    let f = tileRefCache.current.get(k);
+    if (!f) {
+      f = (el: any) => {
+        if (el) tileEls.current.set(key, el); else tileEls.current.delete(key);
+        if (key === autoKey) firstGroupRef.current = el;
+      };
+      tileRefCache.current.set(k, f);
+    }
+    return f;
   };
   // Big centered letter overlay while scrubbing (Big Picture-style).
   const [scrubLetter, setScrubLetter] = useState<string | null>(null);
