@@ -103,7 +103,9 @@ export function roundBtn(size: number, variant: 'glass' | 'emphasized' | 'danger
     backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)',
     transition: 'background 0.15s, color 0.15s, border-color 0.15s',
   };
-  if (variant === 'emphasized') return { ...base, background: '#ffffff', border: '1px solid #ffffff', color: '#111117' };
+  // Opaque fill: a backdrop blur behind it can never show, but it still costs a
+  // composited layer per cover every frame (one on each of ~50 visible tiles).
+  if (variant === 'emphasized') return { ...base, backdropFilter: 'none', WebkitBackdropFilter: 'none', background: '#ffffff', border: '1px solid #ffffff', color: '#111117' };
   if (variant === 'danger') return { ...base, background: 'rgba(0,0,0,0.55)', border: '1px solid rgba(255,80,80,0.55)', color: V2.danger };
   return { ...base, background: 'rgba(0,0,0,0.55)', border: '1px solid rgba(255,255,255,0.12)', color: 'rgba(255,255,255,0.95)' };
 }

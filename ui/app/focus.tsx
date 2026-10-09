@@ -112,6 +112,13 @@ export const V2_ROW_STYLE = `
   .romm-gt-wrap:hover .romm-gt-scrim,
   .romm-gt-wrap:hover .romm-gt-primary { opacity: 1 !important; }
   .romm-gt-wrap:hover .romm-gt-actions { opacity: 1 !important; transform: translateY(0) !important; }
+  /* The Details/Delete glass buttons sit at opacity 0 on every cover until it's
+     hovered or focused, but their backdrop blur still made a composited layer
+     each — ~70 on Home, re-blurred every frame while scrolling. Blur only on
+     the cover that shows them. */
+  .romm-gt-wrap:not(:hover):not(.gpfocuswithin) .romm-gt-actions > div {
+    backdrop-filter: none !important; -webkit-backdrop-filter: none !important;
+  }
   .romm-ct-wrap:hover .romm-ct-cover, .romm-ct-wrap.gpfocuswithin .romm-ct-cover {
     transform: scale(1.04) !important;
     box-shadow: 0 8px 28px rgba(0,0,0,0.4), ${_RING}, 0 0 18px rgba(139,116,232,0.55) !important;
