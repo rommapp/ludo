@@ -18,6 +18,7 @@
 // focused subtree; focus *targets* are found by DOM query so native buttons and
 // inputs participate too.
 
+import { profileSpan } from "./profiler";
 import { GamepadButtonId } from "./gamepad-buttons";
 import { playSound } from "./sound";
 import { consumeRootBackNoop } from "./router";
@@ -486,6 +487,20 @@ function focusAndReveal(el: HTMLElement, horizontal = false, smooth = true) {
   // Right quickly made the row stutter back and forth under the cursor.
   const row = horizontal ? rowScroller(el) : null;
   if (row) { revealInRow(row, el, smooth); return; }
+  // Up/Down gets the same treatment, for the same reason: fast taps restarted
+  // the native smooth scroll mid-flight, and block:'nearest' was judged against
+  // the half-scrolled position, so the page bounced up and down under the
+  // cursor. Our animator decides "nearest" against where the scroll is HEADED.
+  if (!horizontal) {
+    const sc = scrollParentOf(el) ?? (document.scrollingElement as HTMLElement | null);
+    if (sc) {
+      revealVertical(sc, el, smooth);
+      // Keep a card row's horizontal 'nearest' behaviour on vertical moves.
+      const r = rowScroller(el);
+      if (r) revealInRowNearest(r, el);
+      return;
+    }
+  }
   try {
     el.scrollIntoView({
       block: "nearest",
@@ -510,7 +525,7 @@ function rowScroller(el: HTMLElement): HTMLElement | null {
 // Retargeting mid-flight only moves `target`; the running frame keeps easing
 // from the row's current position, so rapid presses glide instead of
 // restarting.
-const _rowAnims = new WeakMap<HTMLElement, { target: number; raf: number; last: number }>();
+const _rowAnims = new WeakMap<HTMLElement, SpringAnim>();
 
 function revealInRow(row: HTMLElement, el: HTMLElement, smooth: boolean) {
   const rr = row.getBoundingClientRect();
@@ -521,32 +536,99 @@ function revealInRow(row: HTMLElement, el: HTMLElement, smooth: boolean) {
   const target = Math.max(0, Math.min(max, left + r.width / 2 - row.clientWidth / 2));
   const cur = _rowAnims.get(row);
   if (!smooth) {
-    if (cur) cancelAnimationFrame(cur.raf);
+    if (cur) { cancelAnimationFrame(cur.raf); cur.end(); }
     _rowAnims.delete(row);
     row.scrollLeft = target;
     return;
   }
   if (cur) { cur.target = target; return; }
-  const anim = { target, raf: 0, last: performance.now() };
-  _rowAnims.set(row, anim);
-  const step = (now: number) => {
-    const dt = Math.min(64, now - anim.last);
+  springScroll(_rowAnims, row, "scrollLeft", target);
+}
+
+// A critically-damped spring driving one scroll axis. Unlike an exponential
+// ease, retargeting mid-flight keeps the current VELOCITY, so a new press
+// carries the motion on smoothly instead of kicking it (felt as a stutter on
+// every press). Position is tracked as a float: scrollTop/Left round to device
+// pixels at the 1.8x zoom, and reading them back each frame lost sub-pixel
+// progress and made the glide judder.
+type SpringAnim = { target: number; raf: number; last: number; pos: number; vel: number; end: () => void };
+const SPRING_OMEGA = 22; // rad/s — settles in ~250ms
+
+function springScroll(map: WeakMap<HTMLElement, SpringAnim>, el: HTMLElement,
+                      prop: "scrollTop" | "scrollLeft", target: number) {
+  const anim: SpringAnim = { target, raf: 0, last: performance.now(), pos: el[prop], vel: 0,
+    end: profileSpan(prop === "scrollTop" ? "scroll-v" : "scroll-row") };
+  map.set(el, anim);
+  const end = anim.end;
+  const frame = (now: number) => {
+    if (map.get(el) !== anim) { end(); return; }
+    // Someone else (wheel, touch) moved it: hand control back.
+    if (Math.abs(el[prop] - anim.pos) > 2) { map.delete(el); end(); return; }
+    const dt = Math.min(0.064, (now - anim.last) / 1000);
     anim.last = now;
-    const pos = row.scrollLeft;
-    const diff = anim.target - pos;
-    if (Math.abs(diff) < 0.5) {
-      row.scrollLeft = anim.target;
-      _rowAnims.delete(row);
+    const x = anim.pos - anim.target;
+    const k = SPRING_OMEGA, e = Math.exp(-k * dt);
+    // Exact critically-damped step: frame-rate independent.
+    const c = anim.vel + k * x;
+    anim.pos = anim.target + (x + c * dt) * e;
+    anim.vel = (c - k * (x + c * dt)) * e;
+    if (Math.abs(anim.pos - anim.target) < 0.5 && Math.abs(anim.vel) < 5) {
+      el[prop] = anim.target;
+      map.delete(el);
+      end();
       return;
     }
-    // Exponential ease-out (~90ms time constant): frame-rate independent and
-    // seamless to retarget.
-    row.scrollLeft = pos + diff * (1 - Math.exp(-dt / 90));
-    // The browser rounds scrollLeft; if it didn't budge, finish the move.
-    if (row.scrollLeft === pos) { row.scrollLeft = anim.target; _rowAnims.delete(row); return; }
-    anim.raf = requestAnimationFrame(step);
+    el[prop] = anim.pos;
+    anim.raf = requestAnimationFrame(frame);
   };
-  anim.raf = requestAnimationFrame(step);
+  anim.raf = requestAnimationFrame(frame);
+}
+
+// Vertical counterpart of revealInRow with block:'nearest' semantics and the
+// container's scroll-padding honoured (120px top for the sticky bar). The
+// visibility test runs against the in-flight TARGET, not the current position,
+// so a burst of presses accumulates into one glide instead of oscillating.
+const _vAnims = new WeakMap<HTMLElement, SpringAnim>();
+
+function revealVertical(sc: HTMLElement, el: HTMLElement, smooth: boolean) {
+  const isPage = sc === document.scrollingElement;
+  const cs = getComputedStyle(sc);
+  const padTop = parseFloat(cs.scrollPaddingTop) || 0;
+  const padBot = parseFloat(cs.scrollPaddingBottom) || 0;
+  const viewTop = isPage ? 0 : sc.getBoundingClientRect().top;
+  const viewH = isPage ? window.innerHeight : sc.clientHeight;
+  const r = el.getBoundingClientRect();
+  // Element position in the scroller's content — independent of in-flight scroll.
+  const top = r.top - viewTop + sc.scrollTop;
+  const bottom = top + r.height;
+  const max = sc.scrollHeight - sc.clientHeight;
+  const cur = _vAnims.get(sc);
+  const base = cur ? cur.target : sc.scrollTop;
+  let target = base;
+  if (top - padTop < base) target = top - padTop;
+  else if (bottom + padBot > base + viewH) {
+    // Taller than the view: align its top rather than its bottom.
+    target = Math.min(top - padTop, bottom + padBot - viewH);
+  }
+  target = Math.max(0, Math.min(max, target));
+  if (!smooth) {
+    if (cur) { cancelAnimationFrame(cur.raf); cur.end(); }
+    _vAnims.delete(sc);
+    sc.scrollTop = target;
+    return;
+  }
+  if (cur) { cur.target = target; return; }
+  if (Math.abs(target - sc.scrollTop) < 0.5) return;
+  springScroll(_vAnims, sc, "scrollTop", target);
+}
+
+// inline:'nearest' inside a card row, instant (a vertical move must not slide
+// the landed row sideways more than needed — see focusAndReveal).
+function revealInRowNearest(row: HTMLElement, el: HTMLElement) {
+  const rr = row.getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  if (r.left < rr.left) row.scrollLeft += r.left - rr.left;
+  else if (r.right > rr.right) row.scrollLeft += r.right - rr.right;
 }
 
 // focusAndReveal with the Deck's navigation tick. Used by move()'s landing
@@ -1211,9 +1293,9 @@ export function startGamepad() {
     clearInterval(repeatTimer);
     delayTimer = repeatTimer = null;
     if (dir) {
-      // A single press animates (smooth); held-repeat steps jump instantly.
-      // Smooth-scrolling every ~110ms repeat re-targets the in-flight animation
-      // and the row oscillates, making covers shake during fast movement.
+      // Held-repeat steps animate too: the spring animator (springScroll)
+      // retargets without losing velocity, so a ~110ms repeat becomes one
+      // continuous glide rather than the oscillation native smooth scroll gave.
       //
       // Distinct FAST taps of Left/Right are the same hazard as held-repeat:
       // each new smooth scrollIntoView interrupts the previous one mid-flight,
@@ -1230,7 +1312,7 @@ export function startGamepad() {
       if (horizontal) lastHMove = now;
       step(dir, smooth, false);
       delayTimer = setTimeout(() => {
-        repeatTimer = setInterval(() => step(dir, false, true), REPEAT_INTERVAL);
+        repeatTimer = setInterval(() => step(dir, true, true), REPEAT_INTERVAL);
       }, REPEAT_DELAY);
     }
   }
