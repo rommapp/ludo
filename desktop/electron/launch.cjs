@@ -28,7 +28,12 @@ if (dev) {
   env.ROMM_PORT = env.ROMM_PORT ?? "8723";
 }
 
-const child = spawn(electron, [require("path").resolve(__dirname, "..")], {
+// LUDO_DEBUG_PORT exposes the Chrome DevTools Protocol, so a script (or
+// Claude) can drive and profile the running window.
+const args = [require("path").resolve(__dirname, "..")];
+if (env.LUDO_DEBUG_PORT) args.unshift(`--remote-debugging-port=${env.LUDO_DEBUG_PORT}`);
+
+const child = spawn(electron, args, {
   env,
   stdio: "inherit",
 });
