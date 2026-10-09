@@ -292,11 +292,13 @@ const PUMP_MS = 16;
 const SCAN_MS = 1000;
 
 // Start reading attached pads and forwarding their events through `emit`
-// ({button(id, down, node), direction(dir|null, node), gone(node)}). Every call
-// carries the evdev node it came from: a pad can present several nodes that all
-// report the same press (the 8BitDo Ultimate does), and the renderer needs to
-// tell them apart to merge them instead of counting each press twice. Returns a
-// stop() function.
+// ({button(id, down, node, pad), direction(dir|null, node, pad), gone(node, pad)}).
+// Every call carries the evdev node it came from: a pad can present several
+// nodes that all report the same press (the 8BitDo Ultimate does), and the
+// renderer needs to tell them apart to merge them instead of counting each press
+// twice. `pad` is the pad's "vendor:product" (lowercase hex), which the renderer
+// matches against the pad Chromium reports so it can drop our copy of a pad the
+// browser already delivers. Returns a stop() function.
 function startNativeInput(emit, python) {
   if (process.platform !== "linux") return () => {};
 
@@ -313,6 +315,7 @@ function startNativeInput(emit, python) {
     const pads = findNativePads();
     if (!pads) return;
     const present = new Set(pads.map((p) => p.eventNode).filter(Boolean));
+    const keyOf = new Map(pads.map((p) => [p.eventNode, p.key]));
     for (const node of readers.keys()) {
       if (!present.has(node)) { readers.get(node).close(); readers.delete(node); }
     }
@@ -321,7 +324,12 @@ function startNativeInput(emit, python) {
       const until = blocked.get(node);
       if (until && Date.now() < until) continue;
       try {
-        readers.set(node, new PadReader(node, emit, python));
+        const pad = keyOf.get(node);
+        readers.set(node, new PadReader(node, {
+          button: (id, down, n) => emit.button(id, down, n, pad),
+          direction: (dir, n) => emit.direction(dir, n, pad),
+          gone: (n) => emit.gone(n, pad),
+        }, python));
         blocked.delete(node);
       } catch (err) {
         // EACCES is the udev-ACL race above; anything else (ENOENT from an

@@ -127,6 +127,41 @@ function startPolling() {
   // announcing it (see the wasUnfocused note in poll()).
   let adoptNext = false;
 
+  // The pad Chromium is currently delivering, as "vendor:product", and the pad
+  // each kernel-read node belongs to. The kernel reader opens EVERY pad, including
+  // the one this poll already reads, and the two copies run at different latencies:
+  // the kernel's release can land before Chromium's snapshot catches up, so the
+  // union saw press → release → press again from a single tap. That surfaced as
+  // the bumpers skipping a tab, worst when the switch stalled the frame (Home,
+  // Collections). One source per physical pad: a pad Chromium reports is Chromium's.
+  let chromiumPad = null;
+  const nodePad = new Map();  // evdev node → "vendor:product"
+  // Nodes caught mirroring the Chromium pad, for when the IDs don't line up
+  // (a driver or Bluetooth stack can report different ones to the kernel and to
+  // the browser). A node that presses the same button within a few frames of
+  // Chromium is the same physical pad. Cleared whenever Chromium's pad changes.
+  const shadowed = new Set();
+  const nativePressAt = new Map();  // evdev node → Map(button id → ms)
+  const chromiumPressAt = new Map();  // button id → ms
+  const MIRROR_MS = 150;
+
+  function isShadowed(node, pad) {
+    return shadowed.has(node) || (!!pad && pad === chromiumPad);
+  }
+
+  function padKeyOf(gp) {
+    const m = /Vendor: ([0-9a-f]{4}) Product: ([0-9a-f]{4})/i.exec(gp.id || "");
+    return m ? `${m[1]}:${m[2]}`.toLowerCase() : null;
+  }
+
+  // Chromium took over a pad the kernel reader was driving (it surfaces a pad on
+  // its first press): drop the kernel copy, or its held state lingers in the union.
+  function dropShadowed() {
+    for (const node of [...sources.keys()]) {
+      if (node !== "chromium" && isShadowed(node, nodePad.get(node))) sources.delete(node);
+    }
+  }
+
   function sourceFor(key) {
     let s = sources.get(key);
     if (!s) { s = { buttons: new Set(), dir: null }; sources.set(key, s); }
@@ -187,6 +222,9 @@ function startPolling() {
       // No pad the browser will admit to. Drop only OUR source: the kernel reader
       // may be driving a hot-plugged pad Chromium never surfaces (see
       // native-input.cjs), and its presses must survive.
+      chromiumPad = null;
+      shadowed.clear();
+      chromiumPressAt.clear();
       if (sources.delete("chromium")) flush();
       requestAnimationFrame(poll);
       return;
@@ -206,12 +244,32 @@ function startPolling() {
       adoptNext = true;
     }
 
+    const key = padKeyOf(gp);
+    if (key !== chromiumPad) { chromiumPad = key; shadowed.clear(); dropShadowed(); }
+
     // Face/shoulder/trigger/menu buttons.
     const s = sourceFor("chromium");
+    const before = new Set(s.buttons);
     s.buttons.clear();
     for (const [idx, id] of Object.entries(BUTTON_MAP)) {
       if (pressed(gp.buttons[idx])) s.buttons.add(id);
     }
+    // A fresh Chromium press that a kernel node also just reported: that node
+    // is this pad seen twice. Shadow it so the two can't double-count a tap.
+    const now = performance.now();
+    let learned = false;
+    for (const id of s.buttons) {
+      if (before.has(id)) continue;
+      chromiumPressAt.set(id, now);
+      for (const [node, presses] of nativePressAt) {
+        const at = presses.get(id);
+        if (at !== undefined && now - at < MIRROR_MS && !shadowed.has(node)) {
+          shadowed.add(node);
+          learned = true;
+        }
+      }
+    }
+    if (learned) dropShadowed();
 
     // Direction: d-pad buttons first, else the left stick past the deadzone.
     // Vertical wins over horizontal (mirrors gamepad_bridge._emit_dir).
@@ -237,13 +295,35 @@ function startPolling() {
     // multi-interface pad behave: the 8BitDo Ultimate reports each press on both
     // of its nodes, and merging them by union turns the duplicate into one press
     // instead of two events that can interleave into a self-cancelling mess.
+    if (payload.node && payload.pad) nodePad.set(payload.node, payload.pad);
+    if (kind === "gone") {
+      sources.delete(payload.node);
+      nodePad.delete(payload.node);
+      shadowed.delete(payload.node);
+      nativePressAt.delete(payload.node);
+      flush();
+      return;
+    }
+    // The poll already reads this pad; a second copy double-counts taps.
+    if (kind === "button" && payload.down && payload.node) {
+      let presses = nativePressAt.get(payload.node);
+      if (!presses) nativePressAt.set(payload.node, presses = new Map());
+      const now = performance.now();
+      presses.set(payload.id, now);
+      // Same test from the other side, for when Chromium saw the press first.
+      const at = chromiumPressAt.get(payload.id);
+      if (sources.has("chromium") && at !== undefined && now - at < MIRROR_MS) {
+        shadowed.add(payload.node);
+        dropShadowed();
+        flush();
+      }
+    }
+    if (isShadowed(payload.node, payload.pad)) return;
     const s = sourceFor(payload.node || "native");
     if (kind === "button") {
       if (payload.down) s.buttons.add(payload.id); else s.buttons.delete(payload.id);
     } else if (kind === "direction") {
       s.dir = payload.dir;
-    } else if (kind === "gone") {
-      sources.delete(payload.node);
     }
     flush();
   });

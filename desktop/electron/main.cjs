@@ -381,9 +381,9 @@ function createWindow(url, fullscreen) {
   let padPython = null;
   try { padPython = pythonExe(); } catch { /* fall back to the guesses */ }
   stopNativeInput = startNativeInput({
-    button(id, down, node) { sendPadEvent(win, "button", { id, down, node }); },
-    direction(dir, node) { sendPadEvent(win, "direction", { dir, node }); },
-    gone(node) { sendPadEvent(win, "gone", { node }); },
+    button(id, down, node, pad) { sendPadEvent(win, "button", { id, down, node, pad }); },
+    direction(dir, node, pad) { sendPadEvent(win, "direction", { dir, node, pad }); },
+    gone(node, pad) { sendPadEvent(win, "gone", { node, pad }); },
   }, padPython);
   win.on("closed", () => {
     win = null;

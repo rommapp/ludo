@@ -81,7 +81,8 @@ function findNativePads() {
       const ev = fs.readdirSync(dir).find((f) => /^event\d+$/.test(f));
       if (ev) eventNode = `/dev/input/${ev}`;
     } catch { /* raced with an unplug */ }
-    pads.push({ id: `${name} (Vendor: ${vendor} Product: ${product})`, name, eventNode });
+    pads.push({ id: `${name} (Vendor: ${vendor} Product: ${product})`, name, eventNode,
+                key: `${vendor}:${product}`.toLowerCase() });
   }
   return pads;
 }
