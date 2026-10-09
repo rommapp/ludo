@@ -1019,10 +1019,6 @@ function footerPrimary(target: HTMLElement, origin: HTMLElement): HTMLElement | 
 
 const REPEAT_DELAY = 400;
 const REPEAT_INTERVAL = 110;
-// Two horizontal presses closer than this collapse to instant scroll (see
-// direction()): fast L/R taps otherwise stack interrupted smooth-scroll layers
-// and the focused cover shimmers/over-scales.
-const H_COALESCE_MS = 140;
 
 type DirName = "up" | "down" | "left" | "right";
 
@@ -1308,8 +1304,6 @@ export function startGamepad() {
   let curDir: DirName | null = null;
   let delayTimer: any = null;
   let repeatTimer: any = null;
-  // Timestamp of the last horizontal press, to coalesce fast dpad mashing.
-  let lastHMove = 0;
   // Whether the OK press matching the next OK release was seen here — see the
   // release branch of button().
   let okPressSeen = false;
@@ -1331,20 +1325,12 @@ export function startGamepad() {
       // retargets without losing velocity, so a ~110ms repeat becomes one
       // continuous glide rather than the oscillation native smooth scroll gave.
       //
-      // Distinct FAST taps of Left/Right are the same hazard as held-repeat:
-      // each new smooth scrollIntoView interrupts the previous one mid-flight,
-      // so the card row's composited scroll layer never settles between presses.
-      // At the ~1.8x page zoom the GPU keeps resampling that in-flight layer, and
-      // the focused cover (scale(1.04) + glow) occasionally paints oversized/soft
-      // for a frame — the intermittent "cover scales up big" shimmer. Coalesce:
-      // if a horizontal press lands within COALESCE_MS of the previous one, jump
-      // instantly (no animated layer to catch), keeping the smooth console-glide
-      // only for relaxed single presses. Vertical moves are unaffected.
-      const now = Date.now();
-      const horizontal = dir === "left" || dir === "right";
-      const smooth = !(horizontal && now - lastHMove < H_COALESCE_MS);
-      if (horizontal) lastHMove = now;
-      step(dir, smooth, false);
+      // Fast Left/Right taps animate too. They used to jump instantly (within
+      // 140ms of each other): native smooth scrollIntoView restarted mid-flight
+      // and the focused cover shimmered at 1.8x zoom. Card rows now glide on the
+      // spring, which sets scrollLeft per frame with no compositor-side scroll
+      // animation to interrupt, so that hazard is gone.
+      step(dir, true, false);
       delayTimer = setTimeout(() => {
         repeatTimer = setInterval(() => step(dir, true, true), REPEAT_INTERVAL);
       }, REPEAT_DELAY);
