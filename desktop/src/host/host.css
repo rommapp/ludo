@@ -133,10 +133,13 @@ textarea,
  * text-align:left on the template keeps it flush with the input's origin.
  * Desktop-only; index.tsx is untouched.
  */
-div[class*="v2pf-"] {
+/* Keyed to the static `v2pf` class PairCodeField sets beside its random
+   `v2pf-xxxx` one. A [class*=] selector made every class change anywhere (each
+   focus move) re-check descendant divs page-wide. */
+div.v2pf {
   text-align: left !important;
 }
-div[class*="v2pf-"] > div {
+div.v2pf > div {
   width: auto !important;
 }
 
@@ -152,13 +155,16 @@ div[class*="v2pf-"] > div {
  * That track's `overflowX:'auto', overflowY:'visible'` serializes in the DOM as
  * the SHORTHAND `overflow: auto visible` (verified by live inspection — NOT
  * `overflow-x: auto`, which is why earlier substring selectors matched nothing),
- * so we key off that and pad its direct `.desk-focusable` flex-row child. Padding
+ * so this used to key off that. It now keys off the `.romm-cardrow-track` class
+ * CardRow sets: an attribute selector on `style` made Chromium re-check the
+ * whole subtree on every inline-style change (React restyles tiles on each
+ * focus move). Pads the track's direct `.desk-focusable` flex-row child. Padding
  * lives on the row (scroll CONTENT), not the track, because WebKit historically
  * drops a scroll container's own padding-right. That inline overflow shorthand is
  * unique to these card tracks, so grids / nav bar / footers are untouched.
  * Desktop-only; index.tsx is untouched.
  */
-[style*="overflow: auto visible"] > .desk-focusable {
+.romm-cardrow-track > .desk-focusable {
   padding-left: 28px !important;
 }
 /* Trailing breathing room: a flex scroll-container's own padding-right is NOT
@@ -167,7 +173,7 @@ div[class*="v2pf-"] > div {
  * clips, even though scrollWidth includes the 48px). A real flex ITEM at the end
  * IS reserved, so add a zero-content ::after spacer instead of padding-right.
  * padding-left (the leading edge) works fine, so it stays. */
-[style*="overflow: auto visible"] > .desk-focusable::after {
+.romm-cardrow-track > .desk-focusable::after {
   content: "";
   flex: 0 0 28px;
   align-self: stretch;

@@ -734,7 +734,7 @@ export function PairCodeField({ label, value, onChange, onKb, onEnter }:
     >
       {label && <div style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase', color: V2.fgMuted, textAlign: 'center' }}>{label}</div>}
       <style>{`.${uid} label{display:none!important}.${uid}>div{background:transparent!important;border:none!important;box-shadow:none!important;padding:0!important;margin:0!important}.${uid}>div>div{background:transparent!important;border:none!important;box-shadow:none!important;padding:0!important}.${uid} input,.${uid} input:focus,.${uid} input:focus-visible{position:absolute!important;inset:0!important;width:100%!important;background:transparent!important;border:none!important;outline:none!important;box-shadow:none!important;color:transparent!important;caret-color:${V2.brand}!important;padding:0!important;margin:0!important;height:100%!important;min-height:0!important;font-family:monospace!important;font-size:20px!important;font-weight:700!important;letter-spacing:.3em!important;text-indent:.3em!important;text-transform:uppercase!important}`}</style>
-      <div className={uid} style={{
+      <div className={`v2pf ${uid}`} style={{
         display: 'flex', alignItems: 'center', justifyContent: 'center', height: '40px', padding: '0 12px',
         borderRadius: V2.radiusMd,
         background: focused ? V2.surfaceHover : 'rgba(255,255,255,0.045)',

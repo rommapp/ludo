@@ -88,6 +88,12 @@ export const V2_ROW_STYLE = `
     background: ${V2.surfaceHover}; transform: translateY(-2px); border-color: ${V2.brand};
     box-shadow: 0 8px 22px rgba(0,0,0,0.4), ${_RING}, 0 0 16px ${_GLOW};
   }
+  /* Cover highlights key off .gpfocus, not .gpfocuswithin. Chromium indexes a
+     descendant rule by its class alone, so with gpfocuswithin every SHELF that
+     gained or lost the marker restyled all of its covers (~800 on entering a
+     new row, 10–50ms). gpfocus only ever moves between two tiles. Same result:
+     these wraps are always the innermost Focusable, so Steam and this shell
+     both put gpfocus exactly where gpfocuswithin's highlight belonged. */
   /* Gamepad focus can be FORCED onto a tile (returning from an emulator
      session) without firing React's onFocus, so the highlight must also be
      reachable via CSS. Keyed to Steam's own .gpfocuswithin marker — NOT DOM
@@ -95,13 +101,13 @@ export const V2_ROW_STYLE = `
      element.focus() (e.g. useAutoFocus on remount) moves DOM activeElement
      silently and :focus-within would light a SECOND tile alongside the one
      Steam actually has gamepad focus on. */
-  .romm-ptile-wrap:hover .romm-ptile-v, .romm-ptile-wrap.gpfocuswithin .romm-ptile-v {
+  .romm-ptile-wrap:hover .romm-ptile-v, .romm-ptile-wrap.gpfocus .romm-ptile-v {
     background: ${V2.surface} !important; border-color: ${V2.brand} !important; transform: scale(1.04) !important;
     box-shadow: 0 8px 28px rgba(0,0,0,0.4), ${_RING}, 0 0 18px rgba(139,116,232,0.55) !important;
   }
-  .romm-ptile-wrap:hover .romm-ptile-ic, .romm-ptile-wrap.gpfocuswithin .romm-ptile-ic { color: ${V2.brandHover} !important; opacity: 1 !important; }
-  .romm-ptile-wrap:hover .romm-ptile-lb, .romm-ptile-wrap.gpfocuswithin .romm-ptile-lb { color: ${V2.fg} !important; }
-  .romm-gt-wrap:hover .romm-gt-cover, .romm-gt-wrap.gpfocuswithin .romm-gt-cover {
+  .romm-ptile-wrap:hover .romm-ptile-ic, .romm-ptile-wrap.gpfocus .romm-ptile-ic { color: ${V2.brandHover} !important; opacity: 1 !important; }
+  .romm-ptile-wrap:hover .romm-ptile-lb, .romm-ptile-wrap.gpfocus .romm-ptile-lb { color: ${V2.fg} !important; }
+  .romm-gt-wrap:hover .romm-gt-cover, .romm-gt-wrap.gpfocus .romm-gt-cover {
     transform: scale(1.04) !important;
     box-shadow: 0 8px 28px rgba(0,0,0,0.4), ${_RING}, 0 0 18px rgba(139,116,232,0.55) !important;
   }
@@ -115,11 +121,13 @@ export const V2_ROW_STYLE = `
   /* The Details/Delete glass buttons sit at opacity 0 on every cover until it's
      hovered or focused, but their backdrop blur still made a composited layer
      each — ~70 on Home, re-blurred every frame while scrolling. Blur only on
-     the cover that shows them. */
-  .romm-gt-wrap:not(:hover):not(.gpfocuswithin) .romm-gt-actions > div {
+     the cover that shows them. Keyed to a class, never a bare div: a rule
+     ending in a tag makes every gpfocuswithin toggle restyle every descendant
+     div (~15k checks, 70ms+ per press when tapping fast). */
+  .romm-gt-wrap:not(:hover):not(.gpfocus) .romm-gt-btn {
     backdrop-filter: none !important; -webkit-backdrop-filter: none !important;
   }
-  .romm-ct-wrap:hover .romm-ct-cover, .romm-ct-wrap.gpfocuswithin .romm-ct-cover {
+  .romm-ct-wrap:hover .romm-ct-cover, .romm-ct-wrap.gpfocus .romm-ct-cover {
     transform: scale(1.04) !important;
     box-shadow: 0 8px 28px rgba(0,0,0,0.4), ${_RING}, 0 0 18px rgba(139,116,232,0.55) !important;
   }

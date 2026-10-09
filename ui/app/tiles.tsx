@@ -870,12 +870,13 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
           transition: 'opacity 0.18s ease, transform 0.18s ease',
         }}>
           <div onPointerDown={() => { subPress.current = true; }}
-            onClick={(e: any) => { e.stopPropagation(); subPress.current = false; onOpen(game); }} style={roundBtn(30, 'glass')}>
+            onClick={(e: any) => { e.stopPropagation(); subPress.current = false; onOpen(game); }} className="romm-gt-btn" style={roundBtn(30, 'glass')}>
             <FaInfoCircle size={13} />
           </div>
           {dl && (
             <div onPointerDown={() => { subPress.current = true; }}
               onClick={(e: any) => { e.stopPropagation(); subPress.current = false; requestDelete(); }}
+              className="romm-gt-btn"
               style={{
                 ...roundBtn(30, 'danger'),
                 // Armed state: solid red fill + check glyph, so it's clear the
@@ -1375,6 +1376,7 @@ export function CardRow({ icon, title, count, children }:
         <div
           ref={trackRef}
           onScroll={update}
+          className="romm-cardrow-track"
           style={{ overflowX: 'auto', overflowY: 'visible' }}
         >
           <Focusable noFocusRing flow-children="horizontal" {...NAV_MAINTAIN_X} style={{ display: 'flex', gap: '12px', padding: '24px 16px 28px' }}>
