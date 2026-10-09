@@ -329,7 +329,7 @@ export function focusFirstIn(root: ParentNode): boolean {
     .filter(isVisible)
     // Don't land on the modal's ✕ close button — start on real content.
     .filter((el) => !el.classList.contains("desk-modal-close"));
-  const inner = all.filter((el) => !all.some((o) => o !== el && el.contains(o)));
+  const inner = innermost(all);
   const targets = dedupe(inner.map(fieldFootprint));
   const first = targets[0];
   if (!first) return false;
@@ -435,7 +435,7 @@ function focusTargets(): HTMLElement[] {
   // second). Keep only the innermost interactive element: if a candidate
   // contains another candidate, drop the outer one. Button routing still works
   // because routeButton() walks DOM ancestors from the focused element up.
-  const inner = all.filter((el) => !all.some((o) => o !== el && el.contains(o)));
+  const inner = innermost(all);
   // Represent a wizard field by its full-width `.wiz-field` wrapper rather than
   // the inner <input>: the pair-code input is deliberately narrow-and-centered
   // (so its caret lands on the slots), which would otherwise give spatial nav a
@@ -450,6 +450,23 @@ function focusTargets(): HTMLElement[] {
 // wizard field wrapper if it sits in one, else the element itself.
 function fieldFootprint(el: HTMLElement): HTMLElement {
   return (el.closest(".wiz-field") as HTMLElement | null) ?? el;
+}
+
+// Drop every candidate that encloses another candidate. Walks each element's
+// ancestors once (O(n·depth)) — the pairwise el.contains(o) check this replaces
+// was O(n²) and cost ~200k contains() calls per D-pad press on a full library.
+function innermost(all: HTMLElement[]): HTMLElement[] {
+  const set = new Set(all);
+  const outer = new Set<HTMLElement>();
+  for (const el of all) {
+    for (let p = el.parentElement; p; p = p.parentElement) {
+      if (set.has(p)) {
+        if (outer.has(p)) break; // its ancestors are already marked
+        outer.add(p);
+      }
+    }
+  }
+  return all.filter((el) => !outer.has(el));
 }
 
 function dedupe(els: HTMLElement[]): HTMLElement[] {
@@ -1077,15 +1094,27 @@ function clearFocusMarkers() {
 // Tag the focused leaf with `gpfocus` and it + every ancestor with
 // `gpfocuswithin`, matching what Steam does on the Deck so the plugin's
 // marker-based focus CSS lights up.
+//
+// Diffed against the previous chain, not cleared and re-added: the shared
+// ancestors run all the way up to #root, and toggling a class there makes
+// Chromium re-match descendant rules (`.x.gpfocuswithin .romm-gt-cover`) for the
+// whole ~7k-element tree — a 25–45ms style recalc on every D-pad press, which
+// was the hitch in every scroll glide. Only the nodes that actually leave or
+// join the chain are touched now.
 function markGamepadFocus(leaf: HTMLElement | null) {
-  clearFocusMarkers();
-  if (!leaf || leaf === document.body) return;
-  leaf.classList.add("gpfocus");
+  if (!leaf || leaf === document.body) { clearFocusMarkers(); return; }
   const marked: HTMLElement[] = [];
   for (let n: HTMLElement | null = leaf; n && n !== document.body; n = n.parentElement) {
-    n.classList.add("gpfocuswithin");
     marked.push(n);
   }
+  const keep = new Set(marked);
+  for (const el of _marked) if (!keep.has(el)) el.classList.remove("gpfocuswithin");
+  const prevLeaf = _marked[0];
+  if (prevLeaf && prevLeaf !== leaf) prevLeaf.classList.remove("gpfocus");
+  // Guarded: per the DOM spec classList.add rewrites the class attribute even
+  // when the token is already there, which still fires mutations up the chain.
+  for (const n of marked) if (!n.classList.contains("gpfocuswithin")) n.classList.add("gpfocuswithin");
+  if (!leaf.classList.contains("gpfocus")) leaf.classList.add("gpfocus");
   _marked = marked;
 }
 // The focus target currently under the mouse pointer (updated only on real
@@ -1264,8 +1293,13 @@ export function startGamepad() {
     }
     seedFocus();
   };
+  // The focusIsUseful() check lives in the timer, not here: it measures layout
+  // (getBoundingClientRect/getComputedStyle), and running it on every mutation
+  // forced a synchronous layout each time React re-rendered a tile mid-scroll —
+  // a visible hitch on every D-pad press. Debouncing first means one check once
+  // the tree settles, which is all the reseed ever needed.
   const observer = new MutationObserver(() => {
-    if (mouseMode || focusIsUseful()) return;
+    if (mouseMode) return;
     clearTimeout(reseedTimer);
     reseedTimer = setTimeout(reseedIfStranded, 120);
   });
