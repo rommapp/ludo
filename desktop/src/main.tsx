@@ -10,13 +10,6 @@ import { startSound } from "./host/sound";
 import { startProfiler } from "./host/profiler";
 import "./host/host.css";
 
-// The desktop backend answers image RPCs in parallel (the Deck's plugin backend
-// serves them one at a time, hence the shared default of 3). Measured cold
-// start, Home: 3 -> 6 cut visible covers from 1.39s to 0.92s and the whole
-// page's ~1,850 images from 10.5s to 6.0s; 12 and 24 were no faster. Must be
-// set before the first image is queued; media.tsx reads it lazily.
-(globalThis as any).__ludoImageConcurrency = 6;
-
 // Ludo itself: ui/app/index.tsx, shared byte-identically with the Decky build.
 // It asks for its shell through the `@ludo/host` specifier, which
 // vite.config.ts points at this shell's adapter (src/host/); the Decky build

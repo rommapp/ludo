@@ -30,8 +30,7 @@ export const IMAGE_RPC_TIMEOUT_MS = 30_000;
 // down a long grid used to queue its 30 on-screen tiles behind every cover
 // still pending from where the user came from, so the screen they're looking
 // at filled last. Within a batch it stays FIFO — the ≈left-to-right fill.
-export function makeImageQueue(concurrency: number | (() => number)) {
-  const limit = typeof concurrency === 'function' ? concurrency : () => concurrency;
+export function makeImageQueue(concurrency: number) {
   let active = 0;
   let seq = 0;
   const pending: Array<{ batch: number; seq: number; run: () => void }> = [];
@@ -44,7 +43,7 @@ export function makeImageQueue(concurrency: number | (() => number)) {
     return pending.splice(best, 1)[0];
   };
   const pump = () => {
-    while (active < limit() && pending.length) {
+    while (active < concurrency && pending.length) {
       active++;
       try {
         takeNext().run();
@@ -104,11 +103,10 @@ export function currentBatch(): number {
   return _batch;
 }
 
-// How many image RPCs run at once. 3 suits the Deck, where the plugin backend
-// serves images one at a time. A host whose backend answers in parallel can
-// raise it by setting globalThis.__ludoImageConcurrency before the first image
-// is queued (read lazily, so it can be set after this module is imported).
-export const imageQueue = makeImageQueue(() => (globalThis as any).__ludoImageConcurrency ?? 3);
+// How many image RPCs run at once. Measured on desktop at cold start: 3 -> 6
+// cut visible covers from 1.39s to ~0.95s and the whole Home page from 10.5s
+// to 6s; 12 and 24 were no faster. Used on the Deck too (not measured there).
+export const imageQueue = makeImageQueue(6);
 
 export const qGetImage = (path: string) => imageQueue(() => getImage(path));
 
