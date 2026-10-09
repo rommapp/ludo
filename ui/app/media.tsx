@@ -107,6 +107,18 @@ export const imageQueue = makeImageQueue(3);
 
 export const qGetImage = (path: string) => imageQueue(() => getImage(path));
 
+// Background tier: served only once no cover/screenshot is waiting. For
+// decorative art that costs several requests per tile — collection mosaics are
+// four images each, and ~400 collection tiles mount at startup. Under plain
+// newest-batch-first they outranked the covers already on screen (the rows
+// above them mounted first, so their batches were older): measured at cold
+// start, 1,684 mosaic images went out while four visible covers sat on a
+// placeholder for 7.8s. Offsetting the batch keeps newest-first WITHIN the tier,
+// so jumping around the Collections tab still serves what you landed on first.
+const BACKGROUND_TIER = 1e9;
+export const qGetImageBg = (path: string) =>
+  imageQueue(() => getImage(path), currentBatch() - BACKGROUND_TIER);
+
 export const qGetGameCover = (romId: number, large: boolean) => imageQueue(() => getGameCover(romId, large));
 
 // Resolved platform-icon cache: platformKey -> data URI (or null = no icon).

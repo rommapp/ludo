@@ -9,7 +9,7 @@ import { toaster } from "./toast";
 import { maybePromptSwitchFirmware } from "./firmware";
 import { _libGamesCache, libCacheSetDownloaded, _focusedPlatform, _setFocusedPlatform, libCacheDelete, libCacheDrop, openGameById} from "./libcache";
 import { V2Focus, V2_FOCUS_STYLE} from "./focus";
-import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImage } from "./media";
+import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImageBg } from "./media";
 import { PlatformIcon, ProgressRing, UserMenuRow, MODAL_SCRIM_INSET, PickerModal, ToastCover} from "./kit";
 import { FaBookmark, FaBoxOpen, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
 import { _broadcastLibRefresh } from "./events";
@@ -915,7 +915,7 @@ export function PathImage({ path }: { path: string }) {
     const p = peekCover(ik);
     if (p !== undefined) { setUri(p); return; }
     (async () => {
-      try { const u = await awaitCover(ik, () => qGetImage(path)); if (alive) setUri(u); }
+      try { const u = await awaitCover(ik, () => qGetImageBg(path)); if (alive) setUri(u); }
       catch { /* ignore */ }
     })();
     return () => { alive = false; };
