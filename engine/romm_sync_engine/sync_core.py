@@ -14,7 +14,8 @@ import logging
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
-from . import eden_config, emulator_saves, ps2_memcard, switch_content, title_ids
+from . import (eden_config, emulator_saves, folder_saves, gamecube_saves,
+               ps2_memcard, switch_content, title_ids)
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -5727,16 +5728,16 @@ class RomMClient:
         # saves, not copies — reporting them all as "autosave" made the dedupe
         # below treat three of the four as stale and drop them, and the server's
         # single autosave row alternated between whichever card was touched
-        # last. Every port gets its own slot, named after the port.
+        # last. Every port but A1 gets its own slot, named after the port.
         #
-        # Port A1 briefly kept "autosave" on the theory that it would pair with
-        # other clients' primary save. It wouldn't: grout and argosy were both
-        # read (Aug 2026) and neither has any concept of a VMU — no flycast
-        # per-content cards, no Dreamcast save handling at all — so there was
-        # nothing on the other side to meet, and the exception only made port A
-        # the odd one out in the slot list.
+        # Port A1 is the game's "autosave": Argosy (Oct 2026, its
+        # DreamcastSaveHandler) syncs exactly that card, "<product id>.A1.bin",
+        # in exactly that slot, so this is where the two meet. Ludo used
+        # "vmu-a1" before Argosy had any Dreamcast support; those rows are
+        # superseded, never downloaded over the autosave (see
+        # _LEGACY_VMU_A1_SLOT).
         port = _vmu_port(file_path)
-        if port:
+        if port and port != 'A1':
             return f"vmu-{port.lower()}", True, 10
 
         if suffix:
@@ -5852,7 +5853,7 @@ class RomMClient:
             logging.warning(f"Error completing sync session {session_id}: {e}")
             return False
 
-    def upload_save(self, rom_id, save_type, file_path, emulator=None, device_id=None, overwrite=False, slot=None, autocleanup=False, autocleanup_limit=None, session_id=None):
+    def upload_save(self, rom_id, save_type, file_path, emulator=None, device_id=None, overwrite=False, slot=None, autocleanup=False, autocleanup_limit=None, session_id=None, upload_name=None):
         """Upload save file using RomM naming convention with timestamps"""
         if not self.ensure_authenticated():
             return False
@@ -5899,10 +5900,13 @@ class RomMClient:
             # timestamp of ours only produced the double-stamped
             # "X [2026-08-04 00-20-51-351] [2026-08-03_22-20-51].bin" — ours in
             # local time, the server's in UTC, for one instant.
-            romm_filename = file_path.name
-            upload_stem = (file_path.name[:-len('.state.auto')]
-                           if file_path.name.lower().endswith('.state.auto')
-                           else file_path.stem)
+            # ``upload_name`` stands in for the file's own name; see
+            # AutoSyncManager._upload_name for why a game's autosave travels
+            # as "autosave.<ext>".
+            romm_filename = upload_name or file_path.name
+            upload_stem = (romm_filename[:-len('.state.auto')]
+                           if romm_filename.lower().endswith('.state.auto')
+                           else Path(romm_filename).stem)
             logging.debug(f"Upload filename: {romm_filename}")
 
             try:
@@ -8767,15 +8771,11 @@ class RetroArchInterface:
 
         1. The disc's own boot serial. SYSTEM.CNF names the ELF the console
            runs ("BOOT2 = cdrom0:\\SCUS_974.90;1") and Sony's prefix encodes the
-           territory, so this is what the BIOS itself checks. title_ids already
-           reads it, through Sigil where that answers and its own ISO 9660
-           reader otherwise — but only for an uncompressed image.
-        2. RomM's own `regions` for the ROM. This is the answer for a .chd:
-           the bundled Sigil is 0.1.0-dev, which carries no CHD support at all
-           (no decompressors, no container magic), and decoding CHD here would
-           mean implementing its v5 hunk map — a Huffman-coded format — to
-           recover one letter. The server already identified the dump against a
-           DAT, which is better evidence than anything we could parse.
+           territory, so this is what the BIOS itself checks. title_ids reads
+           it through Sigil, from an .iso, a .chd or a zipped image alike.
+        2. RomM's own `regions` for the ROM, for a disc Sigil cannot read. The
+           server identified the dump against a DAT, which is better evidence
+           than a filename.
         3. The filename tag, last. It is a scene convention rather than
            something either the console or the server reads, so it is only
            better than guessing — which is what the alternative, lrps2 picking
@@ -8783,7 +8783,7 @@ class RetroArchInterface:
         """
         try:
             from . import title_ids
-            serial = title_ids.title_id_from_rom(rom_path) or ''
+            serial = title_ids.title_id_from_rom(rom_path, platform='ps2') or ''
         except Exception:
             serial = ''
         if serial:
@@ -10931,7 +10931,12 @@ class RetroArchInterface:
     # "<saves>/ps2/retroarch-core/LRPS2/memcards/" — the deepest layout any
     # emulator Ludo supports is known to use — without turning the scan into a
     # walk of everything under a misconfigured save path.
-    SAVE_SCAN_MAX_DEPTH = 4
+    #
+    # Five since GameCube: the libretro Dolphin core puts its user directory
+    # in the save directory RetroArch hands it, and keeps a game's .gci files
+    # four levels under that ("User/GC/USA/Card A") -- five from the root once
+    # RetroArch sorts saves per core ("dolphin-emu/") or per content.
+    SAVE_SCAN_MAX_DEPTH = 5
 
     @classmethod
     def _save_scan_dirs(cls, root):
@@ -11044,7 +11049,7 @@ class RetroArchInterface:
         
         return save_files
 
-    def resolve_restore_dest(self, game, entry, save_type, as_copy=False):
+    def resolve_restore_dest(self, game, entry, save_type, as_copy=False, local_name=None):
         """Resolve the local destination (dir, filename) for a restored version.
 
         Mirrors the on-disk naming RetroArch expects. For an as-copy state it
@@ -11055,8 +11060,12 @@ class RetroArchInterface:
         file_name = entry.get('file_name', '')
         slot = entry.get('slot') or RomMClient.get_slot_info(file_name)[0]
         tgt_name = self.convert_to_retroarch_filename(file_name, save_type, '/tmp', slot=slot)
+        # The name this device reads the save under, when the caller knows it
+        # (AutoSyncManager._local_save_name): the server's is the uploader's.
+        if local_name:
+            tgt_name = local_name
 
-        base = re.sub(r'\s*\[.*?\]', '', Path(file_name).stem)
+        base = re.sub(r'\s*\[.*?\]', '', Path(tgt_name if local_name else file_name).stem)
         local = (self.get_save_files() or {}).get(save_type, [])
         candidates = [f for f in local if f.get('name', '').startswith(base)]
         exact = [f for f in candidates if f.get('name') == tgt_name]
@@ -11085,7 +11094,7 @@ class RetroArchInterface:
         return dest_dir, tgt_name
 
     def restore_save_version(self, romm_client, game, entry, save_type,
-                             as_copy=False, log=None):
+                             as_copy=False, log=None, local_name=None):
         """Restore a server save/state version to local disk.
 
         Backs up the current file (in-place restore only), downloads the chosen
@@ -11103,7 +11112,8 @@ class RetroArchInterface:
             else:
                 logging.info(msg)
         try:
-            dest_dir, tgt_name = self.resolve_restore_dest(game, entry, save_type, as_copy)
+            dest_dir, tgt_name = self.resolve_restore_dest(game, entry, save_type, as_copy,
+                                                           local_name=local_name)
             if not dest_dir or not tgt_name:
                 return {'success': False, 'dest': None, 'tgt_name': None,
                         'error': 'Could not determine restore location (download the game first).'}
@@ -11686,6 +11696,14 @@ class AutoSyncManager:
         persists once per cycle).
         """
         try:
+            # A GameCube unit reconciled: each of its GCIs is in sync too, or
+            # the file watcher reads every one of them as still pending.
+            for member in getattr(self, '_gci_zip_members', {}).get(str(path), ()):
+                try:
+                    mst = Path(member).stat()
+                    self.last_uploaded[str(member)] = (mst.st_size, mst.st_mtime)
+                except OSError:
+                    pass
             card = getattr(self, '_ps2_zip_card', {}).get(str(path))
             if card:
                 # A PS2 zip reconciled: its card is in sync as of this save.
@@ -13017,7 +13035,7 @@ class AutoSyncManager:
                     device_id=device_id, slot=slot, overwrite=True,
                     autocleanup=entry.get('_autocleanup', False),
                     autocleanup_limit=entry.get('_autocleanup_limit'),
-                    session_id=session_id,
+                    session_id=session_id, upload_name=entry.get('_upload_name'),
                 ) is True:
                     summary['uploaded'] += 1
                     summary['_per_game'][rom_id]['up'] += 1
@@ -13554,6 +13572,7 @@ class AutoSyncManager:
                      for g in (self.get_games() or [])}
         except Exception as e:
             logging.debug(f"could not map platforms for the inventory: {e}")
+        gci_units = set()
         for entry in save_files.get('saves', []):
             path = Path(entry['path'])
             rom_id = self.rom_id_for_save(path)
@@ -13601,6 +13620,19 @@ class AutoSyncManager:
                 if packed is None:
                     continue
                 upload_path, file_name = packed, packed.name
+            # A GameCube game's GCIs are one save, packed the way Argosy packs
+            # them; the unit is reported once, dated by its newest member.
+            if path.suffix.lower() == gamecube_saves.GCI_SUFFIX:
+                members = gamecube_saves.unit_members(path)
+                unit = (str(path.parent), gamecube_saves.game_code(path))
+                if unit in gci_units:
+                    continue
+                gci_units.add(unit)
+                upload_path = self._pack_gci_unit(members, rom_id)
+                file_name = upload_path.name
+                updated_at = _dt.datetime.fromtimestamp(
+                    max(m.stat().st_mtime for m in members),
+                    tz=_dt.timezone.utc).isoformat()
             content_hash = RomMClient.compute_content_hash(upload_path)
 
             # Use the RomM core name (e.g. "Mupen64Plus-Next"), not the raw save
@@ -13635,10 +13667,12 @@ class AutoSyncManager:
                 'file_size_bytes': upload_path.stat().st_size,
                 # Local-only fields (stripped before negotiate; used by the executor)
                 '_path': str(upload_path),
+                '_upload_name': self._upload_name(rom_id, upload_path, slot),
                 '_autocleanup': _autocleanup,
                 '_autocleanup_limit': _limit,
             })
 
+        inventory.extend(self._folder_inventory_entries())
         eden_entries = self._eden_inventory_entries()
         if emulator_saves.eden_data_dirs():
             # Keys ride along with an ordinary Switch pass: ~14 KB, needed
@@ -13701,6 +13735,112 @@ class AutoSyncManager:
             out.write_bytes(data)
         self.__dict__.setdefault('_ps2_zip_card', {})[str(out)] = str(card_path)
         return out
+
+    def _pack_gci_unit(self, members, rom_id):
+        """A GameCube game's GCIs as the artifact the server sees.
+
+        One GCI travels as itself. Several are zipped into our cache, written
+        only when the bytes change, so an unchanged unit keeps the file -- and
+        the fingerprint -- it had.
+        """
+        members = list(members)
+        if len(members) == 1:
+            return members[0]
+        code = gamecube_saves.game_code(members[0]) or 'gci'
+        out = cache_dir() / 'gci_saves' / str(rom_id) / f"{code}.zip"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fresh = gamecube_saves.pack(members, out.with_suffix('.zip.part'))
+        if out.is_file() and out.read_bytes() == fresh.read_bytes():
+            fresh.unlink()
+        else:
+            os.replace(fresh, out)
+        self.__dict__.setdefault('_gci_zip_members', {})[str(out)] = [str(m) for m in members]
+        return out
+
+    def _gci_unit_hash(self, rom_id):
+        """The content hash of this game's GCIs as they would upload, or None."""
+        for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
+            path = Path(entry['path'])
+            if (path.suffix.lower() == gamecube_saves.GCI_SUFFIX
+                    and self.rom_id_for_save(path) == rom_id):
+                return RomMClient.compute_content_hash(
+                    self._pack_gci_unit(gamecube_saves.unit_members(path), rom_id))
+        return None
+
+    def _is_gci_op(self, op):
+        """A server save that is a GameCube game's GCIs, raw or zipped."""
+        name = str(op.get('file_name') or '').lower()
+        return (name.endswith(('.gci', '.zip'))
+                and _platform_of(self._game_for_rom(op.get('rom_id'))) == 'gamecube')
+
+    def _gci_card_dir(self, rom_id, code, saves_dir):
+        """Where Dolphin reads this game's GCIs: its card folder.
+
+        The folder already holding the game's GCIs wins. Otherwise the core's
+        user directory is the save directory RetroArch hands it -- per core,
+        per content or flat, as RetroArch is sorting -- plus "User".
+        """
+        for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
+            path = Path(entry['path'])
+            if (path.suffix.lower() == gamecube_saves.GCI_SUFFIX
+                    and gamecube_saves.game_code(path) == code):
+                return path.parent
+        if not saves_dir:
+            return None
+        base = Path(saves_dir)
+        mode = self.retroarch.get_save_subdir_mode('saves')
+        if mode == 'core':
+            base = base / 'dolphin-emu'
+        elif mode == 'content':
+            game = self._game_for_rom(rom_id) or {}
+            base = base / (self._content_dir_for_game(game)
+                           or platform_folder_name(game.get('platform_slug')) or 'gc')
+        return gamecube_saves.card_dir(base / 'User', code)
+
+    def _restore_gci_save(self, op, device_id, session_id):
+        """Put a GameCube save from the server into the game's card folder.
+
+        Deferred (False) while RetroArch runs: Dolphin reads the folder when
+        a game boots and writes it back as it plays.
+        """
+        if self.is_retroarch_running():
+            self.log("ℹ️ Save-sync: RetroArch is running; the GameCube save "
+                     "will restore once it is closed.")
+            return False
+        file_name = op.get('file_name') or 'save.gci'
+        staged = cache_dir() / 'incoming_saves' / Path(file_name).name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if not self.romm_client.download_save_by_id(
+                op.get('save_id'), 'saves', staged,
+                device_id=device_id, session_id=session_id):
+            return False
+        try:
+            members = gamecube_saves.incoming_members(staged)
+            codes = {d[:4].decode('ascii', 'replace').upper() for _n, d in members}
+            if len(codes) != 1:
+                self.log(f"⚠️ Save-sync: {file_name!r} is not one GameCube game's save")
+                return False
+            code = codes.pop()
+            target = self._gci_card_dir(op.get('rom_id'), code,
+                                        self.retroarch.save_dirs.get('saves'))
+            if target is None:
+                return False
+            # A lone GCI is uploaded under the uploader's ROM name; on the
+            # card it gets Dolphin's own, read off its header.
+            written = gamecube_saves.restore(
+                staged, target, code, backup_dir=cache_dir() / 'save_backups',
+                name=gamecube_saves.dolphin_name(members[0][1]),
+                only_same=(len(members) == 1 and not _zipfile.is_zipfile(staged)
+                           and gamecube_saves.is_dolphin_name(file_name)))
+        except (ValueError, OSError, _zipfile.BadZipFile) as e:
+            self.log(f"⚠️ Save-sync: could not restore {file_name!r}: {e}")
+            return False
+        finally:
+            staged.unlink(missing_ok=True)
+        unit = self._pack_gci_unit(written, op.get('rom_id'))
+        self._record_synced(str(unit))
+        self.log(f"✅ Restored {len(written)} GameCube save file(s) for {code}")
+        return True
 
     def _platform_slug_of(self, rom_id):
         for g in (self.get_games() or []):
@@ -13793,6 +13933,212 @@ class AutoSyncManager:
             self._record_synced(str(restored))
         return True
 
+    # ── folder saves: PSP and 3DS (see folder_saves) ─────────────────────────
+
+    # The folder RetroArch gives a core's saves under per-core sorting, and the
+    # one Citra and Azahar each make inside it: their libretro library names.
+    _PSP_CORE_DIR = 'PPSSPP'
+    _N3DS_CORE_DIRS = ('Citra', 'Azahar')
+
+    def _folder_save_roots(self):
+        base = (self.retroarch.save_dirs or {}).get('saves')
+        return [Path(base)] if base else []
+
+    def _pack_folder_unit(self, kind, rom_id, key, pack):
+        """``pack(destination)`` into our cache, rewritten only when it changes."""
+        out = cache_dir() / 'folder_saves' / kind / str(rom_id) / f"{key.replace('/', '_')}.zip"
+        fresh = pack(out.with_suffix('.zip.part'))
+        if fresh is None:
+            return None
+        if out.is_file() and out.read_bytes() == fresh.read_bytes():
+            fresh.unlink()
+        else:
+            os.replace(fresh, out)
+        return out
+
+    def _folder_units(self):
+        """[(platform, rom_id, key, packer, folders)] for every PSP and 3DS save here."""
+        units = []
+        roots = self._folder_save_roots()
+        for savedata in folder_saves.psp_savedata_dirs(roots):
+            for serial, folders in folder_saves.psp_units(savedata).items():
+                rom_id = self._rom_id_for_title_id(serial)
+                if rom_id:
+                    units.append(('psp', rom_id, serial,
+                                  lambda d, f=folders: folder_saves.psp_pack(f, d), folders))
+        for sd_root in folder_saves.n3ds_sd_roots(roots):
+            for tid, unit in folder_saves.n3ds_units(sd_root).items():
+                rom_id = self._rom_id_for_title_id(tid)
+                if rom_id:
+                    units.append(('3ds', rom_id, tid,
+                                  lambda d, u=unit: folder_saves.n3ds_pack(u, d),
+                                  [unit['data'], unit['extdata']]))
+        return units
+
+    def _folder_inventory_entries(self):
+        """Inventory rows for PSP and 3DS saves, one zip per game.
+
+        Their saves are folders, which get_save_files -- a walk for save-file
+        extensions -- never reports. Packed the way Argosy packs them; see
+        folder_saves.
+        """
+        entries = []
+        try:
+            units = self._folder_units()
+        except Exception as e:
+            logging.debug(f"folder-save discovery failed: {e}")
+            return entries
+        for kind, rom_id, key, pack, folders in units:
+            try:
+                packed = self._pack_folder_unit(kind, rom_id, key, pack)
+            except Exception as e:
+                self.log(f"⚠️ Could not pack the {kind.upper()} save for {key}: {e}")
+                continue
+            if packed is None:
+                continue
+            entries.append({
+                'rom_id': rom_id,
+                'file_name': packed.name,
+                'slot': 'autosave',
+                'emulator': 'ppsspp' if kind == 'psp' else 'citra',
+                'content_hash': RomMClient.compute_content_hash(packed),
+                'updated_at': datetime.datetime.fromtimestamp(
+                    folder_saves.unit_newest(folders), tz=datetime.timezone.utc).isoformat(),
+                'file_size_bytes': packed.stat().st_size,
+                '_path': str(packed),
+                '_upload_name': f'{AUTOSAVE_UPLOAD_STEM}.zip',
+                '_autocleanup': True,
+                '_autocleanup_limit': 10,
+            })
+        return entries
+
+    def is_packed_save_op(self, op):
+        """A server save that unpacks into an emulator's tree, not a plain file."""
+        return (self._is_ps2_zip_op(op) or self._is_gci_op(op) or self._is_folder_op(op)
+                or self._is_standalone_emulator(op.get('emulator'))
+                or bool(standalone_emulator_for_platform(
+                    None, _platform_of(self._game_for_rom(op.get('rom_id'))))))
+
+    def _is_folder_op(self, op):
+        """A server save that is a PSP or 3DS game's save folders."""
+        return (str(op.get('file_name') or '').lower().endswith('.zip')
+                and _platform_of(self._game_for_rom(op.get('rom_id'))) in ('psp', '3ds'))
+
+    def _rom_save_id(self, rom_id, platform):
+        """The game's own save id: RomM's scan of it, else Sigil reading the ROM."""
+        game = self._game_for_rom(rom_id) or {}
+        data = game.get('romm_data') or {}
+        for value in (data.get('save_target'), data.get('title_id')):
+            if value:
+                return str(value).strip()
+        local = Path(game.get('local_path') or '')
+        files = [local] if local.is_file() else (
+            sorted((f for f in local.rglob('*') if f.is_file()),
+                   key=lambda f: f.stat().st_size, reverse=True)[:3] if local.is_dir() else [])
+        for rom in files:
+            found = title_ids.identify(rom, platform=platform)
+            if found:
+                return found['save_id']
+        return None
+
+    def _folder_save_base(self, rom_id, core_dir):
+        """The save directory RetroArch hands this game's core, as it sorts saves."""
+        base = (self.retroarch.save_dirs or {}).get('saves')
+        if not base:
+            return None
+        base = Path(base)
+        mode = self.retroarch.get_save_subdir_mode('saves')
+        if mode == 'core':
+            return base / core_dir
+        if mode == 'content':
+            game = self._game_for_rom(rom_id) or {}
+            return base / (self._content_dir_for_game(game)
+                           or platform_folder_name(game.get('platform_slug')) or core_dir)
+        return base
+
+    def _psp_savedata_for(self, rom_id, serial):
+        """The SAVEDATA folder this game's save goes in."""
+        dirs = folder_saves.psp_savedata_dirs(self._folder_save_roots())
+        for savedata in dirs:
+            if folder_saves.psp_folders(savedata, serial):
+                return savedata
+        if dirs:
+            return dirs[0]
+        base = self._folder_save_base(rom_id, self._PSP_CORE_DIR)
+        return base / 'PSP' / 'SAVEDATA' if base else None
+
+    def _n3ds_unit_for(self, rom_id, title_id):
+        """The data/extdata folders this title's save goes in."""
+        sd_roots = folder_saves.n3ds_sd_roots(self._folder_save_roots())
+        key = self._title_id_key(title_id)
+        for sd_root in sd_roots:
+            for tid, unit in folder_saves.n3ds_units(sd_root).items():
+                if tid == key:
+                    return unit
+        if sd_roots:
+            sd_root = sd_roots[0]
+        else:
+            base = self._folder_save_base(rom_id, self._N3DS_CORE_DIRS[0])
+            if not base:
+                return None
+            sd_root = base / self._N3DS_CORE_DIRS[0] / 'sdmc' / 'Nintendo 3DS'
+        id1 = sd_root / folder_saves.N3DS_ID / folder_saves.N3DS_ID
+        return folder_saves.n3ds_unit(id1, key)
+
+    def _restore_folder_save(self, op, device_id, session_id):
+        """Put a PSP or 3DS save zip from the server into the emulator's folders.
+
+        Deferred (False) while RetroArch runs: the core holds the save open
+        and writes it back as it plays.
+        """
+        if self.is_retroarch_running():
+            self.log("ℹ️ Save-sync: RetroArch is running; the save will restore "
+                     "once it is closed.")
+            return False
+        rom_id = op.get('rom_id')
+        platform = _platform_of(self._game_for_rom(rom_id))
+        file_name = Path(op.get('file_name') or 'save.zip').name
+        staged = cache_dir() / 'incoming_saves' / file_name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if not self.romm_client.download_save_by_id(
+                op.get('save_id'), 'saves', staged,
+                device_id=device_id, session_id=session_id):
+            return False
+        backups = cache_dir() / 'save_backups'
+        try:
+            if not _zipfile.is_zipfile(staged):
+                raise ValueError('not a zip')
+            if platform == 'psp':
+                serial = (folder_saves.psp_serial_of_zip(staged)
+                          or (self._rom_save_id(rom_id, 'psp') or '')[:9])
+                savedata = self._psp_savedata_for(rom_id, serial) if serial else None
+                if not savedata:
+                    raise ValueError('no serial or save folder for it')
+                restored = folder_saves.psp_restore(staged, savedata, serial, backups)
+                what = f"{len(restored)} PSP save folder(s) for {serial}"
+            else:
+                tid = self._rom_save_id(rom_id, '3ds')
+                unit = self._n3ds_unit_for(rom_id, tid) if tid else None
+                if not unit:
+                    raise ValueError('no title id for it')
+                restored = folder_saves.n3ds_restore(staged, unit, backups)
+                what = f"3DS {' + '.join(restored)} for {self._title_id_key(tid)}"
+        except (ValueError, OSError, _zipfile.BadZipFile) as e:
+            self.log(f"⚠️ Save-sync: could not restore {file_name!r}: {e}")
+            return False
+        finally:
+            staged.unlink(missing_ok=True)
+        self.log(f"✅ Restored {what}")
+        return True
+
+    def _folder_unit_hash(self, rom_id):
+        """The content hash of this game's PSP/3DS save as it would upload, or None."""
+        for kind, rid, key, pack, _folders in self._folder_units():
+            if rid == rom_id:
+                packed = self._pack_folder_unit(kind, rid, key, pack)
+                return RomMClient.compute_content_hash(packed) if packed else None
+        return None
+
     def _eden_inventory_entries(self):
         """Inventory rows for Eden's Switch saves, packed one zip per game.
 
@@ -13878,6 +14224,10 @@ class AutoSyncManager:
                 'file_name': packed.name,
                 'slot': 'autosave',
                 'emulator': 'Eden',
+                # The name Argosy reads as the game's autosave; the title ID
+                # travels inside the pack ("<title id>/…"), which is where a
+                # restore reads it from when the name does not carry it.
+                '_upload_name': f'{AUTOSAVE_UPLOAD_STEM}.zip',
                 'content_hash': RomMClient.compute_content_hash(packed),
                 'updated_at': updated_at,
                 'file_size_bytes': stat.st_size,
@@ -14660,7 +15010,7 @@ class AutoSyncManager:
                             emulator=entry.get('emulator'), device_id=device_id,
                             slot=slot, autocleanup=entry.get('_autocleanup', False),
                             autocleanup_limit=entry.get('_autocleanup_limit'),
-                            session_id=session_id,
+                            session_id=session_id, upload_name=entry.get('_upload_name'),
                         )
                         if ok is True:
                             summary['uploaded'] += 1
@@ -14723,7 +15073,19 @@ class AutoSyncManager:
                         logging.info(f"[SYNC-OP] skipping download for rom {rom_id}: "
                                      f"not installed on this device")
                         continue
+                    # Port A1 syncs as the autosave now. An old "vmu-a1" row
+                    # holds an earlier copy of the same card, and restoring it
+                    # would overwrite the newer one.
+                    if slot == _LEGACY_VMU_A1_SLOT:
+                        summary['skipped_legacy'] = summary.get('skipped_legacy', 0) + 1
+                        continue
                     target = self._resolve_download_target(op, saves_dir)
+                    if target is DEFER_DOWNLOAD:
+                        summary['deferred'] = summary.get('deferred', 0) + 1
+                        logging.info(f"[SYNC-OP] deferring {op.get('file_name')!r} "
+                                     f"for rom {rom_id}: no local name for it until "
+                                     f"the game is launched")
+                        continue
                     if target is None:
                         if self._restore_standalone_save(op, device_id, session_id):
                             summary['downloaded'] += 1
@@ -14768,7 +15130,7 @@ class AutoSyncManager:
                                 device_id=device_id, slot=slot, overwrite=True,
                                 autocleanup=entry.get('_autocleanup', False),
                                 autocleanup_limit=entry.get('_autocleanup_limit'),
-                                session_id=session_id,
+                                session_id=session_id, upload_name=entry.get('_upload_name'),
                             ) is True:
                                 summary['uploaded'] += 1
                                 _bump(rom_id, 'up')
@@ -14788,6 +15150,11 @@ class AutoSyncManager:
                             except Exception:
                                 pass
                         target = self._resolve_download_target(op, saves_dir)
+                        if target is None or target is DEFER_DOWNLOAD:
+                            # Nowhere RetroArch reads to put it yet; the
+                            # conflict stands until the game is launched.
+                            summary['deferred'] = summary.get('deferred', 0) + 1
+                            continue
                         if self.romm_client.download_save_by_id(
                             op.get('save_id'), 'saves', target,
                             device_id=device_id, session_id=session_id):
@@ -14903,6 +15270,10 @@ class AutoSyncManager:
         """
         if self._is_ps2_zip_op(op):
             return self._restore_ps2_save(op, device_id, session_id)
+        if self._is_gci_op(op):
+            return self._restore_gci_save(op, device_id, session_id)
+        if self._is_folder_op(op):
+            return self._restore_folder_save(op, device_id, session_id)
         file_name = op.get('file_name') or ''
         # is_switch_title_id is the save-directory test specifically: Eden files
         # a save under the BASE title, never an update or DLC id.
@@ -14916,18 +15287,26 @@ class AutoSyncManager:
             # way; only the spelling differs.
             tag = title_ids.raw_switch_tag_in_name(file_name)
             title_id = title_ids.base_switch_title_id(tag) if tag else ''
+            # Argosy names a save after its ROM file, tag or not, and Ludo
+            # uploads as "autosave.zip". The ROM's own ID, read by RomM's scan,
+            # says the same thing the name was being asked for.
             if not title_id:
-                self.log(f"⚠️ Save-sync: {file_name!r} names no Switch title; "
-                         f"not restoring it")
-                return False
+                data = (self._game_for_rom(op.get('rom_id')) or {}).get('romm_data') or {}
+                for value in (data.get('title_id'), data.get('save_target')):
+                    title_id = title_ids.base_switch_title_id(str(value or '').strip())
+                    if title_id:
+                        break
+                title_id = title_id or ''
+            # Still nothing: the pack itself says, once downloaded -- both
+            # Ludo and Argosy nest a save under its title-ID folder.
 
         # Check before spending the transfer. unpack_save checks again and is
         # the authoritative one -- Eden can start while the download runs --
         # but without this a restore attempted with Eden open pays for the
         # whole save every sync just to be refused at the end.
         if emulator_saves.eden_is_running():
-            self.log(f"ℹ️ Save-sync: Eden is running; {title_id} will restore "
-                     f"once it is closed.")
+            self.log(f"ℹ️ Save-sync: Eden is running; {title_id or file_name} will "
+                     f"restore once it is closed.")
             return False
 
         staged = cache_dir() / 'incoming_saves' / file_name
@@ -14947,6 +15326,13 @@ class AutoSyncManager:
                      f"bare .srm, not an Eden save pack — likely a stray upload from "
                      f"a mislabelled sync. Delete it in RomM so the real save can "
                      f"become the slot's latest.")
+            staged.unlink(missing_ok=True)
+            return False
+        if not title_id:
+            title_id = emulator_saves.pack_title_id(staged) or ''
+        if not title_id:
+            self.log(f"⚠️ Save-sync: {file_name!r} names no Switch title; "
+                     f"not restoring it")
             staged.unlink(missing_ok=True)
             return False
 
@@ -15011,8 +15397,9 @@ class AutoSyncManager:
         """
         if self._is_standalone_emulator(op.get('emulator')):
             return None
-        # A PS2 save zip is folders to merge into a card, not a file to drop.
-        if self._is_ps2_zip_op(op):
+        # A PS2 save zip is folders to merge into a card, not a file to drop;
+        # a GameCube save is files for a card folder only its restore finds.
+        if self._is_ps2_zip_op(op) or self._is_gci_op(op) or self._is_folder_op(op):
             return None
         # The op's emulator is the SERVER save's label, which a buggy or
         # foreign upload can set to anything ('switch' instead of 'eden'). The
@@ -15036,9 +15423,12 @@ class AutoSyncManager:
             if mapped:
                 target_dir = target_dir / mapped
         target_dir.mkdir(parents=True, exist_ok=True)
-        local_name = self.retroarch.convert_to_retroarch_filename(
-            op.get('file_name', ''), 'saves', target_dir, op.get('slot')
-        )
+        # A game's battery save is read under this device's name for the
+        # game, not the uploader's; see _local_save_name.
+        local_name = self._local_save_name(
+            op.get('rom_id'), op.get('file_name', ''), op.get('slot'))
+        if local_name is None:
+            return DEFER_DOWNLOAD
         return target_dir / local_name
 
     def find_rom_id_for_save_file(self, file_path, include_orphans=False):
@@ -15427,6 +15817,136 @@ class AutoSyncManager:
         except Exception as e:
             logging.debug(f"could not record launch alias: {e}")
 
+    def _local_save_name(self, rom_id, server_file_name, slot, game=None):
+        """The filename a server save is written under on this device.
+
+        None when it cannot be told yet (see _local_save_stem). Only a game's
+        battery save is renamed; a named channel or a VMU port keeps what the
+        uploader -- this client, for those -- called it.
+        """
+        converted = self.retroarch.convert_to_retroarch_filename(
+            server_file_name, 'saves', '/tmp', slot)
+        if not _is_battery_save_slot(slot):
+            return converted
+        if game is None:
+            game = self._game_for_rom(rom_id)
+        # A Dreamcast game's autosave is its port A1 card, whatever the
+        # uploader named it: Argosy uploads "<its rom name>.bin" and restores
+        # "<product id>.A1.bin", which is the name flycast reads.
+        if _platform_of(game) == 'dreamcast':
+            return self._dreamcast_card_name(rom_id, game, 'A1')
+        if _is_vmu_save(converted):
+            return converted
+        stem = self._local_save_stem(rom_id, server_file_name, game)
+        return stem + Path(converted).suffix if stem is not None else None
+
+    def _upload_name(self, rom_id, path, slot):
+        """The name a save is uploaded under, or None for its own.
+
+        A game's autosave goes up as "autosave.<ext>". Argosy recognises a
+        game's autosave on the server by its name, and only three spellings
+        pass for every copy of a game: its own ROM's name, "argosy-latest" and
+        "autosave" (SaveSyncApiClient.isLatestSaveFileName). Ludo's own name
+        for the game is often not Argosy's -- a zip extracted here, a revision
+        tag -- so a save named after it was found only while it was the lone
+        save on the server. Ludo needs no name to place a download any more
+        (see _local_save_name), so the name can serve Argosy.
+
+        Kept as it is: anything outside the autosave slot (VMU ports, named
+        channels), and a ROM of several games, where the name is the only thing
+        saying which region's save it is.
+        """
+        if not _is_battery_save_slot(slot):
+            return None
+        game = self._game_for_rom(rom_id) or {}
+        members, _content = _content_stems(game.get('local_path'))
+        if len(members) > 1 and _platform_of(game) not in ('dreamcast', 'gamecube', 'ps2'):
+            return None
+        return f"{AUTOSAVE_UPLOAD_STEM}{Path(path).suffix.lower()}"
+
+    def _game_for_rom(self, rom_id):
+        try:
+            return next((g for g in (self.get_games() or [])
+                         if g.get('rom_id') == rom_id), None)
+        except Exception:
+            return None
+
+    def _dreamcast_card_name(self, rom_id, game, port):
+        """The file flycast reads this game's VMU in ``port`` from.
+
+        With per-content VMUs on (see _ensure_per_game_vmu) flycast writes
+        "<product number>.<port>.bin", the product number from the disc's
+        IP.BIN with its reserved characters made underscores. A card already
+        on disk for the game names it best. Otherwise Sigil reads the number
+        off the disc, zipped or not, which is the id Argosy names its cards by
+        too. Failing both, the content name: flycast reads "<content>.<port>
+        .bin" when no id-named card exists, and writes the id-named one after.
+        """
+        suffix = f'.{port}.bin'
+        try:
+            for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
+                path = Path(entry['path'])
+                if (path.name.upper().endswith(suffix.upper())
+                        and self.rom_id_for_save(path) == rom_id):
+                    return path.name
+        except Exception:
+            pass
+        local = Path((game or {}).get('local_path') or '')
+        candidates = [local] if local.is_file() else (
+            sorted((f for f in local.rglob('*') if f.is_file()
+                    and f.suffix.lower() in ('.chd', '.cdi', '.iso', '.bin', '.zip')),
+                   key=lambda f: f.stat().st_size, reverse=True)
+            if local.is_dir() else [])
+        for rom in candidates[:4]:
+            found = title_ids.identify(rom, platform='dreamcast')
+            if found:
+                return _flycast_card_id(found['save_id']) + suffix
+        stems = getattr(self, '_launch_stems', None) or {}
+        stem = stems.get(rom_id) or _content_stems(local)[1]
+        return stem + suffix if stem else None
+
+    def _local_save_stem(self, rom_id, server_file_name, game=None):
+        """The stem RetroArch will read this game's battery save under, here.
+
+        A server save is named after the ROM on whichever device uploaded it.
+        Argosy names a game's autosave after ITS ROM file, and the same game is
+        routinely called something else on this device: RomM serves it as
+        "Game.zip", Ludo extracts "Game (USA) (Rev 1).sfc" out of that, and
+        RetroArch saves under the booted file. Written under the uploader's
+        name, the save sits beside the game and is never loaded.
+
+        So the uploader's name is kept only when it names something RetroArch
+        boots here -- the content being launched, or another file of this ROM,
+        which is what a regional variant's save looks like. Otherwise the save
+        takes this device's content stem: the file last launched, else the ROM
+        itself when it is one file.
+
+        Returns None when neither is known: a folder ROM not launched this
+        session, holding nothing the name matches. (A game this library does
+        not have keeps the uploader's name -- there is nothing else to use.) Guessing a member there
+        could put one region's save on another, so the caller defers, and the
+        pre-launch sync -- which runs after the launch is noted -- places it.
+        """
+        base = re.sub(r'\s*\[[\d\-\s:_]+\]', '', Path(server_file_name or '').stem).strip()
+        if game is None:
+            try:
+                game = next((g for g in (self.get_games() or [])
+                             if g.get('rom_id') == rom_id), None)
+            except Exception:
+                game = None
+        if not game:
+            # Not a game of this library (or the library is not loaded): there
+            # is nothing here to name it after, so the uploader's name stands.
+            return base or None
+        stems = getattr(self, '_launch_stems', None) or {}
+        launched = stems.get(rom_id) or stems.get(game.get('rom_id'))
+        members, content = _content_stems(game.get('local_path'))
+        if launched:
+            members.add(launched)
+        if base and base.lower() in {n.lower() for n in members}:
+            return base
+        return launched or content
+
     def _rom_id_for_launch_alias(self, *names):
         """rom_id for any of these on-disk names, or None."""
         for n in names:
@@ -15456,6 +15976,11 @@ class AutoSyncManager:
             return base
 
         text = text.upper()
+
+        # 3DS. RomM's save_target is the save's path below the title root,
+        # "00040000/00033500", and its title_id the same 16 hex unsplit.
+        if re.fullmatch(r'[0-9A-F]{8}/[0-9A-F]{8}', text):
+            return text.replace('/', '')
 
         # Dreamcast. The product number in a disc's IP.BIN is a fixed-width
         # field, so RomM stores it space-padded ("T1401D  50"), while flycast
@@ -16043,12 +16568,19 @@ class AutoSyncManager:
                 # member file, so pick the latest of EACH member (not one global
                 # latest) — restoring every region's save under its own filename.
                 # Single-file ROMs collapse to a single member (unchanged).
+                # Grouped by the name each save will have HERE: another
+                # client's save for this game is named after its own ROM file,
+                # and keyed by that it was a second "member" whose download
+                # landed on the same file as ours, in whatever order.
                 saves_by_member = {}
                 for _s in user_saves:
                     if not isinstance(_s, dict):
                         continue
+                    _fn = _s.get('file_name', '')
+                    _name = self._local_save_name(rom_id, _fn, _s.get('slot'), game)
                     saves_by_member.setdefault(
-                        self._save_member_key(_s.get('file_name', '')), []).append(_s)
+                        _name.lower() if _name else self._save_member_key(_fn),
+                        []).append(_s)
                 saves_to_process = [get_latest_file(grp, "save")
                                     for grp in saves_by_member.values()]
                 # A PS2 game has ONE card, uploaded as a zip now and as a raw
@@ -16056,7 +16588,10 @@ class AutoSyncManager:
                 # two members, and the newest raw card was weighed against the
                 # card on its own -- a stale one could overwrite it even with
                 # a newer zip on the server. One latest across both.
-                if _platform_slug == 'ps2':
+                # Same for GameCube: a game's GCIs are one save, whether a
+                # client uploaded them zipped, as one raw GCI, or (Ludo before
+                # it packed them) one row per GCI.
+                if _platform_slug == 'ps2' or _platform_of(game) in ('gamecube', 'psp', '3ds'):
                     saves_to_process = [get_latest_file(
                         [x for x in user_saves if isinstance(x, dict)], "save")]
                 saves_to_process = [s for s in saves_to_process if s]
@@ -16134,6 +16669,42 @@ class AutoSyncManager:
                                 downloads_successful += 1
                         continue
 
+                    if (_platform_of(game) in ('psp', '3ds')
+                            and original_filename.lower().endswith('.zip')):
+                        device_id = self.settings.get('Device', 'device_id', '') or None
+                        op = {'rom_id': rom_id, 'file_name': original_filename,
+                              'save_id': latest_save.get('id'), 'emulator': romm_emulator}
+                        current = any(
+                            sync.get('device_id') == device_id and sync.get('is_current')
+                            for sync in (latest_save.get('device_syncs') or []))
+                        if not current and latest_save.get('content_hash'):
+                            current = self._folder_unit_hash(rom_id) == latest_save.get('content_hash')
+                        if current:
+                            skipped_count += 1
+                        else:
+                            downloads_attempted += 1
+                            if self._restore_folder_save(op, device_id, None):
+                                downloads_successful += 1
+                        continue
+
+                    if (_platform_of(game) == 'gamecube'
+                            and original_filename.lower().endswith(('.gci', '.zip'))):
+                        device_id = self.settings.get('Device', 'device_id', '') or None
+                        op = {'rom_id': rom_id, 'file_name': original_filename,
+                              'save_id': latest_save.get('id'), 'emulator': romm_emulator}
+                        current = any(
+                            sync.get('device_id') == device_id and sync.get('is_current')
+                            for sync in (latest_save.get('device_syncs') or []))
+                        if not current and latest_save.get('content_hash'):
+                            current = self._gci_unit_hash(rom_id) == latest_save.get('content_hash')
+                        if current:
+                            skipped_count += 1
+                        else:
+                            downloads_attempted += 1
+                            if self._restore_gci_save(op, device_id, None):
+                                downloads_successful += 1
+                        continue
+
                     # Compute local path to check if file exists before skipping
                     final_path = None
                     emulator_save_dir = None
@@ -16155,9 +16726,11 @@ class AutoSyncManager:
                         else:
                             emulator_save_dir = save_base_dir
                         if emulator_save_dir:
-                            retroarch_filename = self.retroarch.convert_to_retroarch_filename(
-                                original_filename, 'saves', emulator_save_dir
-                            )
+                            retroarch_filename = (
+                                self._local_save_name(rom_id, original_filename,
+                                                      latest_save.get('slot'), game)
+                                or self.retroarch.convert_to_retroarch_filename(
+                                    original_filename, 'saves', emulator_save_dir))
                             final_path = emulator_save_dir / retroarch_filename
 
                     # Only skip download if the local file actually exists AND
@@ -16616,6 +17189,88 @@ def _is_blank_save(path, _chunk=1 << 20):
             return saw_any
     except OSError:
         return False
+
+
+# Mirrors app/ludo_app/backend.py's _LAUNCHABLE_DISC_EXTS / _NON_GAME_EXTS /
+# _DISC_DESCRIPTOR_EXTS, which decide what a ROM folder boots as.
+_DISC_IMAGE_EXTS = ('.chd', '.cue', '.iso', '.pbp', '.ccd', '.gdi', '.cdi', '.nrg')
+_DISC_DESCRIPTOR_EXTS = ('.cue', '.gdi', '.ccd', '.nrg')
+_NON_GAME_EXTS = (
+    '.m3u', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp',
+    '.srm', '.sav', '.dsv', '.mcr', '.eep', '.fla', '.mpk', '.sra', '.rtc',
+    '.state', '.auto', '.txt', '.nfo', '.xml', '.dat', '.json', '.cue',
+    '.pdf', '.md', '.html', '.htm', '.part', '.backup',
+)
+
+
+def _content_stems(local_path):
+    """(names RetroArch may save this ROM under, the one it will) for a ROM.
+
+    RetroArch names a save after the file it boots. A single-file ROM is that
+    file -- a zip RetroArch opens itself included. A folder is what Ludo
+    extracted an archive into, or a multi-file ROM, and it boots as:
+
+      * a disc set (an .m3u beside two or more images): the playlist;
+      * a disc dump (.cue/.gdi/.ccd/.nrg and its tracks): the descriptor;
+      * otherwise its game files -- one, in the ordinary extracted-zip case,
+        or one per region, where nothing says which will boot.
+
+    The second value is None when that last case leaves a choice.
+    """
+    local = Path(local_path or '')
+    if not local.name:
+        return set(), None
+    try:
+        if local.is_file():
+            return {local.stem}, local.stem
+        if not local.is_dir():
+            return set(), None
+        files = [f for f in local.rglob('*') if f.is_file()]
+    except OSError:
+        return set(), None
+    ext = lambda f: f.suffix.lower()
+    playlists = [f for f in files if ext(f) == '.m3u']
+    images = [f for f in files if ext(f) in _DISC_IMAGE_EXTS]
+    if playlists and len(images) >= 2:
+        chosen = playlists
+    elif any(ext(f) in _DISC_DESCRIPTOR_EXTS for f in files):
+        chosen = [f for f in files if ext(f) in _DISC_DESCRIPTOR_EXTS]
+    else:
+        chosen = [f for f in files
+                  if ext(f) not in _NON_GAME_EXTS and not ext(f).startswith('.state')]
+    stems = {f.stem for f in chosen}
+    return stems, (next(iter(stems)) if len(stems) == 1 else None)
+
+
+# _resolve_download_target's answer for a save it cannot name yet: distinct
+# from None, which routes a save to the standalone restore path.
+DEFER_DOWNLOAD = object()
+
+
+def _platform_of(game):
+    """A library entry's platform, folded to one spelling per console."""
+    slug = str((game or {}).get('platform_slug')
+               or ((game or {}).get('romm_data') or {}).get('platform_slug') or '').lower()
+    return {'dc': 'dreamcast', 'ngc': 'gamecube', 'gc': 'gamecube',
+            'n3ds': '3ds', 'nintendo-3ds': '3ds'}.get(slug, slug)
+
+
+def _flycast_card_id(product_number):
+    """A product number as flycast spells it in a VMU filename."""
+    return ''.join('_' if c in ' /\\:*?|<>' else c for c in str(product_number).strip())
+
+
+# The stem every client reads as "this game's autosave" (Argosy's
+# AUTOSAVE_SLOT_NAME); see AutoSyncManager._upload_name.
+AUTOSAVE_UPLOAD_STEM = 'autosave'
+
+# The slot port A1 used before it became the autosave; see get_slot_info.
+_LEGACY_VMU_A1_SLOT = 'vmu-a1'
+
+
+def _is_battery_save_slot(slot):
+    """A game's primary save's slot, as get_slot_info assigns it."""
+    return slot in (None, '', 'autosave')
 
 
 def _vmu_port(path):

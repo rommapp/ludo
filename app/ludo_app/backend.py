@@ -5666,9 +5666,40 @@ class LudoBackend:
             if entry is None:
                 return {'success': False, 'message': f'Version {save_id} not found'}
 
+            # A packed save -- a PS2 card's folders, a GameCube game's GCIs, a
+            # PSP or 3DS game's save folders, an Eden pack -- is not a file to
+            # drop beside the game: the sync's own restore unpacks it into
+            # the emulator's tree, with the same backups and the same refusal
+            # while the emulator is open.
+            if save_type == 'saves' and self._auto_sync:
+                auto = self._auto_sync
+                op = {'rom_id': rom_id, 'save_id': save_id,
+                      'file_name': entry.get('file_name', ''),
+                      'emulator': entry.get('emulator')}
+                if auto.is_packed_save_op(op):
+                    device_id = (self._settings.get('Device', 'device_id', '')
+                                 if self._settings else '') or None
+                    ok = await asyncio.to_thread(
+                        auto._restore_standalone_save, op, device_id, None)
+                    if ok:
+                        _record_activity('save', 'Save restored', entry.get('file_name') or '')
+                    return {'success': bool(ok),
+                            'message': 'Restored' if ok else
+                                       'Could not restore it now -- is the emulator open? '
+                                       'See the log for details.',
+                            'tgt_name': entry.get('file_name')}
+            # A save is restored under the name RetroArch reads it by here,
+            # not the uploader's ("autosave.srm", or another device's ROM).
+            local_name = None
+            if save_type == 'saves' and self._auto_sync:
+                try:
+                    local_name = self._auto_sync._local_save_name(
+                        rom_id, entry.get('file_name', ''), entry.get('slot'))
+                except Exception as e:
+                    logging.debug(f"could not name the restored save locally: {e}")
             result = self._retroarch.restore_save_version(
                 self._romm_client, None, entry, save_type, as_copy,
-                log=lambda m: logging.info(m))
+                log=lambda m: logging.info(m), local_name=local_name)
             if result.get('success'):
                 _record_activity('save',
                                  'State restored' if save_type == 'states' else 'Save restored',
