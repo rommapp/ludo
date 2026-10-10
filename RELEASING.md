@@ -133,8 +133,6 @@ so they say what changed for them, not how. Keep them short: one line per item,
 no internals, no ticket-style detail. The shape:
 
 ```markdown
-**<One line: what this release is about>, on top of v<previous version>.**
-
 ## Highlights
 
 * **<Feature>.** <One or two sentences: what it is and why you'd use it.>
