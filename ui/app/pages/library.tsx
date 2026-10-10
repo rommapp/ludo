@@ -2237,7 +2237,7 @@ export function LibraryGamesPage() {
       ) : (
         <Focusable noFocusRing {...NAV_MAINTAIN_X}
           key={`${group.key}:${reloadTick}`}
-          className={slideDir === 1 ? 'lib-slide-r' : 'lib-slide-l'}
+          className={`romm-games-grid ${slideDir === 1 ? 'lib-slide-r' : 'lib-slide-l'}`}
           style={{
             display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(132px, 1fr))',
             gap: '18px 16px', padding: '16px 16px 0',

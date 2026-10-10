@@ -236,6 +236,18 @@ div.v2pf > div {
   transform: translateZ(0);
 }
 
+/* A platform's games grid mounts every tile (482 for GBA), each one a promoted
+ * layer from the rule above, and the compositor re-layerized all of them on
+ * every scroll frame: ~3ms of a 4ms 240Hz frame. content-visibility skips
+ * tiles that are off-screen. Keep the promotion: dropping it measured slower.
+ * The clip margin leaves room for the focused cover's scale and glow, which
+ * paint containment would otherwise cut off. */
+.romm-games-grid > .romm-gt-wrap {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 200px;
+  overflow-clip-margin: 40px;
+}
+
 /* ── Focusable ─────────────────────────────────────────────────────────── */
 
 .desk-focusable:focus-visible {
