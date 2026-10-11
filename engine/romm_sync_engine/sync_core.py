@@ -8543,7 +8543,12 @@ class RetroArchInterface:
         """argv for a standalone emulator, from its args template."""
         args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
         if executable.startswith('flatpak:'):
-            return ['flatpak', 'run', executable.split(':', 1)[1]] + args
+            # The sandbox can't see a ROM outside the paths its manifest grants
+            # (Eden then says "ROM format not supported", rommapp/ludo#34).
+            # Grant the ROM's folder for this run only, read-only, rather than
+            # writing a lasting `flatpak override` into the user's setup.
+            grant = f'--filesystem={Path(rom_path).parent}:ro'
+            return ['flatpak', 'run', grant, executable.split(':', 1)[1]] + args
         return [executable] + args
 
     def build_launch_command(self, rom_path, platform_name=None, core_name=None,
