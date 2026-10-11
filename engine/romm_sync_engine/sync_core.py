@@ -8355,11 +8355,10 @@ class RetroArchInterface:
             low = (key or '').lower()
             if not low:
                 continue
-            for keyword, cores in self._PLATFORM_KEYWORD_CORES.items():
-                if keyword in low:
-                    for c in cores:
-                        if c not in wanted:
-                            wanted.append(c)
+            for cores in self._keyword_core_lists(low):
+                for c in cores:
+                    if c not in wanted:
+                        wanted.append(c)
         return wanted
 
     def installed_cores_for_platform(self, platform_name, system_slug=None,
@@ -8448,12 +8447,11 @@ class RetroArchInterface:
         platform_lower = (platform_name or '').lower()
 
         # Try keyword matching
-        for keyword, cores in self._PLATFORM_KEYWORD_CORES.items():
-            if keyword in platform_lower:
-                for core in cores:
-                    if core in available_cores:
-                        print(f"✅ Found fuzzy match core: {core} (matched keyword: {keyword})")
-                        return core, available_cores[core]
+        for cores in self._keyword_core_lists(platform_lower):
+            for core in cores:
+                if core in available_cores:
+                    print(f"✅ Found fuzzy match core: {core}")
+                    return core, available_cores[core]
 
         print(f"❌ No suitable core found for platform: {platform_name}")
         print(f"Available cores: {list(available_cores.keys())}")
@@ -8463,6 +8461,18 @@ class RetroArchInterface:
     # platform_core_map exactly ("Sega Mega Drive/Genesis", "Nintendo - Game Boy
     # Advance", …). Shared by the guess, the picker's platform-core list and the
     # download offer, so all three agree on what a platform can run.
+    @classmethod
+    def _keyword_core_lists(cls, platform_lower):
+        """Core lists for the keywords found in a lowercased platform name.
+
+        A keyword contained in a longer keyword that also matched is dropped:
+        'playstation' is in "playstation 2", and without this a PS2 game with
+        no PS2 core installed fell through to the PS1 cores (rommapp/ludo#36).
+        """
+        hits = [k for k in cls._PLATFORM_KEYWORD_CORES if k in platform_lower]
+        return [cls._PLATFORM_KEYWORD_CORES[k] for k in hits
+                if not any(k != o and k in o for o in hits)]
+
     _PLATFORM_KEYWORD_CORES = {
             'n64': ['mupen64plus_next', 'parallel_n64'],
             'nintendo 64': ['mupen64plus_next', 'parallel_n64'],
@@ -8478,6 +8488,8 @@ class RetroArchInterface:
             'gb': ['gambatte', 'sameboy', 'tgbdual'],
             'playstation 2': ['pcsx2', 'play'],
             'ps2': ['pcsx2', 'play'],
+            'playstation portable': ['ppsspp'],
+            'psp': ['ppsspp'],
             # Prefer SOFTWARE-rendered PSX cores first. The hardware-renderer
             # variants (*_hw) require a conformant Vulkan/GL driver and boot to a
             # black screen / BIOS on systems without one (e.g. mesa radv flagged as
