@@ -74,6 +74,10 @@ const PAD_KEY_MAPS = {
     0x138: BUMPER_LEFT, 0x139: BUMPER_RIGHT },
 };
 
+function keyMapFor(pad) {
+  return PAD_KEY_MAPS[pad] || KEY_MAP;
+}
+
 // Some pads (and some kernels) deliver the d-pad as buttons instead of a hat.
 const DPAD_KEYS = { 0x220: "up", 0x221: "down", 0x222: "left", 0x223: "right" };
 
@@ -201,7 +205,7 @@ class PadReader {
   constructor(node, emit, python, pad) {
     this.node = node;
     this.emit = emit;
-    this.keyMap = PAD_KEY_MAPS[pad] || KEY_MAP;
+    this.keyMap = keyMapFor(pad);
     // The kernel's own axis ranges, so a stick at rest normalises to ~0 whatever
     // scale the pad uses. null when the query could not run — normalizeStick
     // falls back to its guesses then.
@@ -369,4 +373,4 @@ function startNativeInput(emit, python) {
   };
 }
 
-module.exports = { startNativeInput };
+module.exports = { startNativeInput, keyMapFor, PadReader };
