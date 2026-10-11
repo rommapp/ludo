@@ -64,6 +64,16 @@ const KEY_MAP = {
   0x13b: START,         // BTN_START  (Start/Menu)
 };
 
+// Per-pad KEY_MAP overrides, keyed by "vendor:product" (lowercase hex). The
+// 8BitDo M30 in Android mode reports its shoulder L/R as BTN_TL2/BTN_TR2 and
+// its face Z/C as BTN_TL/BTN_TR, so the generic map put bumpers on Z/C
+// (rommapp/ludo#33).
+const PAD_KEY_MAPS = {
+  "2dc8:0651": { ...KEY_MAP,
+    0x136: TRIGGER_LEFT, 0x137: TRIGGER_RIGHT,
+    0x138: BUMPER_LEFT, 0x139: BUMPER_RIGHT },
+};
+
 // Some pads (and some kernels) deliver the d-pad as buttons instead of a hat.
 const DPAD_KEYS = { 0x220: "up", 0x221: "down", 0x222: "left", 0x223: "right" };
 
@@ -188,9 +198,10 @@ function normalizeTrigger(seen, code, value) {
 
 // One open pad: its evdev fd plus the state needed to emit only CHANGES.
 class PadReader {
-  constructor(node, emit, python) {
+  constructor(node, emit, python, pad) {
     this.node = node;
     this.emit = emit;
+    this.keyMap = PAD_KEY_MAPS[pad] || KEY_MAP;
     // The kernel's own axis ranges, so a stick at rest normalises to ~0 whatever
     // scale the pad uses. null when the query could not run — normalizeStick
     // falls back to its guesses then.
@@ -247,7 +258,7 @@ class PadReader {
       if (value === 2) return;
       const dir = DPAD_KEYS[code];
       if (dir) { this.dpad[dir] = value === 1; return; }
-      const id = KEY_MAP[code];
+      const id = this.keyMap[code];
       if (id === undefined) return;
       this.setButton(id, value === 1);
       return;
@@ -329,7 +340,7 @@ function startNativeInput(emit, python) {
           button: (id, down, n) => emit.button(id, down, n, pad),
           direction: (dir, n) => emit.direction(dir, n, pad),
           gone: (n) => emit.gone(n, pad),
-        }, python));
+        }, python, pad));
         blocked.delete(node);
       } catch (err) {
         // EACCES is the udev-ACL race above; anything else (ENOENT from an
