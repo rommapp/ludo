@@ -880,6 +880,24 @@ def _save_archive_prefix(archive, title_id):
     return f'{top}/' if top.lower() == str(title_id).lower() else ''
 
 
+def pack_title_id(zip_path):
+    """The Switch title a save pack is nested under, or None.
+
+    Ludo and Argosy both put every member under "<title id>/"; the one
+    top-level folder names the save when the file name does not.
+    """
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            tops = {m.filename.split('/', 1)[0] for m in archive.infolist()
+                    if '/' in m.filename}
+    except (OSError, zipfile.BadZipFile):
+        return None
+    if len(tops) != 1:
+        return None
+    top = tops.pop()
+    return top.upper() if title_ids.is_switch_title_id(top) else None
+
+
 def pack_save(directory, destination, prefix=None):
     """Zip a save directory into a single artifact, and return its path.
 
