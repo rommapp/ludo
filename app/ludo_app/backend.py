@@ -8602,10 +8602,42 @@ class LudoBackend:
                 'installed_update': installed['update'],
                 'installed_dlc': installed['dlc'],
                 'available': available,
+                # Whether Eden applies them. One switch each, because that is
+                # all Eden has: see eden_config.set_add_on_enabled.
+                'enabled': (eden_config.add_ons_enabled(info['base_id'])
+                            if info['kind'] == 'base' else None),
+                # Mods the user put in Eden's load folder; Ludo installs none.
+                'mods': (eden_config.mods_for(info['base_id'])
+                         if info['kind'] == 'base' else []),
             }
         except Exception as e:
             logging.error(f"switch_add_ons error: {e}", exc_info=True)
             return {'kind': None}
+
+    async def set_switch_add_on_enabled(self, rom_id: int, kind: str, enabled: bool,
+                                        name: str = ''):
+        """Turn a Switch game's update, all of its DLC, or one mod on or off.
+
+        ``name`` is the mod's folder name, for kind 'mod'.
+
+        Returns {'status'} with eden_config.set_add_on_enabled's statuses, or
+        'not-switch' when the ROM names no Switch base game.
+        """
+        try:
+            sync = self._auto_sync
+            g = self._games_index().get(rom_id) or {}
+            name = (g.get('file_name')
+                    or (g.get('romm_data') or {}).get('fs_name') or '')
+            info = sync.switch_add_on_state(name) if sync and name else None
+            if not info or info.get('kind') != 'base' or not info.get('base_id'):
+                return {'status': 'not-switch'}
+            status = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: eden_config.set_add_on_enabled(
+                    info['base_id'], kind, bool(enabled), name=name or None))
+            return {'status': status}
+        except Exception as e:
+            logging.error(f"set_switch_add_on_enabled error: {e}", exc_info=True)
+            return {'status': 'failed'}
 
     async def get_switch_addon_mode(self):
         """How Switch updates and DLC are made to apply, for the settings UI.

@@ -29,7 +29,7 @@ import re
 import shutil
 from pathlib import Path
 
-from .emulator_saves import eden_is_running
+from .emulator_saves import eden_data_dirs, eden_is_running
 
 log = logging.getLogger(__name__)
 
@@ -388,4 +388,233 @@ def ensure_player_one_controller(extra_config_dir=None):
         return 'failed'
     log.info("rebound Eden player 1 from %s to %s (%s), %d line(s)",
              current, target['guid'], target['name'] or 'unnamed', changed)
+    return 'ok'
+
+
+# ---------------------------------------------------------------------------
+# Turning a game's update or DLC off
+#
+# Eden keeps one list of disabled add-on NAMES per base title, in its own
+# [DisabledAddOns] array:
+#
+#   size=2
+#   1\title_id=72057594037929986        <- the base title ID, in DECIMAL
+#   1\disabled\size=1
+#   1\disabled\1\d=DLC
+#
+# The names are Eden's, and there are fewer of them than there are files. Read
+# against Eden's patch_manager.cpp and aoc/addon_content_manager.cpp:
+#
+#   * DLC is one switch. "DLC" turns every DLC for the game off at once; there
+#     is no name for a single DLC, so a per-DLC toggle written here would be
+#     one Eden never reads.
+#   * An update has a name per place it can come from: "Update" (the
+#     external-content folder, and a NAND update when no folder has one),
+#     "Update (NAND)", "Update (SDMC)", and "Update@<version>" for one version
+#     in a folder. Eden falls back from a disabled folder update to a NAND one,
+#     so "off" has to name all of them, and "on" has to clear all of them.
+#   * A mod is one folder under <load_directory>/<TITLE ID>/, and its FOLDER
+#     NAME is its entry -- so mods, unlike DLC, switch one at a time.
+# ---------------------------------------------------------------------------
+
+_ADDONS_SECTION = '[DisabledAddOns]'
+_UPDATE_OFF = ('Update', 'Update (NAND)', 'Update (SDMC)')
+_DLC_OFF = 'DLC'
+
+
+def _addons_bounds(lines):
+    """(start, end) of the [DisabledAddOns] body, or None when absent."""
+    start = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == _ADDONS_SECTION:
+            start = index + 1
+            continue
+        if start is not None and stripped.startswith('[') and stripped.endswith(']'):
+            return start, index
+    return (start, len(lines)) if start is not None else None
+
+
+def _parse_disabled(body):
+    """{title_id (int): [names]} from the section body, in Eden's order."""
+    titles, names = {}, {}
+    for line in body:
+        key, sep, value = line.partition('=')
+        if not sep:
+            continue
+        parts = key.strip().split('\\')
+        if not parts[0].isdigit() or parts[-1] == 'default':
+            continue
+        index = int(parts[0])
+        value = value.strip().strip('"')
+        if parts[1:] == ['title_id'] and value.isdigit():
+            titles[index] = int(value)
+        elif (len(parts) == 4 and parts[1] == 'disabled' and parts[2].isdigit()
+              and parts[3] == 'd'):
+            names.setdefault(index, {})[int(parts[2])] = value
+    out = {}
+    for index in sorted(titles):
+        got = names.get(index, {})
+        out[titles[index]] = [got[k] for k in sorted(got) if got[k]]
+    return out
+
+
+def _render_disabled(table):
+    """The section body Eden itself would write for ``table``."""
+    lines = [f"size={len(table)}"]
+    for i, (title_id, disabled) in enumerate(table.items(), start=1):
+        lines += [f"{i}\\title_id\\default=false", f"{i}\\title_id={title_id}",
+                  f"{i}\\disabled\\size={len(disabled)}"]
+        for j, name in enumerate(disabled, start=1):
+            lines += [f"{i}\\disabled\\{j}\\d\\default=false",
+                      f"{i}\\disabled\\{j}\\d={name}"]
+    return lines
+
+
+def _title_key(title_id):
+    return int(str(title_id), 16)
+
+
+def disabled_add_ons(title_id, extra_config_dir=None):
+    """The add-on names Eden has disabled for a base title (hex string)."""
+    path = config_path(extra_config_dir)
+    if path is None:
+        return []
+    try:
+        lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+    except OSError as e:
+        log.debug("could not read %s: %s", path, e)
+        return []
+    bounds = _addons_bounds(lines)
+    if bounds is None:
+        return []
+    return _parse_disabled(lines[bounds[0]:bounds[1]]).get(_title_key(title_id), [])
+
+
+def add_ons_enabled(title_id, extra_config_dir=None):
+    """{'update': bool, 'dlc': bool} -- whether Eden will apply each."""
+    disabled = disabled_add_ons(title_id, extra_config_dir)
+    return {
+        'update': not any(n in _UPDATE_OFF or n.startswith('Update@') for n in disabled),
+        'dlc': _DLC_OFF not in disabled,
+    }
+
+
+def _setting(section, key, extra_config_dir=None):
+    """One value from Eden's config, unquoted, or ''."""
+    path = config_path(extra_config_dir)
+    if path is None:
+        return ''
+    try:
+        lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+    except OSError:
+        return ''
+    inside = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            inside = stripped == section
+            continue
+        if inside:
+            k, sep, value = line.partition('=')
+            if sep and k.strip() == key:
+                return value.strip().strip('"')
+    return ''
+
+
+def mod_load_root(extra_config_dir=None):
+    """Eden's mod folder: its configured load_directory, else <data>/load."""
+    configured = _setting('[Data%20Storage]', 'load_directory', extra_config_dir)
+    if configured:
+        return Path(configured).expanduser()
+    dirs = eden_data_dirs()
+    return dirs[0] / 'load' if dirs else None
+
+
+def mods_for(title_id, extra_config_dir=None):
+    """[{'name', 'enabled'}] for each mod folder Eden has for a base title."""
+    root = mod_load_root(extra_config_dir)
+    if root is None:
+        return []
+    folder = root / str(title_id).upper()
+    try:
+        names = sorted(d.name for d in folder.iterdir()
+                       if d.is_dir() and not d.name.startswith('.'))
+    except OSError:
+        return []
+    disabled = set(disabled_add_ons(title_id, extra_config_dir))
+    return [{'name': n, 'enabled': n not in disabled} for n in names]
+
+
+def set_add_on_enabled(title_id, kind, enabled, extra_config_dir=None, name=None):
+    """Turn a base title's update, DLC or one mod on or off in Eden.
+
+    ``kind`` is 'update', 'dlc' or 'mod'; a mod also needs its folder ``name``. Returns the same statuses as
+    register_external_content_dir: 'ok', 'no-config', 'running', 'failed' --
+    and 'running' for the same reason: Eden rewrites the whole file on exit.
+    Names Eden or the user set for anything else (mods, cheats) are kept.
+    """
+    if kind not in ('update', 'dlc', 'mod'):
+        raise ValueError(f"unknown add-on kind: {kind!r}")
+    if kind == 'mod' and not name:
+        raise ValueError("a mod needs its folder name")
+    path = config_path(extra_config_dir)
+    if path is None:
+        return 'no-config'
+    if eden_is_running():
+        return 'running'
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except OSError as e:
+        log.warning("could not read Eden config %s: %s", path, e)
+        return 'failed'
+    lines = text.splitlines()
+    bounds = _addons_bounds(lines)
+    if bounds is None:
+        # Eden writes this section first; a file without one has simply never
+        # had an add-on disabled.
+        lines[0:0] = [_ADDONS_SECTION, '']
+        bounds = (1, 1)
+    start, end = bounds
+    table = _parse_disabled(lines[start:end])
+
+    key = _title_key(title_id)
+    current = table.get(key, [])
+    if kind == 'update':
+        kept = [n for n in current if n not in _UPDATE_OFF and not n.startswith('Update@')]
+        new = kept if enabled else kept + list(_UPDATE_OFF)
+    else:
+        entry = _DLC_OFF if kind == 'dlc' else name
+        kept = [n for n in current if n != entry]
+        new = kept if enabled else kept + [entry]
+    if sorted(new) == sorted(current):
+        return 'ok'
+    # Eden sorts each list when its own dialog saves it; matching that keeps a
+    # later save from Eden a no-op diff.
+    table[key] = sorted(new)
+
+    # Keep whatever blank lines separated the section from the next one.
+    trailing = 0
+    while end - trailing > start and not lines[end - trailing - 1].strip():
+        trailing += 1
+    if end < len(lines):
+        trailing = max(trailing, 1)
+    lines[start:end] = _render_disabled(table) + [''] * trailing
+
+    backup = path.with_suffix('.ini.ludo-bak')
+    try:
+        shutil.copy2(path, backup)
+    except OSError as e:
+        log.debug("could not back up %s: %s", path, e)
+    out = '\n'.join(lines)
+    if text.endswith('\n') or not text:
+        out += '\n'
+    try:
+        staging = path.with_name(path.name + '.part')
+        staging.write_text(out, encoding='utf-8')
+        staging.replace(path)
+    except OSError as e:
+        log.warning("could not write Eden config %s: %s", path, e)
+        return 'failed'
+    log.info("Eden %s for %s turned %s", name or kind, title_id, 'on' if enabled else 'off')
     return 'ok'

@@ -111,6 +111,7 @@ export const getRomDocument = callable<[number, number], any>("get_rom_document"
 export const getRaEarned = callable<[number], any>("get_ra_earned");
 export const downloadGame = callable<[number], any>("download_game");
 export const getSwitchAddOns = callable<[number], any>("switch_add_ons");
+export const setSwitchAddOnEnabled = callable<[number, string, boolean, string?], any>("set_switch_add_on_enabled");
 export const getSwitchAddonMode = callable<[], any>("get_switch_addon_mode");
 export const setSwitchAddonMode = callable<[string], any>("set_switch_addon_mode");
 export const toggleCollectionSync = callable<[string, boolean], any>("toggle_collection_sync");

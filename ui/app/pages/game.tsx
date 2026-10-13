@@ -1,12 +1,12 @@
 import { Focusable, GamepadButton, ModalRoot, showModal, Navigation } from "@ludo/host";
 import { toaster } from "../toast";
 import { V2, fmtBytes, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
-import { FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
+import { FaWrench, FaChevronDown, FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
-import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns} from "../rpc";
+import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns, setSwitchAddOnEnabled} from "../rpc";
 import { _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
-import { Bumper, GameActionButton, PlatformIcon, V2Button, V2SettingsRow, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage} from "../kit";
+import { Bumper, GameActionButton, PlatformIcon, V2Button, V2CardRow, V2SettingsRow, V2Switch, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage} from "../kit";
 import { _dlSucceeded, _setDlActive, awaitDownload, useDownloadProgress, useIsDownloading, downloadOne} from "../downloads";
 import { maybePromptSwitchFirmware } from "../firmware";
 import { libBack, libNavigate } from "../nav";
@@ -426,9 +426,44 @@ function FileRow({ f }: { f: any }) {
   );
 }
 
+// A row that opens and closes the rows under it. The chevron turns like the
+// "Show all" button in Settings; the header is an ordinary settings row so the
+// controller reaches it like any other.
+// Rows that answer one question share ONE card, separated by hairlines, the
+// way Settings groups its toggles. Each row is V2CardRow props plus a key.
+function CardGroup({ rows }: { rows: any[] }) {
+  if (!rows.length) return null;
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column',
+      borderRadius: V2.radiusCard, background: V2.surface,
+      border: `1px solid ${V2.border}`, overflow: 'hidden',
+    }}>
+      {rows.map(({ key, ...r }, i) => (
+        <V2CardRow key={key} {...r} first={i === 0} divider={i > 0} last={i === rows.length - 1} />
+      ))}
+    </div>
+  );
+}
+
+// A card whose first row is a header that folds the rest of it away.
+function CollapsibleRows({ icon, title, rows }: { icon: any; title: string; rows: any[] }) {
+  const [open, setOpen] = useState(false);
+  if (!rows.length) return null;
+  const header = {
+    key: 'header', icon, title,
+    subtitle: open ? 'Hide' : `Show ${rows.length}`,
+    onClick: () => setOpen((o) => !o),
+    right: <FaChevronDown size={11} style={{ color: V2.fgMuted, transition: 'transform 0.18s ease',
+                                             transform: open ? 'rotate(180deg)' : 'none' }} />,
+  };
+  return <CardGroup rows={open ? [header, ...rows] : [header]} />;
+}
+
 function SwitchAddOnsSection({ romId }: { romId: number }) {
   const [state, setState] = useState<any | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
+  const [toggling, setToggling] = useState<string | null>(null);
 
   const load = async () => {
     try { setState(await getSwitchAddOns(romId)); }
@@ -469,7 +504,9 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
   const available: any[] = (state.available || [])
     .filter((a: any) => !installedNames.has(String(a.file_name || '')));
 
-  if (!update && !dlc.length && !available.length) return null;
+  const mods: any[] = state.mods || [];
+
+  if (!update && !dlc.length && !available.length && !mods.length) return null;
 
   const fetchAddOn = async (a: any) => {
     setBusy(a.rom_id);
@@ -486,34 +523,79 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
     } finally { setBusy(null); }
   };
 
+  // Eden has one switch for the update and one for ALL of a game's DLC, so
+  // that is what this offers: a per-DLC toggle would write a setting Eden
+  // never reads. Eden rewrites its config on exit, so it has to be closed.
+  const enabled = state.enabled || { update: true, dlc: true };
+  const toggle = async (kind: 'update' | 'dlc' | 'mod', mod?: any) => {
+    setToggling(mod ? `mod:${mod.name}` : kind);
+    try {
+      const on = mod ? !mod.enabled : !enabled[kind];
+      const { status } = await setSwitchAddOnEnabled(romId, kind, on, mod?.name ?? '');
+      if (status === 'running') {
+        toaster.toast({ title: 'Close Eden first', body: 'Eden saves its settings when it quits, so the change would be lost.' });
+      } else if (status === 'no-config') {
+        toaster.toast({ title: 'Open Eden once first', body: 'Eden has not created its settings yet.' });
+      } else if (status !== 'ok') {
+        toaster.toast({ title: 'Could not change Eden settings', body: String(status) });
+      }
+      await load();
+    } finally { setToggling(null); }
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
       <SectionHeading icon={<FaPuzzlePiece size={12} />}>Updates &amp; DLC</SectionHeading>
-      {update && (
-        <V2SettingsRow icon={<FaMicrochip size={14} />}
-          title={`Update ${switchVersionLabel(update.version)}`.trim()}
-          subtitle={[update.file_name, switchAddOnWhere(update)].filter(Boolean).join(' · ')}
-          right={<FaCheckCircle size={12} style={{ color: V2.success }} />} />
-      )}
-      {dlc.map((d: any) => (
-        <V2SettingsRow key={d.title_id} icon={<FaPuzzlePiece size={14} />}
-          title={d.file_name || d.title_id}
-          subtitle={[d.title_id, switchAddOnWhere(d)].filter(Boolean).join(' · ')}
-          right={<FaCheckCircle size={12} style={{ color: V2.success }} />} />
-      ))}
-      {available.map((a: any) => (
-        <V2SettingsRow key={a.rom_id} icon={<FaPuzzlePiece size={14} />}
-          // The filename first, not the name: RomM reports an add-on's name as
-          // the base game's, so a list keyed on it is several identical rows.
-          // The filename is what carries the title ID and the DLC's label.
-          title={a.file_name || a.name}
-          subtitle={busy === a.rom_id ? 'Downloading…'
-            : a.is_downloaded ? 'Downloaded · not active in Eden'
-            : 'On the server'}
-          disabled={busy !== null}
-          onClick={() => fetchAddOn(a)}
-          right={<FaDownload size={12} style={{ color: V2.fgMuted }} />} />
-      ))}
+      <CardGroup rows={[
+        ...(update ? [{
+          key: 'update', icon: <FaMicrochip size={14} />, title: 'Use update',
+          subtitle: enabled.update ? 'Eden applies the installed update' : 'The game starts at its original version',
+          onClick: toggling === null ? () => toggle('update') : undefined,
+          right: <V2Switch checked={!!enabled.update} />,
+        }] : []),
+        ...(dlc.length ? [{
+          key: 'dlc', icon: <FaPuzzlePiece size={14} />, title: 'Use DLC',
+          subtitle: enabled.dlc
+            ? `${dlc.length} DLC active in Eden`
+            : `${dlc.length} DLC installed, turned off in Eden`,
+          onClick: toggling === null ? () => toggle('dlc') : undefined,
+          right: <V2Switch checked={!!enabled.dlc} />,
+        }] : []),
+        // One switch per mod: Eden reads each mod folder's name, so unlike
+        // DLC these really do turn on and off one at a time.
+        ...mods.map((m: any) => ({
+          key: `mod:${m.name}`, icon: <FaWrench size={14} />, title: m.name,
+          subtitle: m.enabled ? 'Mod · active in Eden' : 'Mod · turned off in Eden',
+          onClick: toggling === null ? () => toggle('mod', m) : undefined,
+          right: <V2Switch checked={!!m.enabled} />,
+        })),
+      ]} />
+      <CollapsibleRows icon={<FaCheckCircle size={14} />} title="Installed" rows={[
+        ...(update ? [{
+          key: 'update', icon: <FaMicrochip size={14} />,
+          title: `Update ${switchVersionLabel(update.version)}`.trim(),
+          subtitle: [update.file_name, switchAddOnWhere(update)].filter(Boolean).join(' · '),
+          right: <FaCheckCircle size={12} style={{ color: V2.success }} />,
+        }] : []),
+        ...dlc.map((d: any) => ({
+          key: d.title_id, icon: <FaPuzzlePiece size={14} />,
+          title: d.file_name || d.title_id,
+          subtitle: [d.title_id, switchAddOnWhere(d)].filter(Boolean).join(' · '),
+          right: <FaCheckCircle size={12} style={{ color: V2.success }} />,
+        })),
+      ]} />
+      <CollapsibleRows icon={<FaDownload size={14} />} title="On the server" rows={available.map((a: any) => ({
+        key: a.rom_id, icon: <FaPuzzlePiece size={14} />,
+        // The filename first, not the name: RomM reports an add-on's name as
+        // the base game's, so a list keyed on it is several identical rows.
+        // The filename is what carries the title ID and the DLC's label.
+        title: a.file_name || a.name,
+        subtitle: busy === a.rom_id ? 'Downloading…'
+          : a.is_downloaded ? 'Downloaded · not active in Eden'
+          : 'On the server',
+        onClick: busy === null ? () => fetchAddOn(a) : undefined,
+        right: <FaDownload size={12} style={{ color: V2.fgMuted }} />,
+      }))} />
     </div>
   );
 }
