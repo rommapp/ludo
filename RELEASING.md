@@ -158,15 +158,14 @@ no internals, nothing beyond the issue number. The shape:
   "redesigned" already covers it, stop there.
 - Don't mention controller or keyboard-and-mouse support. Every feature has
   it; saying so for one implies the others lack it.
+- Leave out cosmetic touches (a list that now folds away, a moved button).
+  If it doesn't change what a user can do or fix something they hit, it
+  isn't worth a line.
 - Drop any section with nothing in it.
 - End a line with its issue number, e.g. "(#36)", when it fixes or answers a
   GitHub issue. GitHub links it, and the reporter can see their fix shipped.
-- When a release follows another closely, users may skip the one in between.
-  From beta.7 on the update panel lists every skipped release itself, but an
-  older install shows only the newest release's notes. Cover that with a last
-  section, `## Also new since v<older version>`, repeating the skipped
-  releases' highlights. The new panel skips everything from that heading on,
-  so the heading must start with "Also new since".
+- Never repeat an earlier release's notes. Each release lists only its own
+  changes; the update panel shows every release a user skipped.
 - For a platform on the desktop only (or the Deck only), start the line with
   "Desktop:" or "Deck:".
 
