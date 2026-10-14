@@ -14,7 +14,7 @@ import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { _forceGamepadFocus, _summonVirtualKeyboard, _dismissVirtualKeyboard } from "./shell";
 import { useDownloadProgress } from "./downloads";
 import { _platIconCache, _platIconCacheSet, qGetImage, awaitCover, peekCover, qGetGameCover} from "./media";
-import { FaBoxOpen, FaGamepad, FaSearch, FaTimesCircle, FaCheck} from "react-icons/fa";
+import { FaGamepad, FaSearch, FaTimesCircle, FaCheck} from "react-icons/fa";
 // Box art for a Downloads-page row, so each entry is recognisable at a glance
 // rather than being a name in a list. Same cache/queue path as the tiles, so a
 // game whose grid cover was already painted renders on the first frame. The
@@ -298,9 +298,11 @@ export function DownloadStatusRow({ romId, name }: { romId: number; name: string
   const bytes = prog && prog.total > 0 ? `${fmtBytes(prog.downloaded)} / ${fmtBytes(prog.total)}` : '';
   const eta = prog ? formatEta(prog.eta) : '';
   // During extraction there's no transfer to report — surface the phase instead.
+  // The phase goes on this line, not beside the percent: there it would
+  // squeeze the game's name into an ellipsis.
   const sub = extracting
-    ? 'Unpacking archive…'
-    : [bytes, eta ? `${eta} left` : ''].filter(Boolean).join('  ·  ');
+    ? (prog?.message ? [prog.message, prog.detail].filter(Boolean).join(' ') : 'Unpacking archive…')
+    : [prog?.message, bytes, eta ? `${eta} left` : ''].filter(Boolean).join('  ·  ');
   const barColor = V2.brand;
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 14px 12px' }}>
@@ -311,11 +313,10 @@ export function DownloadStatusRow({ romId, name }: { romId: number; name: string
           fontSize: '13px', fontWeight: 600, color: V2.fg, minWidth: 0, display: 'inline-flex',
           alignItems: 'center', gap: '7px', overflow: 'hidden',
         }}>
-          {extracting && <FaBoxOpen size={12} style={{ color: V2.fgMuted, flexShrink: 0 }} />}
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{_gameLabel(name)}</span>
         </span>
         <span style={{ fontSize: '11.5px', fontWeight: 600, color: V2.fgMuted, flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>
-          {extracting ? `Extracting… ${pct}%` : `${prog && prog.speed > 0 ? `${formatSpeed(prog.speed)} · ` : ''}${pct}%`}
+          {extracting ? (prog?.message ? `${pct}%` : `Extracting… ${pct}%`) : `${prog && prog.speed > 0 ? `${formatSpeed(prog.speed)} · ` : ''}${pct}%`}
         </span>
       </div>
       <div style={{ height: '4px', borderRadius: '2px', background: V2.surface, marginTop: '7px', overflow: 'hidden' }}>

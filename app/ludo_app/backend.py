@@ -40,7 +40,8 @@ _paths.set_client_name("Ludo")
 # app's ~/RomMSync — but only for someone who has no ~/RomMSync already, so
 # renaming the app never strands a library that is on disk (see paths.library_dir).
 _paths.set_library_dir_name("Ludo")
-from romm_sync_engine import eden_config, emulator_saves, switch_content, title_ids  # noqa: E402
+from romm_sync_engine import (  # noqa: E402
+    eden_config, emulator_saves, switch_content, switch_nsz, title_ids)
 
 
 def _default_roms_dir() -> str:
@@ -404,6 +405,14 @@ def _resolve_download_path(download_dir, platform_slug, file_name):
         base = Path(download_dir) / folder / file_name
         if is_path_validly_downloaded(base):
             return base, True
+    # A compressed Switch download is decompressed on arrival (see
+    # Plugin._maybe_decompress_switch), so the file on disk is the .nsp/.xci.
+    converted = switch_nsz.converted_name(file_name)
+    if converted:
+        for folder in folders:
+            cand = Path(download_dir) / folder / converted
+            if is_path_validly_downloaded(cand):
+                return cand, True
     if Path(file_name).suffix.lower() in ('.zip', '.7z'):
         stem = Path(file_name).stem
         for folder in folders:
@@ -823,6 +832,10 @@ class LudoBackend:
         # site. The desktop backend passes one directly.
         if host is not None:
             self._host = host
+        # rom_id -> why its download could not be decompressed, read once by
+        # the download worker when it reports the result. Set here, not in
+        # _main, so a download can never meet it missing.
+        self._decompress_failures = {}
         logging.info(f"Ludo backend {self._host.version} on host "
                      f"{self._host.name!r} (updates from {self._host.asset_suffix})")
 
@@ -4301,6 +4314,58 @@ class LudoBackend:
             logging.warning(f"_maybe_unzip_download error (keeping archive): {e}")
             return dest
 
+    # What the Downloads row says under a decompressing game: the step is new
+    # and takes a while, so it names why it is happening.
+    _DECOMPRESS_DETAIL = 'so Eden can open it'
+
+    def _maybe_decompress_switch(self, path: Path, rom_id: int = None) -> Path:
+        """Turn a downloaded .nsz/.xcz into the .nsp/.xci Eden can open.
+
+        Eden reads neither compressed form, so a compressed download would be
+        a game that does not boot. A folder ROM has each compressed container
+        inside it converted. On failure the compressed file stays and the
+        reason is logged -- the download itself still succeeded. Returns the
+        path to use.
+        """
+        try:
+            path = Path(path)
+            targets = ([f for f in sorted(path.iterdir()) if switch_nsz.is_compressed(f)]
+                       if path.is_dir() else
+                       [path] if path.is_file() and switch_nsz.is_compressed(path) else [])
+            if not targets:
+                return path
+            if not switch_nsz.available():
+                logging.warning("cannot decompress %s: libzstd or libcrypto missing",
+                                path.name)
+                if rom_id is not None:
+                    self._decompress_failures[rom_id] = switch_nsz.describe_failure(
+                        switch_nsz.DecompressError('libzstd is not installed'))
+                return path
+
+            def _on_pct(pct):
+                if rom_id is not None:
+                    self._download_progress[rom_id] = {
+                        'percent': pct, 'downloaded': 0, 'total': 0, 'speed': 0,
+                        'eta': 0, 'state': 'extracting', 'message': 'Decompressing…',
+                        'detail': self._DECOMPRESS_DETAIL,
+                    }
+            result = path
+            for target in targets:
+                _on_pct(0)
+                try:
+                    converted = switch_nsz.decompress(target, _on_pct)
+                except Exception as e:
+                    logging.warning(f"could not decompress {target.name}: {e}")
+                    if rom_id is not None:
+                        self._decompress_failures[rom_id] = switch_nsz.describe_failure(e)
+                    continue
+                if target == path:
+                    result = converted
+            return result
+        except Exception as e:
+            logging.warning(f"_maybe_decompress_switch error: {e}")
+            return path
+
     async def get_emulator_status(self, refresh: bool = False):
         """What emulator Ludo will use, and whether anything about it is broken.
 
@@ -6844,6 +6909,27 @@ class LudoBackend:
             return None
         return discs[0]['path']  # .m3u sorts first, else first disc
 
+    async def _ready_to_boot(self, g, launch_path):
+        """Decompress a still-compressed Switch file before it is launched.
+
+        Normally done on download; this is the retry for a download whose
+        decompression failed, so Play never hands Eden a file it cannot read.
+        Returns (path, None) or (None, the reason to show).
+        """
+        if not (launch_path and switch_nsz.is_compressed(launch_path)):
+            return launch_path, None
+        loop = asyncio.get_event_loop()
+        try:
+            converted = await loop.run_in_executor(
+                None, switch_nsz.decompress, Path(launch_path))
+        except Exception as e:
+            logging.warning(f"could not decompress {launch_path} at launch: {e}")
+            return None, switch_nsz.describe_failure(e)
+        if Path(g.get('local_path') or '') == Path(launch_path):
+            g['local_path'] = str(converted)
+            self._persist_snapshot_throttled()
+        return str(converted), None
+
     def _get_last_disc(self, rom_id):
         """Remembered disc filename for a ROM, or '' if none/invalid."""
         try:
@@ -8481,7 +8567,7 @@ class LudoBackend:
             return {'base': None, 'entry_file_installed': entry_file_installed,
                     'failures': []}
         report = {'base': None, 'entry_file_installed': entry_file_installed,
-                  'failures': []}
+                  'failures': [], 'decompress_failures': []}
         try:
             g = self._games_index().get(rom_id) or {}
             add_ons = sync.switch_add_ons_for_rom(
@@ -8506,19 +8592,44 @@ class LudoBackend:
                     continue
                 target = path.parent / file_name
                 # In extcontent mode the previous run moved this file into the
-                # subfolder, so "already here" is two places, not one.
-                already = target.exists() or (
-                    path.parent / switch_content.EXTCONTENT_DIRNAME / file_name).exists()
+                # subfolder, so "already here" is two places, not one -- and a
+                # compressed one was decompressed, so two names as well.
+                names = [file_name] + [n for n in [switch_nsz.converted_name(file_name)] if n]
+                already = any(
+                    (folder / n).exists() for n in names
+                    for folder in (path.parent,
+                                   path.parent / switch_content.EXTCONTENT_DIRNAME))
+                info = title_ids.switch_content_from_name(file_name) or {}
+                noun = {'update': 'update', 'dlc': 'DLC'}.get(info.get('kind'), 'add-on')
                 if not already:
                     logging.info(f"fetching Switch add-on {file_name} for rom {rom_id}")
+
+                    def _labelled(prog, noun=noun):
+                        # The game's own bar carries the add-on's download, so
+                        # it says whose bytes these are.
+                        if progress_callback:
+                            progress_callback(prog)
+                        cur = self._download_progress.get(rom_id)
+                        if cur is not None:
+                            cur['message'] = f'Downloading {noun}…'
                     ok, msg = self._romm_client.download_rom(
                         add_on_id, add_on.get('name') or file_name, target,
-                        progress_callback)
+                        _labelled)
                     if not ok:
                         logging.warning(f"add-on download failed: {file_name}: {msg}")
                         report['failures'].append((file_name, msg or 'download failed'))
                         continue
-                result = sync.install_switch_add_on(target)
+                def _decompressing(pct, noun=noun):
+                    self._download_progress[rom_id] = {
+                        'percent': pct, 'downloaded': 0, 'total': 0, 'speed': 0,
+                        'eta': 0, 'state': 'extracting',
+                        'message': f'Decompressing {noun}…',
+                        'detail': self._DECOMPRESS_DETAIL,
+                    }
+                result = sync.install_switch_add_on(target, on_decompress=_decompressing)
+                if result.get('status') == 'compressed':
+                    report['decompress_failures'].append(
+                        (noun, result.get('error') or ''))
                 if (result.get('status') == 'base' and add_on_id
                         and base_sibling is None):
                     base_sibling = (add_on_id, add_on.get('name'), file_name, target)
@@ -8744,6 +8855,8 @@ class LudoBackend:
                     # grout-style: unpack a single-file .zip/.7z on arrival so
                     # disc cores get a real .cue/.m3u (no-op if disabled/plain ROM).
                     final = self._maybe_unzip_download(dest, rom_id) if ok else dest
+                    if ok:
+                        final = self._maybe_decompress_switch(final, rom_id)
                     # Switch add-on content is the one thing here that is not
                     # finished on arrival: Eden applies an update or DLC only
                     # from its registered cache, so the file has to be installed
@@ -8871,7 +8984,21 @@ class LudoBackend:
                                      + (f' ({fails})' if fails
                                         else ' (no base game found on RomM)'))
                         logging.error(f"rom {rom_id}: {base_note}")
+                    # Downloaded, but not all of it is playable: the game or
+                    # an add-on is still compressed. Not an error -- the bytes
+                    # are here, and Play tries the game again -- but the user
+                    # hears why rather than finding out from Eden.
+                    warning = None
+                    game_fail = self._decompress_failures.pop(rom_id, None)
+                    if ok and game_fail:
+                        warning = {'title': "Downloaded, but can't be played yet",
+                                   'body': game_fail}
+                    elif ok and sweep and sweep.get('decompress_failures'):
+                        noun, why = sweep['decompress_failures'][0]
+                        warning = {'title': f"Downloaded, but the {noun} isn't applied",
+                                   'body': why}
                     self._download_progress[rom_id] = {
+                        'warning': warning,
                         'percent': 100 if ok else 0, 'downloaded': 0, 'total': 0,
                         'speed': 0, 'eta': 0,
                         'state': ('error' if (not ok or base_missing) else 'done'),
@@ -8880,6 +9007,9 @@ class LudoBackend:
                                      else msg or ('Downloaded' if ok else 'Download failed'))),
                         'removed': gone,
                     }
+                    if warning:
+                        _record_activity('error', warning['title'], warning['body'],
+                                         rom_id=rom_id)
                     _record_activity('error' if (not ok or base_missing) else 'download',
                                      'Base game not downloaded' if base_missing
                                      else ('Downloaded' if ok else 'Download failed'),
@@ -9393,6 +9523,10 @@ class LudoBackend:
                 launch_path = self._resolve_launch_path(g['local_path'], None)
             if not launch_path:
                 return {'success': False, 'message': 'No launchable file found'}
+            launch_path, why = await self._ready_to_boot(g, launch_path)
+            if why:
+                return {'success': False, 'title': "Can't start this game yet",
+                        'message': why}
             platform_name = self._platform_name_for(g)
             # Check for a missing core BEFORE syncing. The launch would fail on
             # it anyway, and the picker sends the user back here afterwards — so
@@ -10296,6 +10430,10 @@ class LudoBackend:
             if not launch_path:
                 return {'success': False, 'steam_host': False,
                         'message': 'No launchable file found'}
+            launch_path, why = await self._ready_to_boot(g, launch_path)
+            if why:
+                return {'success': False, 'steam_host': False,
+                        'title': "Can't start this game yet", 'message': why}
             platform_name = self._platform_name_for(g)
             # Same order as launch_game: a missing core makes the sync wasted
             # work, since the picker sends the user back through here.

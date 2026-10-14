@@ -646,9 +646,8 @@ _SIGIL_CONTENT_KINDS = {1: 'base', 2: 'update', 3: 'dlc'}
 _SWITCH_VERSION_RE = re.compile(r'[\[\(]v(\d{1,10})[\]\)]', re.IGNORECASE)
 
 _SWITCH_CONTAINERS = {'.nsp', '.xci'}
-# Compressed rewrites of the two containers. Identifiable by name, but the
-# installer cannot open them -- see switch_content.py, which declines them
-# rather than half-installing one.
+# Compressed rewrites of the two containers. Identifiable by name, but
+# nothing installs them as they are: switch_nsz decompresses them first.
 _SWITCH_COMPRESSED = {'.nsz', '.xcz'}
 
 

@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
-from . import eden_config, emulator_saves, ps2_memcard, switch_content, title_ids
+from . import eden_config, emulator_saves, ps2_memcard, switch_content, switch_nsz, title_ids
 from urllib.parse import urljoin, quote
 import socket
 import configparser
@@ -14374,7 +14374,7 @@ class AutoSyncManager:
             status['eden_running'] = emulator_saves.eden_is_running()
         return status
 
-    def install_switch_add_on(self, local_path, progress=None):
+    def install_switch_add_on(self, local_path, progress=None, on_decompress=None):
         """Make a downloaded update or DLC apply in Eden. Returns its result dict.
 
         Safe to call on any freshly downloaded file: anything that is not an
@@ -14392,6 +14392,16 @@ class AutoSyncManager:
         except Exception:
             prod_keys = None
         local_path = Path(local_path)
+        # Eden opens neither .nsz nor .xcz, in NAND or in a folder, so a
+        # compressed add-on is decompressed before it goes anywhere.
+        if switch_nsz.is_compressed(local_path) and local_path.is_file():
+            try:
+                local_path = switch_nsz.decompress(local_path, on_decompress)
+            except Exception as e:
+                logging.warning(f"Could not decompress {local_path.name}: {e}")
+                self.log(f"⚠️ Could not decompress {local_path.name}: {e}")
+                return {'status': 'compressed',
+                        'error': switch_nsz.describe_failure(e)}
         mode = self.switch_addon_mode()
         try:
             if mode == switch_content.MODE_EXTCONTENT:
@@ -14438,8 +14448,8 @@ class AutoSyncManager:
             self.log(f"⚠️ Could not move {name} into the updates/DLC folder: "
                      f"{result.get('error')}")
         elif status == 'compressed':
-            self.log(f"⚠️ {name} is compressed (.nsz/.xcz) and cannot be "
-                     f"installed; a decompressed .nsp/.xci is needed")
+            self.log(f"⚠️ {name} is compressed (.nsz/.xcz) and could not be "
+                     f"decompressed; a .nsp/.xci is needed")
         elif status == 'unreadable':
             self.log(f"⚠️ Could not read {name} as a Switch container: "
                      f"{result.get('error')}")

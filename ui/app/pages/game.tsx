@@ -1654,7 +1654,7 @@ export function GameDetailPage() {
       }
       const res = await awaitDownload(game.rom_id);
       if (res.ok) {
-        toaster.toast({
+        if (!res.warning) toaster.toast({
           title: 'Downloaded', body: detail?.name || game.name,
           logo: <ToastCover romId={game.rom_id} hasCover={game.has_cover} />,
           // Started from this page, but the toast outlives it — a click has to
@@ -1955,12 +1955,11 @@ export function GameDetailPage() {
               <GameActionButton variant="emphasized" focusRef={ctaRef} disabled={!!busy || downloading} onClick={doDownload}
                 progress={downloading ? (dlPct ?? 0) : undefined}
                 label={downloading
-                  ? (extracting ? (dlPct != null ? `Extracting… ${padPct(dlPct)}%` : 'Extracting…')
-                     : dlPct != null ? `Downloading… ${padPct(smoothPct)}%` : 'Downloading…')
+                  ? (extracting ? `${dlProg?.message || 'Extracting…'}${dlPct != null ? ` ${padPct(dlPct)}%` : ''}`
+                     : `${dlProg?.message || 'Downloading…'}${dlPct != null ? ` ${padPct(smoothPct)}%` : ''}`)
                   : 'Download'}
                 icon={downloading
-                  ? (extracting ? <FaBoxOpen size={15} />
-                     : <FaSync size={15} style={{ animation: 'spin 1s linear infinite' }} />)
+                  ? <FaSync size={15} style={{ animation: 'spin 1s linear infinite' }} />
                   : <FaDownload size={15} />} />
             ) : !confirmDelete ? (
               <>

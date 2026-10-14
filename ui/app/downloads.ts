@@ -21,12 +21,21 @@ import { _broadcastLibRefresh, _broadcastDownloaded } from "./events";
 // Polls get_download_progress until the background download reaches a terminal
 // state, resolving with the outcome. The download itself is kicked off by
 // download_game (which returns immediately); this drives completion + the toast.
-export async function awaitDownload(romId: number): Promise<{ ok: boolean; message?: string; removed?: boolean }> {
+//
+// A finished download can still carry a warning: the files arrived, but the
+// game or an add-on could not be decompressed. That toast is raised here, once,
+// for every caller -- batch downloads included -- and `warning` tells the
+// callers that show their own "Downloaded" toast to leave it out.
+export async function awaitDownload(romId: number): Promise<{ ok: boolean; message?: string; removed?: boolean; warning?: boolean }> {
   for (; ;) {
     let p: any;
     try { p = await getDownloadProgress(romId); }
     catch { await new Promise((r) => setTimeout(r, 500)); continue; }
-    if (p?.state === 'done') return { ok: true };
+    if (p?.state === 'done') {
+      if (!p.warning) return { ok: true };
+      toaster.toast({ title: p.warning.title, body: p.warning.body, duration: 10000 });
+      return { ok: true, warning: true };
+    }
     // `removed` means the backend confirmed with the server that this ROM is
     // gone and dropped it from the library. A different outcome from a failed
     // download, and it needs different words: nothing went wrong, the game
@@ -220,7 +229,10 @@ export function useIsDownloading(romId: number): boolean {
 // is in flight, returning null when idle. Drives the cover download-ring and the
 // GameDetails button fill. Activates on either the local `active` flag or the
 // global registry, so progress is shared across the cover tile and details page.
-export interface DlProgress { percent: number; speed: number; eta: number; downloaded: number; total: number; state?: string; }
+// `message` names the phase when it is not the game's own download -- an
+// add-on fetched with it, or a Switch file being decompressed -- and `detail`
+// says why, for the Downloads row. Both are absent for a plain download.
+export interface DlProgress { percent: number; speed: number; eta: number; downloaded: number; total: number; state?: string; message?: string; detail?: string; }
 
 export function useDownloadProgress(romId: number, active: boolean): DlProgress | null {
   const globalActive = useIsDownloading(romId);
@@ -233,7 +245,7 @@ export function useDownloadProgress(romId: number, active: boolean): DlProgress 
       try {
         const p = await getDownloadProgress(romId);
         if (!cancelled && p && typeof p.percent === 'number') {
-          setProg({ percent: p.percent, speed: p.speed || 0, eta: p.eta || 0, downloaded: p.downloaded || 0, total: p.total || 0, state: p.state });
+          setProg({ percent: p.percent, speed: p.speed || 0, eta: p.eta || 0, downloaded: p.downloaded || 0, total: p.total || 0, state: p.state, message: p.message || undefined, detail: p.detail || undefined });
         }
       } catch { /* transient */ }
     };

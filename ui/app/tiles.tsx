@@ -11,7 +11,7 @@ import { _libGamesCache, libCacheSetDownloaded, _focusedPlatform, _setFocusedPla
 import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImageBg } from "./media";
 import { PlatformIcon, ProgressRing, UserMenuRow, MODAL_SCRIM_INSET, PickerModal, ToastCover} from "./kit";
-import { FaBookmark, FaBoxOpen, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
+import { FaBookmark, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
 import { _broadcastLibRefresh } from "./events";
 import { MdFlashOn } from "react-icons/md";
 import { _forceGamepadFocus } from "./shell";
@@ -296,7 +296,6 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
   const [activeDlRomId, setActiveDlRomId] = useState<number>(game.rom_id);
   const dlProgress = useDownloadProgress(activeDlRomId, busy === 'download');
   const dlPct = dlProgress?.percent ?? null;
-  const extracting = dlProgress?.state === 'extracting';
   const globalDownloading = useIsDownloading(activeDlRomId);
   const downloading = busy === 'download' || globalDownloading;
   const ringColor = V2.brand;
@@ -432,7 +431,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       const res = await awaitDownload(game.rom_id);
       if (res.ok) {
         setDl(true); libCacheSetDownloaded(game.rom_id, true);
-        toaster.toast({
+        if (!res.warning) toaster.toast({
           title: 'Downloaded', body: game.name,
           logo: <ToastCover romId={game.rom_id} hasCover={game.has_cover} />,
           // Clicking the toast opens the game it names. Origin is the library
@@ -499,7 +498,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
           if (isMainRom) { setDl(true); libCacheSetDownloaded(game.rom_id, true); }
           // The main rom's art even when a regional sibling was the download —
           // it's the same game, and only `game` carries a known has_cover.
-          toaster.toast({
+          if (!res.warning) toaster.toast({
             title: 'Downloaded', body: game.name,
             logo: <ToastCover romId={game.rom_id} hasCover={game.has_cover} />,
             // The main rom again, not selectedRomId: the detail page is the
@@ -852,7 +851,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             </div>
           )}
           {downloading
-            ? (extracting ? <FaBoxOpen size={15} /> : <FaDownload size={15} />)
+            ? <FaDownload size={15} />
             : busy === 'launch'
               ? <FaSync size={16} style={{ animation: 'spin 1s linear infinite' }} />
               /* Ranked below launching: if you just pressed Play, what that

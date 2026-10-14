@@ -346,7 +346,7 @@ export async function runLaunch(romId: number, gameName: string, disc: string | 
       romId, gameName, disc, label, setBusy, onDone, siblingRomId))) {
       // The picker owns the outcome now — no toast.
     } else {
-      toaster.toast({ title: 'Launch failed', body: r?.message || 'Error' });
+      toaster.toast({ title: r?.title || 'Launch failed', body: r?.message || 'Error' });
       // Self-heal a stale "downloaded" tile: if launch failed because the files
       // aren't actually there (deleted off-device in a prior session, cache not
       // yet reconciled), flip every cached surface back to not-downloaded so the
