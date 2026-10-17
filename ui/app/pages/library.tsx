@@ -1110,6 +1110,8 @@ export function OfflineBanner({ status }: { status: any }) {
   // experience; only the remedy copy differs (toggle airplane vs. join a
   // network). 'server_unreachable' is the device-online-but-server-down case.
   const noNetwork = airplane || reason === 'no_network';
+  // The server answered and refused the token or password: waiting won't help.
+  const authRejected = reason === 'auth_rejected';
   const pending = status?.pending_saves || 0;
 
   // Short title fragment + remedy sentence for the no-connectivity cases.
@@ -1155,6 +1157,11 @@ export function OfflineBanner({ status }: { status: any }) {
         ? 'This can take a minute on a large library.'
         : 'Your downloaded games are ready to play in the meantime.';
     }
+  } else if (authRejected) {
+    dot = V2.danger;
+    title = 'Sign in to RomM again';
+    detail = 'The server no longer accepts this device’s sign-in (the token may have been revoked). '
+      + 'Pair this device again in Settings to resume syncing.';
   } else if (conn === 'offline_cached') {
     dot = V2.warning;
     title = noNetwork

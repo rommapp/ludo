@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
 from . import eden_config, emulator_saves, ps2_memcard, switch_content, switch_nsz, title_ids
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, urlparse
 import socket
 import configparser
 import html
@@ -2838,6 +2838,10 @@ class ReachabilityLatch:
         self.device_online = bool(online)
 
 
+# What this client tells RomM it can do, on registration and on connect.
+DEVICE_CAPABILITIES = {'remote_install': True}
+
+
 class RomMClient:
     """Client for interacting with RomM API"""
     
@@ -2860,6 +2864,19 @@ class RomMClient:
         # walk. Empty unless a caller sets it (see set_disabled_platforms), so
         # every existing consumer keeps fetching the whole library.
         self.disabled_platform_slugs = frozenset()
+
+        # True once the server has refused our credentials (401) and a refresh
+        # could not fix it: a revoked or deleted Client API Token, a changed
+        # password. Distinct from "unreachable" so the UI can ask the user to
+        # sign in again instead of telling them the server is down.
+        self.auth_rejected = False
+        self._refreshing = False
+        self.session.hooks['response'].append(self._watch_auth)
+        # What /api/heartbeat says the server can do; see get_server_features.
+        self.server_features = {}
+        # The device a QR pairing's token is bound to (RomM creates one per
+        # approval). Set by device_auth_poll on success.
+        self.paired_device_id = None
 
         # OAuth2 token storage
         self.access_token = None
@@ -2913,6 +2930,44 @@ class RomMClient:
         elif username and password:
             self.authenticate(username, password)
 
+    # Endpoints whose 401 means "these credentials are wrong", answered while
+    # signing in or pairing, not "the session we had is gone".
+    _AUTH_PATHS = ('/api/token', '/api/login', '/api/client-tokens/exchange',
+                   '/api/auth/device')
+
+    def _watch_auth(self, response, *args, **kwargs):
+        """Session hook: notice the server revoking us mid-session.
+
+        RomM 5.4 answers an invalid or expired bearer with 401 everywhere
+        (earlier versions could 500). Without this every call after a token
+        revocation just failed on its own and the client stayed "connected",
+        so the UI reported a healthy session that synced nothing.
+
+        A password session gets one refresh attempt; the request that saw the
+        401 still fails, the next one goes out with the new token. A Client API
+        Token has nothing to refresh, so it is marked rejected straight away.
+        """
+        try:
+            if (response.status_code != 401 or not self.authenticated
+                    or self._refreshing):
+                return
+            path = urlparse(response.url).path
+            if not path.startswith('/api/') or path.startswith(self._AUTH_PATHS):
+                return
+            if self.refresh_token and not self.client_token:
+                self._refreshing = True
+                try:
+                    if self.refresh_access_token():
+                        return
+                finally:
+                    self._refreshing = False
+            self.authenticated = False
+            self.auth_rejected = True
+            logging.warning(f"RomM rejected our credentials (401 on {path}) — "
+                            f"sign in again to resume syncing")
+        except Exception as e:
+            logging.debug(f"auth watch failed: {e}")
+
     def authenticate_with_token(self, client_token):
         """Authenticate using a RomM Client API Token (Authorization: Bearer rmm_...).
 
@@ -2934,6 +2989,8 @@ class RomMClient:
                 return True
             # Bad/expired token — drop the header so we don't poison later attempts.
             self.session.headers.pop('Authorization', None)
+            if test.status_code in (401, 403):
+                self.auth_rejected = True
             print(f"❌ Client API Token rejected: HTTP {test.status_code}")
             return False
         except Exception as e:
@@ -3034,8 +3091,10 @@ class RomMClient:
                 timeout=15,
             )
             if resp.status_code == 200:
-                token = (resp.json() or {}).get('access_token')
+                body = resp.json() or {}
+                token = body.get('access_token')
                 if token:
+                    self.paired_device_id = body.get('device_id')
                     print("✅ Device authorization approved")
                     return ('approved', token)
                 return ('error', 'Approved but no token returned')
@@ -3146,6 +3205,8 @@ class RomMClient:
                             return True
                 else:
                     print(f"❌ Token endpoint failed: HTTP {token_response.status_code}")
+                    if token_response.status_code in (400, 401, 403):
+                        self.auth_rejected = True
                     try:
                         error_detail = token_response.json()
                         print(f"   Error: {error_detail}")
@@ -3273,7 +3334,10 @@ class RomMClient:
                 'client_version': client_version or '1.6',
                 'hostname': socket.gethostname(),
                 'allow_existing': True,
-                'allow_duplicate': False
+                'allow_duplicate': False,
+                # RomM 5.4 lists only devices that say they accept installs
+                # under "Install on device". Older servers ignore it.
+                'capabilities': dict(DEVICE_CAPABILITIES),
             }
 
             print(f"📱 Registering device: {payload['name']}")
@@ -3326,6 +3390,75 @@ class RomMClient:
         except Exception as e:
             print(f"Error getting device: {e}")
             return None
+
+    def get_server_features(self):
+        """Read /api/heartbeat once and keep what Ludo cares about.
+
+        Returns {'version': str|None, 'device_install': bool,
+        'install_excluded_platforms': [...]}; empty on failure. Cached on
+        self.server_features so callers can check a feature without a request.
+        """
+        try:
+            r = self.session.get(urljoin(self.base_url, '/api/heartbeat'), timeout=10)
+            if r.status_code != 200:
+                return {}
+            hb = r.json() or {}
+            install = hb.get('DEVICE_INSTALL') or {}
+            self.server_features = {
+                'version': (hb.get('SYSTEM') or {}).get('VERSION'),
+                'device_install': bool(install.get('ENABLED')),
+                'install_excluded_platforms': list(install.get('EXCLUDED_PLATFORM_SLUGS') or []),
+            }
+            return self.server_features
+        except Exception as e:
+            logging.debug(f"heartbeat read failed: {e}")
+            return {}
+
+    def claim_installs(self, device_id):
+        """Take this device's pending install requests (RomM 5.4+).
+
+        Returns (requests, reason). requests is the list of every request the
+        device holds taken, oldest first, or None when the server would not
+        hand them over; reason then says why: 'not_bound' when the token is not
+        bound to this device (the server only lets a device claim its own),
+        'disabled', or 'error'.
+        """
+        try:
+            r = self.session.post(
+                urljoin(self.base_url, f'/api/devices/{device_id}/installs/claim'),
+                timeout=15)
+            if r.status_code == 200:
+                return r.json() or [], None
+            if r.status_code in (403, 404):
+                # 404 is also what a token bound to ANOTHER device gets.
+                text = r.text.lower()
+                if 'disabled' in text:
+                    return None, 'disabled'
+                return None, 'not_bound'
+            logging.debug(f"install claim: HTTP {r.status_code} {r.text[:200]}")
+            return None, 'error'
+        except Exception as e:
+            logging.debug(f"install claim failed: {e}")
+            return None, 'error'
+
+    def report_install(self, device_id, request_id, status, reason=None):
+        """Report a claimed install request's outcome: 'done',
+        'already_installed' or 'failed'. True when the server took it."""
+        body = {'status': status}
+        if reason:
+            body['reason'] = str(reason)[:500]
+        try:
+            r = self.session.put(
+                urljoin(self.base_url, f'/api/devices/{device_id}/installs/{request_id}'),
+                json=body, timeout=15)
+            if r.status_code == 200:
+                return True
+            logging.info(f"install report {request_id} -> {status}: HTTP "
+                         f"{r.status_code} {r.text[:200]}")
+            return False
+        except Exception as e:
+            logging.debug(f"install report failed: {e}")
+            return False
 
     def update_device(self, device_id, updates):
         """Update device information"""
@@ -5993,6 +6126,15 @@ class RomMClient:
 
                 elif response.status_code == 400:
                     logging.warning(f"Upload bad request (400): {response.text[:300]}")
+                    # RomM 5.4 refuses a name it cannot store (too long once it
+                    # appends its timestamp, or unsafe). The same file will be
+                    # refused every time, so it is not worth retrying.
+                    if 'filename' in response.text.lower():
+                        return 'rejected'
+
+                elif response.status_code == 413:
+                    logging.warning(f"Upload too large (413): {response.text[:300]}")
+                    return 'rejected'
 
                 elif response.status_code == 404:
                     # The ROM this save belongs to no longer exists on the
@@ -14599,6 +14741,27 @@ class AutoSyncManager:
 
         threading.Thread(target=_run, daemon=True, name="romm-session-sync").start()
 
+    def _upload_key(self, path):
+        try:
+            st = Path(path).stat()
+            return (str(path), st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _note_upload_rejected(self, path):
+        rejected = self.__dict__.setdefault('_rejected_uploads', set())
+        key = self._upload_key(path)
+        if key:
+            rejected.add(key)
+
+    def _upload_rejected_unchanged(self, path):
+        """True if this exact file (path, mtime, size) was refused before.
+
+        Per process: a restart tries once more, which is also how a server
+        upgrade that lifts a limit gets noticed."""
+        key = self._upload_key(path)
+        return bool(key) and key in self.__dict__.get('_rejected_uploads', ())
+
     def _apply_server_delete(self, entry):
         """Set aside a local save whose server slot was deleted. True if moved.
 
@@ -14731,6 +14894,12 @@ class AutoSyncManager:
                         self.log(f"⚠️ Save-sync: no local file for upload op rom={rom_id} slot={slot!r}")
                         summary['errors'] += 1
                         continue
+                    # Refused before for a reason the file itself carries (its
+                    # name or size). Unchanged since, it will be refused again,
+                    # so don't ask — negotiate re-offers it every cycle.
+                    if self._upload_rejected_unchanged(entry['_path']):
+                        summary['rejected'] = summary.get('rejected', 0) + 1
+                        continue
                     # The whole branch, including the 409 retry: the indicator
                     # should stay lit across a conflict resolution rather than
                     # blink off between the two requests.
@@ -14768,6 +14937,20 @@ class AutoSyncManager:
                                     self.rom_removed_callback(rom_id)
                             except Exception as cb_err:
                                 logging.debug(f"rom_removed_callback failed: {cb_err}")
+                        elif ok == 'rejected':
+                            summary['rejected'] = summary.get('rejected', 0) + 1
+                            self._note_upload_rejected(entry['_path'])
+                            self.log(f"⚠️ RomM refused {Path(entry['_path']).name} "
+                                     f"(name too long or file too large) — not retrying "
+                                     f"until it changes")
+                            _record_activity(
+                                'save', 'Save not uploaded',
+                                f"RomM refused {Path(entry['_path']).name}: its name is "
+                                f"too long or the file too large. Rename the game's "
+                                f"files to sync it.")
+                            # Out of the pending queue: nothing will send it.
+                            if self._record_synced(entry['_path']):
+                                _fp_dirty = True
                         elif ok == 'conflict':
                             # The server rejected a "clean" upload with 409 — a
                             # version diverged underneath us. Resolve like any

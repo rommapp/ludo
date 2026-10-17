@@ -299,10 +299,13 @@ export const checkForNotifications = async () => {
             const noNet = r === 'no_network' || r === 'airplane_mode';
             toaster.toast({
               title: r === 'airplane_mode' ? 'Airplane mode is on'
-                : noNet ? 'No internet connection' : "Can't reach RomM server",
+                : noNet ? 'No internet connection'
+                : r === 'auth_rejected' ? 'Sign in to RomM again' : "Can't reach RomM server",
               body: noNet
                 ? 'Showing your downloaded games — saves sync when you’re back online.'
-                : 'The server isn’t responding — showing your downloaded games.',
+                : r === 'auth_rejected'
+                  ? 'RomM no longer accepts this device — pair it again in Settings.'
+                  : 'The server isn’t responding — showing your downloaded games.',
               duration: 5000,
               category: 'connection',
             });

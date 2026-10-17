@@ -63,7 +63,7 @@ except ImportError as e:
 
 try:
     from romm_sync_engine.sync_core import (
-        SettingsManager, RomMClient, RetroArchInterface,
+        SettingsManager, RomMClient, RetroArchInterface, DEVICE_CAPABILITIES,
         AutoSyncManager, CollectionSyncManager,
         BiosTrackingManager, ROM_TRIM_FIELDS, LIBRARY_PAGE_SIZE,
         SteamShortcutManager, CoverArtManager,
@@ -956,6 +956,11 @@ class LudoBackend:
         )
         self._reach_thread.start()
 
+        # Installs queued from RomM's web UI ("Install on device", RomM 5.4+).
+        self._install_thread = threading.Thread(
+            target=self._install_loop, daemon=True, name="romm-installs")
+        self._install_thread.start()
+
         logging.info("Sync started (retry + reachability threads; managers start on connect)")
 
     def _stop_sync(self):
@@ -1762,6 +1767,7 @@ class LudoBackend:
             # request, while the fetch below runs for minutes on a large library
             # — behind it, save-sync stays dead for that whole stretch.
             self._ensure_device_registered()
+            self._read_server_features()
 
             # Load game list — unless the server provably still holds exactly
             # what we hydrated from the snapshot.
@@ -2331,6 +2337,10 @@ class LudoBackend:
                     # disabled)" from "radio on but joined to no network" so
                     # the UI can tell the user what to actually toggle.
                     reason = 'airplane_mode' if self._wifi_radio_blocked() else 'no_network'
+                elif self._romm_client and getattr(self._romm_client, 'auth_rejected', False):
+                    # The server answered and refused us: a revoked token or a
+                    # changed password. Waiting will not fix it, so say so.
+                    reason = 'auth_rejected'
                 else:
                     reason = 'server_unreachable'
                 has_library = bool(self._available_games)
@@ -2346,11 +2356,15 @@ class LudoBackend:
                     conn_state = 'offline_cached'
                     msg = ("Airplane mode is on" if reason == 'airplane_mode'
                            else "No internet connection" if reason == 'no_network'
+                           else "RomM no longer accepts this device's sign-in"
+                           if reason == 'auth_rejected'
                            else "Can't reach your RomM server")
                 else:
                     conn_state = 'disconnected'
                     msg = ("Airplane mode is on" if reason == 'airplane_mode'
                            else "No internet connection" if reason == 'no_network'
+                           else "RomM no longer accepts this device's sign-in"
+                           if reason == 'auth_rejected'
                            else "Can't reach your RomM server")
                 return {
                     'status':                  'running',
@@ -5120,6 +5134,111 @@ class LudoBackend:
             logging.error(f"[DEVICE] rename error: {e}", exc_info=True)
             return False
 
+    def _read_server_features(self):
+        """Ask the server what it supports, and advertise what we do.
+
+        A device registered before 5.4 has no capabilities on the server, and
+        RomM offers "Install on device" only for devices that say they take
+        installs, so an existing registration is updated here.
+        """
+        try:
+            features = self._romm_client.get_server_features()
+            logging.info(f"[SERVER] RomM {features.get('version') or '?'}, "
+                         f"device installs {'on' if features.get('device_install') else 'off'}")
+            device_id = self._settings.get('Device', 'device_id', '')
+            if features.get('device_install') and device_id:
+                device = self._romm_client.get_device(device_id) or {}
+                caps = device.get('capabilities') or {}
+                if any(caps.get(k) != v for k, v in DEVICE_CAPABILITIES.items()):
+                    self._romm_client.update_device(
+                        device_id, {'capabilities': {**caps, **DEVICE_CAPABILITIES}})
+        except Exception as e:
+            logging.debug(f"server feature read failed: {e}")
+
+    # Seconds between install claims. RomM counts a device that claimed in
+    # the last few minutes as online, which is what lists it in the web UI.
+    _INSTALL_POLL = 60
+
+    def _install_loop(self):
+        """Claim install requests from RomM and download what they ask for.
+
+        Polled rather than pushed: the push is a socket.io namespace, and a
+        claim a minute is the same experience without one. Each request is
+        handled once per process; a request still downloading when the app
+        quits is handed back on the next claim and picked up again.
+        """
+        active = set()        # request ids being handled now
+        warned = set()        # reasons already logged, so a denial logs once
+        while not self._stop_event.wait(self._INSTALL_POLL):
+            try:
+                client = self._romm_client
+                if not (client and client.authenticated and self._online is not False
+                        and client.server_features.get('device_install')):
+                    continue
+                device_id = self._settings.get('Device', 'device_id', '')
+                if not device_id:
+                    continue
+                requests_, reason = client.claim_installs(device_id)
+                if requests_ is None:
+                    if reason not in warned:
+                        warned.add(reason)
+                        logging.info(f"[INSTALL] not claiming installs: {reason}"
+                                     + (" (this device's token is bound to another "
+                                        "device; pair again with the QR code to "
+                                        "receive installs)" if reason == 'not_bound' else ""))
+                    continue
+                for req in requests_:
+                    rid = req.get('id')
+                    if rid and rid not in active:
+                        active.add(rid)
+                        threading.Thread(
+                            target=self._handle_install, args=(req, device_id, active),
+                            daemon=True, name=f"romm-install-{rid[:8]}").start()
+            except Exception as e:
+                logging.debug(f"install loop error: {e}")
+
+    def _handle_install(self, req, device_id, active):
+        """Download one requested ROM and report how it went."""
+        rid, rom_id = req['id'], req.get('rom_id')
+        client = self._romm_client
+        try:
+            g = self._games_index().get(rom_id)
+            name = (g or {}).get('display_name') or (g or {}).get('name') or f'ROM {rom_id}'
+            if g and g.get('is_downloaded'):
+                client.report_install(device_id, rid, 'already_installed')
+                logging.info(f"[INSTALL] {name} is already on this device")
+                return
+            logging.info(f"[INSTALL] RomM asked for {name} (request {rid})")
+            _record_activity('download', 'Install requested from RomM', name, rom_id=rom_id)
+            started = asyncio.run(self.download_game(rom_id))
+            if not started.get('success'):
+                client.report_install(device_id, rid, 'failed',
+                                      started.get('message') or 'Could not start the download')
+                return
+            # download_game returns at once; the worker writes the outcome here.
+            while not self._stop_event.wait(2):
+                state = (self._download_progress.get(rom_id) or {}).get('state')
+                if state in ('done', 'error', 'cancelled'):
+                    break
+            else:
+                return  # shutting down: the request goes back on the next claim
+            prog = self._download_progress.get(rom_id) or {}
+            if prog.get('state') == 'done':
+                client.report_install(device_id, rid, 'done')
+            else:
+                client.report_install(
+                    device_id, rid, 'failed',
+                    'Cancelled on the device' if prog.get('state') == 'cancelled'
+                    else prog.get('message') or 'Download failed')
+        except Exception as e:
+            logging.error(f"[INSTALL] request {rid} failed: {e}", exc_info=True)
+            try:
+                client.report_install(device_id, rid, 'failed', str(e))
+            except Exception:
+                pass
+        finally:
+            active.discard(rid)
+
     def _ensure_device_registered(self):
         """Ensure this device is registered with RomM and device_id is stored.
 
@@ -5320,12 +5439,22 @@ class LudoBackend:
                         'message': 'The pairing request expired'}
 
             loop = asyncio.get_event_loop()
+            poller = RomMClient(state['url'])
             status, value = await loop.run_in_executor(
-                None,
-                lambda: RomMClient(state['url']).device_auth_poll(state['device_code']),
+                None, lambda: poller.device_auth_poll(state['device_code']),
             )
             if status == 'approved':
                 self._qr_pairing = None
+                # RomM creates a device for every approval and binds the token
+                # to it; only that device may claim installs pushed from the
+                # web UI. Adopt it, unless this install already syncs as a
+                # device of its own: switching would drop the server's sync
+                # history for every save.
+                settings = self._require_settings()
+                if poller.paired_device_id and not settings.get('Device', 'device_id', ''):
+                    settings.set('Device', 'device_id', poller.paired_device_id)
+                    logging.info(f"[DEVICE] adopted the paired device "
+                                 f"{poller.paired_device_id}")
                 result = await self._apply_pairing(state['url'], value)
                 return {**result, 'status': 'approved'}
             if status == 'slow_down':
