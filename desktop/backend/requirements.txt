@@ -9,3 +9,6 @@ Pillow>=10.0.0
 # QR encoding for device pairing. Pure Python — unlike Pillow it has no C
 # extension, but it still belongs here: py_modules is not on the desktop path.
 qrcode>=7.4
+# RomM's /devices socket, which nudges the install loop the moment an install
+# is queued. Pure Python; the [client] extra brings websocket-client.
+python-socketio[client]>=5.10

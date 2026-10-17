@@ -29,6 +29,7 @@ from pathlib import Path
 from urllib.parse import quote, urljoin
 
 from .host import HostProfile
+from .install_socket import InstallSocket
 from .release_token import release_token
 
 # Claim our app identity before anything reads or writes engine state. Ludo
@@ -957,6 +958,9 @@ class LudoBackend:
         self._reach_thread.start()
 
         # Installs queued from RomM's web UI ("Install on device", RomM 5.4+).
+        self._install_wake = threading.Event()
+        self._install_socket = InstallSocket(self._install_wake)
+        self._install_wake.set()   # first claim right after connect, not a minute in
         self._install_thread = threading.Thread(
             target=self._install_loop, daemon=True, name="romm-installs")
         self._install_thread.start()
@@ -966,6 +970,9 @@ class LudoBackend:
     def _stop_sync(self):
         if self._stop_event:
             self._stop_event.set()
+        if getattr(self, '_install_socket', None):
+            self._install_wake.set()
+            self._install_socket.close()
         if self._retry_thread:
             self._retry_thread.join(timeout=5)
         if self._reach_thread:
@@ -5165,25 +5172,44 @@ class LudoBackend:
     def _install_loop(self):
         """Claim install requests from RomM and download what they ask for.
 
-        Polled rather than pushed: the push is a socket.io namespace, and a
-        claim a minute is the same experience without one. Each request is
-        handled once per process; a request still downloading when the app
-        quits is handed back on the next claim and picked up again.
+        RomM's device socket wakes this the moment an install is queued (and
+        on every connect, for anything queued while we were away); the timed
+        claim covers a socket that is down. Each request is handled once per
+        process; a request still downloading when the app quits is handed back
+        on the next claim and picked up again.
         """
         active = set()        # request ids being handled now
         warned = set()        # reasons already logged, so a denial logs once
-        while not self._stop_event.wait(self._INSTALL_POLL):
+        wake = self._install_wake
+        ready = False         # until connected, look again soon rather than in a minute
+        while not self._stop_event.is_set():
+            woken = wake.wait(self._INSTALL_POLL if ready else 5)
+            if self._stop_event.is_set():
+                break
+            if woken:
+                # Bursts (connect + queued) arrive together: claim once.
+                self._stop_event.wait(0.5)
+                wake.clear()
             try:
                 client = self._romm_client
                 if not (client and client.authenticated and self._online is not False
                         and client.server_features.get('device_install')):
+                    ready = False
+                    self._install_socket.close()
                     continue
+                ready = True
                 device_id = self._settings.get('Device', 'device_id', '')
                 if not device_id:
                     continue
                 requests_, reason = client.claim_installs(device_id)
                 # The one denial the user can fix: offer to re-pair.
                 self._install_not_bound = (reason == 'not_bound')
+                # Only a token RomM will take for this device gets a socket.
+                if requests_ is None or not client.client_token:
+                    self._install_socket.close()
+                else:
+                    self._install_socket.ensure(client.base_url, client.client_token,
+                                                client.session.verify)
                 if requests_ is None:
                     if reason not in warned:
                         warned.add(reason)

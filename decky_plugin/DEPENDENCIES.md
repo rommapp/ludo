@@ -25,6 +25,7 @@ So: **there is no manual install step.** Add the package to `DEPS` in
 - **qrcode** — QR encoding for the device-auth pairing flow (pure Python, no C extensions)
 - **certifi, charset_normalizer, idna, urllib3** — Transitive dependencies of requests
 - **pypng, typing_extensions** — Transitive dependencies of qrcode
+- **python-socketio** (+ python-engineio, websocket-client, bidict, simple-websocket, wsproto, h11) — RomM's device socket, which starts queued installs instantly
 
 ## How to Add a New Dependency
 
