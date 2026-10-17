@@ -5328,7 +5328,9 @@ class RomMClient:
                         if file_size > 0:
                             # Confirm successful download to server (only if we used the proper API endpoint)
                             if save_id and device_id and not used_fallback:
-                                self.confirm_save_downloaded(save_id, save_type, device_id)
+                                self.confirm_save_downloaded(
+                                    save_id, save_type, device_id,
+                                    content_hash=self.compute_content_hash(download_path))
                             elif used_fallback:
                                 logging.debug(f"Skipping download confirmation (used fallback path)")
                             return True
@@ -5350,13 +5352,17 @@ class RomMClient:
             logging.warning(f"Error downloading {save_type} for ROM {rom_id}: {e}")
             return False
 
-    def confirm_save_downloaded(self, save_id, save_type, device_id):
+    def confirm_save_downloaded(self, save_id, save_type, device_id, content_hash=None):
         """Confirm to the server that a save/state was successfully downloaded by this device
 
         Args:
             save_id: The ID of the save/state that was downloaded
             save_type: Type of save ('saves' or 'states')
             device_id: The device ID that downloaded the save
+            content_hash: Hash of the bytes now on disk. RomM 5.4 records it as
+                this device's baseline, so a later negotiate can tell "unchanged
+                here" from "edited here" by content, not mtime alone. Older
+                servers ignore the extra field.
 
         Returns:
             True if confirmation was successful, False otherwise
@@ -5379,6 +5385,8 @@ class RomMClient:
 
             # Send device_id as query parameter or in body
             payload = {'device_id': device_id}
+            if content_hash:
+                payload['content_hash'] = content_hash
 
             logging.debug(f"Confirming download of {save_type[:-1]} {save_id} for device {device_id}")
 
@@ -5466,7 +5474,9 @@ class RomMClient:
 
             if download_path.exists() and download_path.stat().st_size > 0:
                 if device_id and used_device_id:
-                    self.confirm_save_downloaded(save_id, save_type, device_id)
+                    self.confirm_save_downloaded(
+                        save_id, save_type, device_id,
+                        content_hash=self.compute_content_hash(download_path))
                 return True
 
             logging.warning(f"Download failed or empty for {save_type} {save_id}")
@@ -5882,6 +5892,12 @@ class RomMClient:
                 params.append('autocleanup=true')
                 if autocleanup_limit:
                     params.append(f'autocleanup_limit={autocleanup_limit}')
+            # RomM 5.4 records the uploading device's baseline from this, the
+            # same digest negotiate compares; older servers ignore it.
+            if save_type == 'saves':
+                content_hash = self.compute_content_hash(file_path)
+                if content_hash:
+                    params.append(f'content_hash={content_hash}')
             endpoint = f'/api/{save_type}?' + '&'.join(params)
             upload_url = urljoin(self.base_url, endpoint)
             logging.debug(f"Upload endpoint: {upload_url}")
@@ -14583,6 +14599,41 @@ class AutoSyncManager:
 
         threading.Thread(target=_run, daemon=True, name="romm-session-sync").start()
 
+    def _apply_server_delete(self, entry):
+        """Set aside a local save whose server slot was deleted. True if moved.
+
+        Renamed beside itself to <name>.deleted-<stamp>, not unlinked: the
+        extension no longer matches a save, so neither the emulator nor the
+        next inventory sees it, but a deletion made by mistake on the server
+        can still be undone by hand.
+
+        Packed entries are skipped: their _path is a zip built in our cache
+        from an Eden save tree or a shared PS2 card, and removing the zip
+        removes nothing (the card also holds other games' saves).
+        """
+        if not entry:
+            return False
+        src = Path(entry['_path'])
+        try:
+            if src.is_relative_to(cache_dir()):
+                logging.info(f"[SYNC-OP] server deleted the save for rom "
+                             f"{entry.get('rom_id')}, but {src.name} is packed from "
+                             f"an emulator's own save data — leaving it")
+                return False
+        except Exception:
+            pass
+        if not src.exists():
+            return False
+        stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        dst = src.with_name(f"{src.name}.deleted-{stamp}")
+        try:
+            src.rename(dst)
+        except OSError as e:
+            self.log(f"⚠️ Save-sync: could not set aside {src.name}: {e}")
+            return False
+        self.log(f"🗑️ Save deleted on RomM — moved local copy to {dst.name}")
+        return True
+
     def run_negotiated_save_sync(self, conflict_resolver=None, trigger=""):
         """Run one save-sync cycle via RomM 4.9.0's /negotiate engine (SAVES ONLY).
 
@@ -14592,13 +14643,15 @@ class AutoSyncManager:
           - download -> pull the server save into the RetroArch saves dir
           - conflict -> defer to conflict_resolver(op) -> 'local'|'server'|'skip'
                         (default: 'skip' — never auto-clobber; collected for UI)
+          - delete   -> (RomM 5.4+) the slot was emptied on the server: set the
+                        local copy aside as <name>.deleted-<stamp>
           - no_op    -> nothing
         Finally marks the session complete.
 
         Returns a summary dict: {uploaded, downloaded, conflicts, no_op, errors, session_id}.
         """
-        summary = {'uploaded': 0, 'downloaded': 0, 'conflicts': [], 'no_op': 0,
-                   'errors': 0, 'session_id': None,
+        summary = {'uploaded': 0, 'downloaded': 0, 'deleted': 0, 'conflicts': [],
+                   'no_op': 0, 'errors': 0, 'session_id': None,
                    # rom_id -> {'up': n, 'down': n} — feeds per-game Recent
                    # Activity entries (also bumped by _handle_upload_conflict).
                    '_per_game': defaultdict(lambda: {'up': 0, 'down': 0})}
@@ -14774,6 +14827,17 @@ class AutoSyncManager:
                     else:
                         summary['errors'] += 1
 
+                elif action == 'delete':
+                    # RomM 5.4+: the user deleted this save on the server, and
+                    # the copy here is the version that was deleted, untouched
+                    # since. Ignored, it would linger here and (on servers
+                    # before 5.4, which answered "upload") come straight back.
+                    entry = inv_by_key.get((rom_id, slot))
+                    if self._apply_server_delete(entry):
+                        summary['deleted'] += 1
+                    else:
+                        summary['skipped_delete'] = summary.get('skipped_delete', 0) + 1
+
                 elif action == 'conflict':
                     # Resolve via an explicit resolver, else the user's
                     # overwrite-behavior preference.
@@ -14843,7 +14907,8 @@ class AutoSyncManager:
         # genuinely failed (or are in unresolved conflict) are excluded so they
         # stay flagged as pending. This makes the offline count = only what
         # changed/appeared after the last successful sync.
-        made_contact = (summary['no_op'] + summary['uploaded'] + summary['downloaded']) > 0
+        made_contact = (summary['no_op'] + summary['uploaded'] + summary['downloaded']
+                        + summary['deleted']) > 0
         if made_contact:
             if self.mark_all_synced(exclude=_errored_paths):
                 _fp_dirty = True
@@ -14851,14 +14916,16 @@ class AutoSyncManager:
         if _fp_dirty:
             self._save_upload_fingerprints()
 
-        completed = summary['uploaded'] + summary['downloaded'] + summary['no_op']
+        completed = (summary['uploaded'] + summary['downloaded'] + summary['deleted']
+                     + summary['no_op'])
         self.romm_client.complete_sync_session(
             session_id,
             operations_completed=completed,
             operations_failed=summary['errors'],
         )
         self.log(f"🔄 Save-sync: {summary['uploaded']} up, {summary['downloaded']} down, "
-                 f"{len(summary['conflicts'])} conflict(s), {summary['no_op']} in-sync, "
+                 + (f"{summary['deleted']} removed, " if summary['deleted'] else "")
+                 + f"{len(summary['conflicts'])} conflict(s), {summary['no_op']} in-sync, "
                  f"{summary['errors']} error(s)")
 
         # Tell the player, in the emulator, when something actually moved. The
