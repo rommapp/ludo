@@ -17,6 +17,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+# Node lives in the devbox distrobox, not on the host: re-run there.
+if ! command -v node >/dev/null && command -v distrobox >/dev/null; then
+  exec distrobox enter "${LUDO_DEVBOX:-devbox}" -- "$ROOT/try-dev.sh" "$@"
+fi
 SANDBOX="$ROOT/.dev-sandbox"
 CFG="$SANDBOX/.config/ludo"
 REAL_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
