@@ -5181,6 +5181,7 @@ class LudoBackend:
         active = set()        # request ids being handled now
         warned = set()        # reasons already logged, so a denial logs once
         wake = self._install_wake
+        lock = None           # held while this copy is the one handling installs
         ready = False         # until connected, look again soon rather than in a minute
         while not self._stop_event.is_set():
             woken = wake.wait(self._INSTALL_POLL if ready else 5)
@@ -5198,6 +5199,18 @@ class LudoBackend:
                     self._install_socket.close()
                     continue
                 ready = True
+                # The desktop app and the Decky plugin share one config, so on a
+                # machine with both, two copies would claim the same requests
+                # and download the same ROM into the same file. One handles
+                # installs; the other stays out until it closes.
+                if lock is None:
+                    lock = self._take_install_lock()
+                    if lock is None:
+                        if 'locked' not in warned:
+                            warned.add('locked')
+                            logging.info("[INSTALL] another Ludo is handling installs")
+                        self._install_socket.close()
+                        continue
                 device_id = self._settings.get('Device', 'device_id', '')
                 if not device_id:
                     continue
@@ -5227,6 +5240,19 @@ class LudoBackend:
                             daemon=True, name=f"romm-install-{rid[:8]}").start()
             except Exception as e:
                 logging.debug(f"install loop error: {e}")
+
+    @staticmethod
+    def _take_install_lock():
+        """An exclusive lock on installs.lock, or None if another process has it.
+        The open file is the lock: it is released when the process exits."""
+        import fcntl
+        f = open(CONFIG_DIR / 'installs.lock', 'w')
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except OSError:
+            f.close()
+            return None
 
     def _handle_install(self, req, device_id, active):
         """Download one requested ROM and report how it went."""

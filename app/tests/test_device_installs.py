@@ -94,3 +94,20 @@ def test_shutdown_mid_download_leaves_the_request_for_the_next_claim(backend, mo
     backend._stop_event.set()
     _handle(backend)
     assert client.reports == []
+
+
+def test_install_lock_is_held_by_one_process(tmp_path, monkeypatch):
+    """Desktop and Decky share a config: only one may claim installs."""
+    import subprocess, sys
+    monkeypatch.setattr(backend_mod, "CONFIG_DIR", tmp_path)
+    held = LudoBackend._take_install_lock()
+    assert held is not None
+    other = subprocess.run(
+        [sys.executable, "-c",
+         "import fcntl,sys; f=open(sys.argv[1],'w')\n"
+         "try: fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB); print('got')\n"
+         "except OSError: print('busy')", str(tmp_path / "installs.lock")],
+        capture_output=True, text=True)
+    assert other.stdout.strip() == "busy"
+    held.close()
+    assert LudoBackend._take_install_lock() is not None
