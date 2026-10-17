@@ -42,7 +42,7 @@ export const V2 = {
   radiusCard: '14px',
   radiusPill: '100px',
   elev2: '0 8px 24px rgba(0,0,0,.45)',
-  font: '"Motiva Sans","Segoe UI",system-ui,-apple-system,sans-serif',
+  font: '"Motiva Sans","Inter Variable","Segoe UI",system-ui,-apple-system,sans-serif',
 };
 
 export function fmtBytes(n: number | null | undefined): string {

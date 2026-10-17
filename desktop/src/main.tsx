@@ -8,6 +8,9 @@ import { FooterLegend } from "./host/footer";
 import { Navigation, matchRoute, useRoutePath, useRouteRegistry } from "./host/router";
 import { startSound } from "./host/sound";
 import { startProfiler } from "./host/profiler";
+// Bundled UI font: outside Steam there is no Motiva Sans, and the system
+// fallback differs per desktop (Adwaita Sans, Noto, Segoe UI…).
+import "@fontsource-variable/inter";
 import "./host/host.css";
 
 // Ludo itself: ui/app/index.tsx, shared byte-identically with the Decky build.

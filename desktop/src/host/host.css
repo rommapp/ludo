@@ -32,7 +32,7 @@ body,
 body {
   background: var(--desk-bg);
   color: var(--desk-fg);
-  font-family: "Motiva Sans", system-ui, -apple-system, sans-serif;
+  font-family: "Motiva Sans", "Inter Variable", system-ui, -apple-system, sans-serif;
   font-size: 14px;
 }
 
@@ -456,7 +456,7 @@ div.v2pf > div {
   gap: 12px;
   overflow: hidden;
   pointer-events: auto;
-  font-family: "Motiva Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-family: "Motiva Sans", "Inter Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
   animation: deskToastIn 0.24s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
@@ -563,7 +563,7 @@ div.v2pf > div {
   border-top: 1px solid rgba(255, 255, 255, 0.07);
   -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
-  font-family: "Motiva Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-family: "Motiva Sans", "Inter Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
   pointer-events: none;
   user-select: none;
 }
