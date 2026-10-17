@@ -2441,6 +2441,9 @@ class LudoBackend:
                 'status':                  'connected',
                 'connection':              'online',
                 'unreachable_reason':      None,
+                # RomM can push installs here, but this sign-in is bound to a
+                # different device; pairing again with the QR code fixes it.
+                'install_not_bound':       getattr(self, '_install_not_bound', False),
                 # True once the initial full library fetch has completed — the
                 # frontend gates the post-update "reopen Home" on this so covers
                 # don't fetch against a still-initializing backend.
@@ -5179,6 +5182,8 @@ class LudoBackend:
                 if not device_id:
                     continue
                 requests_, reason = client.claim_installs(device_id)
+                # The one denial the user can fix: offer to re-pair.
+                self._install_not_bound = (reason == 'not_bound')
                 if requests_ is None:
                     if reason not in warned:
                         warned.add(reason)
@@ -5451,8 +5456,23 @@ class LudoBackend:
                 # device of its own: switching would drop the server's sync
                 # history for every save.
                 settings = self._require_settings()
-                if poller.paired_device_id and not settings.get('Device', 'device_id', ''):
+                # ...unless the user re-paired to receive installs, which only
+                # reach the device the sign-in is bound to.
+                if poller.paired_device_id and (
+                        not settings.get('Device', 'device_id', '')
+                        or getattr(self, '_install_not_bound', False)):
+                    # Sync once more as the old device first, so every save on
+                    # disk matches the server and the new device's first
+                    # negotiate finds hashes that agree rather than conflicts.
+                    if self._auto_sync and settings.get('Device', 'device_id', ''):
+                        try:
+                            await loop.run_in_executor(
+                                None, lambda: self._auto_sync.run_negotiated_save_sync(
+                                    trigger="re-pair"))
+                        except Exception as e:
+                            logging.warning(f"[DEVICE] sync before re-pair failed: {e}")
                     settings.set('Device', 'device_id', poller.paired_device_id)
+                    self._install_not_bound = False
                     logging.info(f"[DEVICE] adopted the paired device "
                                  f"{poller.paired_device_id}")
                 result = await self._apply_pairing(state['url'], value)

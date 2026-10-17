@@ -1250,6 +1250,51 @@ export function SyncBlockedBanner({ status }: { status: any }) {
   );
 }
 
+// RomM can push "Install on device" here, but this sign-in belongs to another
+// device record (installs from before RomM 5.4 paired that way). Same chrome as
+// the banners above; the action opens the connection page, where pairing with
+// the QR code again moves Ludo onto the device RomM installs to.
+export function InstallsRepairBanner({ status }: { status: any }) {
+  const [focused, setFocused] = useState(false);
+  if (!status?.install_not_bound || status?.connection !== 'online') return null;
+  const onPair = () => libNavigate("/romm-sync-config");
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: '10px',
+      margin: '0 16px 8px', padding: '8px 12px',
+      background: V2.surface, border: `1px solid ${V2.borderStrong}`,
+      borderRadius: V2.radiusMd, fontSize: '12px',
+    }}>
+      <div style={{
+        width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0,
+        background: V2.brand, boxShadow: `0 0 6px ${V2.brand}`,
+      }} />
+      <div style={{ minWidth: 0, flex: 1 }}>
+        <div style={{ fontWeight: 600, color: V2.fg }}>
+          Install games from RomM's website
+        </div>
+        <div style={{ color: V2.fgMuted, marginTop: '1px' }}>
+          Pair once more with the QR code to receive installs sent to this
+          device. Ludo syncs your saves first, so nothing is lost.
+        </div>
+      </div>
+      <Focusable noFocusRing
+        onActivate={onPair} onClick={onPair}
+        onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}
+        onMouseEnter={() => setFocused(true)} onMouseLeave={() => setFocused(false)}
+        style={{
+          flexShrink: 0, padding: '5px 14px', borderRadius: V2.radiusPill,
+          cursor: 'pointer', fontSize: '12px', fontWeight: 700, whiteSpace: 'nowrap',
+          background: focused ? V2.brandHover : V2.brand, color: '#fff',
+          border: `1px solid ${focused ? V2.brandHover : V2.brand}`,
+          transition: 'background 0.15s, border-color 0.15s',
+        }}>
+        Pair again
+      </Focusable>
+    </div>
+  );
+}
+
 // Route component for /romm-sync-library. Hosts the tabs page permanently and
 // stacks the inner pages (game grid, game detail, settings family) on top as
 // internal views, so backing out of any of them re-shows the still-mounted
@@ -1590,6 +1635,7 @@ export function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
 
       <OfflineBanner status={svcStatus} />
       <SyncBlockedBanner status={svcStatus} />
+      <InstallsRepairBanner status={svcStatus} />
       <StaleLibraryBanner status={svcStatus} />
 
       {/* All four panels stay mounted once visited; only the active one is
