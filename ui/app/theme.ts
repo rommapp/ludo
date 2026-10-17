@@ -31,6 +31,8 @@ export const V2 = {
   success: '#4ade80',
   warning: '#fbbf24',
   danger: '#ff5050',
+  // Focus ring on a filled danger button: a plain danger ring would vanish into the fill.
+  dangerRing: '#ff9e9e',
   igdb: '#6366f1',
   ra: '#ef4444',
   coverPlaceholder: '#1a1a2e',

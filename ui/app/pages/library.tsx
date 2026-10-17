@@ -2,15 +2,15 @@ import { LibGame, LibGroup } from "../types";
 import { viewerOpen } from "../glass";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { deleteCollectionRoms, getConfig, getDownloadProgress, getHomeData, getLibraryGames, getLibraryGroups, getResumeStateEnabled, getServiceStatus, repairEmulatorPaths, searchGames, toggleCollectionSync, checkLibraryStale, refreshFromRomm} from "../rpc";
-import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _setResumeStatesPref, _stateThumbListeners, _stateThumbs, _tileElsByRomId, loadStateThumbs} from "../tiles";
-import { _autoFocusFirstRef, _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
+import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _setResumeStatesPref, _stateThumbListeners, _stateThumbs, loadStateThumbs, tileElFor} from "../tiles";
+import { _autoFocusFirstRef, _forceGamepadFocus, _gpFocusEl, playSteamSound, returnFocusRomId, setReturnFocusTarget, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, V2SearchField, useEtaFromPct, Shimmer} from "../kit";
 import { V2, formatEta, formatSpeed } from "../theme";
 import { Focusable, GamepadButton, Navigation, host, showModal } from "@ludo/host";
 import { toaster } from "../toast";
 import { FaBookmark, FaCheck, FaChevronRight, FaDownload, FaEllipsisH, FaExclamationTriangle, FaGamepad, FaLayerGroup, FaPlay, FaRegClock, FaSync } from "react-icons/fa";
 import { LibView, NavId, libBack, libNavigate, navExitPlugin, pushLibView, setLibViewHooks } from "../nav";
-import { _groupsCache, _libGamesCache, getHomeCache, getLibGroupHolder, getLibGroupsHolder, getLibLastTab, libCacheSet, libCacheSetDownloaded, persistGroupsCache, persistHomeCache, setHomeCache, setLibGameHolder, setLibGameOrigin, setLibGroupHolder, setLibGroupsHolder, setLibLastTab, _focusedPlatformSubs, _focusedPlatform, libCacheDelete} from "../libcache";
+import { _groupsCache, _libGamesCache, getHomeCache, getLibGameHolder, getLibGroupHolder, getLibGroupsHolder, getLibLastTab, libCacheSet, libCacheSetDownloaded, persistGroupsCache, persistHomeCache, setHomeCache, setLibGameHolder, setLibGameOrigin, setLibGroupHolder, setLibGroupsHolder, setLibLastTab, _focusedPlatformSubs, _focusedPlatform, libCacheDelete} from "../libcache";
 import { useOffline, useServiceStatus, StaleInfo, _STALE_CHECK_MS, _STALE_RANK, _setStale, _staleInfo, _staleSubs, _clearStale, lastStaleCheck, markStaleChecked} from "../status";
 import { _broadcastLibRefresh, _libRefreshListeners } from "../events";
 import { ScrubOverlay, letterJump, setLetterJump, setScrubGlimpse, _scrubLetterOf, _scrubTargetIdx, NAV_MAINTAIN_X} from "../scrub";
@@ -1250,10 +1250,26 @@ export function SyncBlockedBanner({ status }: { status: any }) {
 export function LibraryRootPage() {
   const [stack, setStack] = useState<LibView[]>([]);
   const viewRef = useRef<HTMLDivElement | null>(null);
+  // The game whose detail page is on top, so backing out lands on its tile.
+  const returnRomId = useRef<number | null>(null);
   useEffect(() => {
     setLibViewHooks(
-      (v) => setStack((s) => [...s, v]),
-      () => setStack((s) => s.slice(0, -1)),
+      (v) => {
+        if (v === 'game') returnRomId.current = getLibGameHolder()?.rom_id ?? null;
+        setStack((s) => [...s, v]);
+      },
+      () => setStack((s) => {
+        // Backing out of a game page: the view underneath re-runs its
+        // first-item autofocus (a grid remounts outright). Point that at the
+        // game the user opened, if its tile is on screen, for the autofocus
+        // window and the grid's tiles arriving a little after it.
+        const romId = returnRomId.current;
+        if (s[s.length - 1] === 'game' && romId != null) {
+          returnRomId.current = null;
+          setReturnFocusTarget(() => tileElFor(romId), romId, 1000);
+        }
+        return s.slice(0, -1);
+      }),
     );
     return () => setLibViewHooks(null, null);
   }, []);
@@ -1424,7 +1440,7 @@ export function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
         // being impossible to focus — forcing focus onto one lands nowhere.
         const usable = (el: any) => el && el.isConnected && el.offsetParent !== null;
         const played = lastLaunchedRomId() != null
-          ? _tileElsByRomId.get(lastLaunchedRomId()!) : null;
+          ? tileElFor(lastLaunchedRomId()) : null;
         const first = _autoFocusFirstRef?.current;
         const target = usable(played) ? played
           : usable(first) ? first : navPillRef.current;
@@ -1699,8 +1715,15 @@ export function LibraryGamesPage() {
   // rendered tile grows the count by a chunk whenever it nears the viewport, so
   // typically ~2-3 screens of tiles are mounted and the grid stays fluid.
   const GRID_FIRST = 30, GRID_CHUNK = 30;
-  const [visN, setVisN] = useState(() => Math.min(games.length || 0, GRID_FIRST));
-  useEffect(() => { setVisN(Math.min(games.length || 0, GRID_FIRST)); }, [group?.key]);
+  // Coming back from a game further down than the first chunk: mount through
+  // its tile, so focus can go straight back to it.
+  const firstVisN = (list: LibGame[]) => {
+    const back = returnFocusRomId();
+    const i = back == null ? -1 : list.findIndex((g) => g.rom_id === back);
+    return Math.min(list.length, Math.max(GRID_FIRST, i + 1 + GRID_CHUNK));
+  };
+  const [visN, setVisN] = useState(() => firstVisN(games));
+  useEffect(() => { setVisN(firstVisN(games)); }, [group?.key]);
   // Focus-driven growth — the reliable trigger under gamescope. When the
   // focused tile nears the end of the mounted set, mount another chunk. (The IO
   // sentinel below stays as a touch-scroll fallback.) Stable identity via refs

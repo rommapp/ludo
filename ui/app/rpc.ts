@@ -117,6 +117,7 @@ export const setSwitchAddonMode = callable<[string], any>("set_switch_addon_mode
 export const toggleCollectionSync = callable<[string, boolean], any>("toggle_collection_sync");
 export const deleteCollectionRoms = callable<[string, string], any>("delete_collection_roms");
 export const getDownloadProgress = callable<[number], any>("get_download_progress");
+export const cancelDownloadRpc = callable<[number], any>("cancel_download");
 export const deleteGame = callable<[number], any>("delete_game");
 export const launchGame = callable<[number, (string | null)?, (number | null)?, (boolean)?], any>("launch_game");
 // Steam Deck session-host launch: resolves argv + writes a launch-spec; the tile

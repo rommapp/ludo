@@ -17156,7 +17156,15 @@ class CollectionSyncManager:
         }
         logging.info(f"[PROGRESS] Initialized download_progress for {collection_name}: 0/{total_to_download} to download")
 
+        # Sync turned off for this collection (Stop on the Downloads page, or its
+        # switch) or the manager shut down: drop the game in flight and the rest.
+        def _stopped(_coll=collection_name):
+            return not self.running or _coll not in self.selected_collections
+
         for rom in roms_to_download:
+            if _stopped():
+                self.log(f"  ⏹ Sync of '{collection_name}' stopped")
+                break
             # Simple game processing for daemon
             platform_slug = rom.get('platform_slug', 'Unknown')
             file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
@@ -17199,8 +17207,12 @@ class CollectionSyncManager:
                 rom.get('id'),
                 rom.get('name', 'Unknown'),
                 local_path,
-                progress_callback=_chunk_progress
+                progress_callback=_chunk_progress,
+                cancellation_checker=_stopped,
             )
+            if not success and message == 'cancelled':
+                self.log(f"  ⏹ Sync of '{collection_name}' stopped")
+                break
 
             # Child-file variants (regional ROMs inside a parent folder) cannot be
             # downloaded via their own ROM ID — the API returns 404.

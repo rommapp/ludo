@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { LibGame, LibGroup } from "./types";
-import { _dlSucceeded, _setDlActive, awaitDownload, runCollectionBatch, useDownloadProgress, useIsDownloading } from "./downloads";
+import { _dlSucceeded, _setDlActive, awaitDownload, claimDownloadStart, releaseDownloadStart, runCollectionBatch, useDownloadProgress, useIsDownloading } from "./downloads";
 import { V2, roundBtn} from "./theme";
 import { useCollectionSync, useOffline, useSaveActivityFor} from "./status";
 import { deleteCollectionRoms, deleteGame, downloadGame, getLibraryGames, getLocalDiscs, getLocalSiblings, resyncPlatform, toggleCollectionSync, getStateThumbnails} from "./rpc";
@@ -421,10 +421,12 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
     }
     // Before the busy/active flags: they repaint the tile as downloading, and
     // nothing is downloading until this modal has been answered.
+    if (!claimDownloadStart(game.rom_id)) return;
     await maybePromptSwitchFirmware(game.rom_id);
     setBusy('download');
     setActiveDlRomId(game.rom_id);
     _setDlActive(game.rom_id, true, game.name);
+    releaseDownloadStart(game.rom_id);
     try {
       const start = await downloadGame(game.rom_id);
       if (!start?.success) { toaster.toast({ title: 'Download failed', body: start?.message || 'Error' }); return; }
@@ -447,7 +449,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
         toaster.toast({ title: 'No longer on RomM', body: `${game.name} has been removed from your server.` });
         libCacheDrop(game.rom_id);
       }
-      else toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
+      else if (!res.cancelled) toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
     } catch (e) { toaster.toast({ title: 'Download failed', body: String(e) }); }
     finally { _setDlActive(game.rom_id, false); setBusy(null); }
   };
@@ -485,10 +487,12 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
         return;
       }
       // Before the busy/active flags — see doDownload above.
+      if (!claimDownloadStart(selectedRomId)) return;
       await maybePromptSwitchFirmware(selectedRomId);
       setBusy('download');
       setActiveDlRomId(selectedRomId);
       _setDlActive(selectedRomId, true, game.name);
+      releaseDownloadStart(selectedRomId);
       try {
         const start = await downloadGame(selectedRomId);
         if (!start?.success) { toaster.toast({ title: 'Download failed', body: start?.message || 'Error' }); return; }
@@ -506,7 +510,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             onClick: () => openGameById(game.rom_id, game.name, "/romm-sync-library"),
           });
         } else {
-          toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
+          if (!res.cancelled) toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
           return;
         }
       } catch (e) { toaster.toast({ title: 'Download failed', body: String(e) }); return; }
@@ -567,14 +571,19 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
     // Register by rom_id so the post-session focus restore can aim at the tile
     // the user actually launched instead of the first one in the grid. Cleared
     // on unmount (el === null) so detached nodes are not held or focused.
-    // Unregister only if the entry is still OUR node: the same game is on Home
-    // twice (Continue playing + Recently Downloaded) and again in the library,
-    // and React runs the new tile's ref BEFORE the old one's null cleanup — a
-    // blind delete here dropped the entry that had just been registered, so
-    // after a session the map was empty and focus fell back to the first tile.
+    // Every copy is kept: the same game is on Home twice (Continue playing +
+    // Recently Downloaded) and again in the library, and the one to focus is
+    // whichever is on screen — see tileElFor.
     try {
-      if (el) _tileElsByRomId.set(game.rom_id, el);
-      else if (prev && _tileElsByRomId.get(game.rom_id) === prev) _tileElsByRomId.delete(game.rom_id);
+      if (el) {
+        let set = _tileElsByRomId.get(game.rom_id);
+        if (!set) _tileElsByRomId.set(game.rom_id, set = new Set());
+        set.add(el);
+      } else if (prev) {
+        const set = _tileElsByRomId.get(game.rom_id);
+        set?.delete(prev);
+        if (set && !set.size) _tileElsByRomId.delete(game.rom_id);
+      }
     } catch { /* ignore */ }
     if (typeof focusRef === 'function') focusRef(el);
     else if (focusRef) (focusRef as any).current = el;
@@ -1393,7 +1402,18 @@ export function CardRow({ icon, title, count, children }:
 // Aiming at the tile they launched keeps the selection where they left it.
 // A plain Map (not WeakMap): the value IS the key's only strong ref here, and
 // entries are removed on unmount.
-export const _tileElsByRomId = new Map<number, any>();
+export const _tileElsByRomId = new Map<number, Set<any>>();
+
+// The game's tile that can take focus now. Hidden panels stay mounted
+// (display:none), so a tile can be connected and still impossible to focus;
+// keeping one entry per game used to hand back whichever copy registered
+// last — often Home's hidden one — and focus fell back to the first tile.
+export function tileElFor(romId: number | null | undefined): any {
+  if (romId == null) return null;
+  for (const el of _tileElsByRomId.get(romId) || [])
+    if (el.isConnected && el.offsetParent !== null) return el;
+  return null;
+}
 
 // Last known value of the resume-from-state preference. Persisted, because the
 // Home row has to decide how to draw itself on the FIRST frame: read from the

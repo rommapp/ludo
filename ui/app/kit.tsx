@@ -14,7 +14,7 @@ import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { _forceGamepadFocus, _summonVirtualKeyboard, _dismissVirtualKeyboard } from "./shell";
 import { useDownloadProgress } from "./downloads";
 import { _platIconCache, _platIconCacheSet, qGetImage, awaitCover, peekCover, qGetGameCover} from "./media";
-import { FaGamepad, FaSearch, FaTimesCircle, FaCheck} from "react-icons/fa";
+import { FaGamepad, FaSearch, FaTimesCircle, FaCheck, FaTimes} from "react-icons/fa";
 // Box art for a Downloads-page row, so each entry is recognisable at a glance
 // rather than being a name in a list. Same cache/queue path as the tiles, so a
 // game whose grid cover was already painted renders on the first frame. The
@@ -291,7 +291,50 @@ export function UserMenuRow({ icon, label, danger, armed, disabled, onSelect }:
 
 // One entry on the Downloads page: game name over a live progress track, with
 // speed/percent on the right and a bytes/ETA detail line while transferring.
-export function DownloadStatusRow({ romId, name }: { romId: number; name: string }) {
+// Two-press confirm for cancelling a download: the first press arms the
+// control (it turns red and says what the next press does), the second acts.
+// It disarms by itself after a few seconds, or as soon as focus leaves it, so a
+// stray press never cancels anything.
+const ARM_MS = 3000;
+export function useArmedPress(onConfirm: () => void) {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(false), ARM_MS);
+    return () => clearTimeout(t);
+  }, [armed]);
+  return {
+    armed,
+    press: () => { if (armed) { setArmed(false); onConfirm(); } else setArmed(true); },
+    disarm: () => setArmed(false),
+  };
+}
+
+// The ✕ at the end of a download row. Its own focus target, so on a gamepad
+// you move right onto it and press A twice.
+export function CancelDownloadButton({ onCancel }: { onCancel: () => void }) {
+  const [active, setActive] = useState(false);
+  const { armed, press, disarm } = useArmedPress(onCancel);
+  return (
+    <Focusable noFocusRing
+      onActivate={press} onClick={press}
+      onFocus={() => setActive(true)} onBlur={() => { setActive(false); disarm(); }}
+      onMouseEnter={() => setActive(true)} onMouseLeave={() => { setActive(false); disarm(); }}
+      style={{
+        flexShrink: 0, width: '30px', height: '30px', boxSizing: 'border-box',
+        borderRadius: V2.radiusPill,
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+        background: armed ? V2.danger : active ? V2.surfaceHover : 'transparent',
+        color: armed || active ? V2.fg : V2.fgMuted,
+        boxShadow: active ? `0 0 0 2px ${armed ? V2.dangerRing : V2.brand}` : 'none',
+        transition: 'background 0.15s, color 0.15s, box-shadow 0.15s',
+      }}>
+      <FaTimes size={11} />
+    </Focusable>
+  );
+}
+
+export function DownloadStatusRow({ romId, name, onCancel }: { romId: number; name: string; onCancel?: () => void }) {
   const prog = useDownloadProgress(romId, true);
   const pct = Math.max(0, Math.min(100, prog?.percent ?? 0));
   const extracting = prog?.state === 'extracting';
@@ -324,6 +367,8 @@ export function DownloadStatusRow({ romId, name }: { romId: number; name: string
       </div>
       {sub && <div style={{ fontSize: '10.5px', color: V2.fgMuted, marginTop: '5px', fontVariantNumeric: 'tabular-nums' }}>{sub}</div>}
       </div>
+      {/* Unpacking can't be stopped part-way, so the ✕ goes with the transfer. */}
+      {onCancel && !extracting && <CancelDownloadButton onCancel={onCancel} />}
     </div>
   );
 }
@@ -331,12 +376,13 @@ export function DownloadStatusRow({ romId, name }: { romId: number; name: string
 // Same row shape for a backend collection auto-sync pass (CollectionSyncManager),
 // which downloads outside the frontend registry — surfaced from the shared
 // service-status poll (sync_state 'syncing').
-export function CollectionSyncStatusRow({ col }: { col: any }) {
+export function CollectionSyncStatusRow({ col, onStop }: { col: any; onStop?: () => void }) {
   const pct = typeof col.downloaded_pct === 'number'
     ? Math.max(0, Math.min(100, col.downloaded_pct))
     : (col.total ? Math.max(0, Math.min(100, (col.downloaded || 0) / col.total * 100)) : 0);
   return (
-    <div style={{ padding: '10px 14px 12px' }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 14px 12px' }}>
+      <div style={{ flex: '1 1 auto', minWidth: 0 }}>
       <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '10px', minWidth: 0 }}>
         <span style={{
           fontSize: '13px', fontWeight: 600, color: V2.fg, minWidth: 0,
@@ -349,6 +395,8 @@ export function CollectionSyncStatusRow({ col }: { col: any }) {
       <div style={{ height: '4px', borderRadius: '2px', background: V2.surface, marginTop: '7px', overflow: 'hidden' }}>
         <div style={{ height: '100%', width: `${pct}%`, background: V2.brand, borderRadius: '2px', transition: 'width 0.3s ease' }} />
       </div>
+      </div>
+      {onStop && <CancelDownloadButton onCancel={onStop} />}
     </div>
   );
 }
@@ -452,7 +500,11 @@ export function GameActionButton({ icon, label, onClick, variant = 'surface', ac
     // Equal-width digits, so a percentage counting up does not reflow the
     // label under itself. Proportional digits make "11%" narrower than "88%".
     fontVariantNumeric: 'tabular-nums',
-    cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.5 : 1,
+    // Dimmed with filter, not opacity: the desktop shell drops a Focusable with
+    // inline opacity < 1 from navigation, and these must stay reachable. A
+    // greyed-out Play still has to take focus to show why it can't play, and
+    // without it the controller lands on Delete beside it instead.
+    cursor: disabled ? 'default' : 'pointer', filter: disabled ? 'opacity(0.5)' : undefined,
     ...(labelled ? { padding: '0 24px' } : { width: '44px' }),
     // A progress label grows by a whole digit at 10% and again at 100%, and the
     // pill is sized by its content — so without a floor it visibly widens twice
@@ -480,8 +532,8 @@ export function GameActionButton({ icon, label, onClick, variant = 'surface', ac
             background: active ? V2.surfaceHover : V2.surface,
             color: active ? V2.fg : V2.fg2, borderColor: V2.borderStrong
           };
-  const ring = dangerSurface ? V2.danger : V2.brand;
-  const glow = active && !disabled ? { boxShadow: `0 0 0 2px ${ring}` } : {};
+  const ring = variant === 'danger' ? V2.dangerRing : dangerSurface ? V2.danger : V2.brand;
+  const glow = active ? { boxShadow: `0 0 0 2px ${ring}` } : {};
   return (
     <Focusable noFocusRing ref={focusRef}
       onActivate={() => !disabled && onClick()}

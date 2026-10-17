@@ -6,8 +6,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
 import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns, setSwitchAddOnEnabled} from "../rpc";
 import { _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
-import { Bumper, GameActionButton, PlatformIcon, V2Button, V2CardRow, V2SettingsRow, V2Switch, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage} from "../kit";
-import { _dlSucceeded, _setDlActive, awaitDownload, useDownloadProgress, useIsDownloading, downloadOne} from "../downloads";
+import { Bumper, GameActionButton, PlatformIcon, V2Button, V2CardRow, V2SettingsRow, V2Switch, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage, useArmedPress} from "../kit";
+import { _dlSucceeded, _setDlActive, awaitDownload, cancelDownload, claimDownloadStart, releaseDownloadStart, useDownloadProgress, useIsDownloading, downloadOne} from "../downloads";
 import { maybePromptSwitchFirmware } from "../firmware";
 import { libBack, libNavigate } from "../nav";
 import { GameCover, _coverCache, _coverCacheSet } from "../media";
@@ -1522,6 +1522,7 @@ export function GameDetailPage() {
   const globalDownloading = useIsDownloading(game?.rom_id ?? -1);
   const downloading = busy === 'download' || globalDownloading;
   const smoothPct = useSmoothNumber(dlPct, downloading);
+  const cancelArm = useArmedPress(() => { if (game) cancelDownload(game.rom_id); });
   // Nothing to launch into: Play dims rather than disappearing, and says why
   // when focused. Downloading stays available — building a library before you
   // own an emulator is legitimate.
@@ -1640,12 +1641,13 @@ export function GameDetailPage() {
   const isMultiDisc = pickableDiscs.length > 1;
 
   const doDownload = async () => {
-    if (!game) return;
+    if (!game || !claimDownloadStart(game.rom_id)) return;
     // Before the busy/active flags: they repaint the button as "Downloading…",
     // and nothing is downloading until this modal has been answered.
     await maybePromptSwitchFirmware(game.rom_id);
     setBusy('download');
     _setDlActive(game.rom_id, true, detail?.name || game.name);
+    releaseDownloadStart(game.rom_id);
     try {
       const start = await downloadGame(game.rom_id);
       if (!start?.success) {
@@ -1669,7 +1671,7 @@ export function GameDetailPage() {
         // to Download while the library shows the game as present.
         _dlSucceeded.add(game.rom_id);
         libCacheSetDownloaded(game.rom_id, true);
-      } else {
+      } else if (!res.cancelled) {
         toaster.toast({ title: 'Download failed', body: res.message || 'Unknown error' });
       }
     } catch (e) {
@@ -1961,7 +1963,15 @@ export function GameDetailPage() {
                 icon={downloading
                   ? <FaSync size={15} style={{ animation: 'spin 1s linear infinite' }} />
                   : <FaDownload size={15} />} />
-            ) : !confirmDelete ? (
+            ) : null}
+            {/* Unpacking can't be stopped part-way, so the ✕ goes with the transfer. */}
+            {!isDownloaded && downloading && !extracting && (
+              <GameActionButton accent={cancelArm.armed ? undefined : 'danger'}
+                variant={cancelArm.armed ? 'danger' : 'surface'}
+                onClick={cancelArm.press} onBlurred={cancelArm.disarm}
+                icon={<FaTimes size={14} />} />
+            )}
+            {!isDownloaded ? null : !confirmDelete ? (
               <>
                 <GameActionButton variant="emphasized" focusRef={ctaRef} disabled={!!busy || noEmulator}
                   onClick={() => doLaunch()}

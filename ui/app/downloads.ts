@@ -7,9 +7,10 @@
 // batch was still running. So the truth lives here, in module scope, and every
 // surface subscribes to _dlListeners.
 
-import { useState, useEffect } from "react";
+import { createElement, useState, useEffect } from "react";
+import { ToastCover } from "./kit";
 import { toaster } from "./toast";
-import { downloadGame, getDownloadProgress } from "./rpc";
+import { cancelDownloadRpc, downloadGame, getDownloadProgress } from "./rpc";
 import { _broadcastLibRefresh, _broadcastDownloaded } from "./events";
 
 // A single library grid card: art-only with a centered, single-line label
@@ -26,7 +27,10 @@ import { _broadcastLibRefresh, _broadcastDownloaded } from "./events";
 // game or an add-on could not be decompressed. That toast is raised here, once,
 // for every caller -- batch downloads included -- and `warning` tells the
 // callers that show their own "Downloaded" toast to leave it out.
-export async function awaitDownload(romId: number): Promise<{ ok: boolean; message?: string; removed?: boolean; warning?: boolean }> {
+//
+// A cancelled download is reported once here too, so callers only need to
+// leave their failure toast out when `cancelled` is set.
+export async function awaitDownload(romId: number): Promise<{ ok: boolean; message?: string; removed?: boolean; warning?: boolean; cancelled?: boolean }> {
   for (; ;) {
     let p: any;
     try { p = await getDownloadProgress(romId); }
@@ -41,6 +45,12 @@ export async function awaitDownload(romId: number): Promise<{ ok: boolean; messa
     // download, and it needs different words: nothing went wrong, the game
     // isn't there any more.
     if (p?.state === 'error') return { ok: false, message: p.message, removed: !!p.removed };
+    if (p?.state === 'cancelled') {
+      // hasCover true: a game without art just fails the fetch and shows no logo.
+      toaster.toast({ title: 'Download cancelled', body: _dlNames.get(romId) || '',
+        logo: createElement(ToastCover, { romId, hasCover: true }) });
+      return { ok: false, cancelled: true };
+    }
     if (p?.state === 'idle') return { ok: false, message: 'Download did not start' };
     await new Promise((r) => setTimeout(r, 400));
   }
@@ -58,6 +68,36 @@ export const _dlNames = new Map<number, string>();
 // Batch items waiting for a worker slot (rom_id → name) — shown as "Queued" on
 // the Downloads page. Seeded by downloadBatch, drained as each download starts.
 export const _dlQueue = new Map<number, string>();
+
+// Queued items the user removed; downloadBatch's workers skip them.
+const _dlDequeued = new Set<number>();
+
+/** Stop an active download. The outcome (and its toast) comes back through awaitDownload. */
+export async function cancelDownload(romId: number): Promise<void> {
+  try { await cancelDownloadRpc(romId); } catch { /* the poll reports the real state */ }
+}
+
+// Downloads being started: between the press and _setDlActive there is an
+// await (the Switch firmware check), and every press landing in it used to
+// start the same download again — each then waited on it and toasted its end.
+const _dlStarting = new Set<number>();
+
+/** Claim the start of a download; false if it is already starting or running. */
+export function claimDownloadStart(romId: number): boolean {
+  if (_dlStarting.has(romId) || _dlActive.has(romId)) return false;
+  _dlStarting.add(romId);
+  return true;
+}
+
+/** Mark a download as started (or abandoned): _dlActive takes over from here. */
+export function releaseDownloadStart(romId: number) { _dlStarting.delete(romId); }
+
+/** Take a game out of the batch queue before it starts. */
+export function dequeueDownload(romId: number) {
+  if (!_dlQueue.delete(romId)) return;
+  _dlDequeued.add(romId);
+  _notifyDl();
+}
 
 // Roms whose download completed successfully this session, so a mounted tile
 // can light its downloaded dot the moment its global download finishes (the
@@ -133,6 +173,7 @@ export async function downloadBatch(
   const worker = async () => {
     while (i < items.length) {
       const it = items[i++];
+      if (_dlDequeued.delete(it.id)) { done++; onProgress(done, ok); continue; }
       _dlQueue.delete(it.id); _notifyDl();
       if (await downloadOne(it.id, it.name)) ok++;
       done++;
@@ -142,7 +183,7 @@ export async function downloadBatch(
   try {
     await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
   } finally {
-    for (const it of items) _dlQueue.delete(it.id);
+    for (const it of items) { _dlQueue.delete(it.id); _dlDequeued.delete(it.id); }
     _notifyDl();
   }
   return ok;

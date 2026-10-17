@@ -822,6 +822,10 @@ class LudoBackend:
     # frontend via get_download_progress() for the cover/button fill UI.
     _download_progress: dict = {}
 
+    # rom_ids the user asked to stop. download_rom polls this between chunks and
+    # deletes its partial file when it sees the id; cleared when a download starts.
+    _download_cancels: set = set()
+
     # -----------------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------------
@@ -8831,6 +8835,7 @@ class LudoBackend:
             if cur and cur.get('state') == 'downloading':
                 return {'success': True, 'started': True, 'message': 'Already downloading'}
 
+            self._download_cancels.discard(rom_id)
             self._download_progress[rom_id] = {
                 'percent': 0, 'downloaded': 0, 'total': 0,
                 'speed': 0, 'eta': 0, 'state': 'downloading', 'message': '',
@@ -8851,7 +8856,22 @@ class LudoBackend:
                     except Exception:
                         pass
                 try:
-                    ok, msg = self._romm_client.download_rom(rom_id, name, dest, _on_progress)
+                    ok, msg = self._romm_client.download_rom(
+                        rom_id, name, dest, _on_progress,
+                        cancellation_checker=lambda: rom_id in self._download_cancels)
+                    if not ok and rom_id in self._download_cancels:
+                        # The engine has already removed the partial file. Not a
+                        # failure: no activity entry, no server check, no toast.
+                        self._download_cancels.discard(rom_id)
+                        logging.info(f"download cancelled by user: rom_id={rom_id}")
+                        self._download_progress[rom_id] = {
+                            'percent': 0, 'downloaded': 0, 'total': 0,
+                            'speed': 0, 'eta': 0, 'state': 'cancelled', 'message': '',
+                        }
+                        return
+                    # Past the transfer, a cancel is too late: unpacking runs to
+                    # the end and the game lands as downloaded.
+                    self._download_cancels.discard(rom_id)
                     # grout-style: unpack a single-file .zip/.7z on arrival so
                     # disc cores get a real .cue/.m3u (no-op if disabled/plain ROM).
                     final = self._maybe_unzip_download(dest, rom_id) if ok else dest
@@ -9033,11 +9053,26 @@ class LudoBackend:
             logging.error(f"download_game error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
+    async def cancel_download(self, rom_id: int):
+        """Stop an in-flight download and delete what it wrote so far.
+
+        Only the transfer can be stopped. Once unpacking has begun the game is
+        all here, and stopping would only leave a half-extracted folder behind.
+        The outcome reaches the frontend through get_download_progress: state
+        'cancelled', or 'done' when the cancel arrived too late.
+        """
+        cur = self._download_progress.get(rom_id) or {}
+        if cur.get('state') != 'downloading':
+            return {'success': False, 'message': 'Not downloading'}
+        self._download_cancels.add(rom_id)
+        return {'success': True}
+
     async def get_download_progress(self, rom_id: int):
         """Live progress for an in-flight download (polled by the cover/button fill UI).
 
         Returns {percent 0..100, downloaded, total, speed, eta, state, message} where
-        state is one of downloading|done|error, or state 'idle' when nothing is tracked.
+        state is one of downloading|extracting|done|error|cancelled, or state 'idle'
+        when nothing is tracked.
         """
         p = self._download_progress.get(rom_id)
         if not p:
