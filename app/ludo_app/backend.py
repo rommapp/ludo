@@ -5465,6 +5465,10 @@ class LudoBackend:
                     # disk matches the server and the new device's first
                     # negotiate finds hashes that agree rather than conflicts.
                     if self._auto_sync and settings.get('Device', 'device_id', ''):
+                        # Connect attaches the client only after the library
+                        # walk, and the user can pair before that finishes.
+                        if not self._auto_sync.romm_client and self._romm_client:
+                            self._auto_sync.romm_client = self._romm_client
                         try:
                             await loop.run_in_executor(
                                 None, lambda: self._auto_sync.run_negotiated_save_sync(
