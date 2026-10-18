@@ -621,4 +621,9 @@ if (!app.requestSingleInstanceLock()) {
   // Ensure the backend is reaped even on unusual exit paths.
   app.on("before-quit", stopBackend);
   process.on("exit", stopBackend);
+  // A plain `kill` (or the session ending) exits Node without the "exit"
+  // event, so stopBackend would never run. Turn those into a normal quit.
+  for (const sig of ["SIGTERM", "SIGHUP"]) {
+    process.on(sig, () => { stopBackend(); app.quit(); });
+  }
 }

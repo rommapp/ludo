@@ -413,7 +413,29 @@ def serve(host="127.0.0.1", port=8723):
     return httpd, ENGINE
 
 
+def _exit_with_parent():
+    """Shut down cleanly if the Electron process that spawned us dies.
+
+    Electron stops us itself on a normal quit, but a killed or crashed shell
+    never gets to, and an orphaned backend keeps the save-sync and install
+    locks: the next launch then reports "running in another Ludo". The kernel
+    sends SIGINT on the parent's death, which serve_forever turns into the
+    same KeyboardInterrupt path as Ctrl-C.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes, signal
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGINT)
+        if os.getppid() == 1:   # parent already gone before prctl took effect
+            os.kill(os.getpid(), signal.SIGINT)
+    except Exception as e:
+        print(f"[server] could not tie lifetime to parent: {e}", flush=True)
+
+
 def main():
+    _exit_with_parent()
     host = os.environ.get("ROMM_HOST", "127.0.0.1")
     port = int(os.environ.get("ROMM_PORT", "8723"))
     httpd, engine = serve(host, port)
