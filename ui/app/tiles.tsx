@@ -1394,9 +1394,17 @@ export function CardRow({ icon, title, count, children }:
           ref={trackRef}
           onScroll={update}
           className="romm-cardrow-track"
-          style={{ overflowX: 'auto', overflowY: 'visible' }}
+          // Steam scrolls a focused tile only until it touches the track's
+          // edge, cropping its focus scale and glow (the first tile once the
+          // row has shifted, the last always). The padding keeps the
+          // track's own 16px gutter plus room for the glow in view.
+          style={{ overflowX: 'auto', overflowY: 'visible', scrollPaddingInline: '28px' }}
         >
-          <Focusable noFocusRing flow-children="horizontal" {...NAV_MAINTAIN_X} style={{ display: 'flex', gap: '12px', padding: '24px 16px 28px' }}>
+          <Focusable noFocusRing flow-children="horizontal" {...NAV_MAINTAIN_X} style={{ display: 'flex', gap: '12px', padding: '24px 16px 28px',
+            // Grow with the tiles: a block child is only as wide as the track, so the
+            // tiles overflow it and its right padding never counts as scrollable
+            // room, leaving the last tile flush against the edge.
+            width: 'max-content', minWidth: '100%' }}>
             {children}
           </Focusable>
         </div>
