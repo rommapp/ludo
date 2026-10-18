@@ -4625,6 +4625,14 @@ class LudoBackend:
                 label = self._platform_name_for(g)
                 info = ra.describe_core_resolution(label, system_slug=slug)
                 info.update({'slug': slug, 'platform_name': label})
+                # A platform served by a standalone emulator (Switch -> Eden)
+                # has no libretro core by design; reporting "no core" for it
+                # made a working Eden look undetected (rommapp/ludo#39).
+                standalone = ra.standalone_emulator_status(label, slug)
+                if standalone:
+                    info['standalone'] = standalone
+                    info['resolved_core'] = standalone['name'] if standalone['installed'] else ''
+                    info['source'] = 'standalone' if standalone['installed'] else 'none'
                 rows.append(info)
             rows.sort(key=lambda r: (r['platform_name'] or '').lower())
             support = ra.core_download_support()

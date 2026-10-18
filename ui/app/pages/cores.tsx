@@ -299,12 +299,12 @@ export function CoresPage() {
       onDownload={(c) => install(row, c)} />);
 
   const badge = (row: any) => {
-    const labelFor: Record<string, string> = { override: 'pinned', retrodeck: 'RetroDECK', guess: 'auto', none: '—' };
+    const labelFor: Record<string, string> = { override: 'pinned', retrodeck: 'RetroDECK', guess: 'auto', standalone: 'standalone', none: '—' };
     const color = row.source === 'override' ? V2.brandHover : (row.source === 'none' ? V2.danger : V2.fgMuted);
     return (
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
         <span style={{ fontSize: '13px', fontWeight: 600, color: row.resolved_core ? V2.fg : V2.danger }}>
-          {row.resolved_core || 'no core'}
+          {row.resolved_core || (row.standalone ? 'not found' : 'no core')}
         </span>
         <span style={{
           fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
@@ -345,6 +345,10 @@ export function CoresPage() {
             title={row.platform_name}
             subtitle={busy === row.slug
               ? 'Downloading core…'
+              : row.standalone
+                ? (row.standalone.installed
+                  ? `${row.standalone.name} runs this platform on its own — no core needed`
+                  : `${row.standalone.name} not found on this device`)
               : row.source === 'none'
                 ? ((row.download_candidates || []).length
                   ? `No core installed — A to download ${row.download_candidates[0]}`
@@ -354,7 +358,7 @@ export function CoresPage() {
                 : row.source === 'override'
                   ? 'Pinned by you — A to change or reset to auto'
                   : 'Auto-resolved — A to pin a specific core'}
-            onClick={() => openPicker(row)}
+            onClick={() => { if (!row.standalone) openPicker(row); }}
             right={badge(row)} />
         ))}
       </V2SettingsSection>
