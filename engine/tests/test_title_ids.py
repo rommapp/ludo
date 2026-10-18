@@ -4,11 +4,12 @@ No test framework: the engine has no test dependency and this must stay
 runnable on a Steam Deck with nothing installed. Fixtures are synthesised in a
 temp dir, so the suite needs no ROMs.
 
-Set LUDO_SIGIL_LIB to a libsigil build to exercise the Sigil path too; without
-it the pure-Python readers are what run, and both are expected to pass.
+Every disc read goes through the bundled libsigil (LUDO_SIGIL_LIB overrides
+which build); the suite fails loudly rather than passing vacuously without it.
 """
 
 import struct
+import zipfile
 import sys
 import tempfile
 from pathlib import Path
@@ -74,34 +75,100 @@ def make_iso9660(path, files):
     return path
 
 
+def make_dreamcast(path, product=b'T1401D  50'):
+    """A Dreamcast data track: IP.BIN at sector 0, product number at 0x40."""
+    blob = bytearray(SECTOR * 16)
+    blob[0:16] = b'SEGA SEGAKATANA '
+    blob[0x40:0x40 + len(product)] = product.ljust(10)
+    path.write_bytes(bytes(blob))
+    return path
+
+
+def zipped(image, inner=None):
+    """``image`` zipped whole, the way RomM serves a game, beside it."""
+    out = image.with_name(image.stem + '.zip')
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.write(image, inner or image.name)
+    image.unlink()
+    return out
+
+
 def main():
     print(f"sigil: {'loaded ' + (T.sigil_version() or '') if T.sigil_available() else 'absent'}")
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
 
+        check('sigil is bundled and loads', T.sigil_available(), True)
+
         # ── Disc-based readers ────────────────────────────────────────────
-        check('gamecube iso', T.title_id_from_rom(make_gamecube(d / 'melee.iso')),
-              'GALE01')
-        check('wii iso',
-              T.title_id_from_rom(make_gamecube(d / 'brawl.iso', b'RSBE01', wii=True)),
-              'RSBE01')
+        # GameCube and Wii report the hex of the game code as title_id; the
+        # save name is the ASCII code (GameCube, which Dolphin writes into
+        # every .gci name) or its lowercase hex (Wii, Dolphin's title folder).
+        melee = T.identify(make_gamecube(d / 'melee.iso'), platform='ngc')
+        check('gamecube iso', (melee or {}).get('title_id'), '47414C45')
+        check('gamecube save name is the game code', (melee or {}).get('save_id'), 'GALE')
+        check('gamecube saves share a prefix', (melee or {}).get('usage'), 'file-prefix')
+        brawl = T.identify(make_gamecube(d / 'brawl.iso', b'RSBE01', wii=True),
+                           platform='wii')
+        check('wii iso', (brawl or {}).get('title_id'), '52534245')
+        check('wii save folder is lowercase hex', (brawl or {}).get('save_id'), '52534245'.lower())
 
-        # Six printable bytes at offset 0 are not enough; the disc magic is
-        # what makes reading an arbitrary .iso safe.
-        (d / 'random.iso').write_bytes(b'ABCDEF' + bytes(0x200))
-        check('non-disc iso is not identified',
-              T.title_id_from_rom(d / 'random.iso'), None)
+        # Six printable bytes at offset 0 are not enough when nothing names
+        # the platform; the disc magic is what makes reading an arbitrary .iso
+        # safe. (A NAMED platform is taken at its word, upstream's choice, and
+        # Ludo only names one from the folder a ROM was downloaded into.)
+        (d / 'random.wbfs').write_bytes(b'ABCDEF' + bytes(0x200))
+        check('non-disc image is not identified',
+              T.title_id_from_rom(d / 'random.wbfs'), None)
 
-        check('ps2 serial from SYSTEM.CNF', T.title_id_from_rom(make_iso9660(
-            d / 'gt4.iso',
-            {'SYSTEM.CNF;1': b'BOOT2 = cdrom0:\\SCUS_972.68;1\nVER = 1.00\n'})),
-            'SCUS-97268')
+        gt4 = make_iso9660(d / 'gt4.iso',
+                           {'SYSTEM.CNF;1': b'BOOT2 = cdrom0:\\SCUS_972.68;1\nVER = 1.00\n'})
+        check('ps2 serial from SYSTEM.CNF', T.title_id_from_rom(gt4, platform='ps2'),
+              'SCUS-97268')
+        check('ps2 save folders carry the region prefix',
+              (T.identify(gt4, platform='ps2') or {}).get('save_id'), 'BASCUS-97268')
         check('psp serial from UMD_DATA.BIN', T.title_id_from_rom(make_iso9660(
             d / 'gow.iso',
-            {'UMD_DATA.BIN;1': b'ULUS10064|0123456789ABCDEF|0001|G'})),
+            {'UMD_DATA.BIN;1': b'ULUS10064|0123456789ABCDEF|0001|G'}), platform='psp'),
             'ULUS10064')
+        crazy = T.identify(make_dreamcast(d / 'track03.bin'), platform='dc')
+        check('dreamcast product number from IP.BIN',
+              (crazy or {}).get('title_id'), 'T1401D  50')
+
+        # A bare .iso could be any of five consoles, so with no platform named
+        # nothing is guessed -- but a ROM in Ludo's roms/<platform>/ layout
+        # names its platform by where it sits, folder of its own or not.
+        check('an .iso with no platform is not guessed at',
+              T.title_id_from_rom(make_gamecube(d / 'loose.iso')), None)
+        nested = d / 'library' / 'gc' / 'Melee (USA)'
+        nested.mkdir(parents=True)
+        check('the platform folder names the platform',
+              T.title_id_from_rom(make_gamecube(nested / 'Melee (USA).iso')), '47414C45')
+        (nested / 'Melee (USA).iso').unlink()
+
+        # RomM serves a game zipped; Sigil reads the member in place, so a
+        # library left zipped is as identifiable as an extracted one. The
+        # inner name is deliberately unlike the archive's.
+        check('zipped gamecube',
+              T.title_id_from_rom(zipped(make_gamecube(d / 'z_gc.iso'), 'Melee.iso'),
+                                  platform='ngc'), '47414C45')
+        check('zipped ps2', T.title_id_from_rom(zipped(make_iso9660(
+            d / 'z_ps2.iso', {'SYSTEM.CNF;1': b'BOOT2 = cdrom0:\\SLUS_202.02;1\n'})),
+            platform='ps2'), 'SLUS-20202')
+        check('zipped dreamcast', T.title_id_from_rom(
+            zipped(make_dreamcast(d / 'z_dc.bin'), 'Crazy Taxi (USA) (Track 3).bin'),
+            platform='dreamcast'), 'T1401D  50')
 
         check('missing file', T.title_id_from_rom(d / 'nope.iso'), None)
+
+        # ── Save-side identity ────────────────────────────────────────────
+        # Dolphin names a GCI "<maker>-<game code>-<internal name>": two, then
+        # four. The header is read first; the name is the fallback.
+        gci = d / '01-GALE-SuperSmashBros0110290334.gci'
+        gci.write_bytes(b'GALE01' + bytes(58))
+        check('gci header', T.title_id_from_save(gci), 'GALE01')
+        gci.write_bytes(b'\x00' * 64)
+        check('gci name, real Dolphin spelling', T.title_id_from_save(gci), 'GALE')
 
         # ── Switch IDs ────────────────────────────────────────────────────
         # An update and a DLC add-on both resolve to the base title, because

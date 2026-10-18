@@ -13,60 +13,31 @@ recover the owner. What they contain is the game's own identity, stamped into
 the disc header by the publisher, and the same identity is readable straight
 out of the ROM. Matching happens on that instead.
 
-Two backends, one interface:
+The reading is argosy-sigil's (https://github.com/rommapp/argosy-sigil), the
+RomM-org C library bundled in bin/. Argosy, the Android RomM client, reads
+games with the same library, so the two clients agree on a game's identity and
+on the name its emulator saves under -- which is what lets a save made on one
+restore on the other. It covers every disc and cartridge platform Ludo syncs,
+reads a game zipped whole without extracting it, and decrypts Switch
+containers given prod.keys.
 
-  * argosy-sigil (https://github.com/rommforge/argosy-sigil), the RomM-org C
-    library, when it is present. It covers eleven platforms including the ones
-    whose containers are too involved to justify reimplementing here (Switch
-    NSP/XCI, PS3, Vita, Xbox 360) and is the reason this module is shaped as a
-    lookup rather than a parser.
-  * A dependency-free Python reader for the formats whose IDs sit in plain
-    sight: GameCube/Wii (six bytes at offset zero) and the ISO 9660 discs
-    (PS1/PS2 via SYSTEM.CNF, PSP via UMD_DATA.BIN).
-
-Sigil is preferred when both can answer, so that adopting it upgrades coverage
-without changing any result the fallback already got right. Nothing here raises:
-an unreadable or unrecognised file is simply not identifiable, and the caller
-drops back to filename matching.
+What stays here is what Sigil cannot see: IDs in the FILENAMES of games not on
+this device (the server knows those long before a download), and Switch's
+base/update/DLC arithmetic. Nothing here raises: an unreadable or unrecognised
+file is simply not identifiable, and the caller drops back to filename
+matching.
 """
 
 import ctypes
 import logging
 import os
 import re
-import struct
 from pathlib import Path
 
-# Sector size and the layout constants of an ISO 9660 primary volume
-# descriptor. The PVD always begins at sector 16; within it the root directory
-# record starts at byte 156, and a directory record carries its extent LBA at
-# +2 and its data length at +10, each as a little-endian u32 (the format stores
-# both endiannesses back to back; we read the LE half).
-_SECTOR = 2048
-_PVD_SECTOR = 16
-_ROOT_RECORD_OFFSET = 156
-_RECORD_EXTENT = 2
-_RECORD_LENGTH = 10
-
-# A directory tree deeper than this means we are misreading the structure, not
-# that the disc is unusual — bail rather than walking a corrupt image forever.
-_MAX_DIR_BYTES = 1 << 20
-
-# Magic words that identify a GameCube or Wii image. Both formats put the
-# six-byte game ID at offset zero, which is far too generic to trust on its
-# own: plenty of files begin with six printable bytes. The magic is what makes
-# the read safe on a directory of mixed .iso dumps.
-_WII_MAGIC = 0x5D1C9EA3
-_WII_MAGIC_OFFSET = 0x18
-_GC_MAGIC = 0xC2339F3D
-_GC_MAGIC_OFFSET = 0x1C
-
-# "SLUS_202.02" as it appears in SYSTEM.CNF, which is the on-disc spelling of
-# the serial everything else writes as "SLUS-20202".
-_BOOT_RE = re.compile(rb'BOOT2?\s*=\s*cdrom0?:\\?([A-Z]{4})_?(\d{3})\.(\d{2})', re.IGNORECASE)
-
-# Dolphin's GCI filenames: "<index>-<gamecode+makercode>-<internal name>.gci".
-_GCI_NAME_RE = re.compile(r'^\d+-([A-Z0-9]{6})-', re.IGNORECASE)
+# Dolphin's GCI filenames: "<maker code>-<game code>-<internal name>.gci", as
+# in "01-GALE-SuperSmashBros0110290334.gci" -- two characters, then FOUR. The
+# game code is the save's identity; the maker code names the publisher.
+_GCI_NAME_RE = re.compile(r'^[A-Z0-9]{2}-([A-Z0-9]{4})-', re.IGNORECASE)
 
 # A Switch application ID: 16 hex digits opening with "01" and closing with
 # "000". Both halves of that shape are load-bearing. The emulator's save tree
@@ -93,7 +64,10 @@ _SWITCH_ANY_RE = re.compile(r'^01[0-9A-F]{14}$', re.IGNORECASE)
 _UPDATE_BIT = 0x800
 _DLC_STRIDE = 0x1000
 
-_ROM_EXTENSIONS = {'.iso', '.gcm', '.gcz', '.img', '.bin', '.nsp', '.xci', '.cso', '.chd'}
+# What index_roms opens. Sigil reads every one of these, a game zipped whole
+# included: it opens the archive's largest member in place.
+_ROM_EXTENSIONS = {'.iso', '.gcm', '.gcz', '.rvz', '.wbfs', '.ciso', '.img', '.bin',
+                   '.nsp', '.xci', '.cso', '.chd', '.3ds', '.cci', '.cxi', '.zip'}
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +76,7 @@ log = logging.getLogger(__name__)
 # part of the contract: struct_version is the first field of each so the
 # library can reject a mismatched caller, and sigil_result is a caller-owned
 # out-parameter — nothing here allocates, so there is nothing to free.
-_SIGIL_RESULT_V2 = 2
+_SIGIL_RESULT_V3 = 3
 _SIGIL_SUPPORT_V1 = 1
 _SIGIL_OPTIONS_V1 = 1
 
@@ -114,6 +88,19 @@ _SIGIL_SOURCE_FILENAME = 1
 # Scan the filename for community naming patterns when the binary parse fails.
 # On by default in the library; set explicitly because we always pass options.
 _SIGIL_FLAG_FILENAME_FALLBACK = 1 << 0
+
+
+# Spellings Sigil does not take itself (it knows "gc", "ngc", "dc", "n3ds",
+# "vita"), from RomM's slugs and the ES-DE/RetroDECK folder names ROMs live in.
+_PLATFORM_ALIASES = {
+    'ps': 'psx', 'ps1': 'psx', 'psone': 'psx', 'playstation': 'psx',
+    'playstation-2': 'ps2', 'playstation2': 'ps2',
+    'gamecube': 'gamecube', 'nintendo-gamecube': 'gamecube',
+    'dreamcast': 'dreamcast', 'sega-dreamcast': 'dreamcast',
+    'nintendo-switch': 'switch', 'nintendo-3ds': '3ds', 'wii-u': 'wiiu',
+    'playstation-portable': 'psp', 'ps-vita': 'psvita', 'psvita': 'psvita',
+    'xbox-360': 'xbox360', 'gbc': 'gbc', 'gb': 'gb', 'snes': 'snes',
+}
 
 
 class _SigilResult(ctypes.Structure):
@@ -128,6 +115,7 @@ class _SigilResult(ctypes.Structure):
         ('experimental', ctypes.c_int),
         ('switch_content_type', ctypes.c_int),
         ('title_version', ctypes.c_uint32),
+        ('features', ctypes.c_uint32),
     ]
 
 
@@ -156,12 +144,11 @@ class _Sigil:
     absent, which is the normal case on a fresh install. Point LUDO_SIGIL_LIB
     at a build to enable it.
 
-    It is not a superset of the Python reader. Sigil sniffs the platform from
-    the file extension and declines ".iso" outright as ambiguous — verified
-    against 0.1.0-dev, which returns UNKNOWN_PLATFORM for GameCube, Wii, PS2
-    and PSP images. The two backends cover different halves: Sigil the
-    containers (NSP/XCI, and the platforms needing decryption), Python the
-    plain ISOs.
+    Given no platform, Sigil sniffs one from the file extension and declines
+    the ambiguous ones -- ".iso", ".bin", ".chd" could each be half a dozen
+    consoles -- so callers that know the platform pass it (see _platform_hint).
+    That, not a missing extractor, is why this module once kept a Python
+    reader for plain ISOs beside it.
     """
 
     _instance = None
@@ -211,10 +198,16 @@ class _Sigil:
                 lib.sigil_version.restype = ctypes.c_char_p
                 lib.sigil_strerror.argtypes = [ctypes.c_int]
                 lib.sigil_strerror.restype = ctypes.c_char_p
+                lib.sigil_platform_from_slug.argtypes = [ctypes.c_char_p]
+                lib.sigil_platform_from_slug.restype = ctypes.c_int
+                # Present only in builds new enough to fill a V3 result and
+                # read zipped games. An older build reports the same version
+                # string, so the symbol is the only reliable tell; loading one
+                # would quietly lose every platform the hint below unlocks.
+                lib.sigil_save_resolve
             except AttributeError:
-                # A library by that name that is not Sigil. Not worth
-                # surfacing — the Python reader still covers its platforms.
-                log.debug("%s is not a sigil build; ignoring", name)
+                # A library by that name that is not Sigil, or one too old.
+                log.debug("%s is not a usable sigil build; ignoring", name)
                 continue
             self._lib = lib
             log.debug("sigil %s loaded from %s",
@@ -231,16 +224,25 @@ class _Sigil:
             return None
         return self._lib.sigil_version().decode('utf-8', 'replace')
 
-    def extract(self, path, prod_keys=None):
+    def platform(self, slug):
+        """Sigil's platform enum for a RomM slug or ROM folder name; AUTO if none."""
+        if not self._lib or not slug:
+            return _SIGIL_PLATFORM_AUTO
+        slug = str(slug).strip().lower()
+        slug = _PLATFORM_ALIASES.get(slug, slug)
+        return self._lib.sigil_platform_from_slug(slug.encode('utf-8'))
+
+    def extract(self, path, prod_keys=None, platform=None):
         """Return the sigil_result for ``path``, or None.
 
         ``prod_keys`` unlocks Switch NCA decryption; without it a Switch
         extraction degrades to the filename scanner rather than failing, which
-        is why it stays optional.
+        is why it stays optional. ``platform`` is a slug (see platform()); with
+        none, Sigil guesses from the extension and declines a bare ".iso".
         """
         if not self._lib:
             return None
-        result = _SigilResult(struct_version=_SIGIL_RESULT_V2)
+        result = _SigilResult(struct_version=_SIGIL_RESULT_V3)
         options = _SigilOptions(struct_version=_SIGIL_OPTIONS_V1,
                                 flags=_SIGIL_FLAG_FILENAME_FALLBACK)
         support = None
@@ -251,7 +253,7 @@ class _Sigil:
             options.support = ctypes.pointer(support)
         try:
             code = self._lib.sigil_extract_from_path(
-                str(path).encode('utf-8'), _SIGIL_PLATFORM_AUTO,
+                str(path).encode('utf-8'), self.platform(platform),
                 ctypes.byref(options), ctypes.byref(result))
         except Exception as e:
             log.debug("sigil raised on %s: %s", path, e)
@@ -277,115 +279,6 @@ def _read(path, offset, size):
     with open(path, 'rb') as fh:
         fh.seek(offset)
         return fh.read(size)
-
-
-def _gamecube_id(path):
-    """Six-byte game ID from a GameCube or Wii image, e.g. "GALE01".
-
-    Returns None unless one of the two disc magics is present, so this stays
-    safe to call on any .iso.
-    """
-    try:
-        head = _read(path, 0, 0x20)
-    except OSError:
-        return None
-    if len(head) < 0x20:
-        return None
-
-    wii = struct.unpack_from('>I', head, _WII_MAGIC_OFFSET)[0]
-    gc = struct.unpack_from('>I', head, _GC_MAGIC_OFFSET)[0]
-    if wii != _WII_MAGIC and gc != _GC_MAGIC:
-        return None
-
-    code = head[:6]
-    if not code.isalnum():
-        return None
-    return code.decode('ascii', 'replace').upper()
-
-
-def _iso9660_files(path):
-    """Map of uppercased root-directory filenames to (offset, length).
-
-    Only the root directory is read. Every identifier this module looks for
-    (SYSTEM.CNF, UMD_DATA.BIN) lives there by specification, and stopping at
-    the root keeps this bounded on a malformed image.
-    """
-    try:
-        pvd = _read(path, _PVD_SECTOR * _SECTOR, _SECTOR)
-    except OSError:
-        return {}
-    if len(pvd) < _SECTOR or pvd[1:6] != b'CD001':
-        return {}
-
-    record = pvd[_ROOT_RECORD_OFFSET:_ROOT_RECORD_OFFSET + 34]
-    if len(record) < 34:
-        return {}
-    extent = struct.unpack_from('<I', record, _RECORD_EXTENT)[0]
-    length = struct.unpack_from('<I', record, _RECORD_LENGTH)[0]
-    if not length or length > _MAX_DIR_BYTES:
-        return {}
-
-    try:
-        data = _read(path, extent * _SECTOR, length)
-    except OSError:
-        return {}
-
-    entries = {}
-    pos = 0
-    while pos < len(data):
-        record_len = data[pos]
-        if record_len == 0:
-            # Zero padding runs to the end of the sector; the next record, if
-            # any, begins at the following sector boundary.
-            pos = ((pos // _SECTOR) + 1) * _SECTOR
-            continue
-        if pos + record_len > len(data):
-            break
-        record = data[pos:pos + record_len]
-        name_len = record[32] if len(record) > 32 else 0
-        name = bytes(record[33:33 + name_len])
-        if name not in (b'\x00', b'\x01'):  # the "." and ".." entries
-            # Strip the ";1" version suffix ISO 9660 appends to every file.
-            clean = name.split(b';')[0].decode('ascii', 'replace').upper()
-            entries[clean] = (
-                struct.unpack_from('<I', record, _RECORD_EXTENT)[0] * _SECTOR,
-                struct.unpack_from('<I', record, _RECORD_LENGTH)[0],
-            )
-        pos += record_len
-    return entries
-
-
-def _playstation_serial(path, entries):
-    """PS1/PS2 serial from SYSTEM.CNF, normalised to "SLUS-20202" form."""
-    located = entries.get('SYSTEM.CNF')
-    if not located:
-        return None
-    offset, length = located
-    try:
-        blob = _read(path, offset, min(length, _SECTOR))
-    except OSError:
-        return None
-    match = _BOOT_RE.search(blob)
-    if not match:
-        return None
-    prefix, high, low = match.groups()
-    return f"{prefix.decode('ascii').upper()}-{high.decode('ascii')}{low.decode('ascii')}"
-
-
-def _psp_serial(path, entries):
-    """PSP disc ID from UMD_DATA.BIN, whose first field is the serial."""
-    located = entries.get('UMD_DATA.BIN')
-    if not located:
-        return None
-    offset, _length = located
-    try:
-        blob = _read(path, offset, 16)
-    except OSError:
-        return None
-    serial = blob.split(b'|')[0].strip()
-    if not re.fullmatch(rb'[A-Z]{4}\d{5}', serial):
-        return None
-    return serial.decode('ascii')
 
 
 def is_switch_title_id(value):
@@ -478,42 +371,74 @@ def _switch_title_id(path):
     return None
 
 
-def title_id_from_rom(path, prod_keys=None):
-    """The game-native title ID stamped into a ROM, or None.
+_USAGES = {0: 'folder-exact', 1: 'folder-prefix', 2: 'file-exact',
+           3: 'file-prefix', 4: 'folder-split'}
 
-    Sigil answers first when it is installed, but it is not a superset: it
-    declines ".iso" as an ambiguous extension, so the Python reader below still
-    runs for GameCube/Wii and the ISO 9660 discs. The two are complementary,
-    not layered.
 
-    ``prod_keys`` is passed through for Switch decryption; see _Sigil.extract.
+def _platform_hint(path):
+    """The platform a ROM's folder names, or None.
+
+    Ludo keeps ROMs as roms/<platform>/..., the ES-DE layout RetroDECK uses
+    too, so the nearest ancestor Sigil recognises ("gc", "ps2", "dreamcast")
+    says what a bare ".iso" is. The nearest wins because a game may sit in a
+    folder of its own beneath the platform's.
+    """
+    sigil = _Sigil.get()
+    for parent in Path(path).parents:
+        if sigil.platform(parent.name) != _SIGIL_PLATFORM_AUTO:
+            return parent.name
+    return None
+
+
+def identify(path, platform=None, prod_keys=None):
+    """What Sigil reads out of a ROM, as a dict, or None.
+
+    Keys: ``title_id`` (the game's identity, for matching), ``save_id`` (the
+    literal name its emulator gives the save on disk), ``usage`` (one of
+    _USAGES: whether that name is a file or a folder, exact or a prefix shared
+    by several), ``raw_serial``, ``from_binary`` and ``features``.
+
+    ``platform`` is a RomM slug or folder name; without it the ROM's own folder
+    is consulted (_platform_hint). A game zipped whole is read in place. A
+    Switch ID is normalised to its base title, the one Eden files saves under.
     """
     path = Path(path)
     if not path.is_file():
         return None
+    result = _Sigil.get().extract(path, prod_keys=prod_keys,
+                                  platform=platform or _platform_hint(path))
+    if not result:
+        return None
+    text = lambda raw: raw.decode('ascii', 'replace').strip()
+    title_id, save_id = text(result.title_id), text(result.save_id)
+    if result.platform == _SIGIL_PLATFORM_SWITCH:
+        # Sigil reports the ID it found, not the base title: an update NSP
+        # yields "…800" and a DLC "…3001", as both title_id and save_id. The
+        # save belongs to the base title in every case.
+        title_id = save_id = base_switch_title_id(title_id) or ''
+    if not title_id:
+        return None
+    return {
+        'title_id': title_id,
+        'save_id': save_id or title_id,
+        'usage': _USAGES.get(result.usage, ''),
+        'raw_serial': text(result.raw_serial),
+        'from_binary': result.source != _SIGIL_SOURCE_FILENAME,
+        'features': result.features,
+    }
 
-    result = _Sigil.get().extract(path, prod_keys=prod_keys)
-    if result:
-        found = result.title_id.decode('ascii', 'replace').strip()
-        if result.platform == _SIGIL_PLATFORM_SWITCH:
-            # Sigil reports the ID it found, not the base title: an update NSP
-            # yields "…800" and a DLC "…3001", as both title_id and save_id.
-            # Verified against 0.1.0-dev. The save belongs to the base title in
-            # every case, so normalise here rather than trusting save_id.
-            return base_switch_title_id(found)
-        if found:
-            return found
 
-    gc = _gamecube_id(path)
-    if gc:
-        return gc
+def title_id_from_rom(path, prod_keys=None, platform=None):
+    """The game-native title ID stamped into a ROM, or None.
 
-    if path.suffix.lower() in {'.iso', '.img', '.bin'}:
-        entries = _iso9660_files(path)
-        if entries:
-            return _playstation_serial(path, entries) or _psp_serial(path, entries)
-
-    return _switch_title_id(path)
+    Sigil reads it (see identify). When the library is missing the filename
+    is all there is, which only a tagged Switch dump carries.
+    """
+    found = identify(path, platform=platform, prod_keys=prod_keys)
+    if found:
+        return found['title_id']
+    path = Path(path)
+    return _switch_title_id(path) if path.is_file() else None
 
 
 def title_id_from_save(path):
@@ -547,9 +472,9 @@ def title_id_from_save(path):
 def index_roms(directories, extensions=None, prod_keys=None):
     """Build {title_id: rom_path} for the ROMs under ``directories``.
 
-    The Python reader reads at most a few kilobytes per file — a GameCube ID is
-    six bytes at offset zero, an ISO 9660 lookup touches two sectors — so this
-    stays cheap enough to run over a full library. Files that identify nothing
+    Sigil reads at most a few sectors per file -- a disc header, an ISO 9660
+    root -- so this stays cheap enough to run over a full library; a zipped
+    game costs one inflate up to its header. Files that identify nothing
     are skipped.
 
     ``prod_keys`` is forwarded to Sigil for Switch decryption.
