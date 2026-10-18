@@ -216,6 +216,14 @@ const pillWarning = (dark: boolean) => (dark ? '#b45309' : V2.warning);
 
 const pillSuccess = (dark: boolean) => (dark ? '#15803d' : V2.success);
 
+// Flags are pairs of regional-indicator letters, and not every system font
+// draws the pair as a flag: Chromium in the desktop AppImage can end up on one
+// that shows two boxed letters. The desktop app ships "Ludo Flags" for that
+// (see desktop/src/host/host.css); Steam has its own emoji font, so on the
+// Deck the name simply doesn't resolve and the system ones take over. Only the
+// chips use this: emoji fonts carry digits and spaces too.
+const EMOJI_FONT = '"Ludo Flags", "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", sans-serif';
+
 function regionToEmoji(region: string): string {
   return REGION_EMOJI[(region || '').toLowerCase()] || region;
 }
@@ -800,6 +808,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
                     display: 'inline-flex', alignItems: 'center', gap: '2px',
                     padding: '2px 5px', borderRadius: V2.radiusPill,
                     fontSize: '10px', lineHeight: 1.2, whiteSpace: 'nowrap',
+                    fontFamily: EMOJI_FONT,
                     ...coverPill(iconDark),
                     transition: 'background 0.2s ease, border-color 0.2s ease',
                   }}>

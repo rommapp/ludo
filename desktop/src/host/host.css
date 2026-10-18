@@ -5,6 +5,20 @@
  * rings, modal stacking, toast placement) rather than reproduce Steam's look.
  */
 
+/* Flag emoji for the region/language chips on game covers. Chromium in the
+ * AppImage won't use the system's colour emoji font on some distros (Bazzite
+ * falls through to Liberation Sans, so a flag shows as two boxed letters),
+ * and some systems have none at all. This is Noto Color Emoji (OFL, see
+ * fonts/OFL-NotoColorEmoji.txt) cut down to the regional-indicator flags:
+ *   pyftsubset Noto-COLRv1.ttf --text-file=<every flag in ui/app/tiles.tsx>
+ *     --layout-features='*' --flavor=woff2
+ * unicode-range keeps it from loading until a flag is actually drawn. */
+@font-face {
+  font-family: "Ludo Flags";
+  src: url("./fonts/ludo-flags.woff2") format("woff2");
+  unicode-range: U+1F1E6-1F1FF, U+1F30D-1F310;
+}
+
 :root {
   --desk-bg: #1a1f24;
   --desk-fg: #dcdedf;
