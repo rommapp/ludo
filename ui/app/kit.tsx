@@ -1150,11 +1150,15 @@ export function Shimmer({ style }: { style?: any }) {
 // The same row, but flat: no card of its own, so several can live inside ONE
 // surface separated by hairlines (see FoldersSection). Highlight is drawn inset
 // instead of as a border, which keeps the card's outline unbroken.
-export function V2CardRow({ icon, title, subtitle, onClick, right, danger, divider, first, last }:
+export function V2CardRow({ icon, title, subtitle, onClick, right, danger, divider, first, last, focusable }:
   { icon?: any; title: any; subtitle?: any; onClick?: () => void; right?: any;
-    danger?: boolean; divider?: boolean; first?: boolean; last?: boolean }) {
+    danger?: boolean; divider?: boolean; first?: boolean; last?: boolean;
+    // A read-only row the pad can still land on, so a long list can be
+    // scrolled through. Steam drops a Focusable that has no action.
+    focusable?: boolean }) {
   const { active, highlightHandlers } = useRowHighlight();
   const interactive = !!onClick;
+  const reachable = interactive || !!focusable;
   const accent = danger ? V2.danger : V2.brand;
   // The highlight ring has to follow the CARD's corners, not its own: a row in
   // the middle is square, but the top and bottom rows sit in the card's rounded
@@ -1163,7 +1167,7 @@ export function V2CardRow({ icon, title, subtitle, onClick, right, danger, divid
   const end = `calc(${V2.radiusCard} - 1px)`;
   return (
     <Focusable noFocusRing
-      onActivate={interactive ? onClick : undefined}
+      onActivate={interactive ? onClick : reachable ? () => {} : undefined}
       onClick={interactive ? onClick : undefined}
       {...highlightHandlers}
       style={{
@@ -1173,8 +1177,8 @@ export function V2CardRow({ icon, title, subtitle, onClick, right, danger, divid
         borderBottomLeftRadius: last ? end : 0,
         borderBottomRightRadius: last ? end : 0,
         borderTop: divider ? `1px solid ${V2.border}` : 'none',
-        background: active && interactive ? V2.surfaceHover : 'transparent',
-        boxShadow: active && interactive ? `inset 0 0 0 2px ${accent}` : 'none',
+        background: active && reachable ? V2.surfaceHover : 'transparent',
+        boxShadow: active && reachable ? `inset 0 0 0 2px ${accent}` : 'none',
         cursor: interactive ? 'pointer' : 'default',
         transition: 'background 0.15s, box-shadow 0.15s',
       }}>

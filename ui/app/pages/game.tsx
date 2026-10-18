@@ -381,11 +381,34 @@ function ProviderCard({ p, id }: { p: typeof PROVIDERS[number]; id: any }) {
 
 // One RomFile, laid out as RomM's file card: name line, then category + size,
 // then the file's own hashes. No path or modified date — RomM shows neither.
+// A card the gamepad can land on even though it does nothing. The Files tab is
+// mostly read-only text, and the page only scrolls to what has focus: a file
+// without hashes had nothing focusable in it, so D-pad Down skipped over it and
+// the list could not be scrolled without touching the screen. Steam drops a
+// Focusable that has no action, hence the no-op activate. A card that already
+// holds focusable hash chips does not need it -- nesting the two would only
+// make the chips harder to reach.
+function ReadOnlyCard({ focusable, style, children }:
+  { focusable: boolean; style: any; children: any }) {
+  const [focused, setFocused] = useState(false);
+  if (!focusable) return <div style={style}>{children}</div>;
+  return (
+    <Focusable noFocusRing onActivate={() => {}}
+      onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}
+      style={{ ...style, transition: 'border-color 0.15s ease, box-shadow 0.15s ease',
+        // Both branches: a borderColor present only while focused is dropped by
+        // React on blur, and the 1px border then falls back to white.
+        borderColor: focused ? V2.brand : V2.border, ...V2Focus.flat(focused) }}>
+      {children}
+    </Focusable>
+  );
+}
+
 function FileRow({ f }: { f: any }) {
   const cat = String(f?.category || '').toLowerCase();
   const catLabel = FILE_CATEGORY_LABEL[cat] || (cat ? cat[0].toUpperCase() + cat.slice(1) : '');
   return (
-    <div style={{
+    <ReadOnlyCard focusable={!f?.crc && !f?.md5 && !f?.sha1} style={{
       display: 'flex', flexDirection: 'column', gap: '8px',
       // radiusLg is the surface radius the Screenshots, Save Data and
       // Achievements tabs use — the file cards and the header card above them
@@ -422,7 +445,7 @@ function FileRow({ f }: { f: any }) {
         )}
       </div>
       <HashChipRow crc={f?.crc} md5={f?.md5} sha1={f?.sha1} />
-    </div>
+    </ReadOnlyCard>
   );
 }
 
@@ -550,7 +573,7 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
         ...(update ? [{
           key: 'update', icon: <FaMicrochip size={14} />, title: 'Use update',
           subtitle: enabled.update ? 'Eden applies the installed update' : 'The game starts at its original version',
-          onClick: toggling === null ? () => toggle('update') : undefined,
+          onClick: () => { if (toggling === null) toggle('update'); },
           right: <V2Switch checked={!!enabled.update} />,
         }] : []),
         ...(dlc.length ? [{
@@ -558,7 +581,7 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
           subtitle: enabled.dlc
             ? `${dlc.length} DLC active in Eden`
             : `${dlc.length} DLC installed, turned off in Eden`,
-          onClick: toggling === null ? () => toggle('dlc') : undefined,
+          onClick: () => { if (toggling === null) toggle('dlc'); },
           right: <V2Switch checked={!!enabled.dlc} />,
         }] : []),
         // One switch per mod: Eden reads each mod folder's name, so unlike
@@ -566,7 +589,7 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
         ...mods.map((m: any) => ({
           key: `mod:${m.name}`, icon: <FaWrench size={14} />, title: m.name,
           subtitle: m.enabled ? 'Mod · active in Eden' : 'Mod · turned off in Eden',
-          onClick: toggling === null ? () => toggle('mod', m) : undefined,
+          onClick: () => { if (toggling === null) toggle('mod', m); },
           right: <V2Switch checked={!!m.enabled} />,
         })),
       ]} />
@@ -575,10 +598,11 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
           key: 'update', icon: <FaMicrochip size={14} />,
           title: `Update ${switchVersionLabel(update.version)}`.trim(),
           subtitle: [update.file_name, switchAddOnWhere(update)].filter(Boolean).join(' · '),
+          focusable: true,
           right: <FaCheckCircle size={12} style={{ color: V2.success }} />,
         }] : []),
         ...dlc.map((d: any) => ({
-          key: d.title_id, icon: <FaPuzzlePiece size={14} />,
+          key: d.title_id, icon: <FaPuzzlePiece size={14} />, focusable: true,
           title: d.file_name || d.title_id,
           subtitle: [d.title_id, switchAddOnWhere(d)].filter(Boolean).join(' · '),
           right: <FaCheckCircle size={12} style={{ color: V2.success }} />,
@@ -593,7 +617,7 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
         subtitle: busy === a.rom_id ? 'Downloading…'
           : a.is_downloaded ? 'Downloaded · not active in Eden'
           : 'On the server',
-        onClick: busy === null ? () => fetchAddOn(a) : undefined,
+        onClick: () => { if (busy === null) fetchAddOn(a); },
         right: <FaDownload size={12} style={{ color: V2.fgMuted }} />,
       }))} />
     </div>
@@ -881,7 +905,7 @@ export function FilesTab({ detail }: { detail: any }) {
       {/* ROM header — the whole entry: its filename, what it weighs, and the
           ROM-level hashes. RomM leads the Files tab with this card, above the
           per-file list. */}
-      <div style={{
+      <ReadOnlyCard focusable={!hashes.crc && !hashes.md5 && !hashes.sha1} style={{
         display: 'flex', flexDirection: 'column', gap: '10px',
         padding: '14px', borderRadius: V2.radiusLg,
         background: V2.surface, border: `1px solid ${V2.border}`,
@@ -901,7 +925,7 @@ export function FilesTab({ detail }: { detail: any }) {
           )}
         </div>
         <HashChipRow crc={hashes.crc} md5={hashes.md5} sha1={hashes.sha1} />
-      </div>
+      </ReadOnlyCard>
 
       {/* Per-file list, under the same "N files" label RomM puts above it. */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>

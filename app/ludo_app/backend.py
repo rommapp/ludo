@@ -9105,9 +9105,11 @@ class LudoBackend:
         try:
             sync = self._auto_sync
             g = self._games_index().get(rom_id) or {}
-            name = (g.get('file_name')
-                    or (g.get('romm_data') or {}).get('fs_name') or '')
-            info = sync.switch_add_on_state(name) if sync and name else None
+            # Not `name`: that is the mod's folder name, and shadowing it with
+            # the game's filename made every mod toggle write the wrong entry.
+            rom_name = (g.get('file_name')
+                        or (g.get('romm_data') or {}).get('fs_name') or '')
+            info = sync.switch_add_on_state(rom_name) if sync and rom_name else None
             if not info or info.get('kind') != 'base' or not info.get('base_id'):
                 return {'status': 'not-switch'}
             status = await asyncio.get_event_loop().run_in_executor(
@@ -9982,6 +9984,9 @@ class LudoBackend:
                 # a few seconds longer than usual and something was written to
                 # disk, and silence there reads as a stall.
                 out['bios_fetched'] = bios_fetched
+            switch_gap = self._switch_gap(g)
+            if switch_gap:
+                out['switch_warning'] = switch_gap
             if not ok:
                 # A missing core is the one launch failure the user can fix on
                 # the spot, so hand the UI what it needs to offer that instead of
@@ -10327,6 +10332,29 @@ class LudoBackend:
         self._server_firmware_failed = False
         return out
 
+    def _switch_gap(self, game: dict) -> dict:
+        """{'firmware': bool, 'keys': bool} when this is a Switch game and Eden
+        is installed but has no firmware and/or no prod.keys, else {}.
+
+        Local files only, so it is cheap enough for every launch. Eden starts
+        and then fails with no reason on screen when either is missing, which
+        is the black-screen case the BIOS warning exists for on other
+        platforms; the Switch firmware is not a BIOS file, so _bios_gap never
+        sees it.
+        """
+        try:
+            if self._platform_slug_for(game).lower() != 'switch':
+                return {}
+            if not emulator_saves.eden_data_dirs():
+                return {}
+            fw = emulator_saves.firmware_status()
+            no_fw = not (fw and fw.get('count'))
+            no_keys = emulator_saves.keys_status() is None
+            return {'firmware': no_fw, 'keys': no_keys} if (no_fw or no_keys) else {}
+        except Exception as e:
+            logging.debug(f"switch firmware check failed: {e}")
+            return {}
+
     def _bios_gap(self, game: dict, platform_name: str) -> dict:
         """{missing_bios: [name, ...], core, severity} when BIOS files RomM holds
         for this game's platform aren't on disk, else {}.
@@ -10512,7 +10540,12 @@ class LudoBackend:
                     return emulator_saves.keys_are_current(entry), False
                 if chosen_name and f.get('file_name') != chosen_name:
                     return False, True
-                return emulator_saves.firmware_is_current(entry), False
+                if emulator_saves.firmware_is_current(entry):
+                    return True, False
+                # No marker (installed by hand, or before Ludo kept one): trust
+                # the version Eden itself reports when it is this very release.
+                want = emulator_saves.firmware_version_from_name(f.get('file_name'))
+                return bool(want and want == emulator_saves.detected_firmware_version()), False
             except Exception as e:
                 logging.debug(f"[BIOS] Switch presence for {f}: {e}")
                 return False, False
@@ -10892,9 +10925,11 @@ class LudoBackend:
                     logging.warning(f"could not persist last disc: {e}")
             logging.info(f"prepare_steam_launch: wrote spec for '{g.get('name')}' "
                          f"argv={cmd}")
+            switch_gap = self._switch_gap(g)
             return {'success': True, 'steam_host': True, 'message': 'Spec ready',
                     **({'bios_warning': bios} if bios
-                       else {'bios_fetched': bios_fetched} if bios_fetched else {})}
+                       else {'bios_fetched': bios_fetched} if bios_fetched else {}),
+                    **({'switch_warning': switch_gap} if switch_gap else {})}
         except Exception as e:
             logging.error(f"prepare_steam_launch error: {e}", exc_info=True)
             return {'success': False, 'steam_host': False, 'message': str(e)}

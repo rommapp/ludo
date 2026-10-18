@@ -303,6 +303,20 @@ export async function runLaunch(romId: number, gameName: string, disc: string | 
   if (setBusy) setBusy('launch');
   try {
     const r = await launchGameSmart(romId, disc, siblingRomId ?? null);
+    if (r?.success && r?.switch_warning) {
+      // Eden starts and then sits there when it has no firmware or no keys.
+      // Firmware is not a BIOS file, so the BIOS check above never sees it;
+      // this points at the same page, which installs both.
+      const w = r.switch_warning;
+      const what = w.firmware && w.keys ? 'firmware and prod.keys'
+        : w.firmware ? 'firmware' : 'prod.keys';
+      toaster.toast({
+        title: 'Switch firmware missing',
+        body: `Eden needs ${what} to run games. Open Firmware / BIOS to install ${w.firmware && w.keys ? 'them' : 'it'}.`,
+        duration: 10000,
+        onClick: () => libNavigate('/romm-sync-bios'),
+      });
+    }
     if (r?.success && r?.bios_warning) {
       // The launch itself succeeded, so this is deliberately not an error: the
       // core starts and then sits on a black screen with nothing to explain it.
@@ -386,7 +400,8 @@ export async function launchGameSmart(romId: number, disc: string | null = null,
           // the files it fetched to avoid one) is lost unless it is forwarded.
           return { success: true, message: 'Launching',
             ...(prep.bios_warning ? { bios_warning: prep.bios_warning } : {}),
-            ...(prep.bios_fetched ? { bios_fetched: prep.bios_fetched } : {}) };
+            ...(prep.bios_fetched ? { bios_fetched: prep.bios_fetched } : {}),
+            ...(prep.switch_warning ? { switch_warning: prep.switch_warning } : {}) };
         }
         // launchTile already reset its own session state; fall through to the
         // direct daemon launch below.
