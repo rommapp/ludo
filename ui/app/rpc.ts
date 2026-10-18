@@ -20,7 +20,7 @@ export const ackLibraryAnnouncement = callable<[], any>("ack_library_announcemen
 export const notifyNetworkState = callable<[boolean], any>("notify_network_state");
 // rom_id/has_cover are set on events about one specific game (save/state
 // uploads) and absent on collection-wide ones.
-export const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number, rom_id?: number | null, has_cover?: boolean }> }>("drain_notifications");
+export const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number, rom_id?: number | null, has_cover?: boolean, critical?: boolean, action?: { kind: string, platform?: string } | null }> }>("drain_notifications");
 export const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
 export const rebuildLibrary = callable<[], any>("rebuild_library");
 // Re-reads one platform and reconciles that slice. Takes a slug (what the
@@ -148,6 +148,7 @@ export const getSwitchFirmwareProgress = callable<[], any>("get_switch_firmware_
 // whether it's on; set_ takes the whole disabled set, so it's idempotent.
 export const getPlatformSync = callable<[], any>("get_platform_sync");
 export const setPlatformSync = callable<[string[]], any>("set_platform_sync");
+export const enablePlatform = callable<[string], any>("enable_platform");
 export const getLocalDiscs = callable<[number], any>("get_local_discs");
 export const getLocalSiblings = callable<[number], any>("get_local_siblings");
 export const getHomeData = callable<[], any>("get_home_data");

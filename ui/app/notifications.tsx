@@ -3,7 +3,8 @@ import { Navigation } from "@ludo/host";
 import { toaster } from "./toast";
 import { _pushSaveActivity, useSaveActivity, useServiceStatus} from "./status";
 import { useRef } from "react";
-import { FaCloudUploadAlt } from "react-icons/fa";
+import { FaCloudUploadAlt, FaExclamationTriangle } from "react-icons/fa";
+import { V2 } from "./theme";
 import { PlatformIcon, ToastCover, _gameLabel} from "./kit";
 import { _emuInstall } from "./emulator";
 import { _setSyncPillPref, openGameById, syncPillPref } from "./libcache";
@@ -480,10 +481,22 @@ export const checkForNotifications = async () => {
       // art as the logo, and a click that opens it — so a burst of them is
       // still readable as "these games synced" rather than N identical rows.
       const romId = typeof ev.rom_id === 'number' ? ev.rom_id : null;
+      // A declined install: red, and a click goes where the platform is turned
+      // back on. The click is a mouse nicety — a controller can't reach a
+      // toast, so the Recent Activity row carries the real Turn on button.
+      if (ev.action?.kind === 'enable_platform') {
+        toaster.toast({
+          title: ev.title, body: ev.body, duration: 8000, critical: !!ev.critical,
+          logo: <FaExclamationTriangle size={26} style={{ color: V2.danger, margin: '0 4px' }} />,
+          onClick: () => { try { Navigation.Navigate('/romm-sync-platforms'); } catch { /* ignore */ } },
+        });
+        continue;
+      }
       toaster.toast({
         title: ev.title,
         body: ev.body,
         duration: 5000,
+        critical: !!ev.critical,
         ...(romId !== null ? {
           logo: <ToastCover romId={romId} hasCover={!!ev.has_cover} />,
           // Library root as origin: the toast can outlive the page that was

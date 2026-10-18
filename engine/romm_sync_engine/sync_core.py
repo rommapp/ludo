@@ -233,7 +233,7 @@ def notifications_enabled():
 
 
 def push_notification(kind, title, body, rom_id=None, has_cover=False,
-                      activity_kind=None):
+                      activity_kind=None, critical=False, action=None):
     """Queue a toast for the frontend.
 
     `kind` is a free-form tag ('sync' | 'removal' | 'save') the frontend uses
@@ -244,6 +244,10 @@ def push_notification(kind, title, body, rom_id=None, has_cover=False,
     `activity_kind` also files the event in the Recent Activity feed. Leave it
     None when the caller already records its own (richer) activity row, or the
     feed gets the event twice.
+
+    `critical` draws the toast in the warning colour, for something the user
+    has to act on. `action` (same shape as an activity row's) tells the
+    frontend where a click on the toast should go.
     """
     if not _notifications_enabled:
         # Still file the activity row — muting is about interruptions, not
@@ -258,6 +262,8 @@ def push_notification(kind, title, body, rom_id=None, has_cover=False,
             'body':       body,
             'rom_id':     rom_id,
             'has_cover':  bool(has_cover),
+            'critical':   bool(critical),
+            'action':     action,
             'timestamp':  time.time(),
         })
     if activity_kind:

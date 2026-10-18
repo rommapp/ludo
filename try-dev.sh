@@ -71,8 +71,13 @@ cd "$ROOT/desktop"
 if [[ ! -x .venv/bin/python ]]; then
   echo "Creating backend venv"
   python3 -m venv .venv
+fi
+# Reinstall when requirements.txt changes, not only on first run: a venv made
+# before a dependency was added would otherwise run without it.
+if [[ ! .venv/.requirements-stamp -nt backend/requirements.txt ]]; then
   .venv/bin/pip install -q -r backend/requirements.txt
   .venv/bin/pip install -q -e ../engine -e ../app --no-deps
+  touch .venv/.requirements-stamp
 fi
 [[ -d node_modules ]] || npm install
 export HOME="$SANDBOX" XDG_CONFIG_HOME="$SANDBOX/.config" ROMM_FULLSCREEN="${ROMM_FULLSCREEN:-0}"

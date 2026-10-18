@@ -111,3 +111,111 @@ def test_install_lock_is_held_by_one_process(tmp_path, monkeypatch):
     assert other.stdout.strip() == "busy"
     held.close()
     assert LudoBackend._take_install_lock() is not None
+
+
+class Resp:
+    def __init__(self, status, body=None):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        return self._body
+
+
+class StubSession:
+    def __init__(self, resp):
+        self.resp, self.urls = resp, []
+
+    def get(self, url, timeout=None):
+        self.urls.append(url)
+        if isinstance(self.resp, Exception):
+            raise self.resp
+        return self.resp
+
+
+C64_ROM = {'id': ROM, 'name': 'Telepathy', 'platform_slug': 'c64',
+           'platform_display_name': 'Commodore 64'}
+
+
+@pytest.fixture
+def c64_off(backend, monkeypatch):
+    """A ROM on a switched-off platform: not in the library, so asked for by id."""
+    monkeypatch.setattr(backend, "_games_index", lambda: {})
+    monkeypatch.setattr(backend, "_disabled_platforms", lambda: {'c64'})
+    monkeypatch.setattr(backend, "_DECLINE_SETTLE", 0.05)
+    rows, toasts = [], []
+    monkeypatch.setattr(backend_mod, "_record_activity",
+                        lambda *a, **k: rows.append((a, k)))
+    monkeypatch.setattr(backend_mod, "_push_notification",
+                        lambda *a, **k: toasts.append((a, k)), raising=False)
+    monkeypatch.setattr(backend_mod, "SYNC_CORE_AVAILABLE", True)
+    monkeypatch.setattr(backend_mod, "activity_log", None)
+    client = StubClient()
+    client.base_url = 'https://romm.test'
+    client.session = StubSession(Resp(200, C64_ROM))
+    backend._romm_client = client
+    return backend, rows, toasts
+
+
+def _settled(cond):
+    import time
+    end = time.time() + 3
+    while time.time() < end and not cond():
+        time.sleep(0.02)
+    return cond()
+
+
+def test_a_switched_off_platform_is_declined_with_the_reason(c64_off):
+    b, rows, toasts = c64_off
+    assert _handle(b) == [('req-1', 'failed',
+                           'Commodore 64 is switched off in Ludo on this device')]
+    assert ROM not in b._download_progress, "nothing may be downloaded"
+    assert _settled(lambda: rows and toasts)
+    (kind, title, detail), kw = rows[0]
+    assert (kind, title) == ('error', 'Install from RomM declined — Telepathy')
+    assert kw['action'] == {'kind': 'enable_platform', 'label': 'Turn on',
+                            'platform': 'c64', 'count': 1}
+    assert toasts[0][1]['critical'] is True
+
+
+def test_declines_arriving_together_are_one_row_and_one_toast(c64_off):
+    b, rows, toasts = c64_off
+    for i in range(3):
+        b._handle_install({'id': f'req-{i}', 'rom_id': ROM}, 'dev-1', {f'req-{i}'})
+    assert _settled(lambda: rows and toasts)
+    import time; time.sleep(0.2)
+    assert len(rows) == 1 and len(toasts) == 1
+    assert rows[0][0][1] == '3 installs from RomM declined'
+    assert [s for _, s, _ in b._romm_client.reports] == ['failed'] * 3
+
+
+def test_an_unreadable_rom_is_installed_as_before(c64_off):
+    b, rows, toasts = c64_off
+    b._romm_client.session = StubSession(OSError("offline"))
+    started = []
+
+    async def fake_download(rom_id):
+        started.append(rom_id)
+        b._download_progress[rom_id] = {'state': 'done'}
+        return {'success': True}
+    b.download_game = fake_download
+    assert _handle(b) == [('req-1', 'done', None)]
+    assert started == [ROM] and not toasts
+    assert [r[0][0] for r in rows] == ['download']
+
+
+def test_turn_on_switches_the_platform_back_on(backend, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(backend, "_disabled_platforms", lambda: {'c64', 'gb'})
+    wrote = []
+
+    async def fake_set(disabled=None):
+        wrote.append(disabled)
+        return {'success': True, 'changed': True, 'needs_refresh': True}
+    monkeypatch.setattr(backend, "set_platform_sync", fake_set)
+    resolved = []
+    monkeypatch.setattr(backend_mod, "activity_log",
+                        type("A", (), {"resolve_action": staticmethod(
+                            lambda kind, **m: resolved.append((kind, m)))}))
+    r = asyncio.run(backend.enable_platform('C64'))
+    assert r['needs_refresh'] and wrote == [['gb']]
+    assert resolved == [('enable_platform', {'platform': 'c64'})]

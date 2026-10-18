@@ -55,7 +55,7 @@ def _save_locked():
         logging.debug(f"activity_log save failed: {e}")
 
 
-def record(kind, title, detail='', rom_id=None):
+def record(kind, title, detail='', rom_id=None, action=None):
     """Append one activity entry.
 
     kind: free-form tag the UI maps to an icon —
@@ -64,6 +64,9 @@ def record(kind, title, detail='', rom_id=None):
           into a link to that game. Omitted from the entry entirely when not
           given, so older logs and callers that don't pass it read back
           unchanged.
+    action: optional dict the UI renders as a button on the row, e.g.
+          {'kind': 'enable_platform', 'label': 'Turn on', 'platform': 'c64'}.
+          See resolve_action for how one is marked done.
     """
     with _lock:
         _load_locked()
@@ -78,8 +81,51 @@ def record(kind, title, detail='', rom_id=None):
                 entry['rom_id'] = int(rom_id)
             except (TypeError, ValueError):
                 pass
+        if action:
+            entry['action'] = dict(action)
         _entries.append(entry)
         _save_locked()
+
+
+def take_pending(kind, **match):
+    """Remove and return the rows whose action of this kind is still pending.
+
+    For a row that should be replaced rather than repeated: the caller folds
+    what they said into one new row.
+    """
+    with _lock:
+        _load_locked()
+        taken = [e for e in _entries if _pending(e, kind, match)]
+        if taken:
+            kept = [e for e in _entries if not _pending(e, kind, match)]
+            _entries.clear()
+            _entries.extend(kept)
+            _save_locked()
+        return taken
+
+
+def _pending(e, kind, match):
+    a = e.get('action')
+    return (isinstance(a, dict) and a.get('kind') == kind and not a.get('done')
+            and all(a.get(k) == v for k, v in match.items()))
+
+
+def resolve_action(kind, **match):
+    """Mark every pending action of this kind (and matching fields) done.
+
+    Done actions stay on the row so it can say what happened instead of
+    offering the button again. Returns how many rows changed.
+    """
+    with _lock:
+        _load_locked()
+        n = 0
+        for e in _entries:
+            if _pending(e, kind, match):
+                e['action']['done'] = True
+                n += 1
+        if n:
+            _save_locked()
+        return n
 
 
 def get_recent(limit=MAX_ENTRIES):

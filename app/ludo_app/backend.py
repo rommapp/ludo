@@ -75,6 +75,7 @@ try:
         _extract_archive, _archive_member_names,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
+        push_notification as _push_notification,
         ReachabilityLatch,
         flush_pending_game_toasts as _flush_pending_game_toasts,
         qr_matrix,
@@ -90,7 +91,7 @@ except Exception:
     activity_log = None
 
 
-def _record_activity(kind, title, detail='', rom_id=None):
+def _record_activity(kind, title, detail='', rom_id=None, action=None):
     """Append to the Settings ▸ Recent Activity feed (no-op if unavailable).
 
     rom_id is optional and only passed on when set — the engine is shared with
@@ -99,7 +100,9 @@ def _record_activity(kind, title, detail='', rom_id=None):
     """
     if activity_log:
         try:
-            if rom_id is None:
+            if action is not None:
+                activity_log.record(kind, title, detail, rom_id=rom_id, action=action)
+            elif rom_id is None:
                 activity_log.record(kind, title, detail)
             else:
                 activity_log.record(kind, title, detail, rom_id=rom_id)
@@ -837,6 +840,9 @@ class LudoBackend:
         # site. The desktop backend passes one directly.
         if host is not None:
             self._host = host
+        # Declined installs waiting to be announced, by platform slug.
+        self._declined = {}
+        self._declined_lock = threading.Lock()
         # rom_id -> why its download could not be decompressed, read once by
         # the download worker when it reports the result. Set here, not in
         # _main, so a download can never meet it missing.
@@ -5265,6 +5271,14 @@ class LudoBackend:
                 client.report_install(device_id, rid, 'already_installed')
                 logging.info(f"[INSTALL] {name} is already on this device")
                 return
+            off = self._install_platform_off(rom_id, g)
+            if off:
+                slug, platform, name = off[0], off[1], off[2] or name
+                client.report_install(device_id, rid, 'failed',
+                                      f'{platform} is switched off in Ludo on this device')
+                logging.info(f"[INSTALL] declined {name}: {platform} is switched off")
+                self._note_declined_install(slug, platform, name)
+                return
             logging.info(f"[INSTALL] RomM asked for {name} (request {rid})")
             _record_activity('download', 'Install requested from RomM', name, rom_id=rom_id)
             started = asyncio.run(self.download_game(rom_id))
@@ -5295,6 +5309,98 @@ class LudoBackend:
                 pass
         finally:
             active.discard(rid)
+
+    def _install_platform_off(self, rom_id, g):
+        """(slug, platform name, rom name) when the ROM's platform is switched
+        off, else None.
+
+        A ROM on a switched-off platform is not in the library at all, so it is
+        looked up on the server. When that lookup fails the install goes ahead
+        as before: refusing it would need a reason we do not have.
+        """
+        disabled = self._disabled_platforms()
+        if not disabled:
+            return None
+        if g:
+            slug = str(g.get('platform_slug') or '').strip().lower()
+            if slug not in disabled:
+                return None
+            return slug, g.get('platform') or slug, None
+        try:
+            r = self._romm_client.session.get(
+                f"{self._romm_client.base_url.rstrip('/')}/api/roms/{rom_id}", timeout=10)
+            rom = r.json() if r.status_code == 200 else None
+        except Exception as e:
+            logging.debug(f"[INSTALL] could not look up ROM {rom_id}: {e}")
+            rom = None
+        if not rom:
+            return None
+        for key in ('platform_slug', 'platform_fs_slug'):
+            slug = str(rom.get(key) or '').strip().lower()
+            if slug in disabled:
+                platform = _platform_label(rom)
+                if platform == 'Unknown':
+                    platform = slug
+                return slug, platform, rom.get('name') or rom.get('fs_name_no_ext')
+        return None
+
+    # RomM hands a queue over in one claim, so several ROMs from the same
+    # switched-off platform arrive together. They become one toast and one
+    # activity row per platform, not one each.
+    _DECLINE_SETTLE = 1.5
+
+    def _note_declined_install(self, slug, platform, name):
+        with self._declined_lock:
+            batch = self._declined.setdefault(slug, {'platform': platform, 'names': []})
+            batch['names'].append(name)
+            if len(batch['names']) == 1:
+                t = threading.Timer(self._DECLINE_SETTLE, self._flush_declined, args=(slug,))
+                t.daemon = True
+                t.start()
+
+    def _flush_declined(self, slug):
+        with self._declined_lock:
+            batch = self._declined.pop(slug, None)
+        if not batch:
+            return
+        platform, names = batch['platform'], batch['names']
+        # One waiting row per platform: a row still offering Turn on is folded
+        # into this one rather than left beside it.
+        earlier = 0
+        if activity_log:
+            try:
+                for e in activity_log.take_pending('enable_platform', platform=slug):
+                    earlier += int(e['action'].get('count') or 1)
+            except Exception:
+                pass
+        total = earlier + len(names)
+        title = (f'Install from RomM declined — {names[0]}' if total == 1
+                 else f'{total} installs from RomM declined')
+        detail = f'{platform} is switched off in Ludo.'
+        action = {'kind': 'enable_platform', 'label': 'Turn on', 'platform': slug,
+                  'count': total}
+        _record_activity('error', title, detail, action=action)
+        if SYNC_CORE_AVAILABLE:
+            try:
+                toast = (f'Install declined — {names[0]}' if len(names) == 1
+                         else f'{len(names)} installs declined')
+                _push_notification(
+                    'install_declined', toast,
+                    f'{detail[:-1]}. Turn it on in Settings ▸ Platforms.',
+                    critical=True, action=action)
+            except Exception as e:
+                logging.debug(f"declined-install toast failed: {e}")
+
+    async def enable_platform(self, slug: str):
+        """Turn one platform back on — the Turn on button on a declined install."""
+        slug = str(slug or '').strip().lower()
+        r = await self.set_platform_sync(sorted(self._disabled_platforms() - {slug}))
+        if r.get('success') and activity_log:
+            try:
+                activity_log.resolve_action('enable_platform', platform=slug)
+            except Exception:
+                pass
+        return r
 
     def _ensure_device_registered(self):
         """Ensure this device is registered with RomM and device_id is stored.
