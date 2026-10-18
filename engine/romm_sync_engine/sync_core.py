@@ -1663,12 +1663,29 @@ class SettingsManager:
                 key = hashlib.sha256(material.encode()).digest()
                 return Fernet(base64.urlsafe_b64encode(key))
 
-            user = getpass.getuser()
+            user = self._user()
             self.cipher = _fernet(f"{user}-{self._machine_id()}")
             # Legacy username+hostname key, for migrating pre-existing configs.
             self._legacy_ciphers.append(_fernet(f"{user}-{socket.gethostname()}"))
-        except ImportError:
-            print("⚠️ cryptography not available, using plain text storage")
+            # getuser() reads $USER/$LOGNAME, which Decky Loader leaves as
+            # 'root' for plugins it runs as the user. Values written under that
+            # name still decrypt.
+            env_user = getpass.getuser()
+            if env_user != user:
+                self._legacy_ciphers.append(_fernet(f"{env_user}-{self._machine_id()}"))
+        except ImportError as e:
+            logging.warning(f"cryptography not available ({e}); credentials stored in plain text")
+
+    @staticmethod
+    def _user():
+        """The account this process runs as — from the uid, not the environment,
+        so the desktop app and the Decky plugin derive the same key."""
+        try:
+            import pwd
+            return pwd.getpwuid(os.getuid()).pw_name
+        except Exception:
+            import getpass
+            return getpass.getuser()
 
     def _machine_id(self):
         """Stable per-installation identifier, independent of hostname."""
@@ -1704,6 +1721,12 @@ class SettingsManager:
         # so we never send ciphertext to the server as a credential. Otherwise
         # assume it's legacy plaintext and pass it through unchanged.
         if value.startswith("gAAAAA"):
+            if not getattr(self, '_warned_undecryptable', False):
+                self._warned_undecryptable = True
+                logging.warning(
+                    "Saved credentials can't be decrypted here (cryptography %s, "
+                    "user %r); sign in again",
+                    'loaded' if self.cipher else 'missing', self._user())
             return ''
         return value
 
