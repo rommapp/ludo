@@ -22,6 +22,7 @@ const getRommArtwork = callable<[], any>("get_romm_artwork");
 const getSessionHostPath = callable<[], any>("get_session_host_path");
 const getShortcutIconPath = callable<[], any>("get_shortcut_icon_path");
 const installShortcutIcon = callable<[number], any>("install_shortcut_icon");
+const getSteamTileStatus = callable<[], any>("get_steam_tile_status");
 const launchRetrodeckNative = callable<[], { ok: boolean; reason?: string }>("launch_retrodeck");
 
 let _hooks: LauncherHooks | null = null;
@@ -137,8 +138,23 @@ function _isRommName(nm: string): boolean {
     || nm === 'romm-session-host';
 }
 
+// The desktop app's own "Ludo" tile, when this machine also runs it. It carries
+// the same name as ours but is a different shortcut (another exe, written to
+// shortcuts.vdf by the desktop app), so every name-based lookup below would
+// treat it as a duplicate -- deleting it, or worse, rewriting its exe to ours.
+let _desktopTileId: number | null = null;
+
+async function refreshDesktopTileId(): Promise<void> {
+  try {
+    const st = await getSteamTileStatus();
+    const aid = st?.installed ? Number(st.appid) : NaN;
+    _desktopTileId = Number.isFinite(aid) ? aid >>> 0 : null;
+  } catch { /* keep the last answer */ }
+}
+
 function _rommAppIds(): number[] {
-  return _shortcutAppIds().filter((aid) => _isRommName(_appName(aid)));
+  return _shortcutAppIds().filter((aid) =>
+    (aid >>> 0) !== _desktopTileId && _isRommName(_appName(aid)));
 }
 
 // Stamp "played just now" onto the Ludo tile's overview so it surfaces in the
@@ -224,6 +240,7 @@ async function findRommShortcut(): Promise<number | null> {
 // Returns the surviving appId (or null if none).
 async function cleanupRommShortcuts(): Promise<number | null> {
   try {
+    await refreshDesktopTileId();
     const apps = _sc()?.Apps;
     const mine = _rommAppIds();
     if (mine.length === 0) return null;
@@ -338,6 +355,7 @@ async function addRommShortcut(force = false): Promise<number | null> {
   // "Steam shortcuts API unavailable" toast came from).
   if (!_sc()) return null;
   try {
+    await refreshDesktopTileId();
     // Never create while the shortcut store is empty/unloaded: the existing
     // Ludo tile may simply not be visible yet, and AddShortcut here is exactly
     // how duplicate "Ludo" entries were piling up on each Steam restart.

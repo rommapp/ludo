@@ -1,12 +1,13 @@
-import { useActiveDownloads, useQueuedDownloads } from "../downloads";
+import { cancelDownload, dequeueDownload, useActiveDownloads, useQueuedDownloads } from "../downloads";
+import { toaster } from "../toast";
 import { usePendingUploads, useServiceStatus } from "../status";
 import { useEffect, useRef, useState } from "react";
-import { getRecentActivity } from "../rpc";
+import { getRecentActivity, toggleCollectionSync } from "../rpc";
 import { _forceGamepadFocus } from "../shell";
 import { v2Page } from "../focus";
 import { Focusable } from "@ludo/host";
 import { libBack } from "../nav";
-import { CollectionSyncStatusRow, DownloadRowCover, DownloadStatusRow, GameActionButton, V2StatsSectionBox, _gameLabel, useRowHighlight} from "../kit";
+import { CancelDownloadButton, CollectionSyncStatusRow, DownloadRowCover, DownloadStatusRow, GameActionButton, V2StatsSectionBox, _gameLabel, useRowHighlight} from "../kit";
 import { FaBoxOpen, FaChevronLeft, FaCloudUploadAlt, FaDownload, FaHistory, FaRegClock, FaCheckCircle, FaChevronRight} from "react-icons/fa";
 import { V2, fmtAgo} from "../theme";
 import { openGameById } from "../libcache";
@@ -73,6 +74,18 @@ function CompletedDownloadRow({ event, first }: {
 }
 
 
+// Stopping a collection turns its auto-sync off: the worker re-checks on a
+// timer, so ending only this pass would start it again minutes later. Games
+// already downloaded stay; the collection's sync switch resumes it.
+async function stopCollection(c: any) {
+  try {
+    await toggleCollectionSync(c.key ?? c.name, false);
+    toaster.toast({ title: 'Collection sync stopped', body: `${c.name} — turn sync back on from the collection to resume` });
+  } catch (e) {
+    toaster.toast({ title: "Couldn't stop sync", body: String(e) });
+  }
+}
+
 export function DownloadsPage() {
   const activeDls = useActiveDownloads();
   const queued = useQueuedDownloads();
@@ -132,12 +145,12 @@ export function DownloadsPage() {
             <div style={{ display: 'flex', flexDirection: 'column' }}>
               {syncingCols.map((c, i) => (
                 <div key={`col-${c.name}`} style={{ borderTop: i > 0 ? `1px solid ${V2.border}` : 'none' }}>
-                  <CollectionSyncStatusRow col={c} />
+                  <CollectionSyncStatusRow col={c} onStop={() => stopCollection(c)} />
                 </div>
               ))}
               {activeDls.map((d, i) => (
                 <div key={d.romId} style={{ borderTop: (i > 0 || syncingCols.length > 0) ? `1px solid ${V2.border}` : 'none' }}>
-                  <DownloadStatusRow romId={d.romId} name={d.name} />
+                  <DownloadStatusRow romId={d.romId} name={d.name} onCancel={() => cancelDownload(d.romId)} />
                 </div>
               ))}
             </div>
@@ -157,6 +170,7 @@ export function DownloadsPage() {
                   whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                 }}>{_gameLabel(q.name)}</div>
                 <div style={{ flexShrink: 0, fontSize: '10.5px', color: V2.fgMuted }}>Waiting</div>
+                <CancelDownloadButton onCancel={() => dequeueDownload(q.romId)} />
               </div>
             ))}
             {queued.length > 12 && (

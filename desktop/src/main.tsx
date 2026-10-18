@@ -7,6 +7,10 @@ import { ModalHost, ToastHost } from "./host/overlays";
 import { FooterLegend } from "./host/footer";
 import { Navigation, matchRoute, useRoutePath, useRouteRegistry } from "./host/router";
 import { startSound } from "./host/sound";
+import { startProfiler } from "./host/profiler";
+// Bundled UI font: outside Steam there is no Motiva Sans, and the system
+// fallback differs per desktop (Adwaita Sans, Noto, Segoe UI…).
+import "@fontsource-variable/inter";
 import "./host/host.css";
 
 // Ludo itself: ui/app/index.tsx, shared byte-identically with the Decky build.
@@ -31,6 +35,7 @@ startGamepad();
 // Deck UI sounds. Started before startApp() below so __ludoSoundBase is set by
 // the time the app's own playSteamSound resolves a URL.
 startSound();
+startProfiler();
 
 // Register Ludo's routes and start its backend watches. Must happen before the
 // first render so the router already has them. Nothing tears this down: the app

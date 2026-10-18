@@ -28,7 +28,7 @@ export {
   Menu,
   MenuItem,
 } from "./kit";
-export { ButtonGlyph } from "./footer";
+export { ButtonGlyph, useKeyboardBumpers } from "./footer";
 
 // ── Services ────────────────────────────────────────────────────────────────
 export {

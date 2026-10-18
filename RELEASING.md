@@ -130,11 +130,9 @@ gh release edit v1.0.0-beta.8 --notes-file notes.md
 
 The notes are read by users, in the in-app update panel as well as on GitHub,
 so they say what changed for them, not how. Keep them short: one line per item,
-no internals, no ticket-style detail. The shape:
+no internals, nothing beyond the issue number. The shape:
 
 ```markdown
-**<One line: what this release is about>, on top of v<previous version>.**
-
 ## Highlights
 
 * **<Feature>.** <One or two sentences: what it is and why you'd use it.>
@@ -146,7 +144,7 @@ no internals, no ticket-style detail. The shape:
 
 ## Fixes
 
-* <What was wrong and what happens now, one line each.>
+* <What was wrong and what happens now, one line each. (#<issue>)>
 
 **Full Changelog**: https://github.com/rommapp/ludo/compare/v<previous>...v<this>
 ```
@@ -160,13 +158,14 @@ no internals, no ticket-style detail. The shape:
   "redesigned" already covers it, stop there.
 - Don't mention controller or keyboard-and-mouse support. Every feature has
   it; saying so for one implies the others lack it.
+- Leave out cosmetic touches (a list that now folds away, a moved button).
+  If it doesn't change what a user can do or fix something they hit, it
+  isn't worth a line.
 - Drop any section with nothing in it.
-- When a release follows another closely, users may skip the one in between.
-  From beta.7 on the update panel lists every skipped release itself, but an
-  older install shows only the newest release's notes. Cover that with a last
-  section, `## Also new since v<older version>`, repeating the skipped
-  releases' highlights. The new panel skips everything from that heading on,
-  so the heading must start with "Also new since".
+- End a line with its issue number, e.g. "(#36)", when it fixes or answers a
+  GitHub issue. GitHub links it, and the reporter can see their fix shipped.
+- Never repeat an earlier release's notes. Each release lists only its own
+  changes; the update panel shows every release a user skipped.
 - For a platform on the desktop only (or the Deck only), start the line with
   "Desktop:" or "Deck:".
 

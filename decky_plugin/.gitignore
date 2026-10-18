@@ -80,3 +80,15 @@ py_modules/pypng-*.dist-info/
 py_modules/typing_extensions.py
 py_modules/typing_extensions-*.dist-info/
 py_modules/*.libs/
+py_modules/*.dist-info/
+py_modules/_cffi_backend*.so
+py_modules/cryptography/
+py_modules/cffi/
+py_modules/pycparser/
+py_modules/socketio/
+py_modules/engineio/
+py_modules/websocket/
+py_modules/simple_websocket/
+py_modules/wsproto/
+py_modules/h11/
+py_modules/bidict/

@@ -8,10 +8,10 @@ version = "0.1.0"
 description = "Ludo's shell-independent backend: the RPC surface both frontends serve"
 requires-python = ">=3.11"
 authors = [{ name = 'Hector Eduardo "Covin" Silveri' }]
-dependencies = ["romm-sync-engine"]
+dependencies = ["romm-sync-engine", "python-socketio[client]>=5.10"]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-asyncio>=0.23"]
+test = ["pytest>=8", "pytest-asyncio>=0.23", "uvicorn", "wsproto"]
 
 [tool.setuptools.packages.find]
 include = ["ludo_app*"]

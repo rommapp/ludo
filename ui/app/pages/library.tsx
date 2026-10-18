@@ -1,16 +1,16 @@
 import { LibGame, LibGroup } from "../types";
 import { viewerOpen } from "../glass";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { deleteCollectionRoms, getConfig, getDownloadProgress, getHomeData, getLibraryGames, getLibraryGroups, getResumeStateEnabled, getServiceStatus, repairEmulatorPaths, searchGames, toggleCollectionSync, checkLibraryStale, refreshFromRomm} from "../rpc";
-import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _setResumeStatesPref, _stateThumbListeners, _stateThumbs, _tileElsByRomId, loadStateThumbs} from "../tiles";
-import { _autoFocusFirstRef, _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
+import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _setResumeStatesPref, _stateThumbListeners, _stateThumbs, loadStateThumbs, tileElFor} from "../tiles";
+import { _autoFocusFirstRef, _forceGamepadFocus, _gpFocusEl, playSteamSound, returnFocusRomId, setReturnFocusTarget, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, V2SearchField, useEtaFromPct, Shimmer} from "../kit";
 import { V2, formatEta, formatSpeed } from "../theme";
 import { Focusable, GamepadButton, Navigation, host, showModal } from "@ludo/host";
 import { toaster } from "../toast";
 import { FaBookmark, FaCheck, FaChevronRight, FaDownload, FaEllipsisH, FaExclamationTriangle, FaGamepad, FaLayerGroup, FaPlay, FaRegClock, FaSync } from "react-icons/fa";
 import { LibView, NavId, libBack, libNavigate, navExitPlugin, pushLibView, setLibViewHooks } from "../nav";
-import { _groupsCache, _libGamesCache, getHomeCache, getLibGroupHolder, getLibGroupsHolder, getLibLastTab, libCacheSet, libCacheSetDownloaded, persistGroupsCache, persistHomeCache, setHomeCache, setLibGameHolder, setLibGameOrigin, setLibGroupHolder, setLibGroupsHolder, setLibLastTab, _focusedPlatformSubs, _focusedPlatform, libCacheDelete} from "../libcache";
+import { _groupsCache, _libGamesCache, getHomeCache, getLibGameHolder, getLibGroupHolder, getLibGroupsHolder, getLibLastTab, libCacheSet, libCacheSetDownloaded, persistGroupsCache, persistHomeCache, setHomeCache, setLibGameHolder, setLibGameOrigin, setLibGroupHolder, setLibGroupsHolder, setLibLastTab, _focusedPlatformSubs, _focusedPlatform, libCacheDelete} from "../libcache";
 import { useOffline, useServiceStatus, StaleInfo, _STALE_CHECK_MS, _STALE_RANK, _setStale, _staleInfo, _staleSubs, _clearStale, lastStaleCheck, markStaleChecked} from "../status";
 import { _broadcastLibRefresh, _libRefreshListeners } from "../events";
 import { ScrubOverlay, letterJump, setLetterJump, setScrubGlimpse, _scrubLetterOf, _scrubTargetIdx, NAV_MAINTAIN_X} from "../scrub";
@@ -122,6 +122,8 @@ export async function _applyStaleUpdate(): Promise<boolean> {
   }
 }
 
+let _seenScanAt = 0;
+
 export async function _maybeCheckStale(svcStatus: any) {
   if (!svcStatus || svcStatus.connection === 'offline_cached'
       || svcStatus.connection === 'disconnected') return;
@@ -133,7 +135,12 @@ export async function _maybeCheckStale(svcStatus: any) {
   // same banner, and the numbers it shows came from the same source.
   if (_staleInfo) return;
   const now = Date.now();
-  if (now - lastStaleCheck() < _STALE_CHECK_MS) return;
+  // A scan that just finished in RomM is the one reason to look before the
+  // throttle comes round: it is when the library is most likely to have moved.
+  const scanAt = svcStatus.library_scan_at || 0;
+  const freshScan = scanAt > _seenScanAt;
+  _seenScanAt = Math.max(_seenScanAt, scanAt);
+  if (!freshScan && now - lastStaleCheck() < _STALE_CHECK_MS) return;
   // Stamped before the await, not after: two visibility flips in quick
   // succession would otherwise both pass the check.
   markStaleChecked();
@@ -652,6 +659,18 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   // focus grab must refire on each return to the tab, not just on mount.
   const firstRef = useAutoFocus(visible && !loading && firstList !== null, firstList);
 
+  // Stable open handlers for the memo'd Platform/Collection tiles. Focusing any
+  // cover sets the page background (onBg), which re-renders this panel; inline
+  // arrows here were new on every render, so every platform and collection tile
+  // (~190 on a big library, each with a 4-image mosaic) re-rendered on every
+  // D-pad press. The ref keeps them pointing at the current lists.
+  const openLatest = useRef({ onOpenGroup, platforms, collections });
+  openLatest.current = { onOpenGroup, platforms, collections };
+  const openPlatform = useCallback((grp: LibGroup) =>
+    openLatest.current.onOpenGroup('platform', grp, openLatest.current.platforms), []);
+  const openCollection = useCallback((grp: LibGroup) =>
+    openLatest.current.onOpenGroup('collection', grp, openLatest.current.collections), []);
+
   if (loading) return <HomeSkeleton />;
   return (
     <div style={{ paddingTop: '8px' }}>
@@ -708,7 +727,7 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
         <CardRow icon={<FaGamepad size={16} />} title="Platforms" count={platforms.length}>
           {platforms.map((g, i) => (
             <div key={g.key} style={{ width: '150px', flexShrink: 0 }}>
-              <PlatformTile group={g} onOpen={(grp) => onOpenGroup('platform', grp, platforms)}
+              <PlatformTile group={g} onOpen={openPlatform}
                 focusRef={firstList === 'pf' && i === 0 ? firstRef : undefined} focusable={visible} />
             </div>
           ))}
@@ -723,7 +742,7 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
         <CardRow icon={<FaLayerGroup size={15} />} title="Collections" count={ownCollections.length}>
           {ownCollections.map((g, i) => (
             <div key={g.key} style={{ width: '132px', flexShrink: 0 }}>
-              <CollectionTile group={g} onOpen={(grp) => onOpenGroup('collection', grp, collections)}
+              <CollectionTile group={g} onOpen={openCollection}
                 focusRef={firstList === 'cl' && i === 0 ? firstRef : undefined} focusable={visible} />
             </div>
           ))}
@@ -735,7 +754,7 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
         <CardRow icon={<FaLayerGroup size={15} />} title="Virtual collections" count={virtualCollections.length}>
           {virtualCollections.map((g, i) => (
             <div key={g.key} style={{ width: '132px', flexShrink: 0 }}>
-              <CollectionTile group={g} onOpen={(grp) => onOpenGroup('collection', grp, collections)}
+              <CollectionTile group={g} onOpen={openCollection}
                 focusRef={firstList === 'vc' && i === 0 ? firstRef : undefined} focusable={visible} />
             </div>
           ))}
@@ -834,7 +853,14 @@ export function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
   const lastKey = heldGroup && heldGroup.mode === mode ? heldGroup.group.key : null;
   const focusKey = (lastKey && groups.some((g) => g.key === lastKey)) ? lastKey : (groups[0]?.key ?? null);
   const firstGroupRef = useAutoFocus(visible && !loading && groups.length > 0, `${mode}:${focusKey}`);
-  const openGroup = (g: LibGroup) => onOpenGroup(mode, g, groups);
+  // Stable (see HomePanel's openPlatform): the memo'd tiles skip re-rendering
+  // when the panel re-renders around them.
+  const openGroupLatest = useRef({ onOpenGroup, mode, groups });
+  openGroupLatest.current = { onOpenGroup, mode, groups };
+  const openGroup = useCallback((g: LibGroup) => {
+    const l = openGroupLatest.current;
+    l.onOpenGroup(l.mode, g, l.groups);
+  }, []);
 
   // ---- L2/R2 letter scrubbing -------------------------------------------
   // Displayed order (regular/favorite/smart share one section, virtual has
@@ -847,9 +873,20 @@ export function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
   // Every tile registers its DOM node so the jump can (a) locate the currently
   // focused tile via .gpfocus containment and (b) force focus onto the target.
   const tileEls = useRef(new Map<string, any>());
-  const tileRef = (key: string, autoKey: string | null) => (el: any) => {
-    if (el) tileEls.current.set(key, el); else tileEls.current.delete(key);
-    if (key === autoKey) firstGroupRef.current = el;
+  // Cached per (key, autoKey): a fresh callback ref each render would make
+  // React detach/reattach it and defeat the tiles' memo on every re-render.
+  const tileRefCache = useRef(new Map<string, (el: any) => void>());
+  const tileRef = (key: string, autoKey: string | null) => {
+    const k = `${key}\0${autoKey ?? ''}`;
+    let f = tileRefCache.current.get(k);
+    if (!f) {
+      f = (el: any) => {
+        if (el) tileEls.current.set(key, el); else tileEls.current.delete(key);
+        if (key === autoKey) firstGroupRef.current = el;
+      };
+      tileRefCache.current.set(k, f);
+    }
+    return f;
   };
   // Big centered letter overlay while scrubbing (Big Picture-style).
   const [scrubLetter, setScrubLetter] = useState<string | null>(null);
@@ -1080,6 +1117,8 @@ export function OfflineBanner({ status }: { status: any }) {
   // experience; only the remedy copy differs (toggle airplane vs. join a
   // network). 'server_unreachable' is the device-online-but-server-down case.
   const noNetwork = airplane || reason === 'no_network';
+  // The server answered and refused the token or password: waiting won't help.
+  const authRejected = reason === 'auth_rejected';
   const pending = status?.pending_saves || 0;
 
   // Short title fragment + remedy sentence for the no-connectivity cases.
@@ -1125,6 +1164,11 @@ export function OfflineBanner({ status }: { status: any }) {
         ? 'This can take a minute on a large library.'
         : 'Your downloaded games are ready to play in the meantime.';
     }
+  } else if (authRejected) {
+    dot = V2.danger;
+    title = 'Sign in to RomM again';
+    detail = 'The server no longer accepts this device’s sign-in (the token may have been revoked). '
+      + 'Pair this device again in Settings to resume syncing.';
   } else if (conn === 'offline_cached') {
     dot = V2.warning;
     title = noNetwork
@@ -1213,6 +1257,51 @@ export function SyncBlockedBanner({ status }: { status: any }) {
   );
 }
 
+// RomM can push "Install on device" here, but this sign-in belongs to another
+// device record (installs from before RomM 5.4 paired that way). Same chrome as
+// the banners above; the action opens the connection page, where pairing with
+// the QR code again moves Ludo onto the device RomM installs to.
+export function InstallsRepairBanner({ status }: { status: any }) {
+  const [focused, setFocused] = useState(false);
+  if (!status?.install_not_bound || status?.connection !== 'online') return null;
+  const onPair = () => libNavigate("/romm-sync-config");
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: '10px',
+      margin: '0 16px 8px', padding: '8px 12px',
+      background: V2.surface, border: `1px solid ${V2.borderStrong}`,
+      borderRadius: V2.radiusMd, fontSize: '12px',
+    }}>
+      <div style={{
+        width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0,
+        background: V2.brand, boxShadow: `0 0 6px ${V2.brand}`,
+      }} />
+      <div style={{ minWidth: 0, flex: 1 }}>
+        <div style={{ fontWeight: 600, color: V2.fg }}>
+          Install games from RomM's website
+        </div>
+        <div style={{ color: V2.fgMuted, marginTop: '1px' }}>
+          Pair once more with the QR code to receive installs sent to this
+          device. Ludo syncs your saves first, so nothing is lost.
+        </div>
+      </div>
+      <Focusable noFocusRing
+        onActivate={onPair} onClick={onPair}
+        onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}
+        onMouseEnter={() => setFocused(true)} onMouseLeave={() => setFocused(false)}
+        style={{
+          flexShrink: 0, padding: '5px 14px', borderRadius: V2.radiusPill,
+          cursor: 'pointer', fontSize: '12px', fontWeight: 700, whiteSpace: 'nowrap',
+          background: focused ? V2.brandHover : V2.brand, color: '#fff',
+          border: `1px solid ${focused ? V2.brandHover : V2.brand}`,
+          transition: 'background 0.15s, border-color 0.15s',
+        }}>
+        Pair again
+      </Focusable>
+    </div>
+  );
+}
+
 // Route component for /romm-sync-library. Hosts the tabs page permanently and
 // stacks the inner pages (game grid, game detail, settings family) on top as
 // internal views, so backing out of any of them re-shows the still-mounted
@@ -1220,10 +1309,26 @@ export function SyncBlockedBanner({ status }: { status: any }) {
 export function LibraryRootPage() {
   const [stack, setStack] = useState<LibView[]>([]);
   const viewRef = useRef<HTMLDivElement | null>(null);
+  // The game whose detail page is on top, so backing out lands on its tile.
+  const returnRomId = useRef<number | null>(null);
   useEffect(() => {
     setLibViewHooks(
-      (v) => setStack((s) => [...s, v]),
-      () => setStack((s) => s.slice(0, -1)),
+      (v) => {
+        if (v === 'game') returnRomId.current = getLibGameHolder()?.rom_id ?? null;
+        setStack((s) => [...s, v]);
+      },
+      () => setStack((s) => {
+        // Backing out of a game page: the view underneath re-runs its
+        // first-item autofocus (a grid remounts outright). Point that at the
+        // game the user opened, if its tile is on screen, for the autofocus
+        // window and the grid's tiles arriving a little after it.
+        const romId = returnRomId.current;
+        if (s[s.length - 1] === 'game' && romId != null) {
+          returnRomId.current = null;
+          setReturnFocusTarget(() => tileElFor(romId), romId, 1000);
+        }
+        return s.slice(0, -1);
+      }),
     );
     return () => setLibViewHooks(null, null);
   }, []);
@@ -1314,7 +1419,8 @@ export function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   svcRef.current = svcStatus;
   useEffect(() => {
     _maybeCheckStale(svcStatus);
-  }, [svcStatus?.connection, svcStatus?.library_ready, !!svcStatus?.library_progress]);
+  }, [svcStatus?.connection, svcStatus?.library_ready, !!svcStatus?.library_progress,
+    svcStatus?.library_scan_at]);
   // ...plus a tick, because the deps above can stay put for hours while someone
   // browses. The interval is deliberately shorter than _STALE_CHECK_MS and does
   // no work of its own — it just gives the throttle something to fire on when
@@ -1394,7 +1500,7 @@ export function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
         // being impossible to focus — forcing focus onto one lands nowhere.
         const usable = (el: any) => el && el.isConnected && el.offsetParent !== null;
         const played = lastLaunchedRomId() != null
-          ? _tileElsByRomId.get(lastLaunchedRomId()!) : null;
+          ? tileElFor(lastLaunchedRomId()) : null;
         const first = _autoFocusFirstRef?.current;
         const target = usable(played) ? played
           : usable(first) ? first : navPillRef.current;
@@ -1537,6 +1643,7 @@ export function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
 
       <OfflineBanner status={svcStatus} />
       <SyncBlockedBanner status={svcStatus} />
+      <InstallsRepairBanner status={svcStatus} />
       <StaleLibraryBanner status={svcStatus} />
 
       {/* All four panels stay mounted once visited; only the active one is
@@ -1669,8 +1776,15 @@ export function LibraryGamesPage() {
   // rendered tile grows the count by a chunk whenever it nears the viewport, so
   // typically ~2-3 screens of tiles are mounted and the grid stays fluid.
   const GRID_FIRST = 30, GRID_CHUNK = 30;
-  const [visN, setVisN] = useState(() => Math.min(games.length || 0, GRID_FIRST));
-  useEffect(() => { setVisN(Math.min(games.length || 0, GRID_FIRST)); }, [group?.key]);
+  // Coming back from a game further down than the first chunk: mount through
+  // its tile, so focus can go straight back to it.
+  const firstVisN = (list: LibGame[]) => {
+    const back = returnFocusRomId();
+    const i = back == null ? -1 : list.findIndex((g) => g.rom_id === back);
+    return Math.min(list.length, Math.max(GRID_FIRST, i + 1 + GRID_CHUNK));
+  };
+  const [visN, setVisN] = useState(() => firstVisN(games));
+  useEffect(() => { setVisN(firstVisN(games)); }, [group?.key]);
   // Focus-driven growth — the reliable trigger under gamescope. When the
   // focused tile nears the end of the mounted set, mount another chunk. (The IO
   // sentinel below stays as a touch-scroll fallback.) Stable identity via refs
@@ -2207,7 +2321,7 @@ export function LibraryGamesPage() {
       ) : (
         <Focusable noFocusRing {...NAV_MAINTAIN_X}
           key={`${group.key}:${reloadTick}`}
-          className={slideDir === 1 ? 'lib-slide-r' : 'lib-slide-l'}
+          className={`romm-games-grid ${slideDir === 1 ? 'lib-slide-r' : 'lib-slide-l'}`}
           style={{
             display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(132px, 1fr))',
             gap: '18px 16px', padding: '16px 16px 0',

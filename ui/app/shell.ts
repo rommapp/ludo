@@ -32,6 +32,25 @@ export function _dismissVirtualKeyboard(): void { host.keyboard.hide(); }
 // highlighted, matching what a normal tab switch lands on.
 export let _autoFocusFirstRef: React.MutableRefObject<any> | null = null;
 
+// Set while backing out of a game page: returns that game's tile when it is on
+// screen. useAutoFocus aims there instead of the first item, so focus goes
+// straight back to the game rather than flashing on the top of the list first.
+// The rom id is there for a grid that mounts tiles in chunks: it has to mount
+// that far first, or there is no tile to land on.
+let _returnFocusTarget: (() => any) | null = null;
+let _returnFocusRomId: number | null = null;
+let _returnFocusExpiry: any = null;
+/** Aim autofocus at `fn`'s element for `ms`. A new target replaces the old one
+ *  and its expiry: going back again within the window must not have the
+ *  previous back's timer clear this one partway through. */
+export function setReturnFocusTarget(fn: () => any, romId: number, ms: number) {
+  clearTimeout(_returnFocusExpiry);
+  _returnFocusTarget = fn;
+  _returnFocusRomId = romId;
+  _returnFocusExpiry = setTimeout(() => { _returnFocusTarget = null; _returnFocusRomId = null; }, ms);
+}
+export function returnFocusRomId(): number | null { return _returnFocusRomId; }
+
 export function useAutoFocus(ready: boolean, dep?: any) {
   const ref = useRef<any>(null);
   useEffect(() => {
@@ -43,7 +62,12 @@ export function useAutoFocus(ready: boolean, dep?: any) {
     // would come up with nothing selected and the next press gets spent
     // re-acquiring focus. In the healthy state it degrades to the same focus().
     const timers = [0, 60, 160, 320].map((d) =>
-      setTimeout(() => { try { if (ref.current) _forceGamepadFocus(ref.current); } catch { } }, d));
+      setTimeout(() => {
+        try {
+          const el = _returnFocusTarget?.() || ref.current;
+          if (el) _forceGamepadFocus(el);
+        } catch { }
+      }, d));
     return () => timers.forEach(clearTimeout);
   }, [ready, dep]);
   return ref;

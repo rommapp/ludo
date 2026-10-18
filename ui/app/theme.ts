@@ -31,6 +31,8 @@ export const V2 = {
   success: '#4ade80',
   warning: '#fbbf24',
   danger: '#ff5050',
+  // Focus ring on a filled danger button: a plain danger ring would vanish into the fill.
+  dangerRing: '#ff9e9e',
   igdb: '#6366f1',
   ra: '#ef4444',
   coverPlaceholder: '#1a1a2e',
@@ -42,7 +44,7 @@ export const V2 = {
   radiusCard: '14px',
   radiusPill: '100px',
   elev2: '0 8px 24px rgba(0,0,0,.45)',
-  font: '"Motiva Sans","Segoe UI",system-ui,-apple-system,sans-serif',
+  font: '"Motiva Sans","Inter Variable","Segoe UI",system-ui,-apple-system,sans-serif',
 };
 
 export function fmtBytes(n: number | null | undefined): string {
@@ -103,7 +105,9 @@ export function roundBtn(size: number, variant: 'glass' | 'emphasized' | 'danger
     backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)',
     transition: 'background 0.15s, color 0.15s, border-color 0.15s',
   };
-  if (variant === 'emphasized') return { ...base, background: '#ffffff', border: '1px solid #ffffff', color: '#111117' };
+  // Opaque fill: a backdrop blur behind it can never show, but it still costs a
+  // composited layer per cover every frame (one on each of ~50 visible tiles).
+  if (variant === 'emphasized') return { ...base, backdropFilter: 'none', WebkitBackdropFilter: 'none', background: '#ffffff', border: '1px solid #ffffff', color: '#111117' };
   if (variant === 'danger') return { ...base, background: 'rgba(0,0,0,0.55)', border: '1px solid rgba(255,80,80,0.55)', color: V2.danger };
   return { ...base, background: 'rgba(0,0,0,0.55)', border: '1px solid rgba(255,255,255,0.12)', color: 'rgba(255,255,255,0.95)' };
 }

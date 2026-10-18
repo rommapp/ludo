@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, getScreenshotMode, setScreenshotModeRpc, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
+import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, enablePlatform, refreshFromRomm, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, getScreenshotMode, setScreenshotModeRpc, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
 import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel, V2CardRow, RSwitchTrack} from "../kit";
 import { V2, fmtAgo, fmtBytes } from "../theme";
 import { FaBell, FaBookmark, FaBug, FaCameraRetro, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaLayerGroup, FaPlay, FaRedo, FaRegWindowMaximize, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaWifi, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
@@ -350,7 +350,7 @@ export function RemovedFromRomMSection() {
 }
 
 export function RecentActivitySection() {
-  const [events, setEvents] = useState<Array<{ kind: string, title: string, detail: string, timestamp: number }>>([]);
+  const [events, setEvents] = useState<Array<{ kind: string, title: string, detail: string, timestamp: number, action?: { kind: string, label: string, platform?: string, done?: boolean } }>>([]);
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
@@ -369,6 +369,22 @@ export function RecentActivitySection() {
   }, []);
 
   const shown = expanded ? events : events.slice(0, 6);
+
+  // A declined install's Turn on: switch the platform back on, then fetch its
+  // games so RomM's next send finds them, the same as the Platforms page does.
+  const turnOnPlatform = async (slug: string) => {
+    try {
+      const r = await enablePlatform(slug);
+      if (r?.success === false) throw new Error(r.message || 'failed');
+      const res = await getRecentActivity(10);
+      if (res?.events) setEvents(res.events);
+      if (r?.needs_refresh) {
+        refreshFromRomm(false).then(() => _broadcastLibRefresh()).catch(() => { });
+      }
+    } catch {
+      toaster.toast({ title: 'Platforms', body: 'Could not turn the platform on' });
+    }
+  };
 
   // One "control panel" card: all entries as compact divided rows inside a
   // single surface, with the controls in a footer bar — not a card per event.
@@ -403,6 +419,13 @@ export function RecentActivitySection() {
                   whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                 }}>{_gameLabel(e.detail)}</div>}
               </div>
+              {e.action?.kind === 'enable_platform' && (e.action.done ? (
+                <div style={{ flexShrink: 0, fontSize: '11px', color: V2.fgMuted }}>Turned on</div>
+              ) : (
+                <V2Button variant="tonal" onClick={() => turnOnPlatform(e.action!.platform || '')}>
+                  <span>{e.action.label}</span>
+                </V2Button>
+              ))}
               <div style={{ flexShrink: 0, fontSize: '10px', color: V2.fgMuted, whiteSpace: 'nowrap' }}>
                 {fmtAgo(e.timestamp)}
               </div>

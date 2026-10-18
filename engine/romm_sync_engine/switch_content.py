@@ -227,11 +227,11 @@ def extcontent_dir(rom_dir, create=False):
 def install_external(path, dest_dir, info=None, prod_keys=None):
     """Place one update or DLC in Eden's external-content folder.
 
-    Statuses mirror ``install``: 'not-switch', 'base', 'current', 'ok'. There
-    is no 'compressed' -- a .nsz is exactly as readable to Eden here as a .nsp,
-    because nothing in this path opens the container at all. That is the whole
-    difference between the two modes: NAND installation has to parse the file
-    and copy its members out, and this only has to put the file somewhere.
+    Statuses mirror ``install``: 'not-switch', 'base', 'compressed',
+    'current', 'ok'. Nothing in this path opens the container -- NAND
+    installation has to parse the file and copy its members out, and this
+    only has to put the file somewhere -- but Eden itself cannot read a .nsz
+    or .xcz, so one that switch_nsz could not decompress is still declined.
 
     A NAND install of the same title is removed when one exists. That is not
     the mode migration the user did not ask for -- it is the same rule
@@ -247,6 +247,8 @@ def install_external(path, dest_dir, info=None, prod_keys=None):
     kind = info.get('kind')
     if kind not in ('update', 'dlc'):
         return {'status': 'base'}
+    if info.get('compressed'):
+        return {'status': 'compressed'}
 
     target = extcontent_dir(dest_dir, create=True)
     if target is None:
@@ -367,9 +369,8 @@ def container_members(path):
     """[(name, offset, size)] for every member of an NSP or XCI.
 
     Raises ContainerError for anything else, including .nsz/.xcz -- those are
-    the same containers with their NCAs recompressed, and decompressing them
-    needs zstd plus the section layout, which means keys. Declining is honest;
-    half-installing one would leave Eden with a title it cannot read.
+    the same containers with their NCAs recompressed, and switch_nsz turns
+    them back into an NSP/XCI before they get here.
     """
     path = Path(path)
     suffix = path.suffix.lower()

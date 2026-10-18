@@ -57,3 +57,8 @@ export function ButtonGlyph({ slot }: { slot: Slot }) {
     }}>{LABELS[slot]}</span>
   );
 }
+
+// The Deck has real bumpers and no keyboard driving the UI: hints stay L1/R1.
+export function useKeyboardBumpers(): boolean {
+  return false;
+}

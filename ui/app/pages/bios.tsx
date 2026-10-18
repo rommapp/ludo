@@ -263,6 +263,9 @@ export function BiosDetailModal({ slug, platformName, seed, onChanged, closeModa
     <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}>
       <Focusable noFocusRing style={{
         position: 'fixed', inset: MODAL_SCRIM_INSET, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        // Keep clear of Steam's status bar on the Deck: this panel is tall enough
+        // that centred it ran up under the clock and battery.
+        paddingTop: '56px', boxSizing: 'border-box',
         background: 'rgba(7,7,15,0.45)', WebkitBackdropFilter: 'blur(8px)', backdropFilter: 'blur(8px)',
       }}>
         <style>{`${V2_FOCUS_STYLE}
@@ -275,7 +278,7 @@ export function BiosDetailModal({ slug, platformName, seed, onChanged, closeModa
           background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
           WebkitBackdropFilter: 'blur(28px) saturate(1.1)', backdropFilter: 'blur(28px) saturate(1.1)',
           border: `1px solid rgba(255,255,255,0.12)`, borderRadius: V2.radiusCard,
-          boxShadow: '0 16px 48px rgba(0,0,0,0.55)', maxHeight: '82vh', overflowY: 'auto',
+          boxShadow: '0 16px 48px rgba(0,0,0,0.55)', maxHeight: 'calc(100vh - 160px)', overflowY: 'auto',
           animation: 'umIn 0.18s cubic-bezier(0.22,1,0.36,1)',
         }}>
           <div style={{

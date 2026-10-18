@@ -29,6 +29,7 @@ from pathlib import Path
 from urllib.parse import quote, urljoin
 
 from .host import HostProfile
+from .install_socket import InstallSocket, ScanSocket
 from .release_token import release_token
 
 # Claim our app identity before anything reads or writes engine state. Ludo
@@ -40,7 +41,8 @@ _paths.set_client_name("Ludo")
 # app's ~/RomMSync — but only for someone who has no ~/RomMSync already, so
 # renaming the app never strands a library that is on disk (see paths.library_dir).
 _paths.set_library_dir_name("Ludo")
-from romm_sync_engine import eden_config, emulator_saves, switch_content, title_ids  # noqa: E402
+from romm_sync_engine import (  # noqa: E402
+    eden_config, emulator_saves, switch_content, switch_nsz, title_ids)
 
 
 def _default_roms_dir() -> str:
@@ -62,7 +64,7 @@ except ImportError as e:
 
 try:
     from romm_sync_engine.sync_core import (
-        SettingsManager, RomMClient, RetroArchInterface,
+        SettingsManager, RomMClient, RetroArchInterface, DEVICE_CAPABILITIES,
         AutoSyncManager, CollectionSyncManager,
         BiosTrackingManager, ROM_TRIM_FIELDS, LIBRARY_PAGE_SIZE,
         SteamShortcutManager, CoverArtManager,
@@ -73,6 +75,7 @@ try:
         _extract_archive, _archive_member_names,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
+        push_notification as _push_notification,
         ReachabilityLatch,
         flush_pending_game_toasts as _flush_pending_game_toasts,
         qr_matrix,
@@ -88,7 +91,7 @@ except Exception:
     activity_log = None
 
 
-def _record_activity(kind, title, detail='', rom_id=None):
+def _record_activity(kind, title, detail='', rom_id=None, action=None):
     """Append to the Settings ▸ Recent Activity feed (no-op if unavailable).
 
     rom_id is optional and only passed on when set — the engine is shared with
@@ -97,7 +100,9 @@ def _record_activity(kind, title, detail='', rom_id=None):
     """
     if activity_log:
         try:
-            if rom_id is None:
+            if action is not None:
+                activity_log.record(kind, title, detail, rom_id=rom_id, action=action)
+            elif rom_id is None:
                 activity_log.record(kind, title, detail)
             else:
                 activity_log.record(kind, title, detail, rom_id=rom_id)
@@ -404,6 +409,14 @@ def _resolve_download_path(download_dir, platform_slug, file_name):
         base = Path(download_dir) / folder / file_name
         if is_path_validly_downloaded(base):
             return base, True
+    # A compressed Switch download is decompressed on arrival (see
+    # Plugin._maybe_decompress_switch), so the file on disk is the .nsp/.xci.
+    converted = switch_nsz.converted_name(file_name)
+    if converted:
+        for folder in folders:
+            cand = Path(download_dir) / folder / converted
+            if is_path_validly_downloaded(cand):
+                return cand, True
     if Path(file_name).suffix.lower() in ('.zip', '.7z'):
         stem = Path(file_name).stem
         for folder in folders:
@@ -813,6 +826,10 @@ class LudoBackend:
     # frontend via get_download_progress() for the cover/button fill UI.
     _download_progress: dict = {}
 
+    # rom_ids the user asked to stop. download_rom polls this between chunks and
+    # deletes its partial file when it sees the id; cleared when a download starts.
+    _download_cancels: set = set()
+
     # -----------------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------------
@@ -823,6 +840,17 @@ class LudoBackend:
         # site. The desktop backend passes one directly.
         if host is not None:
             self._host = host
+        # Declined installs waiting to be announced, by platform slug.
+        self._declined = {}
+        self._declined_lock = threading.Lock()
+        # Install requests being handled (request id -> rom_id), and the ones
+        # RomM has cancelled while they were.
+        self._install_jobs = {}
+        self._install_cancelled = set()
+        # rom_id -> why its download could not be decompressed, read once by
+        # the download worker when it reports the result. Set here, not in
+        # _main, so a download can never meet it missing.
+        self._decompress_failures = {}
         logging.info(f"Ludo backend {self._host.version} on host "
                      f"{self._host.name!r} (updates from {self._host.asset_suffix})")
 
@@ -939,11 +967,27 @@ class LudoBackend:
         )
         self._reach_thread.start()
 
+        # Installs queued from RomM's web UI ("Install on device", RomM 5.4+).
+        self._install_wake = threading.Event()
+        self._install_socket = InstallSocket(self._install_wake,
+                                             on_cancel=self._on_install_cancelled)
+        self._install_wake.set()   # first claim right after connect, not a minute in
+        # Library scans finished in RomM; see _on_romm_scan_done.
+        self._scan_socket = ScanSocket(self._on_romm_scan_done)
+        self._install_thread = threading.Thread(
+            target=self._install_loop, daemon=True, name="romm-installs")
+        self._install_thread.start()
+
         logging.info("Sync started (retry + reachability threads; managers start on connect)")
 
     def _stop_sync(self):
         if self._stop_event:
             self._stop_event.set()
+        if getattr(self, '_install_socket', None):
+            self._install_wake.set()
+            self._install_socket.close()
+        if getattr(self, '_scan_socket', None):
+            self._scan_socket.close()
         if self._retry_thread:
             self._retry_thread.join(timeout=5)
         if self._reach_thread:
@@ -1745,6 +1789,7 @@ class LudoBackend:
             # request, while the fetch below runs for minutes on a large library
             # — behind it, save-sync stays dead for that whole stretch.
             self._ensure_device_registered()
+            self._read_server_features()
 
             # Load game list — unless the server provably still holds exactly
             # what we hydrated from the snapshot.
@@ -2314,6 +2359,10 @@ class LudoBackend:
                     # disabled)" from "radio on but joined to no network" so
                     # the UI can tell the user what to actually toggle.
                     reason = 'airplane_mode' if self._wifi_radio_blocked() else 'no_network'
+                elif self._romm_client and getattr(self._romm_client, 'auth_rejected', False):
+                    # The server answered and refused us: a revoked token or a
+                    # changed password. Waiting will not fix it, so say so.
+                    reason = 'auth_rejected'
                 else:
                     reason = 'server_unreachable'
                 has_library = bool(self._available_games)
@@ -2329,11 +2378,15 @@ class LudoBackend:
                     conn_state = 'offline_cached'
                     msg = ("Airplane mode is on" if reason == 'airplane_mode'
                            else "No internet connection" if reason == 'no_network'
+                           else "RomM no longer accepts this device's sign-in"
+                           if reason == 'auth_rejected'
                            else "Can't reach your RomM server")
                 else:
                     conn_state = 'disconnected'
                     msg = ("Airplane mode is on" if reason == 'airplane_mode'
                            else "No internet connection" if reason == 'no_network'
+                           else "RomM no longer accepts this device's sign-in"
+                           if reason == 'auth_rejected'
                            else "Can't reach your RomM server")
                 return {
                     'status':                  'running',
@@ -2410,10 +2463,16 @@ class LudoBackend:
                 'status':                  'connected',
                 'connection':              'online',
                 'unreachable_reason':      None,
+                # RomM can push installs here, but this sign-in is bound to a
+                # different device; pairing again with the QR code fixes it.
+                'install_not_bound':       getattr(self, '_install_not_bound', False),
                 # True once the initial full library fetch has completed — the
                 # frontend gates the post-update "reopen Home" on this so covers
                 # don't fetch against a still-initializing backend.
                 'library_ready':           self._last_full_fetch_time is not None,
+                # Bumped when RomM finishes a scan; the frontend re-checks the
+                # library for changes when it moves.
+                'library_scan_at':         getattr(self, '_library_scan_at', 0),
                 # Present only while a full fetch is in flight. It belongs in THIS
                 # branch, not just the not-connected one: RomMClient authenticates
                 # in its constructor, so we report 'online' from the first second
@@ -4301,6 +4360,58 @@ class LudoBackend:
             logging.warning(f"_maybe_unzip_download error (keeping archive): {e}")
             return dest
 
+    # What the Downloads row says under a decompressing game: the step is new
+    # and takes a while, so it names why it is happening.
+    _DECOMPRESS_DETAIL = 'so Eden can open it'
+
+    def _maybe_decompress_switch(self, path: Path, rom_id: int = None) -> Path:
+        """Turn a downloaded .nsz/.xcz into the .nsp/.xci Eden can open.
+
+        Eden reads neither compressed form, so a compressed download would be
+        a game that does not boot. A folder ROM has each compressed container
+        inside it converted. On failure the compressed file stays and the
+        reason is logged -- the download itself still succeeded. Returns the
+        path to use.
+        """
+        try:
+            path = Path(path)
+            targets = ([f for f in sorted(path.iterdir()) if switch_nsz.is_compressed(f)]
+                       if path.is_dir() else
+                       [path] if path.is_file() and switch_nsz.is_compressed(path) else [])
+            if not targets:
+                return path
+            if not switch_nsz.available():
+                logging.warning("cannot decompress %s: libzstd or libcrypto missing",
+                                path.name)
+                if rom_id is not None:
+                    self._decompress_failures[rom_id] = switch_nsz.describe_failure(
+                        switch_nsz.DecompressError('libzstd is not installed'))
+                return path
+
+            def _on_pct(pct):
+                if rom_id is not None:
+                    self._download_progress[rom_id] = {
+                        'percent': pct, 'downloaded': 0, 'total': 0, 'speed': 0,
+                        'eta': 0, 'state': 'extracting', 'message': 'Decompressing…',
+                        'detail': self._DECOMPRESS_DETAIL,
+                    }
+            result = path
+            for target in targets:
+                _on_pct(0)
+                try:
+                    converted = switch_nsz.decompress(target, _on_pct)
+                except Exception as e:
+                    logging.warning(f"could not decompress {target.name}: {e}")
+                    if rom_id is not None:
+                        self._decompress_failures[rom_id] = switch_nsz.describe_failure(e)
+                    continue
+                if target == path:
+                    result = converted
+            return result
+        except Exception as e:
+            logging.warning(f"_maybe_decompress_switch error: {e}")
+            return path
+
     async def get_emulator_status(self, refresh: bool = False):
         """What emulator Ludo will use, and whether anything about it is broken.
 
@@ -4514,6 +4625,14 @@ class LudoBackend:
                 label = self._platform_name_for(g)
                 info = ra.describe_core_resolution(label, system_slug=slug)
                 info.update({'slug': slug, 'platform_name': label})
+                # A platform served by a standalone emulator (Switch -> Eden)
+                # has no libretro core by design; reporting "no core" for it
+                # made a working Eden look undetected (rommapp/ludo#39).
+                standalone = ra.standalone_emulator_status(label, slug)
+                if standalone:
+                    info['standalone'] = standalone
+                    info['resolved_core'] = standalone['name'] if standalone['installed'] else ''
+                    info['source'] = 'standalone' if standalone['installed'] else 'none'
                 rows.append(info)
             rows.sort(key=lambda r: (r['platform_name'] or '').lower())
             support = ra.core_download_support()
@@ -5051,6 +5170,299 @@ class LudoBackend:
             logging.error(f"[DEVICE] rename error: {e}", exc_info=True)
             return False
 
+    def _read_server_features(self):
+        """Ask the server what it supports, and advertise what we do.
+
+        A device registered before 5.4 has no capabilities on the server, and
+        RomM offers "Install on device" only for devices that say they take
+        installs, so an existing registration is updated here.
+        """
+        try:
+            features = self._romm_client.get_server_features()
+            logging.info(f"[SERVER] RomM {features.get('version') or '?'}, "
+                         f"device installs {'on' if features.get('device_install') else 'off'}")
+            device_id = self._settings.get('Device', 'device_id', '')
+            if features.get('device_install') and device_id:
+                device = self._romm_client.get_device(device_id) or {}
+                caps = device.get('capabilities') or {}
+                if any(caps.get(k) != v for k, v in DEVICE_CAPABILITIES.items()):
+                    self._romm_client.update_device(
+                        device_id, {'capabilities': {**caps, **DEVICE_CAPABILITIES}})
+        except Exception as e:
+            logging.debug(f"server feature read failed: {e}")
+
+    # Seconds between install claims. RomM counts a device that claimed in
+    # the last few minutes as online, which is what lists it in the web UI.
+    _INSTALL_POLL = 60
+
+    def _install_loop(self):
+        """Claim install requests from RomM and download what they ask for.
+
+        RomM's device socket wakes this the moment an install is queued (and
+        on every connect, for anything queued while we were away); the timed
+        claim covers a socket that is down. Each request is handled once per
+        process; a request still downloading when the app quits is handed back
+        on the next claim and picked up again.
+        """
+        active = set()        # request ids being handled now
+        warned = set()        # reasons already logged, so a denial logs once
+        wake = self._install_wake
+        lock = None           # held while this copy is the one handling installs
+        ready = False         # until connected, look again soon rather than in a minute
+        while not self._stop_event.is_set():
+            woken = wake.wait(self._INSTALL_POLL if ready else 5)
+            if self._stop_event.is_set():
+                break
+            if woken:
+                # Bursts (connect + queued) arrive together: claim once.
+                self._stop_event.wait(0.5)
+                wake.clear()
+            try:
+                client = self._romm_client
+                # Every copy listens for scans, paired or not, lock or no lock.
+                if client and client.authenticated and self._online is not False:
+                    self._scan_socket.ensure(client.base_url, client.client_token or '-',
+                                             client.session.verify)
+                else:
+                    self._scan_socket.close()
+                if not (client and client.authenticated and self._online is not False
+                        and client.server_features.get('device_install')):
+                    ready = False
+                    self._install_socket.close()
+                    continue
+                ready = True
+                # The desktop app and the Decky plugin share one config, so on a
+                # machine with both, two copies would claim the same requests
+                # and download the same ROM into the same file. One handles
+                # installs; the other stays out until it closes.
+                if lock is None:
+                    lock = self._take_install_lock()
+                    if lock is None:
+                        if 'locked' not in warned:
+                            warned.add('locked')
+                            logging.info("[INSTALL] another Ludo is handling installs")
+                        self._install_socket.close()
+                        continue
+                device_id = self._settings.get('Device', 'device_id', '')
+                if not device_id:
+                    continue
+                requests_, reason = client.claim_installs(device_id)
+                # The one denial the user can fix: offer to re-pair.
+                self._install_not_bound = (reason == 'not_bound')
+                # Only a token RomM will take for this device gets a socket.
+                if requests_ is None or not client.client_token:
+                    self._install_socket.close()
+                else:
+                    self._install_socket.ensure(client.base_url, client.client_token,
+                                                client.session.verify)
+                if requests_ is None:
+                    if reason not in warned:
+                        warned.add(reason)
+                        logging.info(f"[INSTALL] not claiming installs: {reason}"
+                                     + (" (this device's token is bound to another "
+                                        "device; pair again with the QR code to "
+                                        "receive installs)" if reason == 'not_bound' else ""))
+                    continue
+                for req in requests_:
+                    rid = req.get('id')
+                    if rid and rid not in active:
+                        active.add(rid)
+                        threading.Thread(
+                            target=self._handle_install, args=(req, device_id, active),
+                            daemon=True, name=f"romm-install-{rid[:8]}").start()
+            except Exception as e:
+                logging.debug(f"install loop error: {e}")
+
+    @staticmethod
+    def _take_install_lock():
+        """An exclusive lock on installs.lock, or None if another process has it.
+        The open file is the lock: it is released when the process exits."""
+        import fcntl
+        f = open(CONFIG_DIR / 'installs.lock', 'w')
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except OSError:
+            f.close()
+            return None
+
+    def _handle_install(self, req, device_id, active):
+        """Download one requested ROM and report how it went."""
+        rid, rom_id = req['id'], req.get('rom_id')
+        client = self._romm_client
+        self._install_jobs[rid] = rom_id
+        try:
+            g = self._games_index().get(rom_id)
+            name = (g or {}).get('display_name') or (g or {}).get('name') or f'ROM {rom_id}'
+            if g and g.get('is_downloaded'):
+                client.report_install(device_id, rid, 'already_installed')
+                logging.info(f"[INSTALL] {name} is already on this device")
+                return
+            off = self._install_platform_off(rom_id, g)
+            if off:
+                slug, platform, name = off[0], off[1], off[2] or name
+                client.report_install(device_id, rid, 'failed',
+                                      f'{platform} is switched off in Ludo on this device')
+                logging.info(f"[INSTALL] declined {name}: {platform} is switched off")
+                self._note_declined_install(slug, platform, name)
+                return
+            logging.info(f"[INSTALL] RomM asked for {name} (request {rid})")
+            if rid in self._install_cancelled:
+                return  # cancelled before it started; RomM has already ended it
+            _record_activity('download', 'Install requested from RomM', name, rom_id=rom_id)
+            started = asyncio.run(self.download_game(rom_id))
+            if not started.get('success'):
+                client.report_install(device_id, rid, 'failed',
+                                      started.get('message') or 'Could not start the download')
+                return
+            # download_game returns at once; the worker writes the outcome here.
+            while not self._stop_event.wait(2):
+                state = (self._download_progress.get(rom_id) or {}).get('state')
+                if state in ('done', 'error', 'cancelled'):
+                    break
+                # A cancel that landed before the transfer began.
+                if rid in self._install_cancelled and state == 'downloading':
+                    self._download_cancels.add(rom_id)
+            else:
+                return  # shutting down: the request goes back on the next claim
+            prog = self._download_progress.get(rom_id) or {}
+            if rid in self._install_cancelled:
+                # RomM ended the request when it was cancelled; there is
+                # nothing to report. Past the transfer the game is kept.
+                if prog.get('state') == 'cancelled':
+                    _record_activity('delete', 'Install cancelled from RomM', name,
+                                     rom_id=rom_id)
+                logging.info(f"[INSTALL] {name}: cancelled from RomM "
+                             f"({prog.get('state')})")
+                return
+            if prog.get('state') == 'done':
+                client.report_install(device_id, rid, 'done')
+            else:
+                client.report_install(
+                    device_id, rid, 'failed',
+                    'Cancelled on the device' if prog.get('state') == 'cancelled'
+                    else prog.get('message') or 'Download failed')
+        except Exception as e:
+            logging.error(f"[INSTALL] request {rid} failed: {e}", exc_info=True)
+            try:
+                client.report_install(device_id, rid, 'failed', str(e))
+            except Exception:
+                pass
+        finally:
+            active.discard(rid)
+            self._install_jobs.pop(rid, None)
+            self._install_cancelled.discard(rid)
+
+    def _on_romm_scan_done(self, stats):
+        """A scan finished in RomM: tell the frontend to check the library now.
+
+        Only the check, not the update. The frontend's staleness check compares
+        platform counts and raises the usual banner, and applying it still
+        waits for the user, so a scan never rewrites the library mid-browse.
+        """
+        self._library_scan_at = time.time()
+
+    def _on_install_cancelled(self, rid):
+        """RomM cancelled a request: stop its download if one is running."""
+        rom_id = self._install_jobs.get(rid)
+        if rom_id is None:
+            return  # not ours, or already finished
+        self._install_cancelled.add(rid)
+        if (self._download_progress.get(rom_id) or {}).get('state') == 'downloading':
+            self._download_cancels.add(rom_id)
+
+    def _install_platform_off(self, rom_id, g):
+        """(slug, platform name, rom name) when the ROM's platform is switched
+        off, else None.
+
+        A ROM on a switched-off platform is not in the library at all, so it is
+        looked up on the server. When that lookup fails the install goes ahead
+        as before: refusing it would need a reason we do not have.
+        """
+        disabled = self._disabled_platforms()
+        if not disabled:
+            return None
+        if g:
+            slug = str(g.get('platform_slug') or '').strip().lower()
+            if slug not in disabled:
+                return None
+            return slug, g.get('platform') or slug, None
+        try:
+            r = self._romm_client.session.get(
+                f"{self._romm_client.base_url.rstrip('/')}/api/roms/{rom_id}", timeout=10)
+            rom = r.json() if r.status_code == 200 else None
+        except Exception as e:
+            logging.debug(f"[INSTALL] could not look up ROM {rom_id}: {e}")
+            rom = None
+        if not rom:
+            return None
+        for key in ('platform_slug', 'platform_fs_slug'):
+            slug = str(rom.get(key) or '').strip().lower()
+            if slug in disabled:
+                platform = _platform_label(rom)
+                if platform == 'Unknown':
+                    platform = slug
+                return slug, platform, rom.get('name') or rom.get('fs_name_no_ext')
+        return None
+
+    # RomM hands a queue over in one claim, so several ROMs from the same
+    # switched-off platform arrive together. They become one toast and one
+    # activity row per platform, not one each.
+    _DECLINE_SETTLE = 1.5
+
+    def _note_declined_install(self, slug, platform, name):
+        with self._declined_lock:
+            batch = self._declined.setdefault(slug, {'platform': platform, 'names': []})
+            batch['names'].append(name)
+            if len(batch['names']) == 1:
+                t = threading.Timer(self._DECLINE_SETTLE, self._flush_declined, args=(slug,))
+                t.daemon = True
+                t.start()
+
+    def _flush_declined(self, slug):
+        with self._declined_lock:
+            batch = self._declined.pop(slug, None)
+        if not batch:
+            return
+        platform, names = batch['platform'], batch['names']
+        # One waiting row per platform: a row still offering Turn on is folded
+        # into this one rather than left beside it.
+        earlier = 0
+        if activity_log:
+            try:
+                for e in activity_log.take_pending('enable_platform', platform=slug):
+                    earlier += int(e['action'].get('count') or 1)
+            except Exception:
+                pass
+        total = earlier + len(names)
+        title = (f'Install from RomM declined — {names[0]}' if total == 1
+                 else f'{total} installs from RomM declined')
+        detail = f'{platform} is switched off in Ludo.'
+        action = {'kind': 'enable_platform', 'label': 'Turn on', 'platform': slug,
+                  'count': total}
+        _record_activity('error', title, detail, action=action)
+        if SYNC_CORE_AVAILABLE:
+            try:
+                toast = (f'Install declined — {names[0]}' if len(names) == 1
+                         else f'{len(names)} installs declined')
+                _push_notification(
+                    'install_declined', toast,
+                    f'{detail[:-1]}. Turn it on in Settings ▸ Platforms.',
+                    critical=True, action=action)
+            except Exception as e:
+                logging.debug(f"declined-install toast failed: {e}")
+
+    async def enable_platform(self, slug: str):
+        """Turn one platform back on — the Turn on button on a declined install."""
+        slug = str(slug or '').strip().lower()
+        r = await self.set_platform_sync(sorted(self._disabled_platforms() - {slug}))
+        if r.get('success') and activity_log:
+            try:
+                activity_log.resolve_action('enable_platform', platform=slug)
+            except Exception:
+                pass
+        return r
+
     def _ensure_device_registered(self):
         """Ensure this device is registered with RomM and device_id is stored.
 
@@ -5251,12 +5663,41 @@ class LudoBackend:
                         'message': 'The pairing request expired'}
 
             loop = asyncio.get_event_loop()
+            poller = RomMClient(state['url'])
             status, value = await loop.run_in_executor(
-                None,
-                lambda: RomMClient(state['url']).device_auth_poll(state['device_code']),
+                None, lambda: poller.device_auth_poll(state['device_code']),
             )
             if status == 'approved':
                 self._qr_pairing = None
+                # RomM creates a device for every approval and binds the token
+                # to it; only that device may claim installs pushed from the
+                # web UI. Adopt it, unless this install already syncs as a
+                # device of its own: switching would drop the server's sync
+                # history for every save.
+                settings = self._require_settings()
+                # ...unless the user re-paired to receive installs, which only
+                # reach the device the sign-in is bound to.
+                if poller.paired_device_id and (
+                        not settings.get('Device', 'device_id', '')
+                        or getattr(self, '_install_not_bound', False)):
+                    # Sync once more as the old device first, so every save on
+                    # disk matches the server and the new device's first
+                    # negotiate finds hashes that agree rather than conflicts.
+                    if self._auto_sync and settings.get('Device', 'device_id', ''):
+                        # Connect attaches the client only after the library
+                        # walk, and the user can pair before that finishes.
+                        if not self._auto_sync.romm_client and self._romm_client:
+                            self._auto_sync.romm_client = self._romm_client
+                        try:
+                            await loop.run_in_executor(
+                                None, lambda: self._auto_sync.run_negotiated_save_sync(
+                                    trigger="re-pair"))
+                        except Exception as e:
+                            logging.warning(f"[DEVICE] sync before re-pair failed: {e}")
+                    settings.set('Device', 'device_id', poller.paired_device_id)
+                    self._install_not_bound = False
+                    logging.info(f"[DEVICE] adopted the paired device "
+                                 f"{poller.paired_device_id}")
                 result = await self._apply_pairing(state['url'], value)
                 return {**result, 'status': 'approved'}
             if status == 'slow_down':
@@ -6875,6 +7316,27 @@ class LudoBackend:
             return None
         return discs[0]['path']  # .m3u sorts first, else first disc
 
+    async def _ready_to_boot(self, g, launch_path):
+        """Decompress a still-compressed Switch file before it is launched.
+
+        Normally done on download; this is the retry for a download whose
+        decompression failed, so Play never hands Eden a file it cannot read.
+        Returns (path, None) or (None, the reason to show).
+        """
+        if not (launch_path and switch_nsz.is_compressed(launch_path)):
+            return launch_path, None
+        loop = asyncio.get_event_loop()
+        try:
+            converted = await loop.run_in_executor(
+                None, switch_nsz.decompress, Path(launch_path))
+        except Exception as e:
+            logging.warning(f"could not decompress {launch_path} at launch: {e}")
+            return None, switch_nsz.describe_failure(e)
+        if Path(g.get('local_path') or '') == Path(launch_path):
+            g['local_path'] = str(converted)
+            self._persist_snapshot_throttled()
+        return str(converted), None
+
     def _get_last_disc(self, rom_id):
         """Remembered disc filename for a ROM, or '' if none/invalid."""
         try:
@@ -7605,6 +8067,42 @@ class LudoBackend:
             return {'success': True, 'removed': removed}
         except Exception as e:
             logging.error(f"clear_cover_cache error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def refresh_game_metadata(self, rom_id: int):
+        """Re-read one game from RomM and drop its cached art, so a stray game
+        whose cover never loaded (or changed on the server) gets a fresh shot
+        without wiping the whole cover cache."""
+        if not (self._romm_client and self._romm_client.authenticated):
+            return {'success': False, 'message': 'Not connected to RomM'}
+        try:
+            r = await asyncio.to_thread(
+                self._romm_client.session.get,
+                urljoin(self._romm_client.base_url, f'/api/roms/{rom_id}'), timeout=15)
+            if r.status_code != 200:
+                return {'success': False, 'message': f'HTTP {r.status_code}'}
+            d = r.json()
+            small, large = d.get('path_cover_small'), d.get('path_cover_large')
+            # Patch the library row in place so tiles see the new art paths.
+            for g in (self._available_games or []):
+                if g.get('rom_id') == rom_id:
+                    g['cover_path'] = small
+                    g['cover_path_large'] = large
+                    if 'has_cover' in g:
+                        g['has_cover'] = bool(small)
+            self._cover_paths.pop(rom_id, None)
+            for lg in (False, True):
+                self._cover_cache.pop((rom_id, lg), None)
+                for key in (f"covt2:{rom_id}:{lg}", f"cover:{rom_id}:{lg}"):
+                    stem = hashlib.sha1(key.encode()).hexdigest()
+                    for f in self._cover_dir().glob(stem + '.*'):
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
+            return {'success': True, 'has_cover': bool(small or large)}
+        except Exception as e:
+            logging.error(f"refresh_game_metadata error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
     async def get_game_cover(self, rom_id: int, large: bool = False):
@@ -8476,7 +8974,7 @@ class LudoBackend:
             return {'base': None, 'entry_file_installed': entry_file_installed,
                     'failures': []}
         report = {'base': None, 'entry_file_installed': entry_file_installed,
-                  'failures': []}
+                  'failures': [], 'decompress_failures': []}
         try:
             g = self._games_index().get(rom_id) or {}
             add_ons = sync.switch_add_ons_for_rom(
@@ -8501,19 +8999,44 @@ class LudoBackend:
                     continue
                 target = path.parent / file_name
                 # In extcontent mode the previous run moved this file into the
-                # subfolder, so "already here" is two places, not one.
-                already = target.exists() or (
-                    path.parent / switch_content.EXTCONTENT_DIRNAME / file_name).exists()
+                # subfolder, so "already here" is two places, not one -- and a
+                # compressed one was decompressed, so two names as well.
+                names = [file_name] + [n for n in [switch_nsz.converted_name(file_name)] if n]
+                already = any(
+                    (folder / n).exists() for n in names
+                    for folder in (path.parent,
+                                   path.parent / switch_content.EXTCONTENT_DIRNAME))
+                info = title_ids.switch_content_from_name(file_name) or {}
+                noun = {'update': 'update', 'dlc': 'DLC'}.get(info.get('kind'), 'add-on')
                 if not already:
                     logging.info(f"fetching Switch add-on {file_name} for rom {rom_id}")
+
+                    def _labelled(prog, noun=noun):
+                        # The game's own bar carries the add-on's download, so
+                        # it says whose bytes these are.
+                        if progress_callback:
+                            progress_callback(prog)
+                        cur = self._download_progress.get(rom_id)
+                        if cur is not None:
+                            cur['message'] = f'Downloading {noun}…'
                     ok, msg = self._romm_client.download_rom(
                         add_on_id, add_on.get('name') or file_name, target,
-                        progress_callback)
+                        _labelled)
                     if not ok:
                         logging.warning(f"add-on download failed: {file_name}: {msg}")
                         report['failures'].append((file_name, msg or 'download failed'))
                         continue
-                result = sync.install_switch_add_on(target)
+                def _decompressing(pct, noun=noun):
+                    self._download_progress[rom_id] = {
+                        'percent': pct, 'downloaded': 0, 'total': 0, 'speed': 0,
+                        'eta': 0, 'state': 'extracting',
+                        'message': f'Decompressing {noun}…',
+                        'detail': self._DECOMPRESS_DETAIL,
+                    }
+                result = sync.install_switch_add_on(target, on_decompress=_decompressing)
+                if result.get('status') == 'compressed':
+                    report['decompress_failures'].append(
+                        (noun, result.get('error') or ''))
                 if (result.get('status') == 'base' and add_on_id
                         and base_sibling is None):
                     base_sibling = (add_on_id, add_on.get('name'), file_name, target)
@@ -8597,10 +9120,44 @@ class LudoBackend:
                 'installed_update': installed['update'],
                 'installed_dlc': installed['dlc'],
                 'available': available,
+                # Whether Eden applies them. One switch each, because that is
+                # all Eden has: see eden_config.set_add_on_enabled.
+                'enabled': (eden_config.add_ons_enabled(info['base_id'])
+                            if info['kind'] == 'base' else None),
+                # Mods the user put in Eden's load folder; Ludo installs none.
+                'mods': (eden_config.mods_for(info['base_id'])
+                         if info['kind'] == 'base' else []),
             }
         except Exception as e:
             logging.error(f"switch_add_ons error: {e}", exc_info=True)
             return {'kind': None}
+
+    async def set_switch_add_on_enabled(self, rom_id: int, kind: str, enabled: bool,
+                                        name: str = ''):
+        """Turn a Switch game's update, all of its DLC, or one mod on or off.
+
+        ``name`` is the mod's folder name, for kind 'mod'.
+
+        Returns {'status'} with eden_config.set_add_on_enabled's statuses, or
+        'not-switch' when the ROM names no Switch base game.
+        """
+        try:
+            sync = self._auto_sync
+            g = self._games_index().get(rom_id) or {}
+            # Not `name`: that is the mod's folder name, and shadowing it with
+            # the game's filename made every mod toggle write the wrong entry.
+            rom_name = (g.get('file_name')
+                        or (g.get('romm_data') or {}).get('fs_name') or '')
+            info = sync.switch_add_on_state(rom_name) if sync and rom_name else None
+            if not info or info.get('kind') != 'base' or not info.get('base_id'):
+                return {'status': 'not-switch'}
+            status = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: eden_config.set_add_on_enabled(
+                    info['base_id'], kind, bool(enabled), name=name or None))
+            return {'status': status}
+        except Exception as e:
+            logging.error(f"set_switch_add_on_enabled error: {e}", exc_info=True)
+            return {'status': 'failed'}
 
     async def get_switch_addon_mode(self):
         """How Switch updates and DLC are made to apply, for the settings UI.
@@ -8683,6 +9240,7 @@ class LudoBackend:
             if cur and cur.get('state') == 'downloading':
                 return {'success': True, 'started': True, 'message': 'Already downloading'}
 
+            self._download_cancels.discard(rom_id)
             self._download_progress[rom_id] = {
                 'percent': 0, 'downloaded': 0, 'total': 0,
                 'speed': 0, 'eta': 0, 'state': 'downloading', 'message': '',
@@ -8703,10 +9261,27 @@ class LudoBackend:
                     except Exception:
                         pass
                 try:
-                    ok, msg = self._romm_client.download_rom(rom_id, name, dest, _on_progress)
+                    ok, msg = self._romm_client.download_rom(
+                        rom_id, name, dest, _on_progress,
+                        cancellation_checker=lambda: rom_id in self._download_cancels)
+                    if not ok and rom_id in self._download_cancels:
+                        # The engine has already removed the partial file. Not a
+                        # failure: no activity entry, no server check, no toast.
+                        self._download_cancels.discard(rom_id)
+                        logging.info(f"download cancelled by user: rom_id={rom_id}")
+                        self._download_progress[rom_id] = {
+                            'percent': 0, 'downloaded': 0, 'total': 0,
+                            'speed': 0, 'eta': 0, 'state': 'cancelled', 'message': '',
+                        }
+                        return
+                    # Past the transfer, a cancel is too late: unpacking runs to
+                    # the end and the game lands as downloaded.
+                    self._download_cancels.discard(rom_id)
                     # grout-style: unpack a single-file .zip/.7z on arrival so
                     # disc cores get a real .cue/.m3u (no-op if disabled/plain ROM).
                     final = self._maybe_unzip_download(dest, rom_id) if ok else dest
+                    if ok:
+                        final = self._maybe_decompress_switch(final, rom_id)
                     # Switch add-on content is the one thing here that is not
                     # finished on arrival: Eden applies an update or DLC only
                     # from its registered cache, so the file has to be installed
@@ -8834,7 +9409,21 @@ class LudoBackend:
                                      + (f' ({fails})' if fails
                                         else ' (no base game found on RomM)'))
                         logging.error(f"rom {rom_id}: {base_note}")
+                    # Downloaded, but not all of it is playable: the game or
+                    # an add-on is still compressed. Not an error -- the bytes
+                    # are here, and Play tries the game again -- but the user
+                    # hears why rather than finding out from Eden.
+                    warning = None
+                    game_fail = self._decompress_failures.pop(rom_id, None)
+                    if ok and game_fail:
+                        warning = {'title': "Downloaded, but can't be played yet",
+                                   'body': game_fail}
+                    elif ok and sweep and sweep.get('decompress_failures'):
+                        noun, why = sweep['decompress_failures'][0]
+                        warning = {'title': f"Downloaded, but the {noun} isn't applied",
+                                   'body': why}
                     self._download_progress[rom_id] = {
+                        'warning': warning,
                         'percent': 100 if ok else 0, 'downloaded': 0, 'total': 0,
                         'speed': 0, 'eta': 0,
                         'state': ('error' if (not ok or base_missing) else 'done'),
@@ -8843,6 +9432,9 @@ class LudoBackend:
                                      else msg or ('Downloaded' if ok else 'Download failed'))),
                         'removed': gone,
                     }
+                    if warning:
+                        _record_activity('error', warning['title'], warning['body'],
+                                         rom_id=rom_id)
                     _record_activity('error' if (not ok or base_missing) else 'download',
                                      'Base game not downloaded' if base_missing
                                      else ('Downloaded' if ok else 'Download failed'),
@@ -8866,11 +9458,26 @@ class LudoBackend:
             logging.error(f"download_game error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
+    async def cancel_download(self, rom_id: int):
+        """Stop an in-flight download and delete what it wrote so far.
+
+        Only the transfer can be stopped. Once unpacking has begun the game is
+        all here, and stopping would only leave a half-extracted folder behind.
+        The outcome reaches the frontend through get_download_progress: state
+        'cancelled', or 'done' when the cancel arrived too late.
+        """
+        cur = self._download_progress.get(rom_id) or {}
+        if cur.get('state') != 'downloading':
+            return {'success': False, 'message': 'Not downloading'}
+        self._download_cancels.add(rom_id)
+        return {'success': True}
+
     async def get_download_progress(self, rom_id: int):
         """Live progress for an in-flight download (polled by the cover/button fill UI).
 
         Returns {percent 0..100, downloaded, total, speed, eta, state, message} where
-        state is one of downloading|done|error, or state 'idle' when nothing is tracked.
+        state is one of downloading|extracting|done|error|cancelled, or state 'idle'
+        when nothing is tracked.
         """
         p = self._download_progress.get(rom_id)
         if not p:
@@ -9356,6 +9963,10 @@ class LudoBackend:
                 launch_path = self._resolve_launch_path(g['local_path'], None)
             if not launch_path:
                 return {'success': False, 'message': 'No launchable file found'}
+            launch_path, why = await self._ready_to_boot(g, launch_path)
+            if why:
+                return {'success': False, 'title': "Can't start this game yet",
+                        'message': why}
             platform_name = self._platform_name_for(g)
             # Check for a missing core BEFORE syncing. The launch would fail on
             # it anyway, and the picker sends the user back here afterwards — so
@@ -9412,6 +10023,9 @@ class LudoBackend:
                 # a few seconds longer than usual and something was written to
                 # disk, and silence there reads as a stall.
                 out['bios_fetched'] = bios_fetched
+            switch_gap = self._switch_gap(g)
+            if switch_gap:
+                out['switch_warning'] = switch_gap
             if not ok:
                 # A missing core is the one launch failure the user can fix on
                 # the spot, so hand the UI what it needs to offer that instead of
@@ -9757,6 +10371,29 @@ class LudoBackend:
         self._server_firmware_failed = False
         return out
 
+    def _switch_gap(self, game: dict) -> dict:
+        """{'firmware': bool, 'keys': bool} when this is a Switch game and Eden
+        is installed but has no firmware and/or no prod.keys, else {}.
+
+        Local files only, so it is cheap enough for every launch. Eden starts
+        and then fails with no reason on screen when either is missing, which
+        is the black-screen case the BIOS warning exists for on other
+        platforms; the Switch firmware is not a BIOS file, so _bios_gap never
+        sees it.
+        """
+        try:
+            if self._platform_slug_for(game).lower() != 'switch':
+                return {}
+            if not emulator_saves.eden_data_dirs():
+                return {}
+            fw = emulator_saves.firmware_status()
+            no_fw = not (fw and fw.get('count'))
+            no_keys = emulator_saves.keys_status() is None
+            return {'firmware': no_fw, 'keys': no_keys} if (no_fw or no_keys) else {}
+        except Exception as e:
+            logging.debug(f"switch firmware check failed: {e}")
+            return {}
+
     def _bios_gap(self, game: dict, platform_name: str) -> dict:
         """{missing_bios: [name, ...], core, severity} when BIOS files RomM holds
         for this game's platform aren't on disk, else {}.
@@ -9942,7 +10579,12 @@ class LudoBackend:
                     return emulator_saves.keys_are_current(entry), False
                 if chosen_name and f.get('file_name') != chosen_name:
                     return False, True
-                return emulator_saves.firmware_is_current(entry), False
+                if emulator_saves.firmware_is_current(entry):
+                    return True, False
+                # No marker (installed by hand, or before Ludo kept one): trust
+                # the version Eden itself reports when it is this very release.
+                want = emulator_saves.firmware_version_from_name(f.get('file_name'))
+                return bool(want and want == emulator_saves.detected_firmware_version()), False
             except Exception as e:
                 logging.debug(f"[BIOS] Switch presence for {f}: {e}")
                 return False, False
@@ -10259,6 +10901,10 @@ class LudoBackend:
             if not launch_path:
                 return {'success': False, 'steam_host': False,
                         'message': 'No launchable file found'}
+            launch_path, why = await self._ready_to_boot(g, launch_path)
+            if why:
+                return {'success': False, 'steam_host': False,
+                        'title': "Can't start this game yet", 'message': why}
             platform_name = self._platform_name_for(g)
             # Same order as launch_game: a missing core makes the sync wasted
             # work, since the picker sends the user back through here.
@@ -10318,9 +10964,11 @@ class LudoBackend:
                     logging.warning(f"could not persist last disc: {e}")
             logging.info(f"prepare_steam_launch: wrote spec for '{g.get('name')}' "
                          f"argv={cmd}")
+            switch_gap = self._switch_gap(g)
             return {'success': True, 'steam_host': True, 'message': 'Spec ready',
                     **({'bios_warning': bios} if bios
-                       else {'bios_fetched': bios_fetched} if bios_fetched else {})}
+                       else {'bios_fetched': bios_fetched} if bios_fetched else {}),
+                    **({'switch_warning': switch_gap} if switch_gap else {})}
         except Exception as e:
             logging.error(f"prepare_steam_launch error: {e}", exc_info=True)
             return {'success': False, 'steam_host': False, 'message': str(e)}

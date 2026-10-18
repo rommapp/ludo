@@ -288,9 +288,9 @@ def main():
 
         compressed_id = '0100152000045800'
         (roms / f'Ext [{compressed_id}][v0].nsz').write_bytes(b'compressed')
-        check('a compressed add-on is fine here, unlike in NAND',
+        check('a compressed add-on is refused here too: Eden cannot read it',
               S.install_external(roms / f'Ext [{compressed_id}][v0].nsz',
-                                 roms)['status'], 'ok')
+                                 roms)['status'], 'compressed')
 
         base_ext = roms / f'Game [{BASE_ID}].nsp'
         base_ext.write_bytes(b'not an add-on')

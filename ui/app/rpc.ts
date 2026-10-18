@@ -20,7 +20,7 @@ export const ackLibraryAnnouncement = callable<[], any>("ack_library_announcemen
 export const notifyNetworkState = callable<[boolean], any>("notify_network_state");
 // rom_id/has_cover are set on events about one specific game (save/state
 // uploads) and absent on collection-wide ones.
-export const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number, rom_id?: number | null, has_cover?: boolean }> }>("drain_notifications");
+export const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number, rom_id?: number | null, has_cover?: boolean, critical?: boolean, action?: { kind: string, platform?: string } | null }> }>("drain_notifications");
 export const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
 export const rebuildLibrary = callable<[], any>("rebuild_library");
 // Re-reads one platform and reconciles that slice. Takes a slug (what the
@@ -106,15 +106,18 @@ export const getImage = callable<[string], any>("get_image");
 export const clearCoverCache = callable<[], any>("clear_cover_cache");
 export const searchGames = callable<[string], any>("search_games");
 export const getGameDetail = callable<[number], any>("get_game_detail");
+export const refreshGameMetadata = callable<[number], any>("refresh_game_metadata");
 export const getRomDocument = callable<[number, number], any>("get_rom_document");
 export const getRaEarned = callable<[number], any>("get_ra_earned");
 export const downloadGame = callable<[number], any>("download_game");
 export const getSwitchAddOns = callable<[number], any>("switch_add_ons");
+export const setSwitchAddOnEnabled = callable<[number, string, boolean, string?], any>("set_switch_add_on_enabled");
 export const getSwitchAddonMode = callable<[], any>("get_switch_addon_mode");
 export const setSwitchAddonMode = callable<[string], any>("set_switch_addon_mode");
 export const toggleCollectionSync = callable<[string, boolean], any>("toggle_collection_sync");
 export const deleteCollectionRoms = callable<[string, string], any>("delete_collection_roms");
 export const getDownloadProgress = callable<[number], any>("get_download_progress");
+export const cancelDownloadRpc = callable<[number], any>("cancel_download");
 export const deleteGame = callable<[number], any>("delete_game");
 export const launchGame = callable<[number, (string | null)?, (number | null)?, (boolean)?], any>("launch_game");
 // Steam Deck session-host launch: resolves argv + writes a launch-spec; the tile
@@ -145,6 +148,7 @@ export const getSwitchFirmwareProgress = callable<[], any>("get_switch_firmware_
 // whether it's on; set_ takes the whole disabled set, so it's idempotent.
 export const getPlatformSync = callable<[], any>("get_platform_sync");
 export const setPlatformSync = callable<[string[]], any>("set_platform_sync");
+export const enablePlatform = callable<[string], any>("enable_platform");
 export const getLocalDiscs = callable<[number], any>("get_local_discs");
 export const getLocalSiblings = callable<[number], any>("get_local_siblings");
 export const getHomeData = callable<[], any>("get_home_data");

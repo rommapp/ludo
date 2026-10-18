@@ -26,7 +26,7 @@ OUT_ZIP="${SCRIPT_DIR}/../${PLUGIN_NAME}.zip"
 # explicit --python-version is what pins that. Transitive deps are resolved
 # rather than listed by hand — qrcode's typing_extensions is the kind of thing
 # --no-deps drops and nobody notices until a QR code fails to draw.
-DEPS=(requests watchdog psutil qrcode Pillow)
+DEPS=(requests watchdog psutil qrcode Pillow cryptography "python-socketio[client]")
 
 echo "==> Vendoring Python deps for Decky's Python 3.11: ${DEPS[*]}"
 WHEEL_TMP=$(mktemp -d)
@@ -62,16 +62,16 @@ shopt -u nullglob
 # dependency. The cp311 binary wheels can only be imported when the build
 # machine is itself on 3.11 (CI pins that deliberately); anywhere else they are
 # checked as files, since a 3.12 interpreter cannot load a cp311 .so at all.
-for d in PIL pillow.libs psutil; do
+for d in PIL pillow.libs psutil cryptography; do
     [ -e "${SCRIPT_DIR}/py_modules/$d" ] || {
         echo "ERROR: py_modules/$d missing after vendoring" >&2; exit 1; }
 done
 PYTHONPATH="${SCRIPT_DIR}/py_modules" python3 - <<'PYCHECK'
 import sys
 missing = []
-mods = ["requests", "watchdog.observers", "qrcode"]
+mods = ["requests", "watchdog.observers", "qrcode", "socketio", "websocket"]
 if sys.version_info[:2] == (3, 11):
-    mods += ["PIL.Image", "psutil"]
+    mods += ["PIL.Image", "psutil", "cryptography.fernet"]
 for mod in mods:
     try:
         __import__(mod)

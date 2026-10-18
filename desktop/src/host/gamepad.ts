@@ -18,6 +18,7 @@
 // focused subtree; focus *targets* are found by DOM query so native buttons and
 // inputs participate too.
 
+import { profileSpan } from "./profiler";
 import { GamepadButtonId } from "./gamepad-buttons";
 import { playSound } from "./sound";
 import { consumeRootBackNoop } from "./router";
@@ -328,7 +329,7 @@ export function focusFirstIn(root: ParentNode): boolean {
     .filter(isVisible)
     // Don't land on the modal's ✕ close button — start on real content.
     .filter((el) => !el.classList.contains("desk-modal-close"));
-  const inner = all.filter((el) => !all.some((o) => o !== el && el.contains(o)));
+  const inner = innermost(all);
   const targets = dedupe(inner.map(fieldFootprint));
   const first = targets[0];
   if (!first) return false;
@@ -405,6 +406,11 @@ function restoreFocus(): "restored" | "waiting" | "gone" {
 function focusIsUseful(): boolean {
   const a = document.activeElement as HTMLElement | null;
   if (!a || a === document.body || !document.contains(a)) return false;
+  // A deliberate holding spot (data-focus-hold): the app parked focus there
+  // while the content it's waiting for mounts, and will move it on itself.
+  // Not a nav target, but not stranded either — reseeding would yank focus
+  // somewhere else just before the app places it.
+  if (a.hasAttribute("data-focus-hold")) return isVisible(a);
   return a.matches(FOCUS_SELECTOR) && isVisible(a);
 }
 
@@ -429,7 +435,7 @@ function focusTargets(): HTMLElement[] {
   // second). Keep only the innermost interactive element: if a candidate
   // contains another candidate, drop the outer one. Button routing still works
   // because routeButton() walks DOM ancestors from the focused element up.
-  const inner = all.filter((el) => !all.some((o) => o !== el && el.contains(o)));
+  const inner = innermost(all);
   // Represent a wizard field by its full-width `.wiz-field` wrapper rather than
   // the inner <input>: the pair-code input is deliberately narrow-and-centered
   // (so its caret lands on the slots), which would otherwise give spatial nav a
@@ -444,6 +450,23 @@ function focusTargets(): HTMLElement[] {
 // wizard field wrapper if it sits in one, else the element itself.
 function fieldFootprint(el: HTMLElement): HTMLElement {
   return (el.closest(".wiz-field") as HTMLElement | null) ?? el;
+}
+
+// Drop every candidate that encloses another candidate. Walks each element's
+// ancestors once (O(n·depth)) — the pairwise el.contains(o) check this replaces
+// was O(n²) and cost ~200k contains() calls per D-pad press on a full library.
+function innermost(all: HTMLElement[]): HTMLElement[] {
+  const set = new Set(all);
+  const outer = new Set<HTMLElement>();
+  for (const el of all) {
+    for (let p = el.parentElement; p; p = p.parentElement) {
+      if (set.has(p)) {
+        if (outer.has(p)) break; // its ancestors are already marked
+        outer.add(p);
+      }
+    }
+  }
+  return all.filter((el) => !outer.has(el));
 }
 
 function dedupe(els: HTMLElement[]): HTMLElement[] {
@@ -481,6 +504,20 @@ function focusAndReveal(el: HTMLElement, horizontal = false, smooth = true) {
   // Right quickly made the row stutter back and forth under the cursor.
   const row = horizontal ? rowScroller(el) : null;
   if (row) { revealInRow(row, el, smooth); return; }
+  // Up/Down gets the same treatment, for the same reason: fast taps restarted
+  // the native smooth scroll mid-flight, and block:'nearest' was judged against
+  // the half-scrolled position, so the page bounced up and down under the
+  // cursor. Our animator decides "nearest" against where the scroll is HEADED.
+  if (!horizontal) {
+    const sc = scrollParentOf(el) ?? (document.scrollingElement as HTMLElement | null);
+    if (sc) {
+      revealVertical(sc, el, smooth);
+      // Keep a card row's horizontal 'nearest' behaviour on vertical moves.
+      const r = rowScroller(el);
+      if (r) revealInRowNearest(r, el);
+      return;
+    }
+  }
   try {
     el.scrollIntoView({
       block: "nearest",
@@ -505,7 +542,7 @@ function rowScroller(el: HTMLElement): HTMLElement | null {
 // Retargeting mid-flight only moves `target`; the running frame keeps easing
 // from the row's current position, so rapid presses glide instead of
 // restarting.
-const _rowAnims = new WeakMap<HTMLElement, { target: number; raf: number; last: number }>();
+const _rowAnims = new WeakMap<HTMLElement, SpringAnim>();
 
 function revealInRow(row: HTMLElement, el: HTMLElement, smooth: boolean) {
   const rr = row.getBoundingClientRect();
@@ -516,32 +553,99 @@ function revealInRow(row: HTMLElement, el: HTMLElement, smooth: boolean) {
   const target = Math.max(0, Math.min(max, left + r.width / 2 - row.clientWidth / 2));
   const cur = _rowAnims.get(row);
   if (!smooth) {
-    if (cur) cancelAnimationFrame(cur.raf);
+    if (cur) { cancelAnimationFrame(cur.raf); cur.end(); }
     _rowAnims.delete(row);
     row.scrollLeft = target;
     return;
   }
   if (cur) { cur.target = target; return; }
-  const anim = { target, raf: 0, last: performance.now() };
-  _rowAnims.set(row, anim);
-  const step = (now: number) => {
-    const dt = Math.min(64, now - anim.last);
+  springScroll(_rowAnims, row, "scrollLeft", target);
+}
+
+// A critically-damped spring driving one scroll axis. Unlike an exponential
+// ease, retargeting mid-flight keeps the current VELOCITY, so a new press
+// carries the motion on smoothly instead of kicking it (felt as a stutter on
+// every press). Position is tracked as a float: scrollTop/Left round to device
+// pixels at the 1.8x zoom, and reading them back each frame lost sub-pixel
+// progress and made the glide judder.
+type SpringAnim = { target: number; raf: number; last: number; pos: number; vel: number; end: () => void };
+const SPRING_OMEGA = 22; // rad/s — settles in ~250ms
+
+function springScroll(map: WeakMap<HTMLElement, SpringAnim>, el: HTMLElement,
+                      prop: "scrollTop" | "scrollLeft", target: number) {
+  const anim: SpringAnim = { target, raf: 0, last: performance.now(), pos: el[prop], vel: 0,
+    end: profileSpan(prop === "scrollTop" ? "scroll-v" : "scroll-row") };
+  map.set(el, anim);
+  const end = anim.end;
+  const frame = (now: number) => {
+    if (map.get(el) !== anim) { end(); return; }
+    // Someone else (wheel, touch) moved it: hand control back.
+    if (Math.abs(el[prop] - anim.pos) > 2) { map.delete(el); end(); return; }
+    const dt = Math.min(0.064, (now - anim.last) / 1000);
     anim.last = now;
-    const pos = row.scrollLeft;
-    const diff = anim.target - pos;
-    if (Math.abs(diff) < 0.5) {
-      row.scrollLeft = anim.target;
-      _rowAnims.delete(row);
+    const x = anim.pos - anim.target;
+    const k = SPRING_OMEGA, e = Math.exp(-k * dt);
+    // Exact critically-damped step: frame-rate independent.
+    const c = anim.vel + k * x;
+    anim.pos = anim.target + (x + c * dt) * e;
+    anim.vel = (c - k * (x + c * dt)) * e;
+    if (Math.abs(anim.pos - anim.target) < 0.5 && Math.abs(anim.vel) < 5) {
+      el[prop] = anim.target;
+      map.delete(el);
+      end();
       return;
     }
-    // Exponential ease-out (~90ms time constant): frame-rate independent and
-    // seamless to retarget.
-    row.scrollLeft = pos + diff * (1 - Math.exp(-dt / 90));
-    // The browser rounds scrollLeft; if it didn't budge, finish the move.
-    if (row.scrollLeft === pos) { row.scrollLeft = anim.target; _rowAnims.delete(row); return; }
-    anim.raf = requestAnimationFrame(step);
+    el[prop] = anim.pos;
+    anim.raf = requestAnimationFrame(frame);
   };
-  anim.raf = requestAnimationFrame(step);
+  anim.raf = requestAnimationFrame(frame);
+}
+
+// Vertical counterpart of revealInRow with block:'nearest' semantics and the
+// container's scroll-padding honoured (120px top for the sticky bar). The
+// visibility test runs against the in-flight TARGET, not the current position,
+// so a burst of presses accumulates into one glide instead of oscillating.
+const _vAnims = new WeakMap<HTMLElement, SpringAnim>();
+
+function revealVertical(sc: HTMLElement, el: HTMLElement, smooth: boolean) {
+  const isPage = sc === document.scrollingElement;
+  const cs = getComputedStyle(sc);
+  const padTop = parseFloat(cs.scrollPaddingTop) || 0;
+  const padBot = parseFloat(cs.scrollPaddingBottom) || 0;
+  const viewTop = isPage ? 0 : sc.getBoundingClientRect().top;
+  const viewH = isPage ? window.innerHeight : sc.clientHeight;
+  const r = el.getBoundingClientRect();
+  // Element position in the scroller's content — independent of in-flight scroll.
+  const top = r.top - viewTop + sc.scrollTop;
+  const bottom = top + r.height;
+  const max = sc.scrollHeight - sc.clientHeight;
+  const cur = _vAnims.get(sc);
+  const base = cur ? cur.target : sc.scrollTop;
+  let target = base;
+  if (top - padTop < base) target = top - padTop;
+  else if (bottom + padBot > base + viewH) {
+    // Taller than the view: align its top rather than its bottom.
+    target = Math.min(top - padTop, bottom + padBot - viewH);
+  }
+  target = Math.max(0, Math.min(max, target));
+  if (!smooth) {
+    if (cur) { cancelAnimationFrame(cur.raf); cur.end(); }
+    _vAnims.delete(sc);
+    sc.scrollTop = target;
+    return;
+  }
+  if (cur) { cur.target = target; return; }
+  if (Math.abs(target - sc.scrollTop) < 0.5) return;
+  springScroll(_vAnims, sc, "scrollTop", target);
+}
+
+// inline:'nearest' inside a card row, instant (a vertical move must not slide
+// the landed row sideways more than needed — see focusAndReveal).
+function revealInRowNearest(row: HTMLElement, el: HTMLElement) {
+  const rr = row.getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  if (r.left < rr.left) row.scrollLeft += r.left - rr.left;
+  else if (r.right > rr.right) row.scrollLeft += r.right - rr.right;
 }
 
 // focusAndReveal with the Deck's navigation tick. Used by move()'s landing
@@ -746,6 +850,32 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
     if (bridge) best = bridge;
   }
 
+  // Entering a container that asks for its FIRST child (Steam's
+  // navEntryPreferPosition = NavEntryPositionPreferences.FIRST, carried as
+  // data-nav-entry="0") lands there, whichever child is geometrically nearest:
+  // the game page's action row always takes focus on Play, not on Delete just
+  // because the tab item you came from sat under it.
+  // Nothing ahead by geometry (an item far right of the action row, which sits
+  // over on the left): a container that declared an entry point in that
+  // direction is still a destination — the nearest one wins.
+  if (!best && !horizontal) {
+    let near = Infinity;
+    document.querySelectorAll<HTMLElement>('[data-nav-entry="0"]').forEach((box) => {
+      if (box.contains(active) || !isVisible(box)) return;
+      const r = box.getBoundingClientRect();
+      const gap = dir === "up" ? ar.top - r.bottom : r.top - ar.bottom;
+      const first = targets.find((t) => box.contains(t));
+      if (gap >= -1 && gap < near && first) { near = gap; best = first; }
+    });
+  }
+  if (best) {
+    const box = best.closest('[data-nav-entry="0"]');
+    if (box && !box.contains(active)) {
+      const first = targets.find((t) => box.contains(t));
+      if (first) best = first;
+    }
+  }
+
   // Entering a segmented control (Stable/Beta, the notification-corner picker)
   // from above or below lands on its CURRENT value, not on whichever pill is
   // nearest in column — the control represents one setting, so Left/Right should
@@ -889,10 +1019,6 @@ function footerPrimary(target: HTMLElement, origin: HTMLElement): HTMLElement | 
 
 const REPEAT_DELAY = 400;
 const REPEAT_INTERVAL = 110;
-// Two horizontal presses closer than this collapse to instant scroll (see
-// direction()): fast L/R taps otherwise stack interrupted smooth-scroll layers
-// and the focused cover shimmers/over-scales.
-const H_COALESCE_MS = 140;
 
 type DirName = "up" | "down" | "left" | "right";
 
@@ -964,15 +1090,27 @@ function clearFocusMarkers() {
 // Tag the focused leaf with `gpfocus` and it + every ancestor with
 // `gpfocuswithin`, matching what Steam does on the Deck so the plugin's
 // marker-based focus CSS lights up.
+//
+// Diffed against the previous chain, not cleared and re-added: the shared
+// ancestors run all the way up to #root, and toggling a class there makes
+// Chromium re-match descendant rules (`.x.gpfocuswithin .romm-gt-cover`) for the
+// whole ~7k-element tree — a 25–45ms style recalc on every D-pad press, which
+// was the hitch in every scroll glide. Only the nodes that actually leave or
+// join the chain are touched now.
 function markGamepadFocus(leaf: HTMLElement | null) {
-  clearFocusMarkers();
-  if (!leaf || leaf === document.body) return;
-  leaf.classList.add("gpfocus");
+  if (!leaf || leaf === document.body) { clearFocusMarkers(); return; }
   const marked: HTMLElement[] = [];
   for (let n: HTMLElement | null = leaf; n && n !== document.body; n = n.parentElement) {
-    n.classList.add("gpfocuswithin");
     marked.push(n);
   }
+  const keep = new Set(marked);
+  for (const el of _marked) if (!keep.has(el)) el.classList.remove("gpfocuswithin");
+  const prevLeaf = _marked[0];
+  if (prevLeaf && prevLeaf !== leaf) prevLeaf.classList.remove("gpfocus");
+  // Guarded: per the DOM spec classList.add rewrites the class attribute even
+  // when the token is already there, which still fires mutations up the chain.
+  for (const n of marked) if (!n.classList.contains("gpfocuswithin")) n.classList.add("gpfocuswithin");
+  if (!leaf.classList.contains("gpfocus")) leaf.classList.add("gpfocus");
   _marked = marked;
 }
 // The focus target currently under the mouse pointer (updated only on real
@@ -1151,8 +1289,13 @@ export function startGamepad() {
     }
     seedFocus();
   };
+  // The focusIsUseful() check lives in the timer, not here: it measures layout
+  // (getBoundingClientRect/getComputedStyle), and running it on every mutation
+  // forced a synchronous layout each time React re-rendered a tile mid-scroll —
+  // a visible hitch on every D-pad press. Debouncing first means one check once
+  // the tree settles, which is all the reseed ever needed.
   const observer = new MutationObserver(() => {
-    if (mouseMode || focusIsUseful()) return;
+    if (mouseMode) return;
     clearTimeout(reseedTimer);
     reseedTimer = setTimeout(reseedIfStranded, 120);
   });
@@ -1161,8 +1304,6 @@ export function startGamepad() {
   let curDir: DirName | null = null;
   let delayTimer: any = null;
   let repeatTimer: any = null;
-  // Timestamp of the last horizontal press, to coalesce fast dpad mashing.
-  let lastHMove = 0;
   // Whether the OK press matching the next OK release was seen here — see the
   // release branch of button().
   let okPressSeen = false;
@@ -1180,26 +1321,18 @@ export function startGamepad() {
     clearInterval(repeatTimer);
     delayTimer = repeatTimer = null;
     if (dir) {
-      // A single press animates (smooth); held-repeat steps jump instantly.
-      // Smooth-scrolling every ~110ms repeat re-targets the in-flight animation
-      // and the row oscillates, making covers shake during fast movement.
+      // Held-repeat steps animate too: the spring animator (springScroll)
+      // retargets without losing velocity, so a ~110ms repeat becomes one
+      // continuous glide rather than the oscillation native smooth scroll gave.
       //
-      // Distinct FAST taps of Left/Right are the same hazard as held-repeat:
-      // each new smooth scrollIntoView interrupts the previous one mid-flight,
-      // so the card row's composited scroll layer never settles between presses.
-      // At the ~1.8x page zoom the GPU keeps resampling that in-flight layer, and
-      // the focused cover (scale(1.04) + glow) occasionally paints oversized/soft
-      // for a frame — the intermittent "cover scales up big" shimmer. Coalesce:
-      // if a horizontal press lands within COALESCE_MS of the previous one, jump
-      // instantly (no animated layer to catch), keeping the smooth console-glide
-      // only for relaxed single presses. Vertical moves are unaffected.
-      const now = Date.now();
-      const horizontal = dir === "left" || dir === "right";
-      const smooth = !(horizontal && now - lastHMove < H_COALESCE_MS);
-      if (horizontal) lastHMove = now;
-      step(dir, smooth, false);
+      // Fast Left/Right taps animate too. They used to jump instantly (within
+      // 140ms of each other): native smooth scrollIntoView restarted mid-flight
+      // and the focused cover shimmered at 1.8x zoom. Card rows now glide on the
+      // spring, which sets scrollLeft per frame with no compositor-side scroll
+      // animation to interrupt, so that hazard is gone.
+      step(dir, true, false);
       delayTimer = setTimeout(() => {
-        repeatTimer = setInterval(() => step(dir, false, true), REPEAT_INTERVAL);
+        repeatTimer = setInterval(() => step(dir, true, true), REPEAT_INTERVAL);
       }, REPEAT_DELAY);
     }
   }
@@ -1246,6 +1379,10 @@ export function startGamepad() {
   // same code path, not a parallel implementation that can drift from it.
   const ARROWS: Record<string, DirName> = {
     ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
+  };
+  const BUMPER_KEYS: Record<string, number> = {
+    q: GamepadButtonId.BUMPER_LEFT, Q: GamepadButtonId.BUMPER_LEFT,
+    e: GamepadButtonId.BUMPER_RIGHT, E: GamepadButtonId.BUMPER_RIGHT,
   };
   // Arrows currently held, newest last. A held set (rather than a single value)
   // is what makes roll-over work: press Left, then Right without releasing Left,
@@ -1305,6 +1442,19 @@ export function startGamepad() {
       }
       return;
     }
+    // Q/E are the keyboard's L1/R1 (tab and section cycling). Text fields
+    // keep the letters; a held key doesn't auto-cycle, as a bumper doesn't.
+    const bumper = BUMPER_KEYS[e.key];
+    if (bumper !== undefined) {
+      const t = e.target as HTMLElement | null;
+      if (e.ctrlKey || e.altKey || e.metaKey || e.shiftKey || (t && isEditable(t))) return;
+      e.preventDefault();
+      if (e.repeat) return;
+      enterGamepadMode("keyboard");
+      ensureFocusInOverlay();
+      routeButton("down", bumper, false, undefined, cancelStart());
+      return;
+    }
     const dir = ARROWS[e.key];
     if (!dir) return;
     // Leave browser/OS shortcuts (and text selection) alone.
@@ -1328,6 +1478,12 @@ export function startGamepad() {
   }, true);
 
   window.addEventListener("keyup", (e) => {
+    const bumper = BUMPER_KEYS[e.key];
+    if (bumper !== undefined) {
+      const t = e.target as HTMLElement | null;
+      if (!(t && isEditable(t))) routeButton("up", bumper, false, undefined, cancelStart());
+      return;
+    }
     const dir = ARROWS[e.key];
     if (dir) releaseArrow(dir);
   }, true);

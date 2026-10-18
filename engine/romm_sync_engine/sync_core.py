@@ -15,8 +15,8 @@ from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
 from . import (eden_config, emulator_saves, folder_saves, gamecube_saves,
-               ps2_memcard, switch_content, title_ids)
-from urllib.parse import urljoin, quote
+               ps2_memcard, switch_content, switch_nsz, title_ids)
+from urllib.parse import urljoin, quote, urlparse
 import socket
 import configparser
 import html
@@ -234,7 +234,7 @@ def notifications_enabled():
 
 
 def push_notification(kind, title, body, rom_id=None, has_cover=False,
-                      activity_kind=None):
+                      activity_kind=None, critical=False, action=None):
     """Queue a toast for the frontend.
 
     `kind` is a free-form tag ('sync' | 'removal' | 'save') the frontend uses
@@ -245,6 +245,10 @@ def push_notification(kind, title, body, rom_id=None, has_cover=False,
     `activity_kind` also files the event in the Recent Activity feed. Leave it
     None when the caller already records its own (richer) activity row, or the
     feed gets the event twice.
+
+    `critical` draws the toast in the warning colour, for something the user
+    has to act on. `action` (same shape as an activity row's) tells the
+    frontend where a click on the toast should go.
     """
     if not _notifications_enabled:
         # Still file the activity row — muting is about interruptions, not
@@ -259,6 +263,8 @@ def push_notification(kind, title, body, rom_id=None, has_cover=False,
             'body':       body,
             'rom_id':     rom_id,
             'has_cover':  bool(has_cover),
+            'critical':   bool(critical),
+            'action':     action,
             'timestamp':  time.time(),
         })
     if activity_kind:
@@ -1664,12 +1670,29 @@ class SettingsManager:
                 key = hashlib.sha256(material.encode()).digest()
                 return Fernet(base64.urlsafe_b64encode(key))
 
-            user = getpass.getuser()
+            user = self._user()
             self.cipher = _fernet(f"{user}-{self._machine_id()}")
             # Legacy username+hostname key, for migrating pre-existing configs.
             self._legacy_ciphers.append(_fernet(f"{user}-{socket.gethostname()}"))
-        except ImportError:
-            print("⚠️ cryptography not available, using plain text storage")
+            # getuser() reads $USER/$LOGNAME, which Decky Loader leaves as
+            # 'root' for plugins it runs as the user. Values written under that
+            # name still decrypt.
+            env_user = getpass.getuser()
+            if env_user != user:
+                self._legacy_ciphers.append(_fernet(f"{env_user}-{self._machine_id()}"))
+        except ImportError as e:
+            logging.warning(f"cryptography not available ({e}); credentials stored in plain text")
+
+    @staticmethod
+    def _user():
+        """The account this process runs as — from the uid, not the environment,
+        so the desktop app and the Decky plugin derive the same key."""
+        try:
+            import pwd
+            return pwd.getpwuid(os.getuid()).pw_name
+        except Exception:
+            import getpass
+            return getpass.getuser()
 
     def _machine_id(self):
         """Stable per-installation identifier, independent of hostname."""
@@ -1705,6 +1728,12 @@ class SettingsManager:
         # so we never send ciphertext to the server as a credential. Otherwise
         # assume it's legacy plaintext and pass it through unchanged.
         if value.startswith("gAAAAA"):
+            if not getattr(self, '_warned_undecryptable', False):
+                self._warned_undecryptable = True
+                logging.warning(
+                    "Saved credentials can't be decrypted here (cryptography %s, "
+                    "user %r); sign in again",
+                    'loaded' if self.cipher else 'missing', self._user())
             return ''
         return value
 
@@ -2839,6 +2868,10 @@ class ReachabilityLatch:
         self.device_online = bool(online)
 
 
+# What this client tells RomM it can do, on registration and on connect.
+DEVICE_CAPABILITIES = {'remote_install': True}
+
+
 class RomMClient:
     """Client for interacting with RomM API"""
     
@@ -2861,6 +2894,19 @@ class RomMClient:
         # walk. Empty unless a caller sets it (see set_disabled_platforms), so
         # every existing consumer keeps fetching the whole library.
         self.disabled_platform_slugs = frozenset()
+
+        # True once the server has refused our credentials (401) and a refresh
+        # could not fix it: a revoked or deleted Client API Token, a changed
+        # password. Distinct from "unreachable" so the UI can ask the user to
+        # sign in again instead of telling them the server is down.
+        self.auth_rejected = False
+        self._refreshing = False
+        self.session.hooks['response'].append(self._watch_auth)
+        # What /api/heartbeat says the server can do; see get_server_features.
+        self.server_features = {}
+        # The device a QR pairing's token is bound to (RomM creates one per
+        # approval). Set by device_auth_poll on success.
+        self.paired_device_id = None
 
         # OAuth2 token storage
         self.access_token = None
@@ -2914,6 +2960,44 @@ class RomMClient:
         elif username and password:
             self.authenticate(username, password)
 
+    # Endpoints whose 401 means "these credentials are wrong", answered while
+    # signing in or pairing, not "the session we had is gone".
+    _AUTH_PATHS = ('/api/token', '/api/login', '/api/client-tokens/exchange',
+                   '/api/auth/device')
+
+    def _watch_auth(self, response, *args, **kwargs):
+        """Session hook: notice the server revoking us mid-session.
+
+        RomM 5.4 answers an invalid or expired bearer with 401 everywhere
+        (earlier versions could 500). Without this every call after a token
+        revocation just failed on its own and the client stayed "connected",
+        so the UI reported a healthy session that synced nothing.
+
+        A password session gets one refresh attempt; the request that saw the
+        401 still fails, the next one goes out with the new token. A Client API
+        Token has nothing to refresh, so it is marked rejected straight away.
+        """
+        try:
+            if (response.status_code != 401 or not self.authenticated
+                    or self._refreshing):
+                return
+            path = urlparse(response.url).path
+            if not path.startswith('/api/') or path.startswith(self._AUTH_PATHS):
+                return
+            if self.refresh_token and not self.client_token:
+                self._refreshing = True
+                try:
+                    if self.refresh_access_token():
+                        return
+                finally:
+                    self._refreshing = False
+            self.authenticated = False
+            self.auth_rejected = True
+            logging.warning(f"RomM rejected our credentials (401 on {path}) — "
+                            f"sign in again to resume syncing")
+        except Exception as e:
+            logging.debug(f"auth watch failed: {e}")
+
     def authenticate_with_token(self, client_token):
         """Authenticate using a RomM Client API Token (Authorization: Bearer rmm_...).
 
@@ -2935,6 +3019,8 @@ class RomMClient:
                 return True
             # Bad/expired token — drop the header so we don't poison later attempts.
             self.session.headers.pop('Authorization', None)
+            if test.status_code in (401, 403):
+                self.auth_rejected = True
             print(f"❌ Client API Token rejected: HTTP {test.status_code}")
             return False
         except Exception as e:
@@ -3035,8 +3121,10 @@ class RomMClient:
                 timeout=15,
             )
             if resp.status_code == 200:
-                token = (resp.json() or {}).get('access_token')
+                body = resp.json() or {}
+                token = body.get('access_token')
                 if token:
+                    self.paired_device_id = body.get('device_id')
                     print("✅ Device authorization approved")
                     return ('approved', token)
                 return ('error', 'Approved but no token returned')
@@ -3147,6 +3235,8 @@ class RomMClient:
                             return True
                 else:
                     print(f"❌ Token endpoint failed: HTTP {token_response.status_code}")
+                    if token_response.status_code in (400, 401, 403):
+                        self.auth_rejected = True
                     try:
                         error_detail = token_response.json()
                         print(f"   Error: {error_detail}")
@@ -3274,7 +3364,10 @@ class RomMClient:
                 'client_version': client_version or '1.6',
                 'hostname': socket.gethostname(),
                 'allow_existing': True,
-                'allow_duplicate': False
+                'allow_duplicate': False,
+                # RomM 5.4 lists only devices that say they accept installs
+                # under "Install on device". Older servers ignore it.
+                'capabilities': dict(DEVICE_CAPABILITIES),
             }
 
             print(f"📱 Registering device: {payload['name']}")
@@ -3327,6 +3420,75 @@ class RomMClient:
         except Exception as e:
             print(f"Error getting device: {e}")
             return None
+
+    def get_server_features(self):
+        """Read /api/heartbeat once and keep what Ludo cares about.
+
+        Returns {'version': str|None, 'device_install': bool,
+        'install_excluded_platforms': [...]}; empty on failure. Cached on
+        self.server_features so callers can check a feature without a request.
+        """
+        try:
+            r = self.session.get(urljoin(self.base_url, '/api/heartbeat'), timeout=10)
+            if r.status_code != 200:
+                return {}
+            hb = r.json() or {}
+            install = hb.get('DEVICE_INSTALL') or {}
+            self.server_features = {
+                'version': (hb.get('SYSTEM') or {}).get('VERSION'),
+                'device_install': bool(install.get('ENABLED')),
+                'install_excluded_platforms': list(install.get('EXCLUDED_PLATFORM_SLUGS') or []),
+            }
+            return self.server_features
+        except Exception as e:
+            logging.debug(f"heartbeat read failed: {e}")
+            return {}
+
+    def claim_installs(self, device_id):
+        """Take this device's pending install requests (RomM 5.4+).
+
+        Returns (requests, reason). requests is the list of every request the
+        device holds taken, oldest first, or None when the server would not
+        hand them over; reason then says why: 'not_bound' when the token is not
+        bound to this device (the server only lets a device claim its own),
+        'disabled', or 'error'.
+        """
+        try:
+            r = self.session.post(
+                urljoin(self.base_url, f'/api/devices/{device_id}/installs/claim'),
+                timeout=15)
+            if r.status_code == 200:
+                return r.json() or [], None
+            if r.status_code in (403, 404):
+                # 404 is also what a token bound to ANOTHER device gets.
+                text = r.text.lower()
+                if 'disabled' in text:
+                    return None, 'disabled'
+                return None, 'not_bound'
+            logging.debug(f"install claim: HTTP {r.status_code} {r.text[:200]}")
+            return None, 'error'
+        except Exception as e:
+            logging.debug(f"install claim failed: {e}")
+            return None, 'error'
+
+    def report_install(self, device_id, request_id, status, reason=None):
+        """Report a claimed install request's outcome: 'done',
+        'already_installed' or 'failed'. True when the server took it."""
+        body = {'status': status}
+        if reason:
+            body['reason'] = str(reason)[:500]
+        try:
+            r = self.session.put(
+                urljoin(self.base_url, f'/api/devices/{device_id}/installs/{request_id}'),
+                json=body, timeout=15)
+            if r.status_code == 200:
+                return True
+            logging.info(f"install report {request_id} -> {status}: HTTP "
+                         f"{r.status_code} {r.text[:200]}")
+            return False
+        except Exception as e:
+            logging.debug(f"install report failed: {e}")
+            return False
 
     def update_device(self, device_id, updates):
         """Update device information"""
@@ -5329,7 +5491,9 @@ class RomMClient:
                         if file_size > 0:
                             # Confirm successful download to server (only if we used the proper API endpoint)
                             if save_id and device_id and not used_fallback:
-                                self.confirm_save_downloaded(save_id, save_type, device_id)
+                                self.confirm_save_downloaded(
+                                    save_id, save_type, device_id,
+                                    content_hash=self.compute_content_hash(download_path))
                             elif used_fallback:
                                 logging.debug(f"Skipping download confirmation (used fallback path)")
                             return True
@@ -5351,13 +5515,17 @@ class RomMClient:
             logging.warning(f"Error downloading {save_type} for ROM {rom_id}: {e}")
             return False
 
-    def confirm_save_downloaded(self, save_id, save_type, device_id):
+    def confirm_save_downloaded(self, save_id, save_type, device_id, content_hash=None):
         """Confirm to the server that a save/state was successfully downloaded by this device
 
         Args:
             save_id: The ID of the save/state that was downloaded
             save_type: Type of save ('saves' or 'states')
             device_id: The device ID that downloaded the save
+            content_hash: Hash of the bytes now on disk. RomM 5.4 records it as
+                this device's baseline, so a later negotiate can tell "unchanged
+                here" from "edited here" by content, not mtime alone. Older
+                servers ignore the extra field.
 
         Returns:
             True if confirmation was successful, False otherwise
@@ -5380,6 +5548,8 @@ class RomMClient:
 
             # Send device_id as query parameter or in body
             payload = {'device_id': device_id}
+            if content_hash:
+                payload['content_hash'] = content_hash
 
             logging.debug(f"Confirming download of {save_type[:-1]} {save_id} for device {device_id}")
 
@@ -5467,7 +5637,9 @@ class RomMClient:
 
             if download_path.exists() and download_path.stat().st_size > 0:
                 if device_id and used_device_id:
-                    self.confirm_save_downloaded(save_id, save_type, device_id)
+                    self.confirm_save_downloaded(
+                        save_id, save_type, device_id,
+                        content_hash=self.compute_content_hash(download_path))
                 return True
 
             logging.warning(f"Download failed or empty for {save_type} {save_id}")
@@ -5883,6 +6055,12 @@ class RomMClient:
                 params.append('autocleanup=true')
                 if autocleanup_limit:
                     params.append(f'autocleanup_limit={autocleanup_limit}')
+            # RomM 5.4 records the uploading device's baseline from this, the
+            # same digest negotiate compares; older servers ignore it.
+            if save_type == 'saves':
+                content_hash = self.compute_content_hash(file_path)
+                if content_hash:
+                    params.append(f'content_hash={content_hash}')
             endpoint = f'/api/{save_type}?' + '&'.join(params)
             upload_url = urljoin(self.base_url, endpoint)
             logging.debug(f"Upload endpoint: {upload_url}")
@@ -5981,6 +6159,15 @@ class RomMClient:
 
                 elif response.status_code == 400:
                     logging.warning(f"Upload bad request (400): {response.text[:300]}")
+                    # RomM 5.4 refuses a name it cannot store (too long once it
+                    # appends its timestamp, or unsafe). The same file will be
+                    # refused every time, so it is not worth retrying.
+                    if 'filename' in response.text.lower():
+                        return 'rejected'
+
+                elif response.status_code == 413:
+                    logging.warning(f"Upload too large (413): {response.text[:300]}")
+                    return 'rejected'
 
                 elif response.status_code == 404:
                     # The ROM this save belongs to no longer exists on the
@@ -8359,11 +8546,10 @@ class RetroArchInterface:
             low = (key or '').lower()
             if not low:
                 continue
-            for keyword, cores in self._PLATFORM_KEYWORD_CORES.items():
-                if keyword in low:
-                    for c in cores:
-                        if c not in wanted:
-                            wanted.append(c)
+            for cores in self._keyword_core_lists(low):
+                for c in cores:
+                    if c not in wanted:
+                        wanted.append(c)
         return wanted
 
     def installed_cores_for_platform(self, platform_name, system_slug=None,
@@ -8452,12 +8638,11 @@ class RetroArchInterface:
         platform_lower = (platform_name or '').lower()
 
         # Try keyword matching
-        for keyword, cores in self._PLATFORM_KEYWORD_CORES.items():
-            if keyword in platform_lower:
-                for core in cores:
-                    if core in available_cores:
-                        print(f"✅ Found fuzzy match core: {core} (matched keyword: {keyword})")
-                        return core, available_cores[core]
+        for cores in self._keyword_core_lists(platform_lower):
+            for core in cores:
+                if core in available_cores:
+                    print(f"✅ Found fuzzy match core: {core}")
+                    return core, available_cores[core]
 
         print(f"❌ No suitable core found for platform: {platform_name}")
         print(f"Available cores: {list(available_cores.keys())}")
@@ -8467,6 +8652,18 @@ class RetroArchInterface:
     # platform_core_map exactly ("Sega Mega Drive/Genesis", "Nintendo - Game Boy
     # Advance", …). Shared by the guess, the picker's platform-core list and the
     # download offer, so all three agree on what a platform can run.
+    @classmethod
+    def _keyword_core_lists(cls, platform_lower):
+        """Core lists for the keywords found in a lowercased platform name.
+
+        A keyword contained in a longer keyword that also matched is dropped:
+        'playstation' is in "playstation 2", and without this a PS2 game with
+        no PS2 core installed fell through to the PS1 cores (rommapp/ludo#36).
+        """
+        hits = [k for k in cls._PLATFORM_KEYWORD_CORES if k in platform_lower]
+        return [cls._PLATFORM_KEYWORD_CORES[k] for k in hits
+                if not any(k != o and k in o for o in hits)]
+
     _PLATFORM_KEYWORD_CORES = {
             'n64': ['mupen64plus_next', 'parallel_n64'],
             'nintendo 64': ['mupen64plus_next', 'parallel_n64'],
@@ -8482,6 +8679,8 @@ class RetroArchInterface:
             'gb': ['gambatte', 'sameboy', 'tgbdual'],
             'playstation 2': ['pcsx2', 'play'],
             'ps2': ['pcsx2', 'play'],
+            'playstation portable': ['ppsspp'],
+            'psp': ['ppsspp'],
             # Prefer SOFTWARE-rendered PSX cores first. The hardware-renderer
             # variants (*_hw) require a conformant Vulkan/GL driver and boot to a
             # black screen / BIOS on systems without one (e.g. mesa radv flagged as
@@ -8535,7 +8734,12 @@ class RetroArchInterface:
         """argv for a standalone emulator, from its args template."""
         args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
         if executable.startswith('flatpak:'):
-            return ['flatpak', 'run', executable.split(':', 1)[1]] + args
+            # The sandbox can't see a ROM outside the paths its manifest grants
+            # (Eden then says "ROM format not supported", rommapp/ludo#34).
+            # Grant the ROM's folder for this run only, read-only, rather than
+            # writing a lasting `flatpak override` into the user's setup.
+            grant = f'--filesystem={Path(rom_path).parent}:ro'
+            return ['flatpak', 'run', grant, executable.split(':', 1)[1]] + args
         return [executable] + args
 
     def build_launch_command(self, rom_path, platform_name=None, core_name=None,
@@ -14707,7 +14911,7 @@ class AutoSyncManager:
             status['eden_running'] = emulator_saves.eden_is_running()
         return status
 
-    def install_switch_add_on(self, local_path, progress=None):
+    def install_switch_add_on(self, local_path, progress=None, on_decompress=None):
         """Make a downloaded update or DLC apply in Eden. Returns its result dict.
 
         Safe to call on any freshly downloaded file: anything that is not an
@@ -14725,6 +14929,16 @@ class AutoSyncManager:
         except Exception:
             prod_keys = None
         local_path = Path(local_path)
+        # Eden opens neither .nsz nor .xcz, in NAND or in a folder, so a
+        # compressed add-on is decompressed before it goes anywhere.
+        if switch_nsz.is_compressed(local_path) and local_path.is_file():
+            try:
+                local_path = switch_nsz.decompress(local_path, on_decompress)
+            except Exception as e:
+                logging.warning(f"Could not decompress {local_path.name}: {e}")
+                self.log(f"⚠️ Could not decompress {local_path.name}: {e}")
+                return {'status': 'compressed',
+                        'error': switch_nsz.describe_failure(e)}
         mode = self.switch_addon_mode()
         try:
             if mode == switch_content.MODE_EXTCONTENT:
@@ -14771,8 +14985,8 @@ class AutoSyncManager:
             self.log(f"⚠️ Could not move {name} into the updates/DLC folder: "
                      f"{result.get('error')}")
         elif status == 'compressed':
-            self.log(f"⚠️ {name} is compressed (.nsz/.xcz) and cannot be "
-                     f"installed; a decompressed .nsp/.xci is needed")
+            self.log(f"⚠️ {name} is compressed (.nsz/.xcz) and could not be "
+                     f"decompressed; a .nsp/.xci is needed")
         elif status == 'unreadable':
             self.log(f"⚠️ Could not read {name} as a Switch container: "
                      f"{result.get('error')}")
@@ -14906,6 +15120,62 @@ class AutoSyncManager:
 
         threading.Thread(target=_run, daemon=True, name="romm-session-sync").start()
 
+    def _upload_key(self, path):
+        try:
+            st = Path(path).stat()
+            return (str(path), st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _note_upload_rejected(self, path):
+        rejected = self.__dict__.setdefault('_rejected_uploads', set())
+        key = self._upload_key(path)
+        if key:
+            rejected.add(key)
+
+    def _upload_rejected_unchanged(self, path):
+        """True if this exact file (path, mtime, size) was refused before.
+
+        Per process: a restart tries once more, which is also how a server
+        upgrade that lifts a limit gets noticed."""
+        key = self._upload_key(path)
+        return bool(key) and key in self.__dict__.get('_rejected_uploads', ())
+
+    def _apply_server_delete(self, entry):
+        """Set aside a local save whose server slot was deleted. True if moved.
+
+        Renamed beside itself to <name>.deleted-<stamp>, not unlinked: the
+        extension no longer matches a save, so neither the emulator nor the
+        next inventory sees it, but a deletion made by mistake on the server
+        can still be undone by hand.
+
+        Packed entries are skipped: their _path is a zip built in our cache
+        from an Eden save tree or a shared PS2 card, and removing the zip
+        removes nothing (the card also holds other games' saves).
+        """
+        if not entry:
+            return False
+        src = Path(entry['_path'])
+        try:
+            if src.is_relative_to(cache_dir()):
+                logging.info(f"[SYNC-OP] server deleted the save for rom "
+                             f"{entry.get('rom_id')}, but {src.name} is packed from "
+                             f"an emulator's own save data — leaving it")
+                return False
+        except Exception:
+            pass
+        if not src.exists():
+            return False
+        stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        dst = src.with_name(f"{src.name}.deleted-{stamp}")
+        try:
+            src.rename(dst)
+        except OSError as e:
+            self.log(f"⚠️ Save-sync: could not set aside {src.name}: {e}")
+            return False
+        self.log(f"🗑️ Save deleted on RomM — moved local copy to {dst.name}")
+        return True
+
     def run_negotiated_save_sync(self, conflict_resolver=None, trigger=""):
         """Run one save-sync cycle via RomM 4.9.0's /negotiate engine (SAVES ONLY).
 
@@ -14915,13 +15185,15 @@ class AutoSyncManager:
           - download -> pull the server save into the RetroArch saves dir
           - conflict -> defer to conflict_resolver(op) -> 'local'|'server'|'skip'
                         (default: 'skip' — never auto-clobber; collected for UI)
+          - delete   -> (RomM 5.4+) the slot was emptied on the server: set the
+                        local copy aside as <name>.deleted-<stamp>
           - no_op    -> nothing
         Finally marks the session complete.
 
         Returns a summary dict: {uploaded, downloaded, conflicts, no_op, errors, session_id}.
         """
-        summary = {'uploaded': 0, 'downloaded': 0, 'conflicts': [], 'no_op': 0,
-                   'errors': 0, 'session_id': None,
+        summary = {'uploaded': 0, 'downloaded': 0, 'deleted': 0, 'conflicts': [],
+                   'no_op': 0, 'errors': 0, 'session_id': None,
                    # rom_id -> {'up': n, 'down': n} — feeds per-game Recent
                    # Activity entries (also bumped by _handle_upload_conflict).
                    '_per_game': defaultdict(lambda: {'up': 0, 'down': 0})}
@@ -15001,6 +15273,12 @@ class AutoSyncManager:
                         self.log(f"⚠️ Save-sync: no local file for upload op rom={rom_id} slot={slot!r}")
                         summary['errors'] += 1
                         continue
+                    # Refused before for a reason the file itself carries (its
+                    # name or size). Unchanged since, it will be refused again,
+                    # so don't ask — negotiate re-offers it every cycle.
+                    if self._upload_rejected_unchanged(entry['_path']):
+                        summary['rejected'] = summary.get('rejected', 0) + 1
+                        continue
                     # The whole branch, including the 409 retry: the indicator
                     # should stay lit across a conflict resolution rather than
                     # blink off between the two requests.
@@ -15038,6 +15316,20 @@ class AutoSyncManager:
                                     self.rom_removed_callback(rom_id)
                             except Exception as cb_err:
                                 logging.debug(f"rom_removed_callback failed: {cb_err}")
+                        elif ok == 'rejected':
+                            summary['rejected'] = summary.get('rejected', 0) + 1
+                            self._note_upload_rejected(entry['_path'])
+                            self.log(f"⚠️ RomM refused {Path(entry['_path']).name} "
+                                     f"(name too long or file too large) — not retrying "
+                                     f"until it changes")
+                            _record_activity(
+                                'save', 'Save not uploaded',
+                                f"RomM refused {Path(entry['_path']).name}: its name is "
+                                f"too long or the file too large. Rename the game's "
+                                f"files to sync it.")
+                            # Out of the pending queue: nothing will send it.
+                            if self._record_synced(entry['_path']):
+                                _fp_dirty = True
                         elif ok == 'conflict':
                             # The server rejected a "clean" upload with 409 — a
                             # version diverged underneath us. Resolve like any
@@ -15108,6 +15400,17 @@ class AutoSyncManager:
                             _fp_dirty = True
                     else:
                         summary['errors'] += 1
+
+                elif action == 'delete':
+                    # RomM 5.4+: the user deleted this save on the server, and
+                    # the copy here is the version that was deleted, untouched
+                    # since. Ignored, it would linger here and (on servers
+                    # before 5.4, which answered "upload") come straight back.
+                    entry = inv_by_key.get((rom_id, slot))
+                    if self._apply_server_delete(entry):
+                        summary['deleted'] += 1
+                    else:
+                        summary['skipped_delete'] = summary.get('skipped_delete', 0) + 1
 
                 elif action == 'conflict':
                     # Resolve via an explicit resolver, else the user's
@@ -15183,7 +15486,8 @@ class AutoSyncManager:
         # genuinely failed (or are in unresolved conflict) are excluded so they
         # stay flagged as pending. This makes the offline count = only what
         # changed/appeared after the last successful sync.
-        made_contact = (summary['no_op'] + summary['uploaded'] + summary['downloaded']) > 0
+        made_contact = (summary['no_op'] + summary['uploaded'] + summary['downloaded']
+                        + summary['deleted']) > 0
         if made_contact:
             if self.mark_all_synced(exclude=_errored_paths):
                 _fp_dirty = True
@@ -15191,14 +15495,16 @@ class AutoSyncManager:
         if _fp_dirty:
             self._save_upload_fingerprints()
 
-        completed = summary['uploaded'] + summary['downloaded'] + summary['no_op']
+        completed = (summary['uploaded'] + summary['downloaded'] + summary['deleted']
+                     + summary['no_op'])
         self.romm_client.complete_sync_session(
             session_id,
             operations_completed=completed,
             operations_failed=summary['errors'],
         )
         self.log(f"🔄 Save-sync: {summary['uploaded']} up, {summary['downloaded']} down, "
-                 f"{len(summary['conflicts'])} conflict(s), {summary['no_op']} in-sync, "
+                 + (f"{summary['deleted']} removed, " if summary['deleted'] else "")
+                 + f"{len(summary['conflicts'])} conflict(s), {summary['no_op']} in-sync, "
                  f"{summary['errors']} error(s)")
 
         # Tell the player, in the emulator, when something actually moved. The
@@ -17784,7 +18090,15 @@ class CollectionSyncManager:
         }
         logging.info(f"[PROGRESS] Initialized download_progress for {collection_name}: 0/{total_to_download} to download")
 
+        # Sync turned off for this collection (Stop on the Downloads page, or its
+        # switch) or the manager shut down: drop the game in flight and the rest.
+        def _stopped(_coll=collection_name):
+            return not self.running or _coll not in self.selected_collections
+
         for rom in roms_to_download:
+            if _stopped():
+                self.log(f"  ⏹ Sync of '{collection_name}' stopped")
+                break
             # Simple game processing for daemon
             platform_slug = rom.get('platform_slug', 'Unknown')
             file_name = rom.get('fs_name') or f"{rom.get('name', 'unknown')}.rom"
@@ -17827,8 +18141,12 @@ class CollectionSyncManager:
                 rom.get('id'),
                 rom.get('name', 'Unknown'),
                 local_path,
-                progress_callback=_chunk_progress
+                progress_callback=_chunk_progress,
+                cancellation_checker=_stopped,
             )
+            if not success and message == 'cancelled':
+                self.log(f"  ⏹ Sync of '{collection_name}' stopped")
+                break
 
             # Child-file variants (regional ROMs inside a parent folder) cannot be
             # downloaded via their own ROM ID — the API returns 404.

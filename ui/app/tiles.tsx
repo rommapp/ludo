@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { LibGame, LibGroup } from "./types";
-import { _dlSucceeded, _setDlActive, awaitDownload, runCollectionBatch, useDownloadProgress, useIsDownloading } from "./downloads";
+import { _dlSucceeded, _setDlActive, awaitDownload, claimDownloadStart, releaseDownloadStart, runCollectionBatch, useDownloadProgress, useIsDownloading } from "./downloads";
 import { V2, roundBtn} from "./theme";
 import { useCollectionSync, useOffline, useSaveActivityFor} from "./status";
 import { deleteCollectionRoms, deleteGame, downloadGame, getLibraryGames, getLocalDiscs, getLocalSiblings, resyncPlatform, toggleCollectionSync, getStateThumbnails} from "./rpc";
@@ -9,9 +9,9 @@ import { toaster } from "./toast";
 import { maybePromptSwitchFirmware } from "./firmware";
 import { _libGamesCache, libCacheSetDownloaded, _focusedPlatform, _setFocusedPlatform, libCacheDelete, libCacheDrop, openGameById} from "./libcache";
 import { V2Focus, V2_FOCUS_STYLE} from "./focus";
-import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImage } from "./media";
+import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImageBg } from "./media";
 import { PlatformIcon, ProgressRing, UserMenuRow, MODAL_SCRIM_INSET, PickerModal, ToastCover} from "./kit";
-import { FaBookmark, FaBoxOpen, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
+import { FaBookmark, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
 import { _broadcastLibRefresh } from "./events";
 import { MdFlashOn } from "react-icons/md";
 import { _forceGamepadFocus } from "./shell";
@@ -216,6 +216,14 @@ const pillWarning = (dark: boolean) => (dark ? '#b45309' : V2.warning);
 
 const pillSuccess = (dark: boolean) => (dark ? '#15803d' : V2.success);
 
+// Flags are pairs of regional-indicator letters, and not every system font
+// draws the pair as a flag: Chromium in the desktop AppImage can end up on one
+// that shows two boxed letters. The desktop app ships "Ludo Flags" for that
+// (see desktop/src/host/host.css); Steam has its own emoji font, so on the
+// Deck the name simply doesn't resolve and the system ones take over. Only the
+// chips use this: emoji fonts carry digits and spaces too.
+const EMOJI_FONT = '"Ludo Flags", "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", sans-serif';
+
 function regionToEmoji(region: string): string {
   return REGION_EMOJI[(region || '').toLowerCase()] || region;
 }
@@ -296,7 +304,6 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
   const [activeDlRomId, setActiveDlRomId] = useState<number>(game.rom_id);
   const dlProgress = useDownloadProgress(activeDlRomId, busy === 'download');
   const dlPct = dlProgress?.percent ?? null;
-  const extracting = dlProgress?.state === 'extracting';
   const globalDownloading = useIsDownloading(activeDlRomId);
   const downloading = busy === 'download' || globalDownloading;
   const ringColor = V2.brand;
@@ -422,17 +429,19 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
     }
     // Before the busy/active flags: they repaint the tile as downloading, and
     // nothing is downloading until this modal has been answered.
+    if (!claimDownloadStart(game.rom_id)) return;
     await maybePromptSwitchFirmware(game.rom_id);
     setBusy('download');
     setActiveDlRomId(game.rom_id);
     _setDlActive(game.rom_id, true, game.name);
+    releaseDownloadStart(game.rom_id);
     try {
       const start = await downloadGame(game.rom_id);
       if (!start?.success) { toaster.toast({ title: 'Download failed', body: start?.message || 'Error' }); return; }
       const res = await awaitDownload(game.rom_id);
       if (res.ok) {
         setDl(true); libCacheSetDownloaded(game.rom_id, true);
-        toaster.toast({
+        if (!res.warning) toaster.toast({
           title: 'Downloaded', body: game.name,
           logo: <ToastCover romId={game.rom_id} hasCover={game.has_cover} />,
           // Clicking the toast opens the game it names. Origin is the library
@@ -448,7 +457,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
         toaster.toast({ title: 'No longer on RomM', body: `${game.name} has been removed from your server.` });
         libCacheDrop(game.rom_id);
       }
-      else toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
+      else if (!res.cancelled) toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
     } catch (e) { toaster.toast({ title: 'Download failed', body: String(e) }); }
     finally { _setDlActive(game.rom_id, false); setBusy(null); }
   };
@@ -486,10 +495,12 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
         return;
       }
       // Before the busy/active flags — see doDownload above.
+      if (!claimDownloadStart(selectedRomId)) return;
       await maybePromptSwitchFirmware(selectedRomId);
       setBusy('download');
       setActiveDlRomId(selectedRomId);
       _setDlActive(selectedRomId, true, game.name);
+      releaseDownloadStart(selectedRomId);
       try {
         const start = await downloadGame(selectedRomId);
         if (!start?.success) { toaster.toast({ title: 'Download failed', body: start?.message || 'Error' }); return; }
@@ -499,7 +510,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
           if (isMainRom) { setDl(true); libCacheSetDownloaded(game.rom_id, true); }
           // The main rom's art even when a regional sibling was the download —
           // it's the same game, and only `game` carries a known has_cover.
-          toaster.toast({
+          if (!res.warning) toaster.toast({
             title: 'Downloaded', body: game.name,
             logo: <ToastCover romId={game.rom_id} hasCover={game.has_cover} />,
             // The main rom again, not selectedRomId: the detail page is the
@@ -507,7 +518,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             onClick: () => openGameById(game.rom_id, game.name, "/romm-sync-library"),
           });
         } else {
-          toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
+          if (!res.cancelled) toaster.toast({ title: 'Download failed', body: res.message || 'Error' });
           return;
         }
       } catch (e) { toaster.toast({ title: 'Download failed', body: String(e) }); return; }
@@ -568,14 +579,19 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
     // Register by rom_id so the post-session focus restore can aim at the tile
     // the user actually launched instead of the first one in the grid. Cleared
     // on unmount (el === null) so detached nodes are not held or focused.
-    // Unregister only if the entry is still OUR node: the same game is on Home
-    // twice (Continue playing + Recently Downloaded) and again in the library,
-    // and React runs the new tile's ref BEFORE the old one's null cleanup — a
-    // blind delete here dropped the entry that had just been registered, so
-    // after a session the map was empty and focus fell back to the first tile.
+    // Every copy is kept: the same game is on Home twice (Continue playing +
+    // Recently Downloaded) and again in the library, and the one to focus is
+    // whichever is on screen — see tileElFor.
     try {
-      if (el) _tileElsByRomId.set(game.rom_id, el);
-      else if (prev && _tileElsByRomId.get(game.rom_id) === prev) _tileElsByRomId.delete(game.rom_id);
+      if (el) {
+        let set = _tileElsByRomId.get(game.rom_id);
+        if (!set) _tileElsByRomId.set(game.rom_id, set = new Set());
+        set.add(el);
+      } else if (prev) {
+        const set = _tileElsByRomId.get(game.rom_id);
+        set?.delete(prev);
+        if (set && !set.size) _tileElsByRomId.delete(game.rom_id);
+      }
     } catch { /* ignore */ }
     if (typeof focusRef === 'function') focusRef(el);
     else if (focusRef) (focusRef as any).current = el;
@@ -792,6 +808,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
                     display: 'inline-flex', alignItems: 'center', gap: '2px',
                     padding: '2px 5px', borderRadius: V2.radiusPill,
                     fontSize: '10px', lineHeight: 1.2, whiteSpace: 'nowrap',
+                    fontFamily: EMOJI_FONT,
                     ...coverPill(iconDark),
                     transition: 'background 0.2s ease, border-color 0.2s ease',
                   }}>
@@ -852,7 +869,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             </div>
           )}
           {downloading
-            ? (extracting ? <FaBoxOpen size={15} /> : <FaDownload size={15} />)
+            ? <FaDownload size={15} />
             : busy === 'launch'
               ? <FaSync size={16} style={{ animation: 'spin 1s linear infinite' }} />
               /* Ranked below launching: if you just pressed Play, what that
@@ -870,12 +887,13 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
           transition: 'opacity 0.18s ease, transform 0.18s ease',
         }}>
           <div onPointerDown={() => { subPress.current = true; }}
-            onClick={(e: any) => { e.stopPropagation(); subPress.current = false; onOpen(game); }} style={roundBtn(30, 'glass')}>
+            onClick={(e: any) => { e.stopPropagation(); subPress.current = false; onOpen(game); }} className="romm-gt-btn" style={roundBtn(30, 'glass')}>
             <FaInfoCircle size={13} />
           </div>
           {dl && (
             <div onPointerDown={() => { subPress.current = true; }}
               onClick={(e: any) => { e.stopPropagation(); subPress.current = false; requestDelete(); }}
+              className="romm-gt-btn"
               style={{
                 ...roundBtn(30, 'danger'),
                 // Armed state: solid red fill + check glyph, so it's clear the
@@ -914,7 +932,7 @@ export function PathImage({ path }: { path: string }) {
     const p = peekCover(ik);
     if (p !== undefined) { setUri(p); return; }
     (async () => {
-      try { const u = await awaitCover(ik, () => qGetImage(path)); if (alive) setUri(u); }
+      try { const u = await awaitCover(ik, () => qGetImageBg(path)); if (alive) setUri(u); }
       catch { /* ignore */ }
     })();
     return () => { alive = false; };
@@ -949,7 +967,7 @@ export function CollectionMosaic({ covers }: { covers: string[] }) {
 
 // Collection tile — mosaic cover + kind badge + name/count below, with the
 // focus scale + brand glow (RomM CollectionTile).
-export function CollectionTile({ group, onOpen, focusRef, focusable }: { group: LibGroup; onOpen: (g: LibGroup) => void; focusRef?: React.Ref<any>; focusable?: boolean }) {
+export const CollectionTile = memo(function CollectionTile({ group, onOpen, focusRef, focusable }: { group: LibGroup; onOpen: (g: LibGroup) => void; focusRef?: React.Ref<any>; focusable?: boolean }) {
   const [focused, setFocused] = useState(false);
   // Virtual (autogenerated) collections key their sync by the opaque base64 id
   // (== group.key), and still can't be local-deleted wholesale — removal below
@@ -1147,11 +1165,11 @@ export function CollectionTile({ group, onOpen, focusRef, focusable }: { group: 
       </div>
     </Focusable>
   );
-}
+});
 
 // Platform tile — centered icon-led card (RomM PlatformTile): bg-elevated
 // card, large icon on top, name + count, focus brand glow.
-export function PlatformTile({ group, onOpen, focusRef, focusable }: { group: LibGroup; onOpen: (g: LibGroup) => void; focusRef?: React.Ref<any>; focusable?: boolean }) {
+export const PlatformTile = memo(function PlatformTile({ group, onOpen, focusRef, focusable }: { group: LibGroup; onOpen: (g: LibGroup) => void; focusRef?: React.Ref<any>; focusable?: boolean }) {
   const [focused, setFocused] = useState(false);
   const selfRef = useRef<any>(null);
   const setRefs = (el: any) => {
@@ -1295,7 +1313,7 @@ export function PlatformTile({ group, onOpen, focusRef, focusable }: { group: Li
       </div>
     </Focusable>
   );
-}
+});
 
 // Small count tag — RomM RTag x-small used in CardRow headers.
 export function Tag({ children }: { children: any }) {
@@ -1375,9 +1393,18 @@ export function CardRow({ icon, title, count, children }:
         <div
           ref={trackRef}
           onScroll={update}
-          style={{ overflowX: 'auto', overflowY: 'visible' }}
+          className="romm-cardrow-track"
+          // Steam scrolls a focused tile only until it touches the track's
+          // edge, cropping its focus scale and glow (the first tile once the
+          // row has shifted, the last always). The padding keeps the
+          // track's own 16px gutter plus room for the glow in view.
+          style={{ overflowX: 'auto', overflowY: 'visible', scrollPaddingInline: '28px' }}
         >
-          <Focusable noFocusRing flow-children="horizontal" {...NAV_MAINTAIN_X} style={{ display: 'flex', gap: '12px', padding: '24px 16px 28px' }}>
+          <Focusable noFocusRing flow-children="horizontal" {...NAV_MAINTAIN_X} style={{ display: 'flex', gap: '12px', padding: '24px 16px 28px',
+            // Grow with the tiles: a block child is only as wide as the track, so the
+            // tiles overflow it and its right padding never counts as scrollable
+            // room, leaving the last tile flush against the edge.
+            width: 'max-content', minWidth: '100%' }}>
             {children}
           </Focusable>
         </div>
@@ -1392,7 +1419,18 @@ export function CardRow({ icon, title, count, children }:
 // Aiming at the tile they launched keeps the selection where they left it.
 // A plain Map (not WeakMap): the value IS the key's only strong ref here, and
 // entries are removed on unmount.
-export const _tileElsByRomId = new Map<number, any>();
+export const _tileElsByRomId = new Map<number, Set<any>>();
+
+// The game's tile that can take focus now. Hidden panels stay mounted
+// (display:none), so a tile can be connected and still impossible to focus;
+// keeping one entry per game used to hand back whichever copy registered
+// last — often Home's hidden one — and focus fell back to the first tile.
+export function tileElFor(romId: number | null | undefined): any {
+  if (romId == null) return null;
+  for (const el of _tileElsByRomId.get(romId) || [])
+    if (el.isConnected && el.offsetParent !== null) return el;
+  return null;
+}
 
 // Last known value of the resume-from-state preference. Persisted, because the
 // Home row has to decide how to draw itself on the FIRST frame: read from the

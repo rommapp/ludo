@@ -562,9 +562,47 @@ def firmware_version_key(name):
     return (1, tuple(int(part) for part in version.split('.')))
 
 
+_EDEN_LOG_FIRMWARE_RE = re.compile(r'Installed firmware:\s*(\d+(?:\.\d+)+)')
+
+
+def detected_firmware_version(extra_data_dir=None):
+    """The firmware version Eden itself reported, or None.
+
+    Eden logs "Installed firmware: 22.5.0" at start-up, read from the system
+    version archive inside registered/ -- the one place the real version lives,
+    behind the NCA encryption. It answers for firmware nobody here installed
+    (copied in by hand, or put there before Ludo kept a marker).
+
+    Only trusted when the log is newer than registered/: firmware swapped in
+    since Eden last ran would otherwise be reported as the old version.
+    """
+    for data_dir in eden_data_dirs(extra_data_dir):
+        registered = data_dir.joinpath(*_EDEN_FIRMWARE_DIR)
+        try:
+            fw_mtime = registered.stat().st_mtime
+        except OSError:
+            continue
+        for name in ('eden_log.txt', 'eden_log.txt.old.txt'):
+            log = data_dir / 'log' / name
+            try:
+                if log.stat().st_mtime < fw_mtime:
+                    continue
+                text = log.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            found = _EDEN_LOG_FIRMWARE_RE.findall(text)
+            if found:
+                return found[-1]
+    return None
+
+
 def installed_firmware_version():
-    """The version label of the firmware set we last installed, or None."""
-    return firmware_version_from_name(read_firmware_marker().get('file_name'))
+    """The version label of the firmware set we last installed, or None.
+
+    Falls back to what Eden reports when there is no marker.
+    """
+    return (firmware_version_from_name(read_firmware_marker().get('file_name'))
+            or detected_firmware_version())
 
 
 def highest_master_key(path=None, extra_data_dir=None):
