@@ -843,6 +843,10 @@ class LudoBackend:
         # Declined installs waiting to be announced, by platform slug.
         self._declined = {}
         self._declined_lock = threading.Lock()
+        # Install requests being handled (request id -> rom_id), and the ones
+        # RomM has cancelled while they were.
+        self._install_jobs = {}
+        self._install_cancelled = set()
         # rom_id -> why its download could not be decompressed, read once by
         # the download worker when it reports the result. Set here, not in
         # _main, so a download can never meet it missing.
@@ -965,7 +969,8 @@ class LudoBackend:
 
         # Installs queued from RomM's web UI ("Install on device", RomM 5.4+).
         self._install_wake = threading.Event()
-        self._install_socket = InstallSocket(self._install_wake)
+        self._install_socket = InstallSocket(self._install_wake,
+                                             on_cancel=self._on_install_cancelled)
         self._install_wake.set()   # first claim right after connect, not a minute in
         self._install_thread = threading.Thread(
             target=self._install_loop, daemon=True, name="romm-installs")
@@ -5264,6 +5269,7 @@ class LudoBackend:
         """Download one requested ROM and report how it went."""
         rid, rom_id = req['id'], req.get('rom_id')
         client = self._romm_client
+        self._install_jobs[rid] = rom_id
         try:
             g = self._games_index().get(rom_id)
             name = (g or {}).get('display_name') or (g or {}).get('name') or f'ROM {rom_id}'
@@ -5280,6 +5286,8 @@ class LudoBackend:
                 self._note_declined_install(slug, platform, name)
                 return
             logging.info(f"[INSTALL] RomM asked for {name} (request {rid})")
+            if rid in self._install_cancelled:
+                return  # cancelled before it started; RomM has already ended it
             _record_activity('download', 'Install requested from RomM', name, rom_id=rom_id)
             started = asyncio.run(self.download_game(rom_id))
             if not started.get('success'):
@@ -5291,9 +5299,21 @@ class LudoBackend:
                 state = (self._download_progress.get(rom_id) or {}).get('state')
                 if state in ('done', 'error', 'cancelled'):
                     break
+                # A cancel that landed before the transfer began.
+                if rid in self._install_cancelled and state == 'downloading':
+                    self._download_cancels.add(rom_id)
             else:
                 return  # shutting down: the request goes back on the next claim
             prog = self._download_progress.get(rom_id) or {}
+            if rid in self._install_cancelled:
+                # RomM ended the request when it was cancelled; there is
+                # nothing to report. Past the transfer the game is kept.
+                if prog.get('state') == 'cancelled':
+                    _record_activity('delete', 'Install cancelled from RomM', name,
+                                     rom_id=rom_id)
+                logging.info(f"[INSTALL] {name}: cancelled from RomM "
+                             f"({prog.get('state')})")
+                return
             if prog.get('state') == 'done':
                 client.report_install(device_id, rid, 'done')
             else:
@@ -5309,6 +5329,17 @@ class LudoBackend:
                 pass
         finally:
             active.discard(rid)
+            self._install_jobs.pop(rid, None)
+            self._install_cancelled.discard(rid)
+
+    def _on_install_cancelled(self, rid):
+        """RomM cancelled a request: stop its download if one is running."""
+        rom_id = self._install_jobs.get(rid)
+        if rom_id is None:
+            return  # not ours, or already finished
+        self._install_cancelled.add(rid)
+        if (self._download_progress.get(rom_id) or {}).get('state') == 'downloading':
+            self._download_cancels.add(rom_id)
 
     def _install_platform_off(self, rom_id, g):
         """(slug, platform name, rom name) when the ROM's platform is switched

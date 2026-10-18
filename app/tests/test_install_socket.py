@@ -56,9 +56,9 @@ class Server:
 
     url = property(lambda self: f"http://127.0.0.1:{self.port}")
 
-    def queue_install(self):
+    def queue_install(self, event="install:queued"):
         asyncio.run_coroutine_threadsafe(
-            self.sio.emit("install:queued", {"id": "req-1"}, namespace=NAMESPACE),
+            self.sio.emit(event, {"id": "req-1", "rom_id": 7}, namespace=NAMESPACE),
             self.loop).result(5)
 
     def stop(self):
@@ -122,3 +122,15 @@ def test_no_target_closes(server):
     assert _until(lambda: sock.connected)
     sock.ensure(server.url, None)   # signed out
     assert _until(lambda: not server.sids)
+
+
+def test_cancelled_install_reaches_the_handler(server):
+    cancelled = []
+    sock = InstallSocket(threading.Event(), on_cancel=cancelled.append)
+    sock.ensure(server.url, GOOD)
+    try:
+        assert _until(lambda: sock.connected)
+        server.queue_install("install:cancelled")
+        assert _until(lambda: cancelled == ["req-1"])
+    finally:
+        sock.close()

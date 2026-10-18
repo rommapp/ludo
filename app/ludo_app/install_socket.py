@@ -4,6 +4,9 @@ The socket carries no install details. Every request is still read through the
 claim endpoint, so this only decides *when* the install loop claims: on connect
 (anything queued while we were away) and on ``install:queued``. The loop's own
 timed claim stays as the fallback for a socket that is down or never opens.
+
+``install:cancelled`` is the one event acted on directly: RomM has already
+ended the request, so the only thing left is to stop a download in flight.
 """
 import logging
 import threading
@@ -22,8 +25,9 @@ REFUSALS = {'unauthorized', 'disabled'}
 class InstallSocket:
     """One socket per (url, token). ``wake`` is set whenever a claim is due."""
 
-    def __init__(self, wake: threading.Event):
+    def __init__(self, wake: threading.Event, on_cancel=None):
         self._wake = wake
+        self._on_cancel = on_cancel   # called with the request id
         self._lock = threading.Lock()
         self._sio = None
         self._target = None
@@ -77,6 +81,16 @@ class InstallSocket:
         def _queued(*_):
             logging.info('[INSTALL] RomM queued an install for this device')
             self._wake.set()
+
+        @sio.on('install:cancelled', namespace=NAMESPACE)
+        def _cancelled(data=None):
+            rid = data.get('id') if isinstance(data, dict) else None
+            logging.info(f'[INSTALL] RomM cancelled request {rid}')
+            if rid and self._on_cancel:
+                try:
+                    self._on_cancel(rid)
+                except Exception as e:
+                    logging.debug(f'[INSTALL] cancel handler failed: {e}')
 
         @sio.on('connect_error', namespace=NAMESPACE)
         def _refused(data=None):

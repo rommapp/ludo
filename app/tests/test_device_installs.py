@@ -219,3 +219,52 @@ def test_turn_on_switches_the_platform_back_on(backend, monkeypatch):
     r = asyncio.run(backend.enable_platform('C64'))
     assert r['needs_refresh'] and wrote == [['gb']]
     assert resolved == [('enable_platform', {'platform': 'c64'})]
+
+
+def _cancellable_download(b, started):
+    """A transfer that runs until Ludo asks it to stop, like the real worker."""
+    async def download(rom_id):
+        started.set()
+        b._download_progress[rom_id] = {'state': 'downloading'}
+
+        def worker():
+            while rom_id not in b._download_cancels:
+                threading.Event().wait(0.02)
+            b._download_progress[rom_id] = {'state': 'cancelled'}
+        threading.Thread(target=worker, daemon=True).start()
+        return {'success': True}
+    return download
+
+
+def test_a_cancel_from_romm_stops_the_download_and_reports_nothing(backend, monkeypatch):
+    client = backend._romm_client = StubClient()
+    started = threading.Event()
+    monkeypatch.setattr(backend, "download_game", _cancellable_download(backend, started))
+    t = threading.Thread(target=_handle, args=(backend,))
+    t.start()
+    assert started.wait(3)
+    backend._on_install_cancelled('req-1')
+    t.join(10)
+    assert not t.is_alive()
+    assert client.reports == [], "RomM already ended a cancelled request"
+    assert backend._download_progress[ROM]['state'] == 'cancelled'
+    assert not backend._install_jobs and not backend._install_cancelled
+
+
+def test_a_cancel_before_the_download_starts_skips_it(backend, monkeypatch):
+    client = backend._romm_client = StubClient()
+    started = threading.Event()
+    monkeypatch.setattr(backend, "download_game", _cancellable_download(backend, started))
+    real_index = backend._games_index
+
+    def index_then_cancel():
+        backend._on_install_cancelled('req-1')   # lands mid-lookup
+        return real_index()
+    monkeypatch.setattr(backend, "_games_index", index_then_cancel)
+    _handle(backend)
+    assert not started.is_set() and client.reports == []
+
+
+def test_a_cancel_for_another_request_is_ignored(backend):
+    backend._on_install_cancelled('someone-else')
+    assert not backend._install_cancelled
