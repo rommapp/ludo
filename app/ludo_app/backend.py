@@ -29,7 +29,7 @@ from pathlib import Path
 from urllib.parse import quote, urljoin
 
 from .host import HostProfile
-from .install_socket import InstallSocket
+from .install_socket import InstallSocket, ScanSocket
 from .release_token import release_token
 
 # Claim our app identity before anything reads or writes engine state. Ludo
@@ -972,6 +972,8 @@ class LudoBackend:
         self._install_socket = InstallSocket(self._install_wake,
                                              on_cancel=self._on_install_cancelled)
         self._install_wake.set()   # first claim right after connect, not a minute in
+        # Library scans finished in RomM; see _on_romm_scan_done.
+        self._scan_socket = ScanSocket(self._on_romm_scan_done)
         self._install_thread = threading.Thread(
             target=self._install_loop, daemon=True, name="romm-installs")
         self._install_thread.start()
@@ -984,6 +986,8 @@ class LudoBackend:
         if getattr(self, '_install_socket', None):
             self._install_wake.set()
             self._install_socket.close()
+        if getattr(self, '_scan_socket', None):
+            self._scan_socket.close()
         if self._retry_thread:
             self._retry_thread.join(timeout=5)
         if self._reach_thread:
@@ -2466,6 +2470,9 @@ class LudoBackend:
                 # frontend gates the post-update "reopen Home" on this so covers
                 # don't fetch against a still-initializing backend.
                 'library_ready':           self._last_full_fetch_time is not None,
+                # Bumped when RomM finishes a scan; the frontend re-checks the
+                # library for changes when it moves.
+                'library_scan_at':         getattr(self, '_library_scan_at', 0),
                 # Present only while a full fetch is in flight. It belongs in THIS
                 # branch, not just the not-connected one: RomMClient authenticates
                 # in its constructor, so we report 'online' from the first second
@@ -5204,6 +5211,12 @@ class LudoBackend:
                 wake.clear()
             try:
                 client = self._romm_client
+                # Every copy listens for scans, paired or not, lock or no lock.
+                if client and client.authenticated and self._online is not False:
+                    self._scan_socket.ensure(client.base_url, client.client_token or '-',
+                                             client.session.verify)
+                else:
+                    self._scan_socket.close()
                 if not (client and client.authenticated and self._online is not False
                         and client.server_features.get('device_install')):
                     ready = False
@@ -5331,6 +5344,15 @@ class LudoBackend:
             active.discard(rid)
             self._install_jobs.pop(rid, None)
             self._install_cancelled.discard(rid)
+
+    def _on_romm_scan_done(self, stats):
+        """A scan finished in RomM: tell the frontend to check the library now.
+
+        Only the check, not the update. The frontend's staleness check compares
+        platform counts and raises the usual banner, and applying it still
+        waits for the user, so a scan never rewrites the library mid-browse.
+        """
+        self._library_scan_at = time.time()
 
     def _on_install_cancelled(self, rid):
         """RomM cancelled a request: stop its download if one is running."""

@@ -18,7 +18,7 @@ socketio = pytest.importorskip("socketio")
 uvicorn = pytest.importorskip("uvicorn")
 pytest.importorskip("wsproto")
 
-from ludo_app.install_socket import NAMESPACE, InstallSocket
+from ludo_app.install_socket import NAMESPACE, InstallSocket, ScanSocket
 
 GOOD, BAD = "rmm_bound", "rmm_unbound"
 # The test server's per-connection ping tasks outlive its loop; that is noise.
@@ -31,6 +31,7 @@ class Server:
     def __init__(self):
         self.sio = socketio.AsyncServer(async_mode="asgi")
         self.sids = []
+        self.main_sids = []
         self.connects = 0
 
         @self.sio.on("connect", namespace=NAMESPACE)
@@ -39,6 +40,11 @@ class Server:
                 raise socketio.exceptions.ConnectionRefusedError("unauthorized")
             self.connects += 1
             self.sids.append(sid)
+
+        # RomM's main namespace takes anyone; it only gates what it sends.
+        @self.sio.on("connect")
+        async def connect_main(sid, environ, auth=None):
+            self.main_sids.append(sid)
 
         @self.sio.on("disconnect", namespace=NAMESPACE)
         async def disconnect(sid, *_):
@@ -59,6 +65,11 @@ class Server:
     def queue_install(self, event="install:queued"):
         asyncio.run_coroutine_threadsafe(
             self.sio.emit(event, {"id": "req-1", "rom_id": 7}, namespace=NAMESPACE),
+            self.loop).result(5)
+
+    def scan_done(self):
+        asyncio.run_coroutine_threadsafe(
+            self.sio.emit("scan:done", {"new_roms": 3, "scanned_roms": 40}),
             self.loop).result(5)
 
     def stop(self):
@@ -132,5 +143,17 @@ def test_cancelled_install_reaches_the_handler(server):
         assert _until(lambda: sock.connected)
         server.queue_install("install:cancelled")
         assert _until(lambda: cancelled == ["req-1"])
+    finally:
+        sock.close()
+
+
+def test_a_finished_scan_reaches_the_handler_without_a_paired_token(server):
+    seen = []
+    sock = ScanSocket(seen.append)
+    sock.ensure(server.url, BAD)   # the main namespace does not care
+    try:
+        assert _until(lambda: sock.connected and server.main_sids)
+        server.scan_done()
+        assert _until(lambda: seen == [{"new_roms": 3, "scanned_roms": 40}])
     finally:
         sock.close()

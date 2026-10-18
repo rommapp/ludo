@@ -122,6 +122,8 @@ export async function _applyStaleUpdate(): Promise<boolean> {
   }
 }
 
+let _seenScanAt = 0;
+
 export async function _maybeCheckStale(svcStatus: any) {
   if (!svcStatus || svcStatus.connection === 'offline_cached'
       || svcStatus.connection === 'disconnected') return;
@@ -133,7 +135,12 @@ export async function _maybeCheckStale(svcStatus: any) {
   // same banner, and the numbers it shows came from the same source.
   if (_staleInfo) return;
   const now = Date.now();
-  if (now - lastStaleCheck() < _STALE_CHECK_MS) return;
+  // A scan that just finished in RomM is the one reason to look before the
+  // throttle comes round: it is when the library is most likely to have moved.
+  const scanAt = svcStatus.library_scan_at || 0;
+  const freshScan = scanAt > _seenScanAt;
+  _seenScanAt = Math.max(_seenScanAt, scanAt);
+  if (!freshScan && now - lastStaleCheck() < _STALE_CHECK_MS) return;
   // Stamped before the await, not after: two visibility flips in quick
   // succession would otherwise both pass the check.
   markStaleChecked();
@@ -1412,7 +1419,8 @@ export function LibraryGroupsPage({ covered = false }: { covered?: boolean }) {
   svcRef.current = svcStatus;
   useEffect(() => {
     _maybeCheckStale(svcStatus);
-  }, [svcStatus?.connection, svcStatus?.library_ready, !!svcStatus?.library_progress]);
+  }, [svcStatus?.connection, svcStatus?.library_ready, !!svcStatus?.library_progress,
+    svcStatus?.library_scan_at]);
   // ...plus a tick, because the deps above can stay put for hours while someone
   // browses. The interval is deliberately shorter than _STALE_CHECK_MS and does
   // no work of its own — it just gives the throttle something to fire on when
