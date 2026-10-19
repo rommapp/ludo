@@ -16,6 +16,7 @@ table, which ROM file a save belongs to, what each channel's device state is,
 and the HTTP calls. Wiring into AutoSyncManager lives in sync_core.
 """
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -435,6 +436,8 @@ class ChannelOutcome:
                     local copy holds work the server lacks and must be kept
       'conflict'    left for the user (the chooser said 'skip')
       'hardcore'    a softcore save would replace a hardcore current; skipped
+      'rejected'    the server refused the file itself (413 too large, 422
+                    unreadable or not this game's); retrying won't help
       'offline'     the server couldn't be reached
       'failed'      anything else; ``reason`` says what
     """
@@ -451,17 +454,22 @@ class ChannelSync:
     Writing files stays with the caller, which knows where the emulator
     reads them; this only says what to write and records what the device
     holds once it has. ``choose(current_snapshot)`` settles a conflict with
-    'local', 'server' or 'skip'.
+    'local', 'server' or 'skip'. ``uploading()``, when given, is a context
+    manager held only while bytes go up, for the caller's activity indicator.
     """
+
+    REJECTED_STATUSES = (413, 422)
 
     def __init__(self, api, store):
         self.api = api
         self.store = store
+        self._uploading = contextlib.nullcontext
 
     def sync(self, rom_file_id, local, load_unit, emulator=None, core=None,
-             choose=None):
+             choose=None, uploading=None):
         """local: SaveHashes of the save on disk, or None. load_unit: a
         callable returning the SaveUnit to push, called only when pushing."""
+        self._uploading = uploading or contextlib.nullcontext
         channels = self.api.list_channels([rom_file_id])
         if channels is None:
             return ChannelOutcome('offline')
@@ -516,8 +524,9 @@ class ChannelSync:
         held_save = ((current_snap or {}).get('save') or {})
         manifest = build_manifest(rom_file_id, channel, action, save=unit,
                                   emulator=emulator, core=core)
-        res = self.api.push(manifest, save=unit,
-                            server_has_save=held_save.get('content_hash') == unit.content_hash)
+        with self._uploading():
+            res = self.api.push(manifest, save=unit,
+                                server_has_save=held_save.get('content_hash') == unit.content_hash)
         if res.kind in ('written', 'unchanged'):
             snap = res.snapshot or {}
             chan = snap.get('channel') or channel or {}
@@ -536,6 +545,8 @@ class ChannelSync:
                                 emulator, core, choose)
         if res.kind == 'hardcore_downgrade':
             return ChannelOutcome('hardcore', snapshot=current_snap, channel=channel)
+        if res.status in self.REJECTED_STATUSES:
+            return ChannelOutcome('rejected', channel=channel, reason=res.reason)
         return ChannelOutcome(res.kind if res.kind == 'offline' else 'failed',
                               channel=channel, reason=res.reason)
 

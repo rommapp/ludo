@@ -372,7 +372,73 @@ def test_session_routing():
         check('older server negotiates all', sent[0], [1, 2])
 
 
+def test_indicator_and_rejects():
+    import contextlib
+    events = []
+
+    @contextlib.contextmanager
+    def uploading():
+        events.append('begin')
+        yield
+        events.append('end')
+
+    unit = lambda: SaveUnit(b'x', 'g.srm', 'mine', 'mine')  # noqa: E731
+    with tempfile.TemporaryDirectory() as d:
+        store = ChannelStore(Path(d) / 's.json')
+        api = FakeApi([{'id': 'c1', 'label': 'default', 'current': None}],
+                      [PushResult('written', snapshot=_snap(1, 'mine'))])
+        ChannelSync(api, store).sync(7, SaveHashes('mine', 'mine'), unit, uploading=uploading)
+        check('indicator wraps the push', events, ['begin', 'end'])
+        events.clear()
+        api = FakeApi([{'id': 'c1', 'label': 'default', 'current': _snap(1, 'mine')}])
+        ChannelSync(api, store).sync(7, SaveHashes('mine', 'mine'), unit, uploading=uploading)
+        check('no indicator without a push', events, [])
+
+        api = FakeApi([{'id': 'c1', 'label': 'default', 'current': _snap(1, 'mine')}],
+                      [PushResult('failed', reason='HTTP 422: bad', status=422)])
+        out = ChannelSync(api, store).sync(7, SaveHashes('new', 'new'), unit)
+        check('422 is rejected', out.kind, 'rejected')
+        api = FakeApi([{'id': 'c1', 'label': 'default', 'current': _snap(1, 'mine')}],
+                      [PushResult('failed', reason='HTTP 500', status=500)])
+        check('500 just fails', ChannelSync(api, store).sync(7, SaveHashes('new', 'new'), unit).kind,
+              'failed')
+
+    # The manager remembers the refusal for this version of the file.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        srm = tmp / 'G.srm'
+        srm.write_bytes(b'big')
+        m = AutoSyncManager.__new__(AutoSyncManager)
+        m.romm_client = type('C', (), {})()
+        m.get_games = lambda: [{'rom_id': 1, 'romm_data': {'files': [{'id': 5, 'file_name': 'G.sfc'}]}}]
+        m.log = lambda *a, **k: None
+        m._record_synced = lambda p: False
+        m._save_upload_fingerprints = lambda: None
+        m._activity_begin = m._activity_end = lambda *a: None
+        store = ChannelStore(tmp / 's.json')
+        api = FakeApi([{'id': 'c1', 'label': 'default', 'current': None}],
+                      [PushResult('failed', reason='HTTP 413', status=413)])
+        m._channel_sync = lambda dev: ChannelSync(api, store)
+        entry = {'rom_id': 1, 'slot': 'autosave', 'content_hash': 'h', '_path': str(srm),
+                 '_channel_ok': True}
+
+        def summary():
+            from collections import defaultdict
+            return {'uploaded': 0, 'downloaded': 0, 'no_op': 0, 'errors': 0, 'conflicts': [],
+                    '_per_game': defaultdict(lambda: {'up': 0, 'down': 0})}
+        first = summary()
+        m._run_channel_save_sync([entry], 'dev', first)
+        check('refused once', (first.get('rejected'), first['errors']), (1, 0))
+        second = summary()
+        keys, _ = m._run_channel_save_sync([entry], 'dev', second)
+        check('not pushed again', (second.get('rejected'), len(api.manifests)), (1, 1))
+        check('still kept from negotiate', keys, {(1, 'autosave')})
+
+
 def main():
+    # The manager's paths record to the activity log under the default app
+    # id, which is a real app's file; keep test runs out of it.
+    sync_core._record_activity = lambda *a, **k: None
     test_decide()
     test_heartbeat()
     test_rom_file_for_save()
@@ -384,6 +450,7 @@ def main():
     test_manifest()
     test_channel_sync()
     test_session_routing()
+    test_indicator_and_rejects()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")

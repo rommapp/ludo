@@ -15231,6 +15231,11 @@ class AutoSyncManager:
                 continue
             keys.add((rom_id, entry['slot']))
             content_hash = entry['content_hash']
+            # Refused before for what the file itself is; unchanged, it would
+            # be refused again, as on negotiate's upload path.
+            if self._upload_rejected_unchanged(path):
+                summary['rejected'] = summary.get('rejected', 0) + 1
+                continue
 
             def load(path=path, content_hash=content_hash):
                 try:
@@ -15254,7 +15259,9 @@ class AutoSyncManager:
                     rom_file['id'],
                     save_channels.SaveHashes(content_hash, content_hash),
                     load, emulator='retroarch', core=entry.get('emulator'),
-                    choose=choose)
+                    choose=choose,
+                    uploading=lambda rom_id=rom_id, path=path:
+                        self._activity_upload(rom_id, path))
                 if out.kind == 'download':
                     out = self._write_channel_download(sync, rom_file['id'], path, out)
             except Exception as e:
@@ -15278,6 +15285,14 @@ class AutoSyncManager:
                     'server_updated_at': (out.snapshot or {}).get('created_at')})
                 errored.add(str(path))
                 continue
+            elif out.kind == 'rejected':
+                summary['rejected'] = summary.get('rejected', 0) + 1
+                self._note_upload_rejected(path)
+                self.log(f"⚠️ RomM refused {path.name} ({out.reason}) — not "
+                         f"retrying until it changes")
+                _record_activity('save', 'Save not uploaded',
+                                 f"RomM refused {path.name}: {out.reason}")
+                # Out of the pending queue: nothing will send it.
             elif out.kind == 'hardcore':
                 self.log(f"⚠️ Not replacing the hardcore save of {path.name} with "
                          f"a softcore one")
