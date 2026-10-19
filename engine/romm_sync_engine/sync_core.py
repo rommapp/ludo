@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
+from .save_channels import snapshots_supported
 from . import (eden_config, emulator_saves, folder_saves, gamecube_saves,
                ps2_memcard, switch_content, switch_nsz, title_ids)
 from urllib.parse import urljoin, quote, urlparse
@@ -3425,7 +3426,9 @@ class RomMClient:
         """Read /api/heartbeat once and keep what Ludo cares about.
 
         Returns {'version': str|None, 'device_install': bool,
-        'install_excluded_platforms': [...]}; empty on failure. Cached on
+        'install_excluded_platforms': [...], 'save_snapshots': bool}; empty
+        on failure. save_snapshots is the channel/snapshot save API (see
+        save_channels). Cached on
         self.server_features so callers can check a feature without a request.
         """
         try:
@@ -3438,6 +3441,7 @@ class RomMClient:
                 'version': (hb.get('SYSTEM') or {}).get('VERSION'),
                 'device_install': bool(install.get('ENABLED')),
                 'install_excluded_platforms': list(install.get('EXCLUDED_PLATFORM_SLUGS') or []),
+                'save_snapshots': snapshots_supported(hb),
             }
             return self.server_features
         except Exception as e:
