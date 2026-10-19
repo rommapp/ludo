@@ -17,7 +17,12 @@ Asserted:
     rest, and another user's channel is never picked by default;
   * device state survives a reload, and a corrupt file reads as empty;
   * push responses read as the design specifies, with the two retries;
-  * the manifest names a new channel by label and an existing one by id.
+  * the manifest names a new channel by label and an existing one by id;
+  * ChannelSync: a first push creates the channel, a lost race is settled
+    by the chooser (on top of the current, or the server's with a backup),
+    and nothing is held until a download is written;
+  * the session sync sends eligible saves through channels, keeps the rest
+    on negotiate, and ignores negotiate's ops for a channel's save.
 """
 import sys
 import tempfile
@@ -25,8 +30,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from romm_sync_engine import sync_core  # noqa: E402
+from romm_sync_engine.sync_core import AutoSyncManager  # noqa: E402
 from romm_sync_engine.save_channels import (  # noqa: E402
-    Action, ChannelStore, SaveHashes, SaveUnit, SnapshotApi, SnapshotPoint,
+    Action, ChannelStore, ChannelSync, PushResult, SaveHashes, SaveUnit, SnapshotApi, SnapshotPoint,
     build_manifest, decide, pick_channel, rom_file_for_save, snapshot_point,
     snapshots_supported,
 )
@@ -210,6 +217,161 @@ def test_manifest():
     check('downgrade approval', m.get('approve_hardcore_downgrade'), True)
 
 
+class FakeApi:
+    """The channel routes, answering from canned replies."""
+
+    def __init__(self, channels=None, pushes=()):
+        self.channels = channels
+        self.pushes = list(pushes)
+        self.manifests = []
+        self.held = []
+        self.client = None
+
+    def list_channels(self, ids):
+        return self.channels
+
+    def push(self, manifest, save=None, screenshot=None, server_has_save=False):
+        self.manifests.append(manifest)
+        return self.pushes.pop(0)
+
+    def get_snapshot(self, sid, hold=False):
+        if hold:
+            self.held.append(sid)
+        return {'id': sid, 'save': {'content_hash': f'h{sid}', 'identity_hash': f'h{sid}'}}
+
+    def save_content(self, save_id):
+        return b'server bytes'
+
+
+def _snap(sid, h, chan='c1', device='Odin'):
+    return {'id': sid, 'save': {'id': sid * 10, 'content_hash': h, 'identity_hash': h},
+            'channel': {'id': chan, 'label': 'default'}, 'device': {'name': device},
+            'created_at': '2026-10-19T10:00:00+00:00'}
+
+
+def test_channel_sync():
+    unit = lambda: SaveUnit(b'x', 'g.srm', 'mine', 'mine')  # noqa: E731
+    mine = SaveHashes('mine', 'mine')
+    with tempfile.TemporaryDirectory() as d:
+        store = ChannelStore(Path(d) / 's.json')
+        api = FakeApi([], [PushResult('written', snapshot=_snap(1, 'mine'))])
+        out = ChannelSync(api, store).sync(7, mine, unit)
+        check('first push', out.kind, 'pushed')
+        check('creates default', (api.manifests[0].get('label'), api.manifests[0]['expected_current_id']),
+              ('default', None))
+        check('holds it', store.get(7).held_snapshot_id, 1)
+
+        # Unchanged since: nothing, and no push.
+        api = FakeApi([{'id': 'c1', 'label': 'default', 'current': _snap(1, 'mine')}])
+        check('unchanged', ChannelSync(api, store).sync(7, mine, unit).kind, 'up_to_date')
+
+        # Another device pushed (current 2) while this one played on 1.
+        theirs = {'id': 'c1', 'label': 'default', 'current': _snap(2, 'theirs')}
+        mine2 = SaveHashes('mine2', 'mine2')
+        api = FakeApi([theirs], [PushResult('written', snapshot=_snap(3, 'mine2'))])
+        out = ChannelSync(api, store).sync(7, mine2, unit, choose=lambda cur: 'local')
+        check('keep mine pushes on top', (out.kind, api.manifests[0]['expected_current_id'],
+                                         api.manifests[0]['parent_snapshot_id']), ('pushed', 2, 1))
+        check('now holds the new current', store.get(7).held_snapshot_id, 3)
+
+        api = FakeApi([{'id': 'c1', 'label': 'default', 'current': _snap(4, 'theirs')}])
+        seen = []
+        out = ChannelSync(api, store).sync(7, SaveHashes('m3', 'm3'), unit,
+                                           choose=lambda cur: seen.append(cur['device']['name']) or 'server')
+        check('chooser sees the other device', seen, ['Odin'])
+        check('keep server downloads with backup', (out.kind, out.backup, out.snapshot['id']),
+              ('download', True, 4))
+        check('nothing held before the write', store.get(7).held_snapshot_id, 3)
+        ChannelSync(api, store).finish_download(7, out.channel, out.snapshot)
+        check('held after the write', (store.get(7).held_snapshot_id, api.held), (4, [4]))
+
+        # A push that loses a race mid-session is settled the same way.
+        store.forget(7)
+        store.hold(7, 'c1', 'default', _snap(4, 'theirs'))
+        api = FakeApi([{'id': 'c1', 'label': 'default', 'current': _snap(4, 'theirs')}],
+                      [PushResult('branched', snapshot={'id': 6, 'kind': 'branch'}, current=_snap(5, 'x')),
+                       PushResult('written', snapshot=_snap(7, 'mine'))])
+        out = ChannelSync(api, store).sync(7, mine, unit, choose=lambda cur: 'local')
+        check('lost race, keep mine', (out.kind, api.manifests[1]['expected_current_id']), ('pushed', 5))
+
+        api = FakeApi([{'id': 'c1', 'label': 'default', 'current': _snap(7, 'mine')}],
+                      [PushResult('branched', snapshot={'id': 9}, current=_snap(8, 'y'))])
+        out = ChannelSync(api, store).sync(7, SaveHashes('z', 'z'), unit)
+        check('lost race, no chooser', (out.kind, store.get(7).held_snapshot_id), ('conflict', 7))
+
+        check('offline', ChannelSync(FakeApi(None), store).sync(7, mine, unit).kind, 'offline')
+
+
+def test_session_routing():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        srm = tmp / 'Test Game (USA).srm'
+        srm.write_bytes(b'local')
+        other = tmp / 'Other.zip'
+        other.write_bytes(b'zip')
+        inventory = [
+            {'rom_id': 1, 'slot': 'autosave', 'file_name': srm.name, 'emulator': 'snes9x',
+             'content_hash': 'local', 'updated_at': '2026-10-19T09:00:00+00:00',
+             '_path': str(srm), '_channel_ok': True},
+            {'rom_id': 2, 'slot': 'autosave', 'file_name': other.name, 'emulator': 'eden',
+             'content_hash': 'zip', 'updated_at': '2026-10-19T09:00:00+00:00',
+             '_path': str(other)},
+        ]
+        sent = []
+
+        class Client:
+            authenticated = True
+            server_features = {'save_snapshots': True}
+
+            def negotiate_sync(self, device_id, inv):
+                sent.append([e['rom_id'] for e in inv])
+                return 's1', [{'action': 'download', 'rom_id': 1, 'slot': 'autosave',
+                               'save_id': 99, 'file_name': 'x.srm'},
+                              {'action': 'no_op', 'rom_id': 2, 'slot': 'autosave'}]
+
+            def complete_sync_session(self, *a, **k):
+                return True
+
+            def download_save_by_id(self, *a, **k):
+                sent.append('legacy download')
+                return True
+
+        m = AutoSyncManager.__new__(AutoSyncManager)
+        m.romm_client = Client()
+        m.settings = type('S', (), {'get': lambda self, *a: 'dev-1'})()
+        m.build_sync_inventory = lambda: list(inventory)
+        m.retroarch = type('R', (), {'save_dirs': {}})()
+        m.get_games = lambda: [{'rom_id': 1, 'is_downloaded': True, 'romm_data': {
+            'files': [{'id': 50, 'file_name': 'Test Game (USA).sfc'}]}}]
+        m.save_download_blocked = set()
+        recorded = []
+        m._record_synced = lambda p: recorded.append(Path(p).name) or False
+        m.mark_all_synced = lambda exclude=None: False
+        m._save_upload_fingerprints = lambda: None
+        m._notify_sync_result = lambda *a, **k: None
+        m.log = lambda *a, **k: None
+        m._resolve_save_conflict = lambda *a, **k: 'server'
+
+        store = ChannelStore(tmp / 's.json')
+        api = FakeApi([{'id': 'c1', 'label': 'default', 'current': _snap(4, 'theirs')}])
+        m._channel_sync = lambda device_id: ChannelSync(api, store)
+        summary = m.run_negotiated_save_sync()
+
+        check('negotiate gets only the rest', sent[0], [2])
+        check("negotiate's download for a channel save ignored", 'legacy download' in sent, False)
+        check('conflict settled for the server, in place', srm.read_bytes(), b'server bytes')
+        check('local work kept beside it', len(list(tmp.glob('*.srm.local-*'))), 1)
+        check('counted as a download', summary['downloaded'], 1)
+        check('held after writing', store.get(50).held_snapshot_id, 4)
+        check('recorded synced', srm.name in recorded, True)
+
+        # An older server: everything goes to negotiate.
+        sent.clear()
+        m.romm_client.server_features = {}
+        m.run_negotiated_save_sync()
+        check('older server negotiates all', sent[0], [1, 2])
+
+
 def main():
     test_decide()
     test_heartbeat()
@@ -220,6 +382,8 @@ def main():
     test_read_push()
     test_push_retry()
     test_manifest()
+    test_channel_sync()
+    test_session_routing()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")

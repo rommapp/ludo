@@ -16,7 +16,7 @@ from pathlib import Path
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
 from .save_channels import snapshots_supported
 from . import (eden_config, emulator_saves, folder_saves, gamecube_saves,
-               ps2_memcard, switch_content, switch_nsz, title_ids)
+               ps2_memcard, save_channels, switch_content, switch_nsz, title_ids)
 from urllib.parse import urljoin, quote, urlparse
 import socket
 import configparser
@@ -13878,6 +13878,13 @@ class AutoSyncManager:
                 '_upload_name': self._upload_name(rom_id, upload_path, slot),
                 '_autocleanup': _autocleanup,
                 '_autocleanup_limit': _limit,
+                # A game's own battery save, as the emulator wrote it: what
+                # the first pass of channel sync takes (see
+                # _run_channel_save_sync). Packed units, VMUs and named slots
+                # stay on negotiate until channels learn their shapes.
+                '_channel_ok': (slot == 'autosave' and upload_path == path
+                                and path.suffix.lower() != gamecube_saves.GCI_SUFFIX
+                                and not _is_vmu_save(path)),
             })
 
         inventory.extend(self._folder_inventory_entries())
@@ -15180,6 +15187,142 @@ class AutoSyncManager:
         self.log(f"🗑️ Save deleted on RomM — moved local copy to {dst.name}")
         return True
 
+    def _channel_sync(self, device_id):
+        """The ChannelSync for this device, built once per device."""
+        cached = self.__dict__.get('_channel_sync_obj')
+        if cached and cached[0] == device_id and cached[1].api.client is self.romm_client:
+            return cached[1]
+        store = self.__dict__.get('_channel_store')
+        if store is None:
+            store = save_channels.ChannelStore(config_dir() / 'save_channels.json')
+            self._channel_store = store
+        sync = save_channels.ChannelSync(
+            save_channels.SnapshotApi(self.romm_client, device_id), store)
+        self._channel_sync_obj = (device_id, sync)
+        return sync
+
+    def _run_channel_save_sync(self, inventory, device_id, summary):
+        """Sync the inventory's channel-eligible saves through RomM's save
+        channels (rommapp/romm#5175). Counts into ``summary`` the way the
+        negotiate executor does.
+
+        Returns (keys, errored): the (rom_id, slot) keys channels handled,
+        which negotiate must leave alone, and the paths that are still
+        pending. A save whose ROM file can't be pinned down stays with
+        negotiate, which RomM files under the same channel anyway.
+        """
+        keys, errored = set(), set()
+        try:
+            games = {g.get('rom_id'): g for g in (self.get_games() or [])}
+        except Exception as e:
+            logging.debug(f"channel sync: no library: {e}")
+            return keys, errored
+        sync = self._channel_sync(device_id)
+        fp_dirty = False
+
+        for entry in inventory:
+            if not entry.get('_channel_ok') or not entry.get('content_hash'):
+                continue
+            rom_id, path = entry['rom_id'], Path(entry['_path'])
+            game = games.get(rom_id) or {}
+            rom_file = save_channels.rom_file_for_save(
+                (game.get('romm_data') or {}).get('files'), path.stem)
+            if not rom_file:
+                continue
+            keys.add((rom_id, entry['slot']))
+            content_hash = entry['content_hash']
+
+            def load(path=path, content_hash=content_hash):
+                try:
+                    return save_channels.SaveUnit(path.read_bytes(), path.name,
+                                                  content_hash, content_hash)
+                except OSError:
+                    return None
+
+            def choose(current, entry=entry):
+                # The same preference that settles a negotiate conflict,
+                # dated by when the other device pushed its snapshot.
+                device = ((current or {}).get('device') or {}).get('name')
+                self.log(f"⚠️ {Path(entry['_path']).name} changed here and on "
+                         f"{device or 'another device'} — settling by preference")
+                return self._resolve_save_conflict(
+                    {'server_updated_at': (current or {}).get('created_at')},
+                    entry['_path'], entry.get('updated_at'))
+
+            try:
+                out = sync.sync(
+                    rom_file['id'],
+                    save_channels.SaveHashes(content_hash, content_hash),
+                    load, emulator='retroarch', core=entry.get('emulator'),
+                    choose=choose)
+                if out.kind == 'download':
+                    out = self._write_channel_download(sync, rom_file['id'], path, out)
+            except Exception as e:
+                self.log(f"❌ Channel sync for {path.name} failed: {e}")
+                summary['errors'] += 1
+                errored.add(str(path))
+                continue
+
+            if out.kind == 'pushed':
+                summary['uploaded'] += 1
+                summary['_per_game'][rom_id]['up'] += 1
+            elif out.kind == 'downloaded':
+                summary['downloaded'] += 1
+                summary['_per_game'][rom_id]['down'] += 1
+            elif out.kind in ('up_to_date', 'adopted'):
+                summary['no_op'] += 1
+            elif out.kind == 'conflict':
+                summary['conflicts'].append({
+                    'rom_id': rom_id, 'slot': entry['slot'],
+                    'file_name': path.name, 'channel': (out.channel or {}).get('label'),
+                    'server_updated_at': (out.snapshot or {}).get('created_at')})
+                errored.add(str(path))
+                continue
+            elif out.kind == 'hardcore':
+                self.log(f"⚠️ Not replacing the hardcore save of {path.name} with "
+                         f"a softcore one")
+                summary['skipped_hardcore'] = summary.get('skipped_hardcore', 0) + 1
+                errored.add(str(path))
+                continue
+            else:
+                self.log(f"❌ Channel sync for {path.name}: {out.kind} {out.reason}")
+                summary['errors'] += 1
+                errored.add(str(path))
+                continue
+            if self._record_synced(path):
+                fp_dirty = True
+
+        if fp_dirty:
+            # Here, not with negotiate's baseline: a failed negotiate returns
+            # before it, and these saves are already settled.
+            self._save_upload_fingerprints()
+        return keys, errored
+
+    def _write_channel_download(self, sync, rom_file_id, path, out):
+        """Write a channel's current save over the local one, in place.
+
+        In place, because the local file is the one the emulator reads; the
+        bytes are the channel's, whatever name the other device gave them.
+        A local copy holding work the server lacks is kept beside it first.
+        """
+        save = (out.snapshot or {}).get('save')
+        if not save:
+            # A snapshot of states only: no save to write.
+            return save_channels.ChannelOutcome('up_to_date', channel=out.channel)
+        data = sync.api.save_content(save['id'])
+        if data is None:
+            return save_channels.ChannelOutcome('failed', reason='download failed')
+        if out.backup and path.exists():
+            stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+            shutil.copy2(path, path.with_suffix(path.suffix + f".local-{stamp}"))
+        tmp = path.with_suffix(path.suffix + '.part')
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+        sync.finish_download(rom_file_id, out.channel, out.snapshot)
+        self.log(f"⬇️ {path.name} ← channel {(out.channel or {}).get('label')!r}")
+        return save_channels.ChannelOutcome('downloaded', snapshot=out.snapshot,
+                                            channel=out.channel)
+
     def run_negotiated_save_sync(self, conflict_resolver=None, trigger=""):
         """Run one save-sync cycle via RomM 4.9.0's /negotiate engine (SAVES ONLY).
 
@@ -15215,6 +15358,17 @@ class AutoSyncManager:
             return summary
 
         inventory = self.build_sync_inventory()
+        # On a server with save channels, the saves channels can carry go
+        # that way, and negotiate keeps the rest. Their (rom_id, slot) keys
+        # are dropped from negotiate both ways: not reported, and any
+        # download it offers for them ignored, since the server's legacy view
+        # of a channel's save would otherwise be written over it.
+        channel_keys, channel_errored = set(), set()
+        if (getattr(self.romm_client, 'server_features', None) or {}).get('save_snapshots'):
+            channel_keys, channel_errored = self._run_channel_save_sync(
+                inventory, device_id, summary)
+            inventory = [e for e in inventory
+                         if (e['rom_id'], e['slot']) not in channel_keys]
         session_id, operations = self.romm_client.negotiate_sync(device_id, inventory)
         summary['session_id'] = session_id
         if session_id is None:
@@ -15250,12 +15404,14 @@ class AutoSyncManager:
         _fp_dirty = False
         # Save paths whose upload genuinely failed this cycle — excluded from
         # the end-of-cycle baseline so they stay flagged as pending.
-        _errored_paths = set()
+        _errored_paths = set(channel_errored)
 
         for op in operations:
             action = op.get('action')
             rom_id = op.get('rom_id')
             slot = op.get('slot')
+            if (rom_id, slot) in channel_keys:
+                continue
             # Full op payload for non-trivial actions: shows the server's view
             # (its hash/updated_at) so a repeated upload/conflict can be
             # diagnosed from the log without server access.

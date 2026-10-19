@@ -306,6 +306,18 @@ class SnapshotApi:
             logging.warning(f"Error listing channels: {e}")
         return None
 
+    def save_content(self, save_id):
+        """A save's stored bytes, or None."""
+        try:
+            r = self.client.session.get(
+                self._url(f'/api/saves/{int(save_id)}/content'), timeout=120)
+            if r.status_code == 200:
+                return r.content
+            logging.warning(f"Save {save_id} content failed: HTTP {r.status_code}")
+        except Exception as e:
+            logging.warning(f"Error fetching save {save_id}: {e}")
+        return None
+
     def get_snapshot(self, snapshot_id, hold=False):
         """One snapshot. ``hold`` tells the server this device now plays
         from it; a plain fetch for browsing history holds nothing."""
@@ -406,3 +418,132 @@ def build_manifest(rom_file_id, channel, action, save=None, emulator=None,
     if approve_hardcore_downgrade:
         m['approve_hardcore_downgrade'] = True
     return m
+
+
+# ── One save, end to end ──────────────────────────────────────────────────
+
+@dataclass
+class ChannelOutcome:
+    """What syncing one save through its channel came to.
+
+    kind:
+      'up_to_date'  nothing to do, or the server already had these bytes
+      'pushed'      the local save is the channel's new current
+      'adopted'     the local save already matched the current; now held
+      'download'    the caller should write ``snapshot``'s save locally and
+                    then call ChannelSync.finish_download; ``backup`` says the
+                    local copy holds work the server lacks and must be kept
+      'conflict'    left for the user (the chooser said 'skip')
+      'hardcore'    a softcore save would replace a hardcore current; skipped
+      'offline'     the server couldn't be reached
+      'failed'      anything else; ``reason`` says what
+    """
+    kind: str
+    snapshot: Optional[dict] = None
+    channel: Optional[dict] = None
+    backup: bool = False
+    reason: str = ''
+
+
+class ChannelSync:
+    """Runs the design's flow for one save: list, decide, push or download.
+
+    Writing files stays with the caller, which knows where the emulator
+    reads them; this only says what to write and records what the device
+    holds once it has. ``choose(current_snapshot)`` settles a conflict with
+    'local', 'server' or 'skip'.
+    """
+
+    def __init__(self, api, store):
+        self.api = api
+        self.store = store
+
+    def sync(self, rom_file_id, local, load_unit, emulator=None, core=None,
+             choose=None):
+        """local: SaveHashes of the save on disk, or None. load_unit: a
+        callable returning the SaveUnit to push, called only when pushing."""
+        channels = self.api.list_channels([rom_file_id])
+        if channels is None:
+            return ChannelOutcome('offline')
+        state = self.store.get(rom_file_id)
+        channel = pick_channel(channels, state)
+        held = None
+        if state and channel and state.channel_id == channel.get('id'):
+            held = state.held_point()
+        current_snap = (channel or {}).get('current')
+        action = decide(held, snapshot_point(current_snap), local)
+        logging.info(f"[CHANNELS] file={rom_file_id} channel="
+                     f"{(channel or {}).get('label')}/{(channel or {}).get('id')} "
+                     f"held={held.id if held else None} "
+                     f"current={(current_snap or {}).get('id')} -> {action.kind}")
+
+        if action.kind == 'nothing':
+            return ChannelOutcome('up_to_date', channel=channel)
+        if action.kind == 'adopt':
+            snap = self.api.get_snapshot(action.snapshot_id, hold=True) or current_snap
+            self.store.hold(rom_file_id, channel['id'], channel.get('label'), snap)
+            return ChannelOutcome('adopted', snapshot=snap, channel=channel)
+        if action.kind == 'download':
+            return ChannelOutcome('download', snapshot=current_snap, channel=channel)
+        if action.kind == 'push':
+            return self._push(rom_file_id, channel, action, load_unit, emulator,
+                              core, choose, current_snap)
+        return self._settle(rom_file_id, channel, current_snap, held, load_unit,
+                            emulator, core, choose)
+
+    def _settle(self, rom_file_id, channel, current_snap, held, load_unit,
+                emulator, core, choose):
+        """Both sides moved: keep the local save on top of the current, take
+        the server's, or leave both for the user."""
+        choice = choose(current_snap) if choose else 'skip'
+        if choice == 'local':
+            on_top = Action('push', expected_current_id=current_snap['id'],
+                            parent_id=held.id if held else None)
+            # No chooser on the re-push: losing a second race in a row is
+            # left for the next sync rather than looping here.
+            return self._push(rom_file_id, channel, on_top, load_unit, emulator,
+                              core, None, current_snap)
+        if choice == 'server':
+            return ChannelOutcome('download', snapshot=current_snap,
+                                  channel=channel, backup=True)
+        return ChannelOutcome('conflict', snapshot=current_snap, channel=channel)
+
+    def _push(self, rom_file_id, channel, action, load_unit, emulator, core,
+              choose, current_snap):
+        unit = load_unit()
+        if unit is None:
+            return ChannelOutcome('failed', channel=channel, reason='save unreadable')
+        held_save = ((current_snap or {}).get('save') or {})
+        manifest = build_manifest(rom_file_id, channel, action, save=unit,
+                                  emulator=emulator, core=core)
+        res = self.api.push(manifest, save=unit,
+                            server_has_save=held_save.get('content_hash') == unit.content_hash)
+        if res.kind in ('written', 'unchanged'):
+            snap = res.snapshot or {}
+            chan = snap.get('channel') or channel or {}
+            self.store.hold(rom_file_id, chan.get('id'), chan.get('label'), snap)
+            return ChannelOutcome('pushed' if res.kind == 'written' else 'up_to_date',
+                                  snapshot=snap, channel=chan)
+        if res.kind == 'branched':
+            # Another device pushed during this session. The server kept this
+            # push as a branch, so nothing is lost; what's left is choosing
+            # which save this device plays from. Hold nothing new yet: holding
+            # the branch would make the next sync read the local save as
+            # clean and quietly download the other device's over it.
+            held = self.store.get(rom_file_id)
+            return self._settle(rom_file_id, channel, res.current or current_snap,
+                                held.held_point() if held else None, load_unit,
+                                emulator, core, choose)
+        if res.kind == 'hardcore_downgrade':
+            return ChannelOutcome('hardcore', snapshot=current_snap, channel=channel)
+        return ChannelOutcome(res.kind if res.kind == 'offline' else 'failed',
+                              channel=channel, reason=res.reason)
+
+    def finish_download(self, rom_file_id, channel, snapshot):
+        """Record that the caller wrote ``snapshot``'s save to disk.
+
+        Only after the write: a hold recorded first would read an unchanged
+        old file as progress on the new current and push it back on top.
+        """
+        held = self.api.get_snapshot(snapshot['id'], hold=True) or snapshot
+        self.store.hold(rom_file_id, channel['id'], channel.get('label'), held)
