@@ -3,7 +3,7 @@ import { LibGame, LibGroup } from "./types";
 import { _dlSucceeded, _setDlActive, awaitDownload, claimDownloadStart, releaseDownloadStart, runCollectionBatch, useDownloadProgress, useIsDownloading } from "./downloads";
 import { V2, roundBtn} from "./theme";
 import { useCollectionSync, useOffline, useSaveActivityFor} from "./status";
-import { deleteCollectionRoms, deleteGame, downloadGame, getLibraryGames, getLocalDiscs, getLocalSiblings, resyncPlatform, toggleCollectionSync, getStateThumbnails} from "./rpc";
+import { deleteCollectionRoms, deleteGame, downloadGame, getLibraryGames, getLocalDiscs, getLocalSiblings, resyncPlatform, toggleCollectionSync, getStateThumbnails, resolveSaveConflict } from "./rpc";
 import { Focusable, GamepadButton, Menu, MenuItem, showContextMenu, showModal, ModalRoot } from "@ludo/host";
 import { toaster } from "./toast";
 import { maybePromptSwitchFirmware } from "./firmware";
@@ -17,6 +17,7 @@ import { MdFlashOn } from "react-icons/md";
 import { _forceGamepadFocus } from "./shell";
 import { BiosDetailModal } from "./pages/bios";
 import { launchGameSmart, offerCoreInstall, cannotLaunch, runLaunch} from "./launch";
+import { askSaveConflict } from "./saveConflict";
 import { _emuStatus, standaloneFor } from "./emulator";
 import { _lsAvail } from "./storage";
 import { NAV_MAINTAIN_X, _tileFocusScrub } from "./scrub";
@@ -476,6 +477,15 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
     setBusy('launch');
     try {
       const r = await launchGameSmart(game.rom_id, null, null, !!resume);
+      if (r?.save_conflict) {
+        // Same as runLaunch: ask, then the relaunch applies the answer.
+        const a = await askSaveConflict(r.save_conflict);
+        if (a !== 'later') {
+          await resolveSaveConflict(r.save_conflict.id, a, false);
+          setTimeout(() => void doLaunch(), 0);
+        }
+        return;
+      }
       // No success toast — the screen transitions to the launch immediately, so
       // the toast just races the thing it announces. Surface failures only.
       if (!r?.success && !offerCoreInstall(r, () => void doLaunch())) {

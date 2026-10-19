@@ -31,6 +31,7 @@ import { refreshStatusNow } from "./status";
 import { stopBackgroundMonitoring, startBackgroundMonitoring } from "./notifications";
 import { setPreDownloadHook } from "./downloads";
 import { maybePromptSwitchFirmware } from "./firmware";
+import { watchSaveConflicts } from "./saveConflict";
 
 /**
  * Re-exported so the app's public surface stays two names.
@@ -232,9 +233,13 @@ export function startApp(): { stop: () => void } {
     }
   })();
 
+  // Save conflicts the engine parked for the user (see saveConflict.tsx).
+  const stopConflicts = watchSaveConflicts();
+
   return {
     stop: () => {
       console.log('[PLUGIN] stop - Stopping background monitoring');
+      stopConflicts();
       stopBackgroundMonitoring();
       try {
         window.removeEventListener('offline', onNetOffline);

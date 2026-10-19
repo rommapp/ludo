@@ -335,6 +335,16 @@ def _toast_title(counts):
 # Constructing one runs the whole executable/core discovery, which is far too
 # much to redo per toast; the answer it gives is a live process scan either way.
 _osd_ra = None
+# Whether Ludo's toasts reach the screen while a game is up: true under the
+# Decky plugin, whose toasts are Steam notifications drawn over the game (in
+# Gaming Mode and in desktop Steam alike). The desktop app's window sits
+# behind the emulator however it was started, Steam or not.
+_toasts_over_games = False
+
+
+def set_toasts_over_games(on):
+    global _toasts_over_games
+    _toasts_over_games = bool(on)
 _osd_ra_lock = threading.Lock()
 
 # A sweep flushes each game's held message separately, so three games synced in
@@ -383,7 +393,7 @@ def _queue_osd_line(ra, title):
             _osd_batch_timer.start()
 
 
-def _emit_game_sync_toast(title, body, rom_id=None, has_cover=False):
+def _emit_game_sync_toast(title, body, rom_id=None, has_cover=False, over_games=False):
     """Announce a save/state sync — in RetroArch if a game is up, else in Ludo.
 
     Mid-session, Ludo's window is behind the emulator: its toast is never seen,
@@ -400,6 +410,11 @@ def _emit_game_sync_toast(title, body, rom_id=None, has_cover=False):
     here: no notification in Ludo while a game is running.
     """
     global _osd_ra
+    # over_games: a notice worth the same surface for every emulator, which
+    # Steam's notification is where there is one.
+    if over_games and _toasts_over_games:
+        push_notification('save', title, body, rom_id=rom_id, has_cover=has_cover)
+        return
     try:
         with _osd_ra_lock:
             if _osd_ra is None:
@@ -13289,7 +13304,13 @@ class AutoSyncManager:
           - "Smart (prefer newer)"         -> newer of local mtime vs server_updated_at
           - "Ask each time"                -> modal dialog (GTK); 'server' if unavailable
         Defaults to 'server' (safe: local is always backed up by the caller).
+
+        Ludo has no GTK window and always asks: nothing is decided here, the
+        conflict is parked for the UI and 'skip' leaves both sides alone until
+        the user answers, which the next cycle then applies.
         """
+        if self._ask_on_conflict():
+            return self._park_conflict(op, local_path, local_updated_at)
         pref = "Smart (prefer newer)"
         if self.parent_window and hasattr(self.parent_window, 'get_overwrite_behavior'):
             try:
@@ -13330,6 +13351,123 @@ class AutoSyncManager:
             return 'local' if local_ts >= server_ts else 'server'
         except Exception:
             return 'server'
+
+    # An answer is applied by the sync it triggers. One that finds no
+    # conflict left (it settled meanwhile) must not linger and decide some
+    # later, unrelated one, so it expires.
+    CONFLICT_ANSWER_TTL = 600
+    # Syncs whose conflicts are asked about on the spot: the game is about to
+    # start or has just closed, so a prompt interrupts nothing.
+    PROMPT_TRIGGERS = ('launch', 'RetroArch closed', 'Eden closed')
+
+    def _conflicts(self):
+        state = getattr(self, '_conflict_state', None)
+        if state is None:
+            state = self._conflict_state = {
+                'pending': {}, 'answers': {}, 'lock': threading.Lock(),
+                # Conflicts found at launch or game close, which the UI pops
+                # up; and every one already announced, so a re-find each
+                # background cycle doesn't toast again.
+                'prompt': set(), 'seen': set()}
+        return state
+
+    def _ask_on_conflict(self):
+        """Ludo asks; only the GTK app's own preference settles silently."""
+        return not (self.parent_window
+                    and hasattr(self.parent_window, 'get_overwrite_behavior'))
+
+    @staticmethod
+    def _conflict_id(rom_id, local_path):
+        return f"{rom_id}:{Path(local_path).name}"
+
+    def _park_conflict(self, op, local_path, local_updated_at=None):
+        """'local'/'server' if the user already answered this one, else
+        queue it for the prompt and return 'skip'."""
+        rom_id = op.get('rom_id')
+        cid = self._conflict_id(rom_id, local_path)
+        state = self._conflicts()
+        with state['lock']:
+            answer = state['answers'].pop(cid, None)
+            if answer and time.time() - answer[1] < self.CONFLICT_ANSWER_TTL:
+                self.log(f"⚖️ {Path(local_path).name}: applying the user's choice ({answer[0]})")
+                return answer[0]
+            if not local_updated_at:
+                try:
+                    local_updated_at = datetime.datetime.fromtimestamp(
+                        Path(local_path).stat().st_mtime, datetime.timezone.utc).isoformat()
+                except OSError:
+                    local_updated_at = None
+            game = None
+            try:
+                # The library title; 'name' is RomM's file-style one.
+                game = next((g.get('display_name') or display_game_name(g.get('name'))
+                             for g in (self.get_games() or [])
+                             if g.get('rom_id') == rom_id), None)
+            except Exception:
+                pass
+            if getattr(self, '_sync_trigger', '') in self.PROMPT_TRIGGERS:
+                state['prompt'].add(cid)
+            announce = cid not in state['seen'] and cid not in state['prompt']
+            state['seen'].add(cid)
+            state['pending'][cid] = {
+                'prompt': cid in state['prompt'],
+                'id': cid, 'rom_id': rom_id,
+                'game': game or display_game_name(Path(local_path).stem),
+                'file_name': Path(local_path).name,
+                'local': {'updated_at': local_updated_at},
+                'server': {'updated_at': op.get('server_updated_at'),
+                           'device': op.get('device_name')},
+            }
+        self.log(f"⚖️ {Path(local_path).name}: conflict parked for the user")
+        if announce:
+            # Found in the background: no popup mid-whatever, just word that
+            # one is waiting. It's asked when the game is next launched.
+            _emit_game_sync_toast('Save conflict', state['pending'][cid]['game'],
+                                  rom_id=rom_id, over_games=True)
+        return 'skip'
+
+    def pending_conflicts(self):
+        """Conflicts waiting on the user, oldest first."""
+        state = self._conflicts()
+        with state['lock']:
+            return list(state['pending'].values())
+
+    def conflicts_before_launch(self, rom_id):
+        """Sync just this game's saves and return its parked conflicts, so
+        a launch can ask before the emulator reads either save. Waits a few
+        seconds for a sync already in flight rather than racing it."""
+        # Only while save sync is on: with it off, a launch must not push
+        # anything, and there's no sync whose conflict could need asking.
+        if not (self.enabled and self.romm_client and self.romm_client.authenticated):
+            return []
+        t0 = time.monotonic()
+        got = self._session_sync_lock.acquire(timeout=10)
+        t1 = time.monotonic()
+        try:
+            self.run_negotiated_save_sync(trigger='launch', only_rom_id=rom_id)
+            logging.info("[AUTO-SYNC] ⏱️ pre-launch conflict check %.2fs "
+                         "(waiting on a sync %.2fs, sync %.2fs)",
+                         time.monotonic() - t0, t1 - t0, time.monotonic() - t1)
+        except Exception as e:
+            logging.warning(f"pre-launch conflict check failed: {e}")
+        finally:
+            if got:
+                self._session_sync_lock.release()
+        return [c for c in self.pending_conflicts() if c['rom_id'] == rom_id]
+
+    def answer_conflict(self, cid, choice):
+        """Record 'local' or 'server' for a parked conflict. The caller runs a
+        sync to apply it; returns False for an unknown id or choice."""
+        if choice not in ('local', 'server'):
+            return False
+        state = self._conflicts()
+        with state['lock']:
+            if state['pending'].pop(cid, None) is None:
+                return False
+            state['answers'][cid] = (choice, time.time())
+            state['prompt'].discard(cid)
+            state['seen'].discard(cid)
+        return True
 
     def _ask_conflict_dialog(self, op, local_path):
         """Prompt the user to resolve a save conflict on the main thread.
@@ -13712,16 +13850,14 @@ class AutoSyncManager:
         toast still fires — that is the channel that reaches the player here.
         """
         up, down = summary.get('uploaded', 0), summary.get('downloaded', 0)
-        conflicts, errors = len(summary.get('conflicts') or []), summary.get('errors', 0)
-        if not (up or down or conflicts or errors):
+        errors = summary.get('errors', 0)
+        if not (up or down or errors):
             return
         def plural(n, word):
             return f"{n} {word}{'' if n == 1 else 's'}"
 
         if errors:
             msg = f"RomM: sync failed ({plural(errors, 'error')})"
-        elif conflicts:
-            msg = f"RomM: {plural(conflicts, 'conflict')} — resolve in Ludo"
         else:
             parts = []
             if up:
@@ -13737,7 +13873,10 @@ class AutoSyncManager:
         # be delivered two seconds INTO the game, describing work finished
         # before the game even started. Conflicts and errors have no per-game
         # channel and are the cases where the player has to do something.
-        if not (errors or conflicts):
+        # Conflicts aren't: each is announced once when first found, and asked
+        # about at launch or close. Queued for RetroArch's arrival, this line
+        # surfaced in the NEXT game, after the conflict was already settled.
+        if not errors:
             return
         # Straight out when the emulator is up, queued for its arrival otherwise
         # (a sync that ran just before launch). Never queued for a sweep the
@@ -15249,9 +15388,10 @@ class AutoSyncManager:
                 # dated by when the other device pushed its snapshot.
                 device = ((current or {}).get('device') or {}).get('name')
                 self.log(f"⚠️ {Path(entry['_path']).name} changed here and on "
-                         f"{device or 'another device'} — settling by preference")
+                         f"{device or 'another device'}")
                 return self._resolve_save_conflict(
-                    {'server_updated_at': (current or {}).get('created_at')},
+                    {'server_updated_at': (current or {}).get('created_at'),
+                     'rom_id': entry['rom_id'], 'device_name': device},
                     entry['_path'], entry.get('updated_at'))
 
             try:
@@ -15338,7 +15478,7 @@ class AutoSyncManager:
         return save_channels.ChannelOutcome('downloaded', snapshot=out.snapshot,
                                             channel=out.channel)
 
-    def run_negotiated_save_sync(self, conflict_resolver=None, trigger=""):
+    def run_negotiated_save_sync(self, conflict_resolver=None, trigger="", only_rom_id=None):
         """Run one save-sync cycle via RomM 4.9.0's /negotiate engine (SAVES ONLY).
 
         Builds the local inventory, negotiates with the server, then executes the
@@ -15353,6 +15493,9 @@ class AutoSyncManager:
         Finally marks the session complete.
 
         Returns a summary dict: {uploaded, downloaded, conflicts, no_op, errors, session_id}.
+
+        only_rom_id scopes the cycle to one game (the pre-launch check): the
+        rest of the library is neither reported nor baselined.
         """
         summary = {'uploaded': 0, 'downloaded': 0, 'deleted': 0, 'conflicts': [],
                    'no_op': 0, 'errors': 0, 'session_id': None,
@@ -15373,6 +15516,16 @@ class AutoSyncManager:
             return summary
 
         inventory = self.build_sync_inventory()
+        if only_rom_id is not None:
+            inventory = [e for e in inventory if e['rom_id'] == only_rom_id]
+        # Parked conflicts are re-found every cycle; one that settled itself
+        # meanwhile (the other side caught up) drops.
+        state = self._conflicts()
+        with state['lock']:
+            for cid in [c for c, v in state['pending'].items()
+                        if only_rom_id is None or v['rom_id'] == only_rom_id]:
+                del state['pending'][cid]
+        self._sync_trigger = trigger
         # On a server with save channels, the saves channels can carry go
         # that way, and negotiate keeps the rest. Their (rom_id, slot) keys
         # are dropped from negotiate both ways: not reported, and any
@@ -15426,6 +15579,8 @@ class AutoSyncManager:
             rom_id = op.get('rom_id')
             slot = op.get('slot')
             if (rom_id, slot) in channel_keys:
+                continue
+            if only_rom_id is not None and rom_id != only_rom_id:
                 continue
             # Full op payload for non-trivial actions: shows the server's view
             # (its hash/updated_at) so a repeated upload/conflict can be
@@ -15663,7 +15818,7 @@ class AutoSyncManager:
         # changed/appeared after the last successful sync.
         made_contact = (summary['no_op'] + summary['uploaded'] + summary['downloaded']
                         + summary['deleted']) > 0
-        if made_contact:
+        if made_contact and only_rom_id is None:
             if self.mark_all_synced(exclude=_errored_paths):
                 _fp_dirty = True
 
@@ -15733,7 +15888,7 @@ class AutoSyncManager:
                     parts.append(f"{len(summary['conflicts'])} conflict(s)")
                 if summary['errors']:
                     parts.append(f"{summary['errors']} error(s)")
-                _record_activity('error', 'Save sync issues', ', '.join(parts))
+                _record_activity('error', 'Save conflict' if summary.get('conflicts') and not summary.get('errors') else 'Save sync issues', ', '.join(parts))
         return summary
 
     def _restore_standalone_save(self, op, device_id, session_id):

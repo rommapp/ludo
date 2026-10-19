@@ -2,7 +2,8 @@ import { host, showModal, Focusable, GamepadButton, ModalRoot } from "@ludo/host
 import { toaster } from "./toast";
 import { libNavigate } from "./nav";
 import { libCacheSetDownloaded } from "./libcache";
-import { launchGame, prepareSteamLaunch, downloadCore, getSyncEpoch, setCoreOverride} from "./rpc";
+import { launchGame, prepareSteamLaunch, downloadCore, getSyncEpoch, setCoreOverride, resolveSaveConflict } from "./rpc";
+import { askSaveConflict } from "./saveConflict";
 import { useRef, useState } from "react";
 import { V2_FOCUS_STYLE } from "./focus";
 import { V2 } from "./theme";
@@ -301,8 +302,20 @@ function watchForSessionEnd() {
 export async function runLaunch(romId: number, gameName: string, disc: string | null,
   label?: string, setBusy?: (b: any) => void, onDone?: () => void, siblingRomId?: number | null) {
   if (setBusy) setBusy('launch');
+  let again = false;
   try {
     const r = await launchGameSmart(romId, disc, siblingRomId ?? null);
+    if (r?.save_conflict) {
+      // The save changed here and on another device: ask before the emulator
+      // reads either one. The relaunch's own pre-launch sync applies the
+      // answer; B leaves the game unlaunched and both saves as they are.
+      const a = await askSaveConflict(r.save_conflict);
+      if (a !== 'later') {
+        await resolveSaveConflict(r.save_conflict.id, a, false);
+        again = true;
+      }
+      return;
+    }
     if (r?.success && r?.switch_warning) {
       // Eden starts and then sits there when it has no firmware or no keys.
       // Firmware is not a BIOS file, so the BIOS check above never sees it;
@@ -370,8 +383,12 @@ export async function runLaunch(romId: number, gameName: string, disc: string | 
   } catch (e) {
     toaster.toast({ title: 'Launch failed', body: String(e) });
   } finally {
-    if (setBusy) setBusy(null);
-    if (onDone) onDone();
+    // Still busy for the relaunch; it clears busy and calls onDone itself.
+    if (again) void runLaunch(romId, gameName, disc, label, setBusy, onDone, siblingRomId);
+    else {
+      if (setBusy) setBusy(null);
+      if (onDone) onDone();
+    }
   }
 }
 
@@ -393,6 +410,7 @@ export async function launchGameSmart(romId: number, disc: string | null = null,
   try {
     if (await host.launcher.hasTile()) {
       const prep = await prepareSteamLaunch(romId, disc, siblingRomId, resume);
+      if (prep?.save_conflict) return prep;
       if (prep?.steam_host) {
         if (await host.launcher.launchTile()) {
           // Carry the prep's BIOS verdict through: this path returns a synthetic

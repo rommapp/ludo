@@ -648,6 +648,13 @@ def release_notes_between(channel: str, asset_suffix: str,
 # The backend
 # ---------------------------------------------------------------------------
 
+class SaveConflictPending(Exception):
+    """A launch stopped so the user can pick a side of a save conflict."""
+    def __init__(self, conflict):
+        super().__init__(conflict.get('id'))
+        self.conflict = conflict
+
+
 class LudoBackend:
     """Every RPC the UI can call, on either shell.
 
@@ -840,6 +847,11 @@ class LudoBackend:
         # site. The desktop backend passes one directly.
         if host is not None:
             self._host = host
+        try:
+            from romm_sync_engine.sync_core import set_toasts_over_games
+            set_toasts_over_games(self._host.name == 'decky')
+        except Exception as e:
+            logging.debug(f"could not set the in-game toast surface: {e}")
         # Declined installs waiting to be announced, by platform slug.
         self._declined = {}
         self._declined_lock = threading.Lock()
@@ -2081,7 +2093,10 @@ class LudoBackend:
             # is a decision rather than a screen in progress.)
             if self._defer_library_fetch:
                 logging.info("Setup in progress — holding save auto-sync until setup ends")
-            elif self._settings.get('AutoSync', 'auto_enable_on_connect') == 'true':
+            # Always on: Ludo has no switch for it. AutoSync/auto_enable_on_connect
+            # is RomM RetroArch Sync's, and a settings file carried over from it
+            # with that off left sync silently dead, with nothing in Ludo to undo it.
+            else:
                 self._auto_sync.upload_enabled   = True
                 self._auto_sync.download_enabled = True
                 try:
@@ -3136,6 +3151,34 @@ class LudoBackend:
         except Exception as e:
             logging.error(f"set_sync_indicator error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
+
+    async def get_save_conflicts(self):
+        """Save conflicts parked for the user to answer."""
+        try:
+            return self._auto_sync.pending_conflicts() if self._auto_sync else []
+        except Exception as e:
+            logging.debug(f"get_save_conflicts: {e}")
+            return []
+
+    async def resolve_save_conflict(self, conflict_id: str, choice: str, apply: bool = True):
+        """Answer a parked conflict and run the sync that applies it. Returns
+        at once; the sync runs in the background like any other. A launch
+        passes apply=False: its own pre-launch sync applies the answer."""
+        sync = self._auto_sync
+        if not sync or not sync.answer_conflict(conflict_id, choice):
+            return {'success': False, 'message': 'No such conflict'}
+        logging.info(f"Save conflict {conflict_id}: user chose {choice}")
+        if not apply or not sync.enabled:
+            return {'success': True}
+        loop = asyncio.get_running_loop()
+
+        def run():
+            try:
+                sync.run_negotiated_save_sync(trigger="conflict")
+            except Exception as e:
+                logging.warning(f"sync after conflict answer failed: {e}")
+        loop.run_in_executor(None, run)
+        return {'success': True}
 
     # -----------------------------------------------------------------------
     # Notification preferences
@@ -9761,6 +9804,8 @@ class LudoBackend:
 
         Returns the core name the launch will use, or None — the caller needs it
         to find the states RetroArch is about to read (resume-from-state).
+        Raises SaveConflictPending when this game's save changed here and on
+        the server: the launch stops so the user can choose first.
         """
         auto = self._auto_sync
         if auto is None and self._romm_client is not None:
@@ -9804,6 +9849,13 @@ class LudoBackend:
                 auto.note_launch_content(game, launch_path)
             except Exception as e:
                 logging.warning(f"could not record launch content name: {e}")
+        # Asked before anything is downloaded: the legacy pull below would
+        # otherwise settle the conflict by timestamps on its own.
+        rom_id = game.get('rom_id')
+        if rom_id is not None and hasattr(auto, 'conflicts_before_launch'):
+            conflicts = await asyncio.to_thread(auto.conflicts_before_launch, rom_id)
+            if conflicts:
+                raise SaveConflictPending(conflicts[0])
         try:
             await asyncio.to_thread(auto.sync_before_launch, game, core)
         except Exception as e:
@@ -9997,7 +10049,10 @@ class LudoBackend:
 
             # Pull down the latest saves/states from RomM before launching so the
             # session starts from the most recent progress (no-op if download is off).
-            core = await self._pre_launch_sync(g, launch_path)
+            try:
+                core = await self._pre_launch_sync(g, launch_path)
+            except SaveConflictPending as c:
+                return {'success': False, 'save_conflict': c.conflict}
             # Resolved AFTER the sync: the state to resume into may be the one
             # that just came down from the server, and reconcile has to have
             # filed it under the launching core first.
@@ -10918,7 +10973,10 @@ class LudoBackend:
                 logging.info(f"{platform_name} core '{self.core_label(bios['core'])}' "
                              f"is missing required BIOS: {bios['missing_bios']}")
                 bios, bios_fetched = await self._close_bios_gap(g, platform_name, bios)
-            core = await self._pre_launch_sync(g, launch_path)
+            try:
+                core = await self._pre_launch_sync(g, launch_path)
+            except SaveConflictPending as c:
+                return {'success': False, 'save_conflict': c.conflict}
             entry_slot = self._resume_entry_slot(g, core) if resume else None
             cmd, err = self._retroarch.build_launch_command(
                 Path(launch_path), platform_name, entry_slot=entry_slot,

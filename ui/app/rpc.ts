@@ -98,6 +98,8 @@ export const getSaveHistory = callable<[number], any>("get_save_history");
 export const getPendingUploads = callable<[], any>("get_pending_uploads");
 export const getSaveScreenshot = callable<[number, number, string], any>("get_save_screenshot");
 export const restoreSaveVersion = callable<[number, number, string, boolean], any>("restore_save_version");
+export const getSaveConflicts = callable<[], any>("get_save_conflicts");
+export const resolveSaveConflict = callable<[string, string, boolean?], any>("resolve_save_conflict");
 // Game Browser
 export const getLibraryGroups = callable<[string], any>("get_library_groups");
 export const getLibraryGames = callable<[string, string], any>("get_library_games");

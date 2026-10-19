@@ -26,6 +26,8 @@ Asserted:
 """
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -435,10 +437,118 @@ def test_indicator_and_rejects():
         check('still kept from negotiate', keys, {(1, 'autosave')})
 
 
+def test_ask_on_conflict():
+    """Ludo parks a conflict, the answer is applied once, and it expires."""
+    with tempfile.TemporaryDirectory() as d:
+        srm = Path(d) / 'Zelda (USA).srm'
+        srm.write_bytes(b'x')
+        m = AutoSyncManager.__new__(AutoSyncManager)
+        m.parent_window = type('W', (), {'get_overwrite_behavior': lambda self: 'Smart (prefer newer)'})()
+        m.get_games = lambda: [{'rom_id': 7, 'name': 'A Link to the Past'}]
+        m.log = lambda *a: None
+        old = {'rom_id': 7, 'server_updated_at': '2020-01-01T00:00:00+00:00'}
+
+        check('GTK app: its preference decides', m._resolve_save_conflict(old, str(srm)), 'local')
+        check('GTK app: nothing parked', m.pending_conflicts(), [])
+
+        m.parent_window = None
+        op = dict(old, device_name='Living room PC')
+        check('Ludo: parked', m._resolve_save_conflict(op, str(srm)), 'skip')
+        p = m.pending_conflicts()
+        check('one pending', len(p), 1)
+        check('pending carries the game and device',
+              (p[0]['game'], p[0]['server']['device'], p[0]['file_name']),
+              ('A Link to the Past', 'Living room PC', 'Zelda (USA).srm'))
+        check('re-found, not duplicated',
+              (m._resolve_save_conflict(op, str(srm)), len(m.pending_conflicts())), ('skip', 1))
+
+        check('bad choice refused', m.answer_conflict(p[0]['id'], 'both'), False)
+        check('unknown id refused', m.answer_conflict('7:other.srm', 'server'), False)
+        check('answered', m.answer_conflict(p[0]['id'], 'server'), True)
+        check('answer clears the prompt', m.pending_conflicts(), [])
+        check('next sync applies it', m._resolve_save_conflict(op, str(srm)), 'server')
+        check('only once', m._resolve_save_conflict(op, str(srm)), 'skip')
+
+        cid = m.pending_conflicts()[0]['id']
+        m.answer_conflict(cid, 'local')
+        m._conflicts()['answers'][cid] = ('local', time.time() - m.CONFLICT_ANSWER_TTL - 1)
+        check('a stale answer is not applied', m._resolve_save_conflict(op, str(srm)), 'skip')
+
+
+def test_launch_and_background():
+    """Background finds toast once and don't pop up; launch and close ones do.
+    The pre-launch sync touches only the launching game."""
+    toasts = []
+    real_emit = REAL_EMIT
+    sync_core._emit_game_sync_toast = lambda title, body, **k: toasts.append(body)
+    with tempfile.TemporaryDirectory() as d:
+        a, b = Path(d) / 'A.srm', Path(d) / 'B.srm'
+        a.write_bytes(b'a'); b.write_bytes(b'b')
+        m = AutoSyncManager.__new__(AutoSyncManager)
+        m.parent_window = None
+        m.get_games = lambda: [{'rom_id': 1, 'name': 'Game A'}, {'rom_id': 2, 'name': 'Game B'}]
+        m.log = lambda *a: None
+        op = {'rom_id': 1, 'server_updated_at': '2020-01-01T00:00:00+00:00'}
+
+        m._sync_trigger = 'save changed'
+        m._resolve_save_conflict(op, str(a))
+        m._resolve_save_conflict(op, str(a))
+        check('background: toasted once', toasts, ['Game A'])
+        sent_to = []
+        sync_core.push_notification = lambda *a, **k: sent_to.append('ludo')
+        sync_core._emit_game_sync_toast = real_emit
+        sync_core.set_toasts_over_games(True)
+        sync_core._emit_game_sync_toast('Save conflict', 'Game A', over_games=True)
+        check('Decky: a Steam notification, whatever the emulator', sent_to, ['ludo'])
+        sync_core.set_toasts_over_games(False)
+        sync_core._emit_game_sync_toast = lambda title, body, **k: toasts.append(body)
+        check('background: no popup', m.pending_conflicts()[0]['prompt'], False)
+        m._sync_trigger = 'RetroArch closed'
+        m._resolve_save_conflict(op, str(a))
+        check('game close: popped up', m.pending_conflicts()[0]['prompt'], True)
+        m._sync_trigger = 'reconnect'
+        m._resolve_save_conflict(op, str(a))
+        check('still popped up after a background re-find',
+              (m.pending_conflicts()[0]['prompt'], len(toasts)), (True, 1))
+
+        # Pre-launch: only game 1 reported, other games' ops and conflicts left
+        # alone, and nothing baselined.
+        m._conflicts()['pending'].clear()
+        m._conflicts()['pending']['2:B.srm'] = {'id': '2:B.srm', 'rom_id': 2}
+        sent, marked = [], []
+        m.romm_client = type('C', (), {
+            'authenticated': True, 'server_features': {},
+            'negotiate_sync': lambda self, dev, inv: (sent.extend(inv) or 's1', [
+                {'action': 'conflict', 'rom_id': 1, 'slot': 'autosave',
+                 'server_updated_at': '2020-01-01T00:00:00+00:00'},
+                {'action': 'download', 'rom_id': 2, 'slot': 'autosave'}]),
+            'complete_sync_session': lambda self, *a, **k: None})()
+        m.settings = type('S', (), {'get': lambda self, *a: 'dev1'})()
+        m.retroarch = type('R', (), {'save_dirs': {}})()
+        m._session_sync_lock = threading.Lock()
+        m.build_sync_inventory = lambda: [
+            {'rom_id': 1, 'slot': 'autosave', '_path': str(a)},
+            {'rom_id': 2, 'slot': 'autosave', '_path': str(b)}]
+        m.mark_all_synced = lambda **k: marked.append(1)
+        m.save_download_blocked = set()
+        m.enabled = False
+        check('sync off: launch checks nothing', (m.conflicts_before_launch(1), sent), ([], []))
+        m.enabled = True
+        got = m.conflicts_before_launch(1)
+        check('launch: only that game negotiated', [e['rom_id'] for e in sent], [1])
+        check('launch: its conflict returned to ask', [(c['rom_id'], c['prompt']) for c in got], [(1, True)])
+        check("launch: other games' conflicts kept",
+              sorted(c['rom_id'] for c in m.pending_conflicts()), [1, 2])
+        check('launch: nothing baselined', marked, [])
+
+
 def main():
     # The manager's paths record to the activity log under the default app
     # id, which is a real app's file; keep test runs out of it.
     sync_core._record_activity = lambda *a, **k: None
+    global REAL_EMIT
+    REAL_EMIT = sync_core._emit_game_sync_toast
+    sync_core._emit_game_sync_toast = lambda *a, **k: None
     test_decide()
     test_heartbeat()
     test_rom_file_for_save()
@@ -451,6 +561,8 @@ def main():
     test_channel_sync()
     test_session_routing()
     test_indicator_and_rejects()
+    test_ask_on_conflict()
+    test_launch_and_background()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")
