@@ -1,10 +1,10 @@
 import { Focusable, GamepadButton, ModalRoot, showModal, Navigation } from "@ludo/host";
 import { toaster } from "../toast";
 import { V2, fmtBytes, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
-import { FaWrench, FaChevronDown, FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
+import { FaWrench, FaChevronDown, FaChevronRight, FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
-import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns, setSwitchAddOnEnabled} from "../rpc";
+import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns, setSwitchAddOnEnabled, setSwitchDlc, setSwitchUpdate, fetchSwitchAddOn} from "../rpc";
 import { _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, PlatformIcon, V2Button, V2CardRow, V2SettingsRow, V2Switch, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage, useArmedPress} from "../kit";
 import { _dlSucceeded, _setDlActive, awaitDownload, cancelDownload, claimDownloadStart, releaseDownloadStart, useDownloadProgress, useIsDownloading, downloadOne} from "../downloads";
@@ -21,6 +21,7 @@ import { cannotLaunch, runLaunch } from "../launch";
 import { standaloneFor, useEmulatorStatus } from "../emulator";
 import { LocalDisc, discDisplayLabel, openDiscPicker } from "../tiles";
 import { useSaveActivityFor } from "../status";
+import { SwitchDlcModal, addOnLabel, fetchLabel, openUpdatePicker, runEdenChange, useFetchProgress } from "../switchAddOns";
 // One game, in full: the hero art, the actions, and the four metadata tabs.
 //
 // The tabs are where most of this lives — overview, files, save data,
@@ -487,12 +488,15 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
   const [state, setState] = useState<any | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
   const [toggling, setToggling] = useState<string | null>(null);
+  const [fetching, setFetching] = useState<string | null>(null);
 
   const load = async () => {
     try { setState(await getSwitchAddOns(romId)); }
     catch (e) { console.error('switch_add_ons failed', e); setState(null); }
   };
   useEffect(() => { load(); }, [romId]);
+  // Up here, before the early returns: a hook has to run on every render.
+  const fetchProgress = useFetchProgress(romId, fetching !== null);
 
   if (!state?.kind) return null;
 
@@ -529,7 +533,8 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
 
   const mods: any[] = state.mods || [];
 
-  if (!update && !dlc.length && !available.length && !mods.length) return null;
+  if (!update && !dlc.length && !available.length && !mods.length
+      && !(state.server_updates || []).length && !(state.server_dlc || []).length) return null;
 
   const fetchAddOn = async (a: any) => {
     setBusy(a.rom_id);
@@ -546,22 +551,59 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
     } finally { setBusy(null); }
   };
 
-  // Eden has one switch for the update and one for ALL of a game's DLC, so
-  // that is what this offers: a per-DLC toggle would write a setting Eden
-  // never reads. Eden rewrites its config on exit, so it has to be closed.
+  // Eden applies one update, so the update row opens a choice of version; it
+  // has one switch for all of a game's DLC, so the DLC row opens a list that
+  // turns single ones off by hiding their file (switchAddOns.tsx). Mods are
+  // one folder each and stay plain switches. Eden rewrites its config on
+  // exit, so runEdenChange offers to close it first.
   const enabled = state.enabled || { update: true, dlc: true };
-  const toggle = async (kind: 'update' | 'dlc' | 'mod', mod?: any) => {
-    setToggling(mod ? `mod:${mod.name}` : kind);
+  const updates: any[] = state.updates || [];
+  const serverUpdates: any[] = state.server_updates || [];
+  const serverDlc: any[] = state.server_dlc || [];
+  const fetchFromRomm = async (e: any) => {
+    setFetching(e.file_name);
     try {
-      const on = mod ? !mod.enabled : !enabled[kind];
-      const { status } = await setSwitchAddOnEnabled(romId, kind, on, mod?.name ?? '');
-      if (status === 'running') {
-        toaster.toast({ title: 'Close Eden first', body: 'Eden saves its settings when it quits, so the change would be lost.' });
-      } else if (status === 'no-config') {
-        toaster.toast({ title: 'Open Eden once first', body: 'Eden has not created its settings yet.' });
-      } else if (status !== 'ok') {
-        toaster.toast({ title: 'Could not change Eden settings', body: String(status) });
+      const r = await fetchSwitchAddOn(romId, e.rom_id, e.file_id ?? null, e.file_name);
+      if (r?.status !== 'ok') {
+        toaster.toast({ title: 'Could not download the add-on',
+                        body: `${addOnLabel(e.file_name)}${r?.message ? ` · ${r.message}` : ''}` });
       }
+      return r;
+    } finally { setFetching(null); }
+  };
+  const choice = state.update_choice ?? null;
+  const chosen = updates.find((u: any) => (u.mode === 'extcontent' ? u.version : 'nand') === choice);
+  const activeDlc = enabled.dlc ? dlc.filter((d: any) => d.enabled !== false).length : 0;
+  const applyUpdate = async (c: number | string | null) => {
+    setToggling('update');
+    try { await runEdenChange(() => setSwitchUpdate(romId, c)); await load(); }
+    finally { setToggling(null); }
+  };
+  const pickUpdate = () => openUpdatePicker({
+    updates, server: serverUpdates, choice,
+    onPick: applyUpdate,
+    // Downloaded on purpose to be played, so it becomes the one Eden applies.
+    // A NAND install has no version of its own in Eden's eyes.
+    onFetch: async (e) => {
+      const r = await fetchFromRomm(e);
+      await load();
+      if (r?.status === 'ok') await applyUpdate(state.mode === 'extcontent' ? r.version : 'nand');
+    },
+  });
+  const pickDlc = () => showModal(
+    <SwitchDlcModal romId={romId} dlc={dlc} server={serverDlc} enabled={!!enabled.dlc}
+      onFetch={async (e) => { const r = await fetchFromRomm(e); await load(); return r; }}
+      onApply={async (ids) => {
+        const status = await runEdenChange(() => setSwitchDlc(romId, ids));
+        await load();
+        return status;
+      }} />
+  );
+
+  const toggleMod = async (mod: any) => {
+    setToggling(`mod:${mod.name}`);
+    try {
+      await runEdenChange(() => setSwitchAddOnEnabled(romId, 'mod', !mod.enabled, mod.name));
       await load();
     } finally { setToggling(null); }
   };
@@ -570,26 +612,33 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
       <SectionHeading icon={<FaPuzzlePiece size={12} />}>Updates &amp; DLC</SectionHeading>
       <CardGroup rows={[
-        ...(update ? [{
-          key: 'update', icon: <FaMicrochip size={14} />, title: 'Use update',
-          subtitle: enabled.update ? 'Eden applies the installed update' : 'The game starts at its original version',
-          onClick: () => { if (toggling === null) toggle('update'); },
-          right: <V2Switch checked={!!enabled.update} />,
+        ...(updates.length || serverUpdates.length ? [{
+          key: 'update', icon: <FaMicrochip size={14} />, title: 'Update',
+          subtitle: fetching && serverUpdates.some((u: any) => u.file_name === fetching)
+            ? `${addOnLabel(fetching)} · ${fetchLabel(fetchProgress)}`
+            : chosen
+            ? `${addOnLabel(chosen.file_name)} · applied by Eden`
+            : 'Original version · no update applied',
+          onClick: () => { if (toggling === null && fetching === null) pickUpdate(); },
+          right: <FaChevronRight size={11} style={{ color: V2.fgMuted }} />,
         }] : []),
-        ...(dlc.length ? [{
-          key: 'dlc', icon: <FaPuzzlePiece size={14} />, title: 'Use DLC',
-          subtitle: enabled.dlc
-            ? `${dlc.length} DLC active in Eden`
-            : `${dlc.length} DLC installed, turned off in Eden`,
-          onClick: () => { if (toggling === null) toggle('dlc'); },
-          right: <V2Switch checked={!!enabled.dlc} />,
+        ...(dlc.length || serverDlc.length ? [{
+          key: 'dlc', icon: <FaPuzzlePiece size={14} />, title: 'DLC',
+          subtitle: [
+            !dlc.length ? 'None downloaded'
+              : activeDlc === dlc.length ? `${dlc.length} DLC active in Eden`
+              : `${activeDlc} of ${dlc.length} DLC active in Eden`,
+            serverDlc.length ? `${serverDlc.length} more on RomM` : '',
+          ].filter(Boolean).join(' · '),
+          onClick: () => { if (toggling === null && fetching === null) pickDlc(); },
+          right: <FaChevronRight size={11} style={{ color: V2.fgMuted }} />,
         }] : []),
-        // One switch per mod: Eden reads each mod folder's name, so unlike
-        // DLC these really do turn on and off one at a time.
+        // One switch per mod: Eden reads each mod folder's name, so these
+        // turn on and off one at a time in Eden's own config.
         ...mods.map((m: any) => ({
           key: `mod:${m.name}`, icon: <FaWrench size={14} />, title: m.name,
           subtitle: m.enabled ? 'Mod · active in Eden' : 'Mod · turned off in Eden',
-          onClick: () => { if (toggling === null) toggle('mod', m); },
+          onClick: () => { if (toggling === null) toggleMod(m); },
           right: <V2Switch checked={!!m.enabled} />,
         })),
       ]} />
@@ -604,7 +653,8 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
         ...dlc.map((d: any) => ({
           key: d.title_id, icon: <FaPuzzlePiece size={14} />, focusable: true,
           title: d.file_name || d.title_id,
-          subtitle: [d.title_id, switchAddOnWhere(d)].filter(Boolean).join(' · '),
+          subtitle: [d.title_id, switchAddOnWhere(d), d.enabled === false ? 'Turned off' : '']
+            .filter(Boolean).join(' · '),
           right: <FaCheckCircle size={12} style={{ color: V2.success }} />,
         })),
       ]} />

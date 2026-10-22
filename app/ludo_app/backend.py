@@ -12,6 +12,7 @@ than being read from the environment or patched onto module globals.
 """
 import asyncio
 import base64
+import glob
 import hashlib
 import json
 import logging
@@ -863,6 +864,12 @@ class LudoBackend:
         # the download worker when it reports the result. Set here, not in
         # _main, so a download can never meet it missing.
         self._decompress_failures = {}
+        # What each Switch container read as, keyed by path, mtime and size,
+        # so the game page does not re-read the updates folder on every open.
+        self._switch_read_cache = {}
+        # base rom_id -> {'file_name', 'percent', 'state'} for the add-on
+        # fetch_switch_add_on is downloading for that game.
+        self._switch_fetch_state = {}
         logging.info(f"Ludo backend {self._host.version} on host "
                      f"{self._host.name!r} (updates from {self._host.asset_suffix})")
 
@@ -9115,6 +9122,145 @@ class LudoBackend:
                           exc_info=True)
         return report
 
+    def _switch_identity(self, sync, g):
+        """What a library entry is as Switch content, or None.
+
+        The name is asked first, as it costs nothing. A folder ROM is named
+        after the game alone -- "Pokémon Legends Z-A", base game, update and
+        DLC inside -- so the name says nothing, and the Updates & DLC section
+        used to vanish for exactly the games that come with their add-ons.
+        Once the game is on disk its base container states its own title ID.
+        """
+        name = (g.get('file_name')
+                or (g.get('romm_data') or {}).get('fs_name') or '')
+        info = sync.switch_add_on_state(name) if name else None
+        if info:
+            return info
+        local = g.get('local_path') if g.get('is_downloaded') else None
+        if not local:
+            return None
+        path = Path(local)
+        prod_keys = self._prod_keys()
+        if path.is_dir():
+            members = sorted(f for f in path.rglob('*') if f.is_file()
+                             and f.suffix.lower() in switch_content.CONTAINER_EXTS)
+            path = switch_content.base_game(members, prod_keys)
+        if path is None or not path.is_file():
+            return None
+        info = self._switch_content_cached(path, prod_keys)
+        if not info or info.get('kind') != 'base':
+            return None
+        info = dict(info)
+        info['installed_version'] = None
+        info['installed'] = True
+        return info
+
+    def _switch_content_cached(self, path, prod_keys):
+        """title_ids.switch_content, remembered per file until it changes.
+
+        The detail page asks on every open, and the updates folder holds every
+        game's add-ons: reading each header again each time is wasted I/O.
+        """
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        cache = self._switch_read_cache
+        if len(cache) > 512:
+            cache.clear()
+        key = (str(path), st.st_mtime_ns, st.st_size, bool(prod_keys))
+        if key not in cache:
+            try:
+                cache[key] = title_ids.switch_content(path, prod_keys=prod_keys)
+            except Exception as e:
+                logging.debug(f"could not read {path.name}: {e}")
+                cache[key] = None
+        return cache[key]
+
+    def _switch_installed(self, sync, base_id):
+        """Every update and DLC of a base title, as Eden can see them.
+
+        {'update': the newest update record or None, 'updates': every update
+        record, newest first, 'dlc': every DLC record}. Each DLC carries
+        'enabled' -- False for one turned off by renaming -- and 'toggleable',
+        True only for a folder copy, the only kind that can be turned off on
+        its own.
+
+        The folder is read as well as Ludo's manifest: a file can be there
+        because a build that kept no manifest moved it, or the user did, and
+        Eden applies it all the same.
+        """
+        manifest = switch_content.installed_for_base(base_id)
+        disk = self._switch_installed_on_disk(sync, base_id)
+        seen = {r['path'] for r in disk['updates'] + disk['dlc']}
+
+        def extra(record):
+            # A manifest record the folder scan did not already list: a NAND
+            # install, or a folder copy outside this ROM directory's folder. A
+            # folder copy whose file is not there is not installed -- it is
+            # turned off (renamed) or gone, and the registry speaks for it.
+            if not record or record.get('path') in seen:
+                return False
+            if record.get('mode') == switch_content.MODE_EXTCONTENT:
+                return Path(record.get('path') or '').is_file()
+            return True
+
+        updates = list(disk['updates'])
+        if extra(manifest['update']):
+            updates.append(manifest['update'])
+        dlc = list(disk['dlc'])
+        dlc += [r for r in manifest['dlc'] if extra(r)]
+        dlc = [dict(r, enabled=True,
+                    toggleable=r.get('mode') == switch_content.MODE_EXTCONTENT)
+               for r in dlc]
+        dlc += [dict(r, enabled=False, toggleable=True)
+                for r in switch_content.disabled_for_base(base_id)]
+        updates.sort(key=lambda r: r.get('version') or 0, reverse=True)
+        dlc.sort(key=lambda r: r.get('title_id') or '')
+        return {'update': updates[0] if updates else None,
+                'updates': updates, 'dlc': dlc}
+
+    def _switch_installed_on_disk(self, sync, base_id):
+        """{'updates', 'dlc'} records found in the updates folder for a base title."""
+        out = {'updates': [], 'dlc': []}
+        folder = switch_content.extcontent_dir(sync.switch_rom_dir())
+        if folder is None:
+            return out
+        prod_keys = self._prod_keys()
+        base_id = str(base_id).upper()
+        try:
+            files = sorted(f for f in folder.iterdir() if f.is_file()
+                           and f.suffix.lower() in switch_content.CONTAINER_EXTS)
+        except OSError:
+            return out
+        for f in files:
+            # A name that names another game settles it without a read.
+            named = title_ids.switch_content_from_name(f.name)
+            if named and named.get('base_id') and named['base_id'].upper() != base_id:
+                continue
+            info = self._switch_content_cached(f, prod_keys) or named
+            if not info or str(info.get('base_id') or '').upper() != base_id:
+                continue
+            record = {'title_id': info['title_id'], 'base_id': base_id,
+                      'kind': info.get('kind'), 'version': info.get('version'),
+                      'file_name': f.name, 'mode': switch_content.MODE_EXTCONTENT,
+                      'path': str(f)}
+            if info.get('kind') == 'update':
+                out['updates'].append(record)
+            elif info.get('kind') == 'dlc':
+                out['dlc'].append(record)
+        return out
+
+    @staticmethod
+    def _update_sources(installed):
+        """(folder versions, whether a NAND update exists) for eden_config."""
+        versions = [r['version'] for r in installed['updates']
+                    if r.get('mode') == switch_content.MODE_EXTCONTENT
+                    and r.get('version') is not None]
+        nand = any(r.get('mode') != switch_content.MODE_EXTCONTENT
+                   for r in installed['updates'])
+        return versions, nand
+
     async def switch_add_ons(self, rom_id: int):
         """Update and DLC state for a game, for the detail page.
 
@@ -9126,31 +9272,23 @@ class LudoBackend:
         try:
             sync = self._auto_sync
             g = self._games_index().get(rom_id) or {}
-            name = (g.get('file_name')
-                    or (g.get('romm_data') or {}).get('fs_name') or '')
-            if not sync or not name:
+            if not sync:
                 return {'kind': None}
-            info = sync.switch_add_on_state(name)
+            info = await asyncio.get_event_loop().run_in_executor(
+                None, self._switch_identity, sync, g)
             if not info:
                 return {'kind': None}
-            installed = sync.switch_add_ons_installed_for(name)
-            # file_name is spelled two ways here, and reading only one of them
-            # broke both things it feeds. A library entry keys it 'file_name';
-            # a sibling row folded into the parent game keys it 'fs_name' — and
-            # RomM reports a patch as a sibling, so the add-ons are mostly the
-            # second kind. With the name missing, an installed add-on could not
-            # be matched against its server row and reappeared as available,
-            # labelled with the only string left: the base game's name. Hence
-            # two identical "Mario Kart 8 Deluxe · On the server" rows under
-            # the update and DLC that were already installed.
-            available = [] if info['kind'] != 'base' else [
-                {'rom_id': a.get('rom_id') or a.get('id'),
-                 'name': a.get('name'),
-                 'file_name': (a.get('file_name') or a.get('fs_name')
-                               or (a.get('romm_data') or {}).get('fs_name')),
-                 'is_downloaded': bool(a.get('is_downloaded'))}
-                for a in sync.switch_add_ons_for_rom(
-                    g, library=self._available_games)]
+            installed = (await asyncio.get_event_loop().run_in_executor(
+                None, self._switch_installed, sync, info['base_id'])
+                if info['kind'] == 'base'
+                else switch_content.installed_for_base(info['base_id']))
+            available = [] if info['kind'] != 'base' else self._switch_available(sync, g)
+            server = {'updates': [], 'dlc': [], 'rest': available}
+            if info['kind'] == 'base':
+                local_names = await asyncio.get_event_loop().run_in_executor(
+                    None, self._switch_local_names, sync, g, installed)
+                server = await asyncio.get_event_loop().run_in_executor(
+                    None, self._switch_server_add_ons, rom_id, g, available, local_names)
             return {
                 'mode': sync.switch_addon_mode(),
                 'extcontent_dir': str(
@@ -9162,11 +9300,13 @@ class LudoBackend:
                 'installed': info.get('installed'),
                 'installed_update': installed['update'],
                 'installed_dlc': installed['dlc'],
-                'available': available,
-                # Whether Eden applies them. One switch each, because that is
-                # all Eden has: see eden_config.set_add_on_enabled.
-                'enabled': (eden_config.add_ons_enabled(info['base_id'])
-                            if info['kind'] == 'base' else None),
+                'available': server['rest'],
+                # On the server, not here: offered in the update picker and the
+                # DLC list, and fetched by fetch_switch_add_on.
+                'server_updates': server['updates'],
+                'server_dlc': server['dlc'],
+                **(self._switch_choices(info['base_id'], installed)
+                   if info['kind'] == 'base' else {'enabled': None}),
                 # Mods the user put in Eden's load folder; Ludo installs none.
                 'mods': (eden_config.mods_for(info['base_id'])
                          if info['kind'] == 'base' else []),
@@ -9174,6 +9314,317 @@ class LudoBackend:
         except Exception as e:
             logging.error(f"switch_add_ons error: {e}", exc_info=True)
             return {'kind': None}
+
+    def _switch_available(self, sync, g):
+        """The server ROMs holding a base game's add-ons, as the page lists them."""
+        # file_name is spelled two ways here, and reading only one of them
+        # broke both things it feeds. A library entry keys it 'file_name';
+        # a sibling row folded into the parent game keys it 'fs_name' — and
+        # RomM reports a patch as a sibling, so the add-ons are mostly the
+        # second kind. With the name missing, an installed add-on could not
+        # be matched against its server row and reappeared as available,
+        # labelled with the only string left: the base game's name. Hence
+        # two identical "Mario Kart 8 Deluxe · On the server" rows under
+        # the update and DLC that were already installed.
+        return [
+            {'rom_id': a.get('rom_id') or a.get('id'),
+             'name': a.get('name'),
+             'file_name': (a.get('file_name') or a.get('fs_name')
+                           or (a.get('romm_data') or {}).get('fs_name')),
+             'is_downloaded': bool(a.get('is_downloaded'))}
+            for a in sync.switch_add_ons_for_rom(g, library=self._available_games)]
+
+    def _switch_local_names(self, sync, g, installed):
+        """File names of the add-ons already on this device, for a base game.
+
+        A server file is offered for download only when its name is in none of
+        the places a copy can be: the game's own folder, the updates folder
+        (turned-off DLC under the name they had), or what the manifest says it
+        installed into NAND.
+        """
+        names = {r.get('file_name') for r in installed['updates'] + installed['dlc']}
+        local = Path(g.get('local_path') or '')
+        roots = [local] if local.is_dir() else []
+        folder = switch_content.extcontent_dir(sync.switch_rom_dir())
+        if folder is not None:
+            roots.append(folder)
+        for root in roots:
+            try:
+                for f in root.rglob('*'):
+                    if f.is_file():
+                        name = f.name
+                        if name.endswith(switch_content.DISABLED_SUFFIX):
+                            name = name[:-len(switch_content.DISABLED_SUFFIX)]
+                        names.add(name)
+            except OSError:
+                continue
+        names.discard(None)
+        return names
+
+    def _switch_server_add_ons(self, rom_id, g, available, local_names):
+        """Updates and DLC on the server but not here: {'updates', 'dlc', 'rest'}.
+
+        Two shapes hold them. A folder ROM carries its add-ons as files of the
+        game itself -- download picks out one by file id. RomM can also list
+        them as ROMs of their own, which switch_add_ons_for_rom found
+        ('available'); those whose name says what they are join the lists, and
+        the rest stay under "On the server" as before.
+
+        The server says only 'update' or 'dlc' for a file; which version an
+        update is, nothing short of downloading it says, so it is offered by
+        its filename.
+        """
+        out = {'updates': [], 'dlc': [], 'rest': []}
+
+        def add(kind, entry):
+            if entry['file_name'] in local_names:
+                return
+            (out['updates'] if kind == 'update' else out['dlc']).append(entry)
+
+        client = self._romm_client
+        if client and client.authenticated:
+            try:
+                r = client.session.get(
+                    urljoin(client.base_url, f'/api/roms/{rom_id}'), timeout=8)
+                files = (r.json().get('files') or []) if r.status_code == 200 else []
+            except Exception as e:
+                logging.debug(f"could not list files of rom {rom_id}: {e}")
+                files = []
+            for f in files:
+                name = f.get('file_name') or f.get('fs_name') or ''
+                if (f.get('missing_from_fs') or not f.get('id')
+                        or Path(name).suffix.lower() not in switch_content.CONTAINER_EXTS):
+                    continue
+                kind = str(f.get('category') or '').lower()
+                if kind not in ('update', 'dlc'):
+                    kind = (title_ids.switch_content_from_name(name) or {}).get('kind')
+                if kind in ('update', 'dlc'):
+                    add(kind, {'rom_id': rom_id, 'file_id': f['id'], 'file_name': name,
+                               'size': f.get('file_size_bytes') or f.get('size_bytes')})
+        for a in available:
+            name = a.get('file_name') or ''
+            kind = (title_ids.switch_content_from_name(name) or {}).get('kind')
+            if kind in ('update', 'dlc') and a.get('rom_id'):
+                add(kind, {'rom_id': a['rom_id'], 'file_id': None, 'file_name': name,
+                           'size': None})
+            else:
+                out['rest'].append(a)
+        return out
+
+    def _switch_choices(self, base_id, installed):
+        """What Eden applies of a base title's add-ons, for the page.
+
+        'updates' lists every update Eden could apply and 'update_choice' the
+        one it will: a version, 'nand', or None for the game as released.
+        'enabled' keeps the two summary flags the page's rows read.
+        """
+        versions, nand = self._update_sources(installed)
+        choice = eden_config.selected_update(base_id, versions, nand)
+        dlc_flag = eden_config.add_ons_enabled(base_id)['dlc']
+        return {
+            'updates': [{'version': r.get('version'), 'file_name': r.get('file_name'),
+                         'mode': r.get('mode'), 'title_id': r.get('title_id')}
+                        for r in installed['updates']],
+            'update_choice': choice,
+            'enabled': {
+                'update': choice is not None,
+                'dlc': dlc_flag and any(d['enabled'] for d in installed['dlc']),
+            },
+        }
+
+    async def _switch_base(self, rom_id):
+        """(sync, identity, installed) for a Switch base game, or None."""
+        sync = self._auto_sync
+        if not sync:
+            return None
+        g = self._games_index().get(rom_id) or {}
+        loop = asyncio.get_event_loop()
+        # The same identity the page was drawn from, or a folder ROM shows its
+        # switches and then answers 'not-switch' to every one of them.
+        info = await loop.run_in_executor(None, self._switch_identity, sync, g)
+        if not info or info.get('kind') != 'base' or not info.get('base_id'):
+            return None
+        installed = await loop.run_in_executor(
+            None, self._switch_installed, sync, info['base_id'])
+        return sync, info, installed
+
+    async def set_switch_update(self, rom_id: int, choice=None):
+        """Choose which update Eden applies to a Switch game.
+
+        ``choice`` is a version from switch_add_ons' 'updates', 'nand' for a
+        NAND install, or None to play the game as released. Returns {'status'}
+        with eden_config's statuses, or 'not-switch'.
+        """
+        try:
+            found = await self._switch_base(rom_id)
+            if not found:
+                return {'status': 'not-switch'}
+            _, info, installed = found
+            versions, _ = self._update_sources(installed)
+            if choice is not None and choice != eden_config.UPDATE_NAND:
+                choice = int(choice)
+            status = await asyncio.get_event_loop().run_in_executor(
+                None, eden_config.set_update_choice, info['base_id'], versions, choice)
+            return {'status': status}
+        except ValueError:
+            return {'status': 'unknown-update'}
+        except Exception as e:
+            logging.error(f"set_switch_update error: {e}", exc_info=True)
+            return {'status': 'failed'}
+
+    async def set_switch_dlc(self, rom_id: int, enabled_ids=None):
+        """Turn a Switch game's DLC on and off, one by one.
+
+        ``enabled_ids`` are the title IDs to leave on; every other DLC goes
+        off. A folder copy goes off by renaming (switch_content.set_file_enabled);
+        Eden's own "DLC" switch follows -- on while any DLC is, off otherwise --
+        which is also the only way to turn off a NAND copy. Returns {'status'}.
+        """
+        try:
+            found = await self._switch_base(rom_id)
+            if not found:
+                return {'status': 'not-switch'}
+            _, info, installed = found
+            wanted = {str(t).upper() for t in (enabled_ids or [])}
+            loop = asyncio.get_event_loop()
+            # Eden's config first: it is what refuses while Eden is open, and
+            # nothing should be renamed under an Eden that is about to rewrite
+            # its config on exit.
+            status = await loop.run_in_executor(
+                None, lambda: eden_config.set_add_on_enabled(
+                    info['base_id'], 'dlc', bool(wanted)))
+            if status != 'ok':
+                return {'status': status}
+            failed = []
+            for record in installed['dlc']:
+                on = str(record.get('title_id') or '').upper() in wanted
+                if not record.get('toggleable') or record.get('enabled') == on:
+                    continue
+                result = await loop.run_in_executor(
+                    None, switch_content.set_file_enabled, record, on)
+                if result != 'ok':
+                    failed.append(record.get('file_name'))
+            return {'status': 'failed', 'files': failed} if failed else {'status': 'ok'}
+        except Exception as e:
+            logging.error(f"set_switch_dlc error: {e}", exc_info=True)
+            return {'status': 'failed'}
+
+    async def switch_fetch_progress(self, rom_id: int):
+        """Progress of the add-on fetch_switch_add_on is downloading for a game."""
+        return self._switch_fetch_state.get(rom_id) or {}
+
+    async def fetch_switch_add_on(self, rom_id: int, rom_ref: int, file_id=None,
+                                  file_name: str = ''):
+        """Download one update or DLC the server has and this device does not.
+
+        ``rom_ref``/``file_id``/``file_name`` name an entry of switch_add_ons'
+        'server_updates' or 'server_dlc' -- and only such an entry is fetched,
+        as the list is worked out again here rather than trusted.
+
+        An update goes beside the ones already in the updates folder
+        (switch_content.place_external), so choosing it is a separate step
+        and the version it replaced is still there to go back to. A DLC
+        installs the usual way. Returns {'status', 'kind', 'title_id',
+        'version'}; the caller applies it with set_switch_update or
+        set_switch_dlc, which is where Eden being open is dealt with.
+        """
+        fetches = self._switch_fetch_state
+        if rom_id in fetches:
+            return {'status': 'busy'}
+        # Claimed before the first await, or a second press arriving while the
+        # list is worked out would pass the check above too.
+        fetches[rom_id] = {'file_name': file_name, 'percent': 0, 'state': 'preparing'}
+        try:
+            found = await self._switch_base(rom_id)
+            if not found:
+                return {'status': 'not-switch'}
+            sync, info, installed = found
+            g = self._games_index().get(rom_id) or {}
+            loop = asyncio.get_event_loop()
+            available = await loop.run_in_executor(None, self._switch_available, sync, g)
+            local_names = await loop.run_in_executor(
+                None, self._switch_local_names, sync, g, installed)
+            server = await loop.run_in_executor(
+                None, self._switch_server_add_ons, rom_id, g, available, local_names)
+            entry = next((e for e in server['updates'] + server['dlc']
+                          if e['rom_id'] == rom_ref and e['file_name'] == file_name
+                          and (e['file_id'] or None) == (file_id or None)), None)
+            if entry is None:
+                return {'status': 'not-offered'}
+            fetches[rom_id]['state'] = 'downloading'
+            return await loop.run_in_executor(
+                None, self._fetch_switch_add_on_sync, sync, g, rom_id, entry)
+        except Exception as e:
+            logging.error(f"fetch_switch_add_on error: {e}", exc_info=True)
+            return {'status': 'failed'}
+        finally:
+            fetches.pop(rom_id, None)
+
+    def _fetch_switch_add_on_sync(self, sync, g, rom_id, entry):
+        """fetch_switch_add_on's download and install, on a worker thread."""
+        state = self._switch_fetch_state[rom_id]
+        name = entry['file_name']
+
+        def progress(p):
+            if isinstance(p, dict):
+                state['percent'] = int(100 * float(p.get('progress') or 0))
+
+        local = Path(g.get('local_path') or '')
+        platform_dir = local.parent
+        if entry['file_id']:
+            # A file of this folder ROM: download_rom puts it in the folder,
+            # next to the game, under its own name.
+            ok, message = self._romm_client.download_rom(
+                entry['rom_id'], name, local, progress_callback=progress,
+                file_ids=str(entry['file_id']))
+        else:
+            ok, message = self._romm_client.download_rom(
+                entry['rom_id'], name, platform_dir / name, progress_callback=progress)
+        if not ok:
+            logging.warning(f"could not download {name}: {message}")
+            return {'status': 'download-failed', 'message': str(message)}
+        landed = next((c for c in (local / name, platform_dir / name) if c.is_file()), None)
+        if landed is None:
+            landed = next(platform_dir.glob(f'*/{glob.escape(name)}'), None)
+        if landed is None:
+            return {'status': 'failed', 'message': 'downloaded file not found'}
+
+        state['state'] = 'installing'
+        prod_keys = self._prod_keys()
+        if switch_nsz.is_compressed(landed):
+            try:
+                landed = switch_nsz.decompress(landed)
+            except Exception as e:
+                return {'status': 'compressed', 'message': switch_nsz.describe_failure(e)}
+        read = title_ids.switch_content(landed, prod_keys=prod_keys) or {}
+        if read.get('kind') not in ('update', 'dlc'):
+            return {'status': 'not-add-on'}
+        if (read['kind'] == 'update'
+                and sync.switch_addon_mode() == switch_content.MODE_EXTCONTENT):
+            placed = switch_content.place_external(landed, sync.switch_rom_dir() or platform_dir)
+            if placed is None:
+                return {'status': 'failed', 'message': 'could not move into the updates folder'}
+        else:
+            result = sync.install_switch_add_on(landed)
+            if result.get('status') not in ('ok', 'current'):
+                return {'status': 'failed', 'message': str(result.get('status'))}
+        logging.info(f"fetched {read['kind']} {name} for rom {rom_id}")
+        return {'status': 'ok', 'kind': read['kind'], 'title_id': read.get('title_id'),
+                'version': read.get('version')}
+
+    async def close_eden(self):
+        """Quit Eden so its settings can be changed. Returns {'closed'}.
+
+        The page asks first: whatever game Eden is running loses what was not
+        saved.
+        """
+        try:
+            closed = await asyncio.get_event_loop().run_in_executor(
+                None, emulator_saves.close_eden)
+            return {'closed': bool(closed)}
+        except Exception as e:
+            logging.error(f"close_eden error: {e}", exc_info=True)
+            return {'closed': False}
 
     async def set_switch_add_on_enabled(self, rom_id: int, kind: str, enabled: bool,
                                         name: str = ''):
@@ -9185,18 +9636,26 @@ class LudoBackend:
         'not-switch' when the ROM names no Switch base game.
         """
         try:
-            sync = self._auto_sync
-            g = self._games_index().get(rom_id) or {}
-            # Not `name`: that is the mod's folder name, and shadowing it with
-            # the game's filename made every mod toggle write the wrong entry.
-            rom_name = (g.get('file_name')
-                        or (g.get('romm_data') or {}).get('fs_name') or '')
-            info = sync.switch_add_on_state(rom_name) if sync and rom_name else None
-            if not info or info.get('kind') != 'base' or not info.get('base_id'):
+            found = await self._switch_base(rom_id)
+            if not found:
                 return {'status': 'not-switch'}
-            status = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: eden_config.set_add_on_enabled(
-                    info['base_id'], kind, bool(enabled), name=name or None))
+            _, info, installed = found
+            loop = asyncio.get_event_loop()
+            if kind == 'update':
+                # The same mechanism as the picker, so this cannot undo what it
+                # chose: on is the newest update Eden can see, off is none.
+                versions, nand = self._update_sources(installed)
+                choice = None
+                if enabled and versions:
+                    choice = max(versions)
+                elif enabled and nand:
+                    choice = eden_config.UPDATE_NAND
+                status = await loop.run_in_executor(
+                    None, eden_config.set_update_choice, info['base_id'], versions, choice)
+            else:
+                status = await loop.run_in_executor(
+                    None, lambda: eden_config.set_add_on_enabled(
+                        info['base_id'], kind, bool(enabled), name=name or None))
             return {'status': status}
         except Exception as e:
             logging.error(f"set_switch_add_on_enabled error: {e}", exc_info=True)

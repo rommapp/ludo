@@ -293,6 +293,10 @@ def install_external(path, dest_dir, info=None, prod_keys=None):
                 log.warning("could not move %s into %s: %s", path.name, target, e)
                 return {'status': 'failed', 'error': str(e)}
 
+    # A fresh copy of a DLC the user had turned off: the new file is live, so
+    # the renamed one would only be a second copy waiting to come back.
+    _drop_disabled_twin(destination)
+
     manifest = read_manifest()
     manifest[title_id] = {
         'base_id': info['base_id'],
@@ -312,6 +316,38 @@ def install_external(path, dest_dir, info=None, prod_keys=None):
             'target': target, 'title_id': title_id,
             'base_id': info['base_id'], 'kind': kind, 'version': version,
             'mode': MODE_EXTCONTENT, 'path': str(destination)}
+
+
+def place_external(path, dest_dir):
+    """Move an add-on into the external-content folder, beside what is there.
+
+    install_external keeps one file per title ID, replacing an older patch
+    with a newer one, and records it in the manifest. This is for the version
+    the user asked for on purpose -- an older update fetched to play against
+    -- which has to sit alongside the one installed rather than replace it:
+    Eden lists every version in the folder and eden_config chooses between
+    them. Nothing is recorded; the folder itself is the record (see the
+    backend's scan of it). Returns the file's new Path, or None.
+    """
+    path = Path(path)
+    target = extcontent_dir(dest_dir, create=True)
+    if target is None:
+        return None
+    destination = target / path.name
+    try:
+        if path.resolve() == destination.resolve():
+            return destination
+        if destination.is_file():
+            # Already there under this name: the copy in front of us is a
+            # duplicate, and leaving it beside the game would only show twice.
+            path.unlink()
+            return destination
+        shutil.move(str(path), str(destination))
+    except OSError as e:
+        log.warning("could not move %s into %s: %s", path.name, target, e)
+        return None
+    _drop_disabled_twin(destination)
+    return destination
 
 
 def _read_at(fh, offset, size):
@@ -458,6 +494,8 @@ def _forget(title_id, extra_data_dir=None, keep_path=None):
                         removed += 1
                 except OSError as e:
                     log.debug("could not remove %s: %s", candidate, e)
+                # A DLC turned off by renaming is still this record's file.
+                _drop_disabled_twin(candidate)
         manifest.pop(key, None)
         _write_manifest(manifest)
         return removed
@@ -687,3 +725,121 @@ def installed_for_base(base_id):
             out['dlc'].append(entry)
     out['dlc'].sort(key=lambda r: r['title_id'])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Turning one DLC off
+#
+# Eden has a single "DLC" switch per game (eden_config), so one DLC cannot be
+# turned off in its config. What it does not see, though, it cannot load: its
+# external-content scan keeps only .nsp and .xci files, so a DLC in the folder
+# is turned off by renaming it out of that set and on by renaming it back.
+# Only folder copies can go this way -- a NAND install would have to be
+# uninstalled -- and only ones inside an extcontent folder, where every file is
+# one we put there or the user did.
+#
+# A renamed file is no longer a container to title_ids, so what it was is kept
+# beside the manifest, keyed by the renamed path.
+# ---------------------------------------------------------------------------
+
+DISABLED_SUFFIX = '.disabled'
+# What is kept of a turned-off add-on's record: what it is and where it lives.
+_DISABLED_FIELDS = ('title_id', 'base_id', 'kind', 'version', 'file_name', 'mode')
+
+
+def _disabled_path():
+    return cache_dir() / 'switch_content' / 'disabled.json'
+
+
+def read_disabled():
+    """{renamed path: record} for every add-on file turned off by renaming."""
+    try:
+        with open(_disabled_path()) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_disabled(table):
+    path = _disabled_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.part')
+        with open(tmp, 'w') as fh:
+            json.dump(table, fh, indent=1, sort_keys=True)
+        tmp.replace(path)
+    except OSError as e:
+        log.warning("could not write %s: %s", path, e)
+
+
+def set_file_enabled(record, enabled):
+    """Rename an add-on in an extcontent folder in or out of Eden's sight.
+
+    ``record`` is the add-on's installed record; its 'path' is where the file
+    sits while enabled. Returns 'ok', 'not-folder' for a copy that cannot be
+    renamed (NAND, or outside an extcontent folder) or 'failed'.
+    """
+    live = Path(record.get('path') or '')
+    if record.get('mode') != MODE_EXTCONTENT or live.parent.name != EXTCONTENT_DIRNAME:
+        return 'not-folder'
+    hidden = live.with_name(live.name + DISABLED_SUFFIX)
+    table = read_disabled()
+    src, dst = (hidden, live) if enabled else (live, hidden)
+    if dst.is_file() and not src.exists():
+        pass  # already where it should be; only the registry may lag
+    else:
+        try:
+            src.rename(dst)
+        except OSError as e:
+            log.warning("could not rename %s: %s", src.name, e)
+            return 'failed'
+    if enabled:
+        table.pop(str(hidden), None)
+    else:
+        table[str(hidden)] = {k: record.get(k) for k in _DISABLED_FIELDS}
+        table[str(hidden)]['path'] = str(live)
+    _write_disabled(table)
+    log.info("%s %s", live.name, 'enabled' if enabled else 'disabled')
+    return 'ok'
+
+
+def disabled_for_base(base_id):
+    """[records] of the add-ons of a base title turned off by renaming.
+
+    Entries whose renamed file is gone -- deleted, or renamed back by hand --
+    are dropped on the way.
+    """
+    base_id = str(base_id).upper()
+    table = read_disabled()
+    out, stale = [], []
+    for hidden, record in table.items():
+        if not Path(hidden).is_file():
+            stale.append(hidden)
+        elif str(record.get('base_id') or '').upper() == base_id:
+            out.append(record)
+    if stale:
+        for hidden in stale:
+            table.pop(hidden, None)
+        _write_disabled(table)
+    out.sort(key=lambda r: r.get('title_id') or '')
+    return out
+
+
+def _drop_disabled_twin(live):
+    """Forget, and delete, a turned-off copy of the file now at ``live``.
+
+    Only one set_file_enabled renamed: a ".disabled" file the user made is
+    theirs, the same as anything else in the folder we did not put there.
+    """
+    hidden = Path(live).with_name(Path(live).name + DISABLED_SUFFIX)
+    table = read_disabled()
+    if str(hidden) not in table:
+        return
+    try:
+        if hidden.is_file():
+            hidden.unlink()
+    except OSError as e:
+        log.debug("could not remove %s: %s", hidden, e)
+    table.pop(str(hidden), None)
+    _write_disabled(table)

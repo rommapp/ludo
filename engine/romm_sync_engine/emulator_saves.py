@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import time
 import zipfile
 from pathlib import Path
@@ -752,15 +753,13 @@ def install_keys_file(path, extra_data_dir=None, dry_run=False):
     return 1
 
 
-def eden_is_running():
-    """True when an Eden process appears to be running.
+def eden_pids():
+    """PIDs of the Eden processes that are really running (zombies excluded).
 
-    Restoring into a live emulator's save directory races whatever Eden holds
-    in memory: it can flush its own copy over the restored one at exit, or read
-    a half-swapped directory. Cheap /proc scan rather than a dependency -- a
-    false negative only costs us the guard, and a false positive only defers a
-    restore the user can retry.
+    Cheap /proc scan rather than a dependency -- a false negative only costs
+    the caller its guard, and a false positive only defers what it guards.
     """
+    pids = []
     try:
         for entry in Path('/proc').iterdir():
             if not entry.name.isdigit():
@@ -790,10 +789,40 @@ def eden_is_running():
                 state = ''
             if state in ('Z', 'X'):
                 continue
-            return True
+            pids.append(int(entry.name))
     except OSError as e:
         log.debug("could not scan /proc for Eden: %s", e)
-    return False
+    return pids
+
+
+def eden_is_running():
+    """True when an Eden process appears to be running.
+
+    Restoring into a live emulator's save directory races whatever Eden holds
+    in memory: it can flush its own copy over the restored one at exit, or read
+    a half-swapped directory.
+    """
+    return bool(eden_pids())
+
+
+def close_eden(timeout=10.0):
+    """Ask Eden to quit and wait for it. Returns True once no Eden is left.
+
+    SIGTERM, not SIGKILL: Eden gets to quit the way it would from its own
+    menu. Whatever game it was running loses unsaved progress either way,
+    which is why callers ask the user first.
+    """
+    for pid in eden_pids():
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as e:
+            log.debug("could not signal Eden (%s): %s", pid, e)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not eden_pids():
+            return True
+        time.sleep(0.2)
+    return not eden_pids()
 
 
 def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None):

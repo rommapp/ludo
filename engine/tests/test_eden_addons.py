@@ -79,6 +79,38 @@ def main():
         check('Update@ver cleared', E.disabled_add_ons(BASE, d), [])
 
     with tempfile.TemporaryDirectory() as tmp:
+        # Choosing one update among several in the folder: Eden applies the
+        # newest one not disabled, so every other version gets disabled.
+        d = fresh(tmp)
+        versions = [65536, 393216, 262144]
+        check('newest applies by default', E.selected_update(BASE, versions, False, d), 393216)
+        check('pick older', E.set_update_choice(BASE, versions, 262144, d), 'ok')
+        check('older disables the rest', E.disabled_add_ons(BASE, d),
+              ['Update@393216', 'Update@65536'])
+        check('older is selected', E.selected_update(BASE, versions, False, d), 262144)
+        E.set_update_choice(BASE, versions, None, d)
+        check('original game selected', E.selected_update(BASE, versions, True, d), None)
+        check('original disables NAND too', 'Update (NAND)' in E.disabled_add_ons(BASE, d), True)
+        E.set_update_choice(BASE, versions, E.UPDATE_NAND, d)
+        check('NAND selected', E.selected_update(BASE, versions, True, d), E.UPDATE_NAND)
+        E.set_update_choice(BASE, versions, 393216, d)
+        check('back to newest', E.selected_update(BASE, versions, False, d), 393216)
+        check('other titles untouched', E.disabled_add_ons(OTHER, d), ['SomeMod'])
+        try:
+            E.set_update_choice(BASE, versions, 1, d)
+            check('unknown version refused', False, True)
+        except ValueError:
+            check('unknown version refused', True, True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # An entry for a version no longer on disk is the user's, and stays.
+        d = fresh(tmp, CONFIG.replace('d=SomeMod', 'd=Update@65536').replace(
+            str(int(OTHER, 16)), str(int(BASE, 16))))
+        E.set_update_choice(BASE, [393216], 393216, d)
+        check('stale version entry kept', E.disabled_add_ons(BASE, d), ['Update@65536'])
+        check('NAND only, nothing in the folder', E.selected_update(BASE, [], True, d), E.UPDATE_NAND)
+
+    with tempfile.TemporaryDirectory() as tmp:
         d = fresh(tmp, "[UI]\ntheme=default\n")
         check('no section: write', E.set_add_on_enabled(BASE, 'dlc', False, d), 'ok')
         check('no section: read back', E.disabled_add_ons(BASE, d), ['DLC'])

@@ -191,6 +191,24 @@ def main():
         finally:
             proc.wait()
 
+        # --- closing Eden so its settings can change --------------------
+        # SIGTERM, then wait for it to go. Scoped to the fake alone: a real
+        # Eden open on the machine running the tests must not be closed.
+        proc = subprocess.Popen([str(fake), '30'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        every_eden = E.eden_pids
+        E.eden_pids = lambda: [p for p in every_eden() if p == proc.pid]
+        try:
+            time.sleep(0.5)
+            check('the fake Eden is seen', E.eden_pids(), [proc.pid])
+            check('close_eden reports it gone', E.close_eden(timeout=5), True)
+            check('and it went by SIGTERM', proc.wait(timeout=5), -15)
+        finally:
+            E.eden_pids = every_eden
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

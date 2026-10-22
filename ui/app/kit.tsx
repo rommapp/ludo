@@ -1259,19 +1259,25 @@ export function ScrollFade({ maxHeight, refresh, children, style }: {
 // (same chrome as CollectionActionsModal / UserMenuModal) instead of Steam's
 // native context menu. Rows reuse UserMenuRow; the remembered/default entry
 // carries a check in the icon slot.
-export function PickerModal({ title, items, closeModal }: {
+// `message` is a line of explanation under the title, for a picker that is
+// really a question. `onDismiss` runs when it is closed without a choice (B,
+// Escape, the scrim) -- a caller waiting on the answer needs to hear "none".
+export function PickerModal({ title, message, items, onDismiss, closeModal }: {
   title: string;
-  items: { key: string | number; label: string; active?: boolean; onSelect: () => void }[];
+  message?: string;
+  items: { key: string | number; label: string; active?: boolean; danger?: boolean; onSelect: () => void }[];
+  onDismiss?: () => void;
   closeModal?: () => void;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   useEffect(() => { const t = setTimeout(() => { if (panelRef.current) _forceGamepadFocus(panelRef.current); }, 60); return () => clearTimeout(t); }, []);
+  const dismiss = () => { onDismiss?.(); closeModal?.(); };
   return (
-    <ModalRoot bHideCloseIcon onCancel={closeModal} onEscKeypress={closeModal}
+    <ModalRoot bHideCloseIcon onCancel={dismiss} onEscKeypress={dismiss}
       className="romm-modal-collapse" modalClassName="romm-modal-collapse">
       <Focusable noFocusRing className="romm-ui"
-        onCancelButton={() => closeModal?.()}
-        onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) closeModal?.(); }}
+        onCancelButton={dismiss}
+        onButtonDown={(e: any) => { if (e?.detail?.button === GamepadButton.CANCEL) dismiss(); }}
         style={{
           position: 'fixed', inset: MODAL_SCRIM_INSET, zIndex: 9999,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1285,9 +1291,9 @@ export function PickerModal({ title, items, closeModal }: {
           }
           @keyframes umIn { from { opacity: 0; transform: translateY(-6px) scale(0.98); } to { opacity: 1; transform: none; } }
         `}</style>
-        <div onClick={() => closeModal?.()} style={{ position: 'absolute', inset: 0 }} />
+        <div onClick={dismiss} style={{ position: 'absolute', inset: 0 }} />
         <Focusable noFocusRing autoFocus ref={panelRef} flow-children="vertical" style={{
-          position: 'relative', width: '340px', maxWidth: '90vw', boxSizing: 'border-box',
+          position: 'relative', width: message ? '420px' : '340px', maxWidth: '90vw', boxSizing: 'border-box',
           fontFamily: V2.font, color: V2.fg, padding: '8px',
           display: 'flex', flexDirection: 'column',
           background: 'linear-gradient(180deg, rgba(20,20,30,0.7) 0%, rgba(10,10,18,0.78) 100%)',
@@ -1301,11 +1307,14 @@ export function PickerModal({ title, items, closeModal }: {
             fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em',
             color: V2.fgMuted, padding: '6px 8px 10px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
           }}>{title}</div>
+          {message && (
+            <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.4, padding: '0 8px 10px' }}>{message}</div>
+          )}
           <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
           {items.map((it) => (
             <UserMenuRow key={it.key}
               icon={it.active ? <FaCheck size={14} style={{ color: V2.brand }} /> : null}
-              label={it.label}
+              label={it.label} danger={it.danger}
               onSelect={() => { closeModal?.(); it.onSelect(); }} />
           ))}
         </Focusable>
