@@ -129,28 +129,30 @@ gh release edit v1.0.0-beta.8 --notes-file notes.md
 ```
 
 The notes are read by users, in the in-app update panel as well as on GitHub,
-so they say what changed for them, not how. Keep them short: one line per item,
-no internals, nothing beyond the issue number. The shape:
+so they say what changed for them, not how. Keep them very short: one plain
+sentence per item, usually under ten words, no internals. The shape:
 
 ```markdown
 ## Highlights
 
-* **<Feature>.** <One or two sentences: what it is and why you'd use it.>
-
-## What's Changed
-
-* <Smaller changes, one line each. Group related ones into a single line,
-  e.g. "Added compatibility with RomM 5.3.0." rather than a line per fix.>
+* <The feature, in one short sentence.>
 
 ## Fixes
 
-* <What was wrong and what happens now, one line each. (#<issue>)>
+* <What works now, in one short sentence.>
 
 **Full Changelog**: https://github.com/rommapp/ludo/compare/v<previous>...v<this>
 ```
 
-- **Highlights** are only the headline features, usually one to three. A
+- **Highlights** are only the headline features, usually one or two. A
   release with none leaves the section out.
+- Name the emulator, never the console or platform: "Eden", not "Switch".
+- Credit outside contributions at the end of the line: "(thanks
+  @<user>)". Maintainers' own work is not credited.
+- No bold titles and no "What's Changed" section. A change too small for
+  Highlights is either a fix or not worth a line.
+- Group related changes into one line rather than a line each, e.g.
+  "Firmware detection, mod toggles and gamepad focus fixes."
 - Say what a feature does, not how to operate it: no button names or
   controls ("L1/R1 to browse"). The app shows its own button hints.
 - Name what the user gains, not what the screen looks like. "Your reading
@@ -169,7 +171,19 @@ no internals, nothing beyond the issue number. The shape:
 - For a platform on the desktop only (or the Deck only), start the line with
   "Desktop:" or "Deck:".
 
-v1.0.0-beta.6 is the reference example.
+The last few betas (v1.0.0-beta.18 to beta.21) are the reference. For example,
+beta.19:
+
+```markdown
+## Highlights
+
+* Emulator Cores page now lists standalone emulators, such as Eden.
+
+## Fixes
+
+* Firmware detection, mod toggles and gamepad focus fixes.
+* No more duplicate Ludo tile when the plugin and desktop app are both installed.
+```
 
 ---
 
