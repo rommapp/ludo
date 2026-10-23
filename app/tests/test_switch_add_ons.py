@@ -156,6 +156,7 @@ class StubRomm:
     def __init__(self, files):
         self.files = files
         self.downloads = []
+        self.paths = []
         stub = self
 
         class Session:
@@ -165,6 +166,7 @@ class StubRomm:
 
     def download_rom(self, rom_id, name, path, progress_callback=None, file_ids=None, **kw):
         self.downloads.append((rom_id, name, file_ids))
+        self.paths.append(Path(path))
         # A folder ROM's file lands inside the game folder, as download_rom does.
         target = (Path(path) / name) if file_ids else Path(path)
         target.write_bytes(b'x')
@@ -232,3 +234,53 @@ async def test_a_manifest_dlc_turned_off_is_listed_once(backend, monkeypatch, tm
     assert await backend.set_switch_dlc(ROM, [dlc_id]) == {'status': 'ok'}
     state = await backend.switch_add_ons(ROM)
     assert [(d['title_id'], d['enabled']) for d in state['installed_dlc']] == [(dlc_id, True)]
+
+
+# A game that is not downloaded has no local_path. Path('') is the working
+# directory, so the add-on scan used to walk wherever Ludo was started from --
+# hiding any server add-on whose name turned up there -- and a fetch landed in
+# it. These run from a directory holding exactly such a decoy.
+SIBLING_UPDATE = 'Legends Update [0100F43008C44800][v65536].nsp'
+READ[SIBLING_UPDATE] = {'title_id': '0100F43008C44800', 'base_id': BASE,
+                        'kind': 'update', 'version': 65536}
+
+
+@pytest.fixture
+def not_downloaded(backend, monkeypatch, tmp_path):
+    cwd = tmp_path / 'started-here'
+    (cwd / 'deep').mkdir(parents=True)
+    for name in ('Pokémon Legends Z-A 1.0.1.nsp', SIBLING_UPDATE):
+        (cwd / 'deep' / name).write_bytes(b'decoy')
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(backend, "_games_index", lambda: {ROM: {
+        'file_name': f'Pokémon Legends Z-A [{BASE}][v0].nsp', 'is_downloaded': False}})
+    backend._auto_sync.switch_add_on_state = lambda name: {
+        'kind': 'base', 'base_id': BASE, 'title_id': BASE, 'version': 0, 'installed': False}
+    backend._auto_sync.switch_add_ons_for_rom = lambda g, library=None: [
+        {'rom_id': 77, 'name': 'Update', 'fs_name': SIBLING_UPDATE}]
+    backend._auto_sync.install_switch_add_on = lambda path: {'status': 'ok'}
+    backend._romm_client = StubRomm(SERVER_FILES)
+    return cwd
+
+
+async def test_not_downloaded_game_ignores_the_working_directory(backend, not_downloaded):
+    state = await backend.switch_add_ons(ROM)
+    assert [u['file_name'] for u in state['server_updates']] == [
+        'Pokémon Legends Z-A 1.0.1.nsp', SIBLING_UPDATE]
+
+
+async def test_a_folder_file_needs_the_game_downloaded(backend, not_downloaded):
+    result = await backend.fetch_switch_add_on(ROM, ROM, 2, 'Pokémon Legends Z-A 1.0.1.nsp')
+    assert result == {'status': 'failed', 'message': 'download the game first'}
+    assert backend._romm_client.downloads == []
+
+
+async def test_a_not_downloaded_games_add_on_lands_in_the_switch_folder(
+        backend, not_downloaded, tmp_path):
+    (not_downloaded / 'deep' / SIBLING_UPDATE).unlink()
+    result = await backend.fetch_switch_add_on(ROM, 77, None, SIBLING_UPDATE)
+    assert result['status'] == 'ok'
+    # Downloaded into the Switch folder, not merely moved out of the working
+    # directory afterwards by place_external.
+    assert backend._romm_client.paths == [tmp_path / 'roms' / 'switch' / SIBLING_UPDATE]
+    assert (tmp_path / 'roms' / 'switch' / 'extcontent' / SIBLING_UPDATE).is_file()

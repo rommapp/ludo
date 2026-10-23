@@ -9136,10 +9136,9 @@ class LudoBackend:
         info = sync.switch_add_on_state(name) if name else None
         if info:
             return info
-        local = g.get('local_path') if g.get('is_downloaded') else None
-        if not local:
+        path = self._switch_game_path(g)
+        if path is None:
             return None
-        path = Path(local)
         prod_keys = self._prod_keys()
         if path.is_dir():
             members = sorted(f for f in path.rglob('*') if f.is_file()
@@ -9334,6 +9333,17 @@ class LudoBackend:
              'is_downloaded': bool(a.get('is_downloaded'))}
             for a in sync.switch_add_ons_for_rom(g, library=self._available_games)]
 
+    @staticmethod
+    def _switch_game_path(g):
+        """Where a library entry's game is on disk, or None when it is not.
+
+        Not Path(g.get('local_path') or ''): an entry that is not downloaded
+        has no local_path, and Path('') is the working directory -- which the
+        add-on scan then walked in full, and a server download landed in.
+        """
+        local = g.get('local_path') if g.get('is_downloaded') else None
+        return Path(local) if local else None
+
     def _switch_local_names(self, sync, g, installed):
         """File names of the add-ons already on this device, for a base game.
 
@@ -9343,8 +9353,8 @@ class LudoBackend:
         installed into NAND.
         """
         names = {r.get('file_name') for r in installed['updates'] + installed['dlc']}
-        local = Path(g.get('local_path') or '')
-        roots = [local] if local.is_dir() else []
+        local = self._switch_game_path(g)
+        roots = [local] if local is not None and local.is_dir() else []
         folder = switch_content.extcontent_dir(sync.switch_rom_dir())
         if folder is not None:
             roots.append(folder)
@@ -9569,8 +9579,17 @@ class LudoBackend:
             if isinstance(p, dict):
                 state['percent'] = int(100 * float(p.get('progress') or 0))
 
-        local = Path(g.get('local_path') or '')
-        platform_dir = local.parent
+        local = self._switch_game_path(g)
+        if local is not None:
+            platform_dir = local.parent
+        elif entry['file_id']:
+            # A file of a folder ROM goes inside the game's folder, and there
+            # is none yet.
+            return {'status': 'failed', 'message': 'download the game first'}
+        else:
+            platform_dir = sync.switch_rom_dir()
+            if platform_dir is None:
+                return {'status': 'failed', 'message': 'no Switch ROM folder yet'}
         if entry['file_id']:
             # A file of this folder ROM: download_rom puts it in the folder,
             # next to the game, under its own name.
@@ -9583,7 +9602,8 @@ class LudoBackend:
         if not ok:
             logging.warning(f"could not download {name}: {message}")
             return {'status': 'download-failed', 'message': str(message)}
-        landed = next((c for c in (local / name, platform_dir / name) if c.is_file()), None)
+        candidates = ([local / name] if local is not None else []) + [platform_dir / name]
+        landed = next((c for c in candidates if c.is_file()), None)
         if landed is None:
             landed = next(platform_dir.glob(f'*/{glob.escape(name)}'), None)
         if landed is None:
