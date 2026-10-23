@@ -1264,7 +1264,46 @@ STANDALONE_EMULATORS = {
         'binaries': ('eden',),
         'args': ('-f', '-g', '{rom}'),
     },
+    'cemu': {
+        'name': 'Cemu',
+        # "wii u" before anything shorter: the plain Wii is a Dolphin platform
+        # and must never land here. A RomM slug is 'wiiu'; names vary.
+        'platforms': ('wii u', 'wiiu', 'wii-u'),
+        # Upstream publishes both: Flathub's info.cemu.Cemu and
+        # Cemu-<ver>-x86_64.AppImage. The AppImage stem starts with 'cemu'.
+        'flatpak_id': 'info.cemu.Cemu',
+        'binaries': ('cemu',),
+        'args': ('-f', '-g', '{rom}'),
+        # A decrypted title is a folder (code/ content/ meta/), not a file.
+        'resolve_rom': 'wiiu',
+    },
 }
+
+
+def resolve_wiiu_rom(rom_path):
+    """(launch_file, grant_root) for a Wii U title.
+
+    Cemu is handed a single file: a .wua/.wux/.wud/.wup as-is, or the .rpx of
+    an unpacked title (code/<name>.rpx). ``grant_root`` is the folder a
+    sandboxed Cemu must be able to read -- for an unpacked title that is the
+    title's root, NOT code/: the emulator also reads the sibling content/ and
+    meta/ folders, and a grant on code/ alone launches into a black screen.
+    """
+    path = Path(rom_path)
+    if path.is_dir():
+        for code in sorted(p for p in path.iterdir()
+                           if p.is_dir() and p.name.lower() == 'code'):
+            rpx = sorted((f for f in code.iterdir()
+                          if f.is_file() and f.suffix.lower() == '.rpx'),
+                         key=lambda f: f.stat().st_size, reverse=True)
+            if rpx:
+                return rpx[0], path
+        rpx = sorted(f for f in path.iterdir()
+                     if f.is_file() and f.suffix.lower() == '.rpx')
+        return (rpx[0] if rpx else path), path
+    if path.suffix.lower() == '.rpx' and path.parent.name.lower() == 'code':
+        return path, path.parent.parent
+    return path, path.parent
 
 
 def _standalone_appimage_dirs():
@@ -8751,13 +8790,16 @@ class RetroArchInterface:
 
     def build_standalone_launch_command(self, rom_path, key, spec, executable):
         """argv for a standalone emulator, from its args template."""
+        grant_root = Path(rom_path).parent
+        if spec.get('resolve_rom') == 'wiiu':
+            rom_path, grant_root = resolve_wiiu_rom(rom_path)
         args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
         if executable.startswith('flatpak:'):
             # The sandbox can't see a ROM outside the paths its manifest grants
             # (Eden then says "ROM format not supported", rommapp/ludo#34).
             # Grant the ROM's folder for this run only, read-only, rather than
             # writing a lasting `flatpak override` into the user's setup.
-            grant = f'--filesystem={Path(rom_path).parent}:ro'
+            grant = f'--filesystem={grant_root}:ro'
             return ['flatpak', 'run', grant, executable.split(':', 1)[1]] + args
         return [executable] + args
 
