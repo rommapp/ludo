@@ -1,9 +1,10 @@
-// The Updates & DLC toggles on a Switch game's Files tab (rommapp/ludo#35).
+// The Updates & DLC section on a Switch game's Files tab (rommapp/ludo#35, #40).
 //
-// Eden has one switch for a game's update and one for all of its DLC, and the
-// page offers exactly those two. This walks to the Files tab with a Switch
-// game that has both installed, checks each toggle renders with the state the
-// backend reported, and that activating one asks the backend to flip it.
+// Eden applies one update of the several it may see, and has one switch for
+// all of a game's DLC, so the page offers a choice of update and a DLC list
+// that turns single ones off by renaming their files. This walks to the Files tab with a Switch
+// game that has both installed, checks the rows say what Eden applies, and
+// that the update picker and the DLC list each ask the backend to change it.
 //
 // Needs `npm run build` first, like routes.render.test.mjs. Set
 // LUDO_SCREENSHOT=<file.png> to keep a picture of the section.
@@ -30,21 +31,42 @@ const FIXTURES = {
   ...POPULATED_FIXTURES,
   switch_add_ons: {
     mode: "extcontent",
-    extcontent_dir: "/home/deck/Ludo/roms/switch/updates",
+    extcontent_dir: "/home/deck/Ludo/roms/switch/extcontent",
     kind: "base",
     base_id: "0100152000022000",
     title_id: "0100152000022000",
-    installed_update: { title_id: "0100152000022800", version: 393216,
+    installed_update: { title_id: "0100152000022800", version: 393216, mode: "extcontent",
                         file_name: "Mario Kart 8 Deluxe [0100152000022800][v393216].nsp" },
+    updates: [
+      { title_id: "0100152000022800", version: 393216, mode: "extcontent",
+        file_name: "Mario Kart 8 Deluxe [0100152000022800][v393216].nsp" },
+      { title_id: "0100152000022800", version: 327680, mode: "extcontent",
+        file_name: "Mario Kart 8 Deluxe [0100152000022800][v327680].nsp" },
+    ],
+    update_choice: 393216,
     installed_dlc: [
-      { title_id: "0100152000023001", file_name: "Booster Course Pass [0100152000023001].nsp" },
-      { title_id: "0100152000023002", file_name: "Booster Course Pass Wave 2 [0100152000023002].nsp" },
+      { title_id: "0100152000023001", mode: "extcontent", enabled: true, toggleable: true,
+        file_name: "Booster Course Pass [0100152000023001].nsp" },
+      { title_id: "0100152000023002", mode: "extcontent", enabled: false, toggleable: true,
+        file_name: "Booster Course Pass Wave 2 [0100152000023002].nsp" },
     ],
     available: [],
-    enabled: { update: true, dlc: false },
+    server_updates: [
+      { rom_id: 42, file_id: 7, size: 1073741824,
+        file_name: "Mario Kart 8 Deluxe [0100152000022800][v262144].nsp" },
+    ],
+    server_dlc: [
+      { rom_id: 42, file_id: 8, size: 2048,
+        file_name: "Booster Course Pass Wave 3 [0100152000023003].nsp" },
+    ],
+    enabled: { update: true, dlc: true },
     mods: [{ name: "CTGP", enabled: true }, { name: "60fps", enabled: false }],
   },
   set_switch_add_on_enabled: { status: "ok" },
+  set_switch_update: { status: "ok" },
+  set_switch_dlc: { status: "ok" },
+  fetch_switch_add_on: { status: "ok", kind: "dlc", title_id: "0100152000023003", version: 0 },
+  switch_fetch_progress: {},
 };
 if (LIVE) Object.assign(FIXTURES.switch_add_ons, LIVE);
 
@@ -59,7 +81,7 @@ describe("Switch updates & DLC toggles", { skip: SKIP }, () => {
     await srv?.close();
   });
 
-  test("the Files tab offers the update and DLC toggles", async () => {
+  test("the Files tab offers the update and DLC choices", async () => {
     const r = await openRoute(browser, srv.origin, "/romm-sync-library");
     try {
       await r.activateText("Platforms");
@@ -69,9 +91,8 @@ describe("Switch updates & DLC toggles", { skip: SKIP }, () => {
 
       const p = await r.probe();
       assert.ok(p.text.toUpperCase().includes("UPDATES & DLC"), `no section: ${p.text.slice(0, 300)}`);
-      assert.ok(p.text.includes("Use update"), "no update toggle");
-      assert.ok(p.text.includes("Eden applies the installed update"), "update shown off");
-      if (!LIVE) assert.ok(p.text.includes("2 DLC installed, turned off in Eden"), "DLC shown on");
+      assert.ok(p.text.includes("[v393216] · applied by Eden"), "chosen update not named");
+      if (!LIVE) assert.ok(p.text.includes("1 of 2 DLC active in Eden · 1 more on RomM"), "DLC count wrong");
       assert.ok(p.text.includes("CTGP") && p.text.includes("Mod · active in Eden"), "no CTGP row");
       if (!LIVE) assert.ok(p.text.includes("Mod · turned off in Eden"), "disabled mod shown on");
 
@@ -81,9 +102,9 @@ describe("Switch updates & DLC toggles", { skip: SKIP }, () => {
 
       const heading = r.page.getByText("Updates & DLC", { exact: true });
       await heading.scrollIntoViewIfNeeded();
-      const shot = async (suffix) => {
+      const shot = async (suffix, target = heading.locator("xpath=../..")) => {
         if (!process.env.LUDO_SCREENSHOT) return;
-        await heading.locator("xpath=../..").screenshot({
+        await target.screenshot({
           path: process.env.LUDO_SCREENSHOT.replace(/\.png$/, `${suffix}.png`) });
       };
       await shot("-closed");
@@ -94,9 +115,40 @@ describe("Switch updates & DLC toggles", { skip: SKIP }, () => {
       assert.ok(opened.text.includes("Booster Course Pass Wave 2"), "Installed did not open");
       await shot("-open");
 
-      await r.page.getByText("Use DLC", { exact: true }).dispatchEvent("click");
+      // The update row opens a choice of version, and the game as released.
+      await r.page.getByText("Update", { exact: true }).dispatchEvent("click");
       await r.page.waitForTimeout(400);
-      assert.ok(srv.calls.includes("set_switch_add_on_enabled"), `calls: ${srv.calls.join(", ")}`);
+      const picker = await r.probe();
+      assert.ok(picker.text.toUpperCase().includes("UPDATE EDEN APPLIES"), "no update picker");
+      assert.ok(picker.text.includes("[v327680]"), "older update not offered");
+      assert.ok(picker.text.includes("[v262144] · download 1.0 GB"), "update on RomM not offered");
+      await shot("-update", r.page.getByText("Update Eden applies", { exact: true }).locator("xpath=.."));
+      await r.page.getByText("Original version (no update)", { exact: true }).dispatchEvent("click");
+      await r.page.waitForTimeout(400);
+      assert.ok(srv.calls.includes("set_switch_update"), `calls: ${srv.calls.join(", ")}`);
+
+      // The DLC row opens one switch per DLC, under one for all of them.
+      await r.page.getByText("DLC", { exact: true }).dispatchEvent("click");
+      await r.page.waitForTimeout(400);
+      const list = await r.probe();
+      assert.ok(list.text.includes("All DLC"), "no DLC list");
+      await shot("-dlc", r.page.getByText("DLC Eden loads", { exact: true }).locator("xpath=.."));
+      await r.page.getByText("Booster Course Pass Wave 2 [0100152000023002]", { exact: true })
+        .last().dispatchEvent("click");
+      await r.page.waitForTimeout(400);
+      assert.ok(srv.calls.includes("set_switch_dlc"), `calls: ${srv.calls.join(", ")}`);
+
+      // A DLC still on RomM downloads when turned on, then joins the list on.
+      const fetched = srv.calls.filter((c) => c === "set_switch_dlc").length;
+      assert.ok(list.text.includes("On RomM"), "DLC on RomM not offered");
+      await r.page.getByText("Booster Course Pass Wave 3 [0100152000023003]", { exact: true })
+        .last().dispatchEvent("click");
+      await r.page.waitForTimeout(600);
+      assert.ok(srv.calls.includes("fetch_switch_add_on"), `calls: ${srv.calls.join(", ")}`);
+      assert.equal(srv.calls.filter((c) => c === "set_switch_dlc").length, fetched + 1,
+                   "fetched DLC was not turned on");
+      await r.pressPad(PAD.CANCEL);
+      await r.page.waitForTimeout(300);
 
       const before = srv.calls.filter((c) => c === "set_switch_add_on_enabled").length;
       await r.page.getByText("CTGP", { exact: true }).dispatchEvent("click");

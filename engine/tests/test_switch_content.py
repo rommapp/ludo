@@ -286,6 +286,59 @@ def main():
         check('while the duplicate beside the game was taken away',
               rewritten.exists(), False)
 
+        # One DLC off: Eden has no per-DLC switch, so the file is renamed out
+        # of the .nsp/.xci set its folder scan keeps, and back.
+        dlc_id = '0100152000045001'
+        dlc = make_nsp(roms / f'Dlc [{dlc_id}][v0].nsp', [(NCA_A, b'D' * 10)])
+        check('a DLC installs into the folder', S.install_external(dlc, roms)['status'], 'ok')
+        live = roms / 'extcontent' / dlc.name
+        hidden = roms / 'extcontent' / (dlc.name + S.DISABLED_SUFFIX)
+        record = dict(S.read_manifest()[dlc_id], title_id=dlc_id)
+        check('turning one DLC off', S.set_file_enabled(record, False), 'ok')
+        check('renames it out of Eden\'s sight', (live.exists(), hidden.is_file()), (False, True))
+        check('and remembers what it was',
+              [r['title_id'] for r in S.disabled_for_base(record['base_id'])], [dlc_id])
+        check('turning it off twice is harmless', S.set_file_enabled(record, False), 'ok')
+        check('turning it back on', S.set_file_enabled(record, True), 'ok')
+        check('renames it back', (live.is_file(), hidden.exists()), (True, False))
+        check('and forgets it was off', S.disabled_for_base(record['base_id']), [])
+        check('a NAND copy cannot be renamed',
+              S.set_file_enabled(dict(record, mode='nand'), False), 'not-folder')
+        S.set_file_enabled(record, False)
+        check('reinstalling a DLC that was off', S.install_external(
+            make_nsp(roms / dlc.name, [(NCA_A, b'D' * 10)]), roms)['status'], 'ok')
+        check('leaves one live copy and no renamed one',
+              (live.is_file(), hidden.exists(), S.disabled_for_base(record['base_id'])),
+              (True, False, []))
+        stray = roms / 'extcontent' / ('Mine.nsp' + S.DISABLED_SUFFIX)
+        stray.write_bytes(b'the user\'s')
+        S._drop_disabled_twin(roms / 'extcontent' / 'Mine.nsp')
+        check('a .disabled file Ludo did not rename is left alone', stray.is_file(), True)
+        S.set_file_enabled(dict(record, enabled=True, toggleable=True), False)
+        check('only the record\'s own fields are kept',
+              sorted(S.read_disabled()[str(hidden)]),
+              ['base_id', 'file_name', 'kind', 'mode', 'path', 'title_id', 'version'])
+        S.uninstall(dlc_id)
+        check('uninstalling a DLC that was off removes the renamed file',
+              (live.exists(), hidden.exists()), (False, False))
+
+        # An older update fetched on purpose sits beside the installed one, so
+        # Eden can be told which to apply, instead of replacing it.
+        older = make_nsp(roms / f'Ext [{ext_id}][v131072].nsp', [(NCA_A, b'H' * 10)])
+        placed = S.place_external(older, roms)
+        check('an older update is placed in the folder',
+              placed, roms / 'extcontent' / older.name)
+        check('beside the installed one, which stays',
+              sorted(p.name for p in (roms / 'extcontent').iterdir()
+                     if p.name.startswith('Ext ')),
+              [f'Ext [{ext_id}][v131072].nsp', f'Ext [{ext_id}][v196608].nsp'])
+        check('and the manifest still names the installed one',
+              S.installed_version(ext_id), 196608)
+        again = make_nsp(roms / older.name, [(NCA_A, b'H' * 10)])
+        check('placing it twice keeps one copy',
+              (S.place_external(again, roms), again.exists()),
+              (roms / 'extcontent' / older.name, False))
+
         compressed_id = '0100152000045800'
         (roms / f'Ext [{compressed_id}][v0].nsz').write_bytes(b'compressed')
         check('a compressed add-on is refused here too: Eden cannot read it',

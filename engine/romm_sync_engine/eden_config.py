@@ -546,18 +546,15 @@ def mods_for(title_id, extra_config_dir=None):
     return [{'name': n, 'enabled': n not in disabled} for n in names]
 
 
-def set_add_on_enabled(title_id, kind, enabled, extra_config_dir=None, name=None):
-    """Turn a base title's update, DLC or one mod on or off in Eden.
+def _rewrite_disabled(title_id, change, extra_config_dir=None):
+    """Apply ``change`` to a base title's disabled list in Eden's config.
 
-    ``kind`` is 'update', 'dlc' or 'mod'; a mod also needs its folder ``name``. Returns the same statuses as
-    register_external_content_dir: 'ok', 'no-config', 'running', 'failed' --
-    and 'running' for the same reason: Eden rewrites the whole file on exit.
-    Names Eden or the user set for anything else (mods, cheats) are kept.
+    ``change`` maps the current list of names to the new one. Returns
+    register_external_content_dir's statuses: 'ok', 'no-config', 'running',
+    'failed' -- 'running' for the same reason, as Eden rewrites the whole file
+    on exit. Names Eden or the user set for anything else are the caller's to
+    keep, which every ``change`` here does.
     """
-    if kind not in ('update', 'dlc', 'mod'):
-        raise ValueError(f"unknown add-on kind: {kind!r}")
-    if kind == 'mod' and not name:
-        raise ValueError("a mod needs its folder name")
     path = config_path(extra_config_dir)
     if path is None:
         return 'no-config'
@@ -580,13 +577,7 @@ def set_add_on_enabled(title_id, kind, enabled, extra_config_dir=None, name=None
 
     key = _title_key(title_id)
     current = table.get(key, [])
-    if kind == 'update':
-        kept = [n for n in current if n not in _UPDATE_OFF and not n.startswith('Update@')]
-        new = kept if enabled else kept + list(_UPDATE_OFF)
-    else:
-        entry = _DLC_OFF if kind == 'dlc' else name
-        kept = [n for n in current if n != entry]
-        new = kept if enabled else kept + [entry]
+    new = change(list(current))
     if sorted(new) == sorted(current):
         return 'ok'
     # Eden sorts each list when its own dialog saves it; matching that keeps a
@@ -616,5 +607,87 @@ def set_add_on_enabled(title_id, kind, enabled, extra_config_dir=None, name=None
     except OSError as e:
         log.warning("could not write Eden config %s: %s", path, e)
         return 'failed'
-    log.info("Eden %s for %s turned %s", name or kind, title_id, 'on' if enabled else 'off')
     return 'ok'
+
+
+def set_add_on_enabled(title_id, kind, enabled, extra_config_dir=None, name=None):
+    """Turn a base title's update, DLC or one mod on or off in Eden.
+
+    ``kind`` is 'update', 'dlc' or 'mod'; a mod also needs its folder ``name``.
+    Returns _rewrite_disabled's statuses. To choose one update among several,
+    see set_update_choice.
+    """
+    if kind not in ('update', 'dlc', 'mod'):
+        raise ValueError(f"unknown add-on kind: {kind!r}")
+    if kind == 'mod' and not name:
+        raise ValueError("a mod needs its folder name")
+
+    def change(current):
+        if kind == 'update':
+            kept = [n for n in current if n not in _UPDATE_OFF and not n.startswith('Update@')]
+            return kept if enabled else kept + list(_UPDATE_OFF)
+        entry = _DLC_OFF if kind == 'dlc' else name
+        kept = [n for n in current if n != entry]
+        return kept if enabled else kept + [entry]
+
+    status = _rewrite_disabled(title_id, change, extra_config_dir)
+    if status == 'ok':
+        log.info("Eden %s for %s turned %s", name or kind, title_id, 'on' if enabled else 'off')
+    return status
+
+
+# ---------------------------------------------------------------------------
+# Choosing which update applies
+#
+# Read against Eden's PatchManager::PatchExeFS. The external-content folders
+# can hold several versions of one update; Eden lists them newest first and
+# applies the first one not disabled, by "Update@<version>" or by the plain
+# "Update". Only when every folder version is out of the way does it fall back
+# to a NAND update, which "Update (NAND)", "Update (SDMC)" and "Update" each
+# turn off. So "use version N" is "disable every other folder version", and
+# "play the original game" is "disable all of them, NAND included".
+# ---------------------------------------------------------------------------
+
+UPDATE_NAND = 'nand'
+
+
+def selected_update(title_id, versions, nand=False, extra_config_dir=None):
+    """The update Eden will apply: a folder version, UPDATE_NAND, or None.
+
+    ``versions`` are the packed versions in the external-content folders and
+    ``nand`` whether a NAND update is installed -- Eden's config only says
+    what is disabled, so what exists has to come from the caller.
+    """
+    disabled = disabled_add_ons(title_id, extra_config_dir)
+    for version in sorted(set(versions), reverse=True):
+        if 'Update' not in disabled and f'Update@{version}' not in disabled:
+            return version
+    if nand and not any(n in disabled for n in _UPDATE_OFF):
+        return UPDATE_NAND
+    return None
+
+
+def set_update_choice(title_id, versions, choice, extra_config_dir=None):
+    """Make Eden apply ``choice``: a version in ``versions``, UPDATE_NAND or None.
+
+    Entries for versions not in ``versions`` -- turned off in Eden's dialog
+    for a file since deleted -- are left as they are. Returns
+    _rewrite_disabled's statuses.
+    """
+    versions = sorted(set(versions), reverse=True)
+    if choice is not None and choice != UPDATE_NAND and choice not in versions:
+        raise ValueError(f"no such update version: {choice!r}")
+    ours = set(_UPDATE_OFF) | {f'Update@{v}' for v in versions}
+
+    def change(current):
+        kept = [n for n in current if n not in ours]
+        off = [f'Update@{v}' for v in versions if v != choice]
+        if choice is None:
+            off += list(_UPDATE_OFF)
+        return kept + off
+
+    status = _rewrite_disabled(title_id, change, extra_config_dir)
+    if status == 'ok':
+        log.info("Eden update for %s set to %s", title_id,
+                 'none' if choice is None else choice)
+    return status
