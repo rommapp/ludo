@@ -1280,6 +1280,9 @@ STANDALONE_EMULATORS = {
 }
 
 
+_WIIU_IMAGE_SUFFIXES = ('.wua', '.wux', '.wud')
+
+
 def resolve_wiiu_rom(rom_path):
     """(launch_file, grant_root) for a Wii U title.
 
@@ -1291,6 +1294,14 @@ def resolve_wiiu_rom(rom_path):
     """
     path = Path(rom_path)
     if path.is_dir():
+        # A folder game holding a disc image or .wua at its top level: the
+        # largest one wins, as in argosy-launcher's findPrimaryRomInFolder
+        # (its tiebreak is size, with no preference between the formats).
+        images = sorted((f for f in path.iterdir()
+                         if f.is_file() and f.suffix.lower() in _WIIU_IMAGE_SUFFIXES),
+                        key=lambda f: f.stat().st_size, reverse=True)
+        if images:
+            return images[0], path
         for code in sorted(p for p in path.iterdir()
                            if p.is_dir() and p.name.lower() == 'code'):
             rpx = sorted((f for f in code.iterdir()
@@ -2443,6 +2454,37 @@ def _extract_archive(archive_path, dest_dir, on_progress=None):
     except Exception as e:
         logging.warning(f"Failed to extract {archive_path}: {e}")
     return False
+
+
+# A Wii U download is always unpacked, as in argosy-launcher (its wiiu entry in
+# ALWAYS_EXTRACT_ZIP_PLATFORMS): Cemu cannot open a .zip or a .7z, only the
+# .wua/.wux/.wud inside or an unpacked title folder.
+WIIU_SLUGS = ('wiiu', 'wii-u', 'wii_u')
+# Scene leftovers Argosy prunes after extracting (ZipExtractor.COMPANION_EXTENSIONS).
+_ARCHIVE_COMPANION_SUFFIXES = ('.m3u', '.nfo', '.sfv', '.md5', '.sha1',
+                               '.diz', '.url', '.jpg', '.jpeg')
+
+
+def _extract_wiiu_archive(archive_path, on_progress=None):
+    """Unpack a Wii U .zip/.7z into a folder named after it. (ok, message).
+
+    The folder is <archive stem> next to the archive; the archive is removed
+    only once it has unpacked, so a failure leaves the download in place.
+    resolve_wiiu_rom then picks the launch file inside the folder.
+    """
+    archive_path = Path(archive_path)
+    dest = archive_path.parent / archive_path.stem
+    if not _extract_archive(archive_path, dest, on_progress):
+        return False, (f"Downloaded {archive_path.name} but could not unpack it "
+                       "(a .7z needs 7z or py7zr); Cemu cannot open an archive")
+    for f in dest.rglob('*'):
+        if f.is_file() and f.suffix.lower() in _ARCHIVE_COMPANION_SUFFIXES:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    archive_path.unlink()
+    return True, ''
 
 
 def _sevenzip_total_size(exe, archive_path):
@@ -5318,7 +5360,15 @@ class RomMClient:
                 # single-file archives: .zip or .7z). Console ROM archives are left
                 # as-is (RetroArch loads them natively); only directory-based PC games
                 # are extracted.
-                if download_path.suffix.lower() in ('.zip', '.7z') and actual_downloaded > 0:
+                wiiu_archive = (download_path.suffix.lower() in ('.zip', '.7z')
+                                and actual_downloaded > 0
+                                and str(rom_details.get('platform_slug') or '').lower()
+                                in WIIU_SLUGS)
+                if wiiu_archive:
+                    unpacked, why = _extract_wiiu_archive(download_path)
+                    if not unpacked:
+                        return False, why
+                elif download_path.suffix.lower() in ('.zip', '.7z') and actual_downloaded > 0:
                     file_list = _archive_member_names(download_path)
 
                     # Only extract if it looks like a directory-based game
