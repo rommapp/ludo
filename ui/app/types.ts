@@ -11,4 +11,4 @@ export interface LibGroup {
   synced?: boolean; virtual?: boolean;
 }
 
-export interface LibGame { rom_id: number; name: string; platform: string | null; is_downloaded: boolean; has_cover: boolean; screenshot?: string | null; platform_slug?: string | null; is_multi_disc?: boolean; disc_count?: number; sibling_roms?: { rom_id: number; name: string }[]; region_count?: number; is_orphan?: boolean; regions?: string[]; languages?: string[]; }
+export interface LibGame { rom_id: number; name: string; platform: string | null; is_downloaded: boolean; has_cover: boolean; screenshot?: string | null; platform_slug?: string | null; is_multi_disc?: boolean; disc_count?: number; sibling_roms?: { rom_id: number; name: string; fs_name_no_ext?: string }[]; file_name?: string; region_count?: number; is_orphan?: boolean; regions?: string[]; languages?: string[]; }
