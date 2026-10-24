@@ -231,24 +231,30 @@ function regionToEmoji(region: string): string {
 
 function openRegionPicker(
   romId: number, gameName: string,
-  siblings: { rom_id: number; name: string }[],
+  siblings: { rom_id: number; name: string; fs_name_no_ext?: string }[],
   downloadedIds: Set<number>,
   lastUsedId?: number,
   onSelected?: (sibRomId: number) => void,
+  mainFile?: string,
 ) {
-  const mainEntry = { rom_id: romId, name: gameName };
+  const mainEntry = { rom_id: romId, name: gameName, file: mainFile?.replace(/\.[^.]+$/, '') };
   const sorted = [...siblings].sort((a, b) => {
     const aDl = downloadedIds.has(a.rom_id) ? 0 : 1;
     const bDl = downloadedIds.has(b.rom_id) ? 0 : 1;
     if (aDl !== bDl) return aDl - bDl;
     return a.name.localeCompare(b.name);
   });
-  const all = [mainEntry, ...sorted];
+  const all = [mainEntry, ...sorted.map((s) => ({ ...s, file: s.fs_name_no_ext }))];
+  // Versions of one game usually share its title (two Wii U formats of Terraria
+  // are both "Terraria"), so the title cannot tell the rows apart. Their file
+  // names can, and are only shown when the titles actually collide.
+  const names = all.map((e) => e.name);
+  const clash = names.some((n, i) => names.indexOf(n) !== i);
 
   showModal(
     <PickerModal title="Select region" items={all.map((entry) => ({
       key: entry.rom_id,
-      label: entry.name
+      label: (clash && entry.file ? entry.file : entry.name)
         + (entry.rom_id !== romId && !downloadedIds.has(entry.rom_id) ? ' (not downloaded)' : ''),
       active: entry.rom_id === lastUsedId,
       onSelect: () => onSelected?.(entry.rom_id),
@@ -396,7 +402,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
         if (isMultiRegion) {
           const allSiblings = game.sibling_roms || [];
           openRegionPicker(game.rom_id, game.name, allSiblings, downloadedRegionIds,
-            activeRegionId, handleRegionSelected);
+            activeRegionId, handleRegionSelected, game.file_name);
         } else {
           openDiscPicker(game.rom_id, game.name, discs, discLast, setBusy,
             () => ensureDiscs(true));
@@ -808,6 +814,9 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             display: 'flex', alignItems: 'center', gap: '4px',
             maxWidth: 'calc(100% - 14px)', overflow: 'hidden',
             opacity: focused ? 0 : 1, transition: 'opacity 0.18s ease',
+            // Faded is not gone: an invisible chip still takes the click, and this
+            // corner is where the action overlay puts Delete and Versions.
+            pointerEvents: focused ? 'none' : 'auto',
           }}>
             {([['regions', game.regions, regionToEmoji],
                ['languages', game.languages, languageToEmoji]] as const)
@@ -900,6 +909,19 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             onClick={(e: any) => { e.stopPropagation(); subPress.current = false; onOpen(game); }} className="romm-gt-btn" style={roundBtn(30, 'glass')}>
             <FaInfoCircle size={13} />
           </div>
+          {/* The picker is otherwise a gamepad hold only (OK for 500ms); this is
+              the way to it from a mouse or keyboard. Same picker, same handler. */}
+          {isMultiRegion && (
+            <div onPointerDown={() => { subPress.current = true; }}
+              onClick={(e: any) => {
+                e.stopPropagation(); subPress.current = false;
+                openRegionPicker(game.rom_id, game.name, game.sibling_roms || [],
+                  downloadedRegionIds, activeRegionId, handleRegionSelected, game.file_name);
+              }}
+              title="Versions" className="romm-gt-btn" style={roundBtn(30, 'glass')}>
+              <FaGlobe size={13} />
+            </div>
+          )}
           {dl && (
             <div onPointerDown={() => { subPress.current = true; }}
               onClick={(e: any) => { e.stopPropagation(); subPress.current = false; requestDelete(); }}
