@@ -1283,6 +1283,131 @@ STANDALONE_EMULATORS = {
 _WIIU_IMAGE_SUFFIXES = ('.wua', '.wux', '.wud')
 
 
+_WIIU_UPDATE_TID = '0005000e'
+_WIIU_DLC_TID = '0005000c'
+
+
+def _wiiu_title_id(folder):
+    """The 16-hex title id in a title folder's meta/meta.xml, or ''."""
+    import re
+    try:
+        text = (Path(folder) / 'meta' / 'meta.xml').read_text(
+            encoding='utf-8', errors='replace')
+    except OSError:
+        return ''
+    m = re.search(r'<title_id[^>]*>\s*([0-9a-fA-F]{16})\s*</title_id>', text)
+    return m.group(1).lower() if m else ''
+
+
+def find_wiiu_addons(game_folder):
+    """[(folder, kind, hi, lo)] for each update/DLC title folder under a game.
+
+    A decrypted title folder has meta/, plus code/ or content/. Its title id
+    says what it is: 0005000e is an update, 0005000c is DLC. The base game
+    (00050000) is not an add-on and is left alone.
+    """
+    out = []
+    game_folder = Path(game_folder)
+    if not game_folder.is_dir():
+        return out
+    for meta in game_folder.rglob('meta.xml'):
+        folder = meta.parent.parent
+        if meta.parent.name.lower() != 'meta':
+            continue
+        if not ((folder / 'code').is_dir() or (folder / 'content').is_dir()):
+            continue
+        tid = _wiiu_title_id(folder)
+        if len(tid) != 16 or tid[:8] not in (_WIIU_UPDATE_TID, _WIIU_DLC_TID):
+            continue
+        out.append((folder, 'update' if tid[:8] == _WIIU_UPDATE_TID else 'dlc',
+                    tid[:8], tid[8:]))
+    return out
+
+
+def cemu_mlc_dirs(executable=''):
+    """Cemu's mlc01 folders worth looking at, best guess first.
+
+    The flatpak keeps its data under ~/.var/app, an AppImage under the XDG
+    data dir. A `mlc_path` set in Cemu's own settings.xml wins for that build.
+    """
+    import re
+    home = Path(os.path.expanduser('~'))
+    xdg_data = Path(os.environ.get('XDG_DATA_HOME') or home / '.local/share')
+    xdg_conf = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config')
+    builds = {
+        'flatpak': (home / '.var/app/info.cemu.Cemu/data/Cemu',
+                    home / '.var/app/info.cemu.Cemu/config/Cemu'),
+        'appimage': (xdg_data / 'Cemu', xdg_conf / 'Cemu'),
+    }
+    order = ['flatpak', 'appimage'] if str(executable).startswith('flatpak:') \
+        else ['appimage', 'flatpak']
+    dirs = []
+    for name in order:
+        data, conf = builds[name]
+        mlc = data / 'mlc01'
+        try:
+            m = re.search(r'<mlc_path>([^<]+)</mlc_path>',
+                          (conf / 'settings.xml').read_text(errors='replace'))
+            if m and m.group(1).strip():
+                mlc = Path(m.group(1).strip())
+        except OSError:
+            pass
+        dirs.append(mlc)
+    return dirs
+
+
+def _same_meta(a, b):
+    try:
+        return (Path(a) / 'meta' / 'meta.xml').read_bytes() == \
+            (Path(b) / 'meta' / 'meta.xml').read_bytes()
+    except OSError:
+        return False
+
+
+def install_wiiu_addons(game_folder, mlc_dir):
+    """Put a game's update and DLC into Cemu's mlc so Cemu applies them.
+
+    Cemu matches add-ons to the base game by title id out of the titles it
+    scans, and always scans mlc01/usr/title; so copying a decrypted add-on to
+    usr/title/<0005000e|0005000c>/<low id> is all an install is. Returns the
+    folders installed this call. Anything already there and identical is left.
+    """
+    installed = []
+    mlc_dir = Path(mlc_dir)
+    for folder, kind, hi, lo in find_wiiu_addons(game_folder):
+        dest = mlc_dir / 'usr' / 'title' / hi / lo
+        if dest.is_dir() and _same_meta(folder, dest):
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(folder, dest)
+            installed.append(dest)
+            logging.info(f"Cemu: installed {kind} {hi}/{lo} from {folder}")
+        except OSError as e:
+            logging.warning(f"Cemu: could not install {kind} {hi}/{lo}: {e}")
+    return installed
+
+
+def remove_wiiu_addons(game_folder, mlc_dir):
+    """Take back what install_wiiu_addons put in mlc.
+
+    Only a copy that still matches the game's own add-on is removed, so an
+    update or DLC the user installed themselves is never touched.
+    """
+    removed = []
+    for folder, kind, hi, lo in find_wiiu_addons(game_folder):
+        dest = Path(mlc_dir) / 'usr' / 'title' / hi / lo
+        if dest.is_dir() and _same_meta(folder, dest):
+            try:
+                shutil.rmtree(dest)
+                removed.append(dest)
+            except OSError as e:
+                logging.warning(f"Cemu: could not remove {dest}: {e}")
+    return removed
+
+
 def resolve_wiiu_rom(rom_path):
     """(launch_file, grant_root) for a Wii U title.
 
@@ -8851,6 +8976,15 @@ class RetroArchInterface:
         grant_root = Path(rom_path).parent
         if spec.get('resolve_rom') == 'wiiu':
             rom_path, grant_root = resolve_wiiu_rom(rom_path)
+            # Cemu applies updates and DLC it finds in its own mlc, so the
+            # game's are put there before it starts.
+            try:
+                # A lone image in the platform folder has no folder of its own,
+                # and that folder holds other games' add-ons.
+                if Path(grant_root).name.lower() not in WIIU_SLUGS + ('wii u',):
+                    install_wiiu_addons(grant_root, cemu_mlc_dirs(executable)[0])
+            except Exception as e:
+                logging.warning(f"Cemu add-on install skipped: {e}")
         args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
         if executable.startswith('flatpak:'):
             # The sandbox can't see a ROM outside the paths its manifest grants

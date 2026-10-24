@@ -73,7 +73,7 @@ try:
         platform_folder_candidates,
         flatpak_app_installed,
         STANDALONE_EMULATORS, find_standalone_builds,
-        _extract_archive, _archive_member_names, WIIU_SLUGS, resolve_wiiu_rom,
+        _extract_archive, _archive_member_names, WIIU_SLUGS, resolve_wiiu_rom, cemu_mlc_dirs, remove_wiiu_addons,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
         push_notification as _push_notification,
@@ -10147,6 +10147,13 @@ class LudoBackend:
                 return {'success': True, 'deleted_saves': removed_saves,
                         'message': 'Deleted' if (removed or removed_saves)
                                    else 'Nothing to delete'}
+            if g and str(g.get('platform_slug') or '').lower() in WIIU_SLUGS and target.is_dir():
+                # Take back the update/DLC put into Cemu's mlc for this game.
+                try:
+                    for mlc in cemu_mlc_dirs(''):
+                        remove_wiiu_addons(target, mlc)
+                except Exception as e:
+                    logging.warning(f"could not remove Wii U add-ons: {e}")
             if target.is_file():
                 target.unlink()
             else:
