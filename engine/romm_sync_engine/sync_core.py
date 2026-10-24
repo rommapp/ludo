@@ -2710,6 +2710,58 @@ NON_GAME_FILE_CATEGORIES = frozenset({
 })
 
 
+# Which of a folder game's file categories a download takes, as argosy's
+# DownloadDefaults.FACTORY has it. `game` is always taken; manuals and
+# walkthroughs ride along; `other` covers files RomM left uncategorised below
+# the top level.
+FILE_CATEGORY_DEFAULTS = {
+    'update': True, 'dlc': True, 'patch': True, 'translation': True,
+    'mod': False, 'hack': False, 'demo': False, 'prototype': False,
+    'cheat': False, 'manual': True, 'walkthrough': True,
+    'soundtrack': False, 'screenshot': False, 'other': False,
+}
+_FILE_CATEGORY_COMPANIONS = ('.nfo', '.sfv', '.md5', '.sha1', '.diz', '.url',
+                             '.jpg', '.jpeg', '.txt')
+
+
+def select_download_files(files, defaults=None):
+    """File ids of a folder game to download, or None for all of them.
+
+    Argosy's resolveSelection: a `game` file is always taken; an uncategorised
+    file at the top level is content unless it is a companion note; any other
+    file follows its category's default (uncategorised ones follow `other`).
+    None when everything is selected or nothing would be.
+    """
+    files = [f for f in (files or []) if f.get('id') is not None]
+    if len(files) <= 1:
+        return None
+    table = dict(FILE_CATEGORY_DEFAULTS)
+    table.update({k: bool(v) for k, v in (defaults or {}).items()})
+
+    def depth_len(f):
+        return len(str(f.get('file_path') or ''))
+
+    root_len = min(depth_len(f) for f in files)
+    picked = []
+    for f in files:
+        cat = str(f.get('category') or '').lower() or None
+        name = str(f.get('file_name') or '').lower()
+        if cat == 'game':
+            take = True
+        elif cat is None and depth_len(f) == root_len and \
+                not name.endswith(_FILE_CATEGORY_COMPANIONS):
+            take = True
+        elif cat is None:
+            take = table.get('other', False)
+        else:
+            take = table.get(cat, False)
+        if take:
+            picked.append(f['id'])
+    if len(picked) == len(files) or not picked:
+        return None
+    return picked
+
+
 def game_files(rom):
     """A ROM's files, with the documents and media filtered out.
 
@@ -2974,6 +3026,8 @@ class RomMClient:
     
     def __init__(self, base_url, username=None, password=None, client_token=None):
         self.base_url = base_url.rstrip('/')
+        # Per-category choices for a folder game's files; None = factory.
+        self.file_category_defaults = None
         self.session = requests.Session()
         self.authenticated = False
         self.client_token = None  # RomM Client API Token (rmm_...) if used
@@ -5148,6 +5202,24 @@ class RomMClient:
                     if only:
                         file_ids = [only]
 
+            # A Wii U folder game carries its updates and DLC as files; take the
+            # categories the user wants rather than always the lot.
+            selected_ids = None
+            if (is_folder and not file_ids
+                    and str(rom_details.get('platform_slug') or '').lower() in WIIU_SLUGS):
+                try:
+                    selected_ids = select_download_files(
+                        rom_details.get('files'), self.file_category_defaults)
+                except Exception:
+                    selected_ids = None
+                if selected_ids and len(selected_ids) == 1:
+                    # One file is streamed raw, not zipped: fetch it by name.
+                    only = next(f for f in rom_details['files']
+                                if f.get('id') == selected_ids[0])
+                    file_ids = [only['id']]
+                    rom_name = only.get('file_name') or rom_name
+                    selected_ids = None
+
             if is_folder:
                 folder_name = rom_details.get('fs_name', filename)
                 folder_path = download_path.parent / folder_name
@@ -5173,6 +5245,8 @@ class RomMClient:
                 encoded_filename = quote(filename)
                 api_endpoint = f'/api/roms/{rom_id}/content/{encoded_filename}'
                 params = {}
+                if selected_ids:
+                    params = {'file_ids': ','.join(str(i) for i in selected_ids)}
                 print(f"Downloading entire ROM: {filename}")
 
             full_url = urljoin(self.base_url, api_endpoint)

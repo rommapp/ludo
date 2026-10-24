@@ -73,7 +73,7 @@ try:
         platform_folder_candidates,
         flatpak_app_installed,
         STANDALONE_EMULATORS, find_standalone_builds,
-        _extract_archive, _archive_member_names, WIIU_SLUGS, resolve_wiiu_rom,
+        _extract_archive, _archive_member_names, WIIU_SLUGS, FILE_CATEGORY_DEFAULTS, resolve_wiiu_rom,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
         push_notification as _push_notification,
@@ -1744,6 +1744,7 @@ class LudoBackend:
         try:
             logging.info(f"Connecting to RomM at {url}...")
             self._romm_client = RomMClient(url, username, password, client_token=client_token or None)
+            self._romm_client.file_category_defaults = self._file_category_defaults()
             if not self._romm_client.authenticated:
                 logging.error("RomM authentication failed")
                 return False
@@ -3350,6 +3351,41 @@ class LudoBackend:
             return {'success': True, 'enabled': bool(enabled)}
         except Exception as e:
             logging.error(f"set_library_auto_update error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    _FILE_CATEGORY_KEYS = ('update', 'dlc', 'patch', 'translation', 'mod', 'hack',
+                           'demo', 'prototype', 'cheat', 'soundtrack',
+                           'screenshot', 'other')
+
+    def _file_category_defaults(self):
+        """Which file categories of a Wii U folder game a download takes."""
+        out = dict(FILE_CATEGORY_DEFAULTS)
+        raw = self._settings.get('Download', 'file_categories', '') or ''
+        for part in raw.split(','):
+            key, _, val = part.partition(':')
+            if key.strip() in self._FILE_CATEGORY_KEYS and val.strip() in ('0', '1'):
+                out[key.strip()] = val.strip() == '1'
+        return out
+
+    async def get_file_categories(self):
+        return {'success': True, 'categories': {
+            k: v for k, v in self._file_category_defaults().items()
+            if k in self._FILE_CATEGORY_KEYS}}
+
+    async def set_file_category(self, category: str, enabled: bool):
+        try:
+            if category not in self._FILE_CATEGORY_KEYS:
+                return {'success': False, 'message': 'Unknown category'}
+            cur = self._file_category_defaults()
+            cur[category] = bool(enabled)
+            self._settings.set('Download', 'file_categories', ','.join(
+                f"{k}:{1 if cur[k] else 0}" for k in self._FILE_CATEGORY_KEYS))
+            if self._romm_client:
+                self._romm_client.file_category_defaults = cur
+            return {'success': True, 'categories': {
+                k: cur[k] for k in self._FILE_CATEGORY_KEYS}}
+        except Exception as e:
+            logging.error(f"set_file_category error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
     async def get_platform_sync(self):

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, enablePlatform, refreshFromRomm, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, getScreenshotMode, setScreenshotModeRpc, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
+import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, enablePlatform, refreshFromRomm, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getFileCategories, setFileCategory, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, getScreenshotMode, setScreenshotModeRpc, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
 import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel, V2CardRow, RSwitchTrack} from "../kit";
 import { V2, fmtAgo, fmtBytes } from "../theme";
 import { FaBell, FaBookmark, FaBug, FaCameraRetro, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaLayerGroup, FaPlay, FaRedo, FaRegWindowMaximize, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaWifi, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
@@ -675,6 +675,29 @@ export function SettingsPage() {
       })
       .catch(() => { /* keep the default */ });
   }, []);
+  // Which kinds of file a Wii U folder game downloads (argosy's per-category
+  // defaults): updates and DLC are on, mods and hacks off.
+  const FILE_CATEGORY_LABELS: [string, string][] = [
+    ['update', 'Updates'], ['dlc', 'DLC'], ['patch', 'Versions / patches'],
+    ['translation', 'Translations'], ['mod', 'Mods'], ['hack', 'Hacks'],
+    ['demo', 'Demos'], ['prototype', 'Prototypes'], ['cheat', 'Cheats'],
+    ['soundtrack', 'Soundtracks'], ['screenshot', 'Screenshots'], ['other', 'Other files'],
+  ];
+  const [fileCats, setFileCats] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    getFileCategories()
+      .then((r) => { if (r?.success) setFileCats(r.categories || {}); })
+      .catch(() => { /* keep empty */ });
+  }, []);
+  const handleFileCatToggle = async (key: string, enabled: boolean) => {
+    setFileCats((c) => ({ ...c, [key]: enabled }));
+    try {
+      const r = await setFileCategory(key, enabled);
+      if (r && r.success === false) throw new Error(r.message || 'failed');
+    } catch {
+      setFileCats((c) => ({ ...c, [key]: !enabled }));
+    }
+  };
   const [showVirtual, setShowVirtual] = useState<boolean>(_settingsToggles.showVirtual ?? true);
   useEffect(() => {
     getVirtualCollectionsVisible()
@@ -1263,6 +1286,28 @@ export function SettingsPage() {
             onClick={() => libNavigate("/romm-sync-platforms")}
             right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
           />
+        </div>
+      </V2SettingsSection>
+
+      <V2SettingsSection title="Wii U downloads">
+        <div style={{
+          display: 'flex', flexDirection: 'column',
+          borderRadius: V2.radiusCard, background: V2.surface,
+          border: `1px solid ${V2.border}`, overflow: 'hidden',
+        }}>
+          {FILE_CATEGORY_LABELS.map(([key, label], i) => (
+            <V2CardRow
+              key={key}
+              first={i === 0}
+              divider={i > 0}
+              last={i === FILE_CATEGORY_LABELS.length - 1}
+              icon={<FaDownload size={16} />}
+              title={label}
+              subtitle={i === 0 ? 'Which files of a Wii U game to download with it.' : undefined}
+              onClick={() => handleFileCatToggle(key, !(fileCats[key] ?? false))}
+              right={<V2Switch checked={!!fileCats[key]} />}
+            />
+          ))}
         </div>
       </V2SettingsSection>
 
