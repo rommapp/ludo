@@ -7,6 +7,7 @@ Cemu-<ver>-x86_64.AppImage, so every behaviour is asserted for each.
 """
 
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -16,10 +17,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from romm_sync_engine import sync_core  # noqa: E402
 from romm_sync_engine.sync_core import (  # noqa: E402
     RetroArchInterface, STANDALONE_EMULATORS, find_standalone_builds,
-    find_standalone_executable, resolve_wiiu_rom,
+    _extract_wiiu_archive, _find_7z, find_standalone_executable,
+    resolve_wiiu_rom,
     standalone_emulator_for_platform)
 
 FAILED = []
+# main() stubs shutil.which and HOME for the whole run; the .7z case needs the real ones.
+_REAL_WHICH = shutil.which
+_REAL_HOME = os.environ.get('HOME', '')
 
 
 def check(name, got, want):
@@ -134,6 +139,57 @@ def main():
         empty = game_dir / 'Empty'
         empty.mkdir()
         check('no rpx -> folder itself', resolve_wiiu_rom(empty), (empty, empty))
+
+        # --- folder game with disc images at the top: largest wins (Argosy) --
+        t3 = game_dir / 'Terraria'
+        small = touch(t3 / 'Terraria.wua', size=10)
+        big = touch(t3 / 'Terraria.wux', size=100)
+        touch(t3 / 'readme.txt', size=1000)
+        check('folder with wua+wux -> largest image', resolve_wiiu_rom(t3), (big, t3))
+        big.unlink()
+        check('folder with only wua -> the wua', resolve_wiiu_rom(t3), (small, t3))
+
+        # --- a downloaded .zip/.7z is always unpacked (Argosy: always-extract) --
+        import subprocess
+        import zipfile
+        src = Path(tmp) / 'src'
+        touch(src / 'Terraria.wua', size=10)
+        touch(src / 'Terraria.wux', size=100)
+        touch(src / 'Terraria.nfo')
+        touch(src / 'cover.jpg')
+        touch(src / 'notes.txt')
+        archives = []
+        zpath = game_dir / 'Zipped.zip'
+        with zipfile.ZipFile(zpath, 'w') as zf:
+            for f in sorted(src.iterdir()):
+                zf.write(f, f.name)
+        archives.append(zpath)
+        stub_which, stub_home = sync_core.shutil.which, os.environ['HOME']
+        sync_core.shutil.which, os.environ['HOME'] = _REAL_WHICH, _REAL_HOME
+        exe7 = _find_7z()
+        if exe7:
+            spath = game_dir / 'Sevenzipped.7z'
+            subprocess.run([exe7, 'a', str(spath), *map(str, sorted(src.iterdir()))],
+                           check=True, capture_output=True)
+            archives.append(spath)
+        else:
+            print('skip  .7z case: no 7z binary on this machine')
+        for arc in archives:
+            ok, why = _extract_wiiu_archive(arc)
+            folder = arc.parent / arc.stem
+            check(f'{arc.suffix} unpacked ok', (ok, why), (True, ''))
+            check(f'{arc.suffix} archive removed', arc.exists(), False)
+            check(f'{arc.suffix} companions pruned, rest kept',
+                  sorted(p.name for p in folder.iterdir()),
+                  ['Terraria.wua', 'Terraria.wux', 'notes.txt'])
+            check(f'{arc.suffix} launches the largest image',
+                  resolve_wiiu_rom(folder), (folder / 'Terraria.wux', folder))
+        sync_core.shutil.which, os.environ['HOME'] = stub_which, stub_home
+        bad = game_dir / 'Broken.zip'
+        bad.write_bytes(b'not an archive')
+        ok, _ = _extract_wiiu_archive(bad)
+        check('corrupt archive reports failure', ok, False)
+        check('corrupt archive left in place', bad.exists(), True)
 
         # --- Eden is untouched by the new resolver ---------------------------
         nsp = touch(home / 'Ludo' / 'roms' / 'switch' / 'g.nsp')
