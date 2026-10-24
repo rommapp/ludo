@@ -5311,6 +5311,11 @@ class RomMClient:
                 # and the truncated file failed in the emulator instead of
                 # here. A partial must not be able to impersonate a ROM.
                 partial_path = download_path.with_name(download_path.name + '.part')
+                if download_path.is_dir():
+                    # Another version of this game unpacked under the same name.
+                    # Replace it, as argosy does on promote: the rename below
+                    # cannot land on a folder.
+                    shutil.rmtree(download_path, ignore_errors=True)
                 with open(partial_path, 'wb') as f:
                     _seen = {'n': 0}
 
@@ -5365,7 +5370,10 @@ class RomMClient:
                                 and str(rom_details.get('platform_slug') or '').lower()
                                 in WIIU_SLUGS)
                 if wiiu_archive:
-                    unpacked, why = _extract_wiiu_archive(download_path)
+                    def _unpack_pct(pct):
+                        if progress_callback:
+                            progress_callback({'extracting': pct})
+                    unpacked, why = _extract_wiiu_archive(download_path, _unpack_pct)
                     if not unpacked:
                         return False, why
                 elif download_path.suffix.lower() in ('.zip', '.7z') and actual_downloaded > 0:

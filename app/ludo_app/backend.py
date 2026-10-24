@@ -9798,6 +9798,14 @@ class LudoBackend:
             def _worker():
                 def _on_progress(info):
                     try:
+                        if info.get('extracting') is not None:
+                            # Unpacking after the transfer (a Wii U archive).
+                            self._download_progress[rom_id] = {
+                                'percent': int(info['extracting']), 'downloaded': 0,
+                                'total': 0, 'speed': 0, 'eta': 0,
+                                'state': 'extracting', 'message': 'Extracting…',
+                            }
+                            return
                         prog = info.get('progress')  # 0..1
                         self._download_progress[rom_id] = {
                             'percent': int(round((prog or 0) * 100)),

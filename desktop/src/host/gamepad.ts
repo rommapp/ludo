@@ -1307,6 +1307,7 @@ export function startGamepad() {
   // Whether the OK press matching the next OK release was seen here — see the
   // release branch of button().
   let okPressSeen = false;
+  let okPressTarget: Element | null = null;
   // The focused element at the moment the window went to the background, so it
   // can be restored when we come back (see the focus listener below).
   let focusBeforeBlur: HTMLElement | null = null;
@@ -1344,7 +1345,7 @@ export function startGamepad() {
       // PRESS even though activation happens on release: the click feedback has
       // to be immediate, and sound.ts's dedupe absorbs the synthetic .click()
       // that follows.
-      if (id === GamepadButtonId.OK) { playSound("activate"); okPressSeen = true; }
+      if (id === GamepadButtonId.OK) { playSound("activate"); okPressSeen = true; okPressTarget = document.activeElement; }
       const claimed = routeButton("down", id, false,
         id === GamepadButtonId.OK ? undefined : dedicatedFor(id));
       // B only sounds when it actually took the user somewhere. It can't be
@@ -1362,8 +1363,11 @@ export function startGamepad() {
         // a tap: it can be the tail of a press that belonged to something else
         // (a game we just quit, an alt-tabbed window), and activating on it
         // fires whatever happens to hold focus here.
-        const tap = okPressSeen;
+        // Nor when focus moved while A was down: a hold that opened a picker
+        // puts focus on its first option, and the release would pick it.
+        const tap = okPressSeen && document.activeElement === okPressTarget;
         okPressSeen = false;
+        okPressTarget = null;
         if (tap) (document.activeElement as HTMLElement | null)?.click();
       }
     }
