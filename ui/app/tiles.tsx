@@ -404,6 +404,14 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
   // multi-game OK handlers below run on the PARENT and aren't stopped by the
   // child's stopPropagation, so without this a tap on Details would also launch.
   const subPress = useRef(false);
+  const openVersions = () => {
+    if (isMultiRegion) {
+      void showRegionPicker();
+    } else {
+      openDiscPicker(game.rom_id, game.name, discs, discLast, setBusy,
+        () => ensureDiscs(true));
+    }
+  };
   const onBtnDown = (e: any) => {
     if (subPress.current) return;
     if (e?.detail?.button === GamepadButton.OK && isMulti) {
@@ -412,12 +420,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       pressTimer.current = setTimeout(() => {
         longFired.current = true;
         pressTimer.current = null;
-        if (isMultiRegion) {
-          void showRegionPicker();
-        } else {
-          openDiscPicker(game.rom_id, game.name, discs, discLast, setBusy,
-            () => ensureDiscs(true));
-        }
+        openVersions();
       }, 500);
     }
   };
@@ -654,8 +657,28 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
         if (typeof e?.detail === 'number' && e.detail > 0) { onOpen(game); return; }
         // Multi games drive launch from the release handler (onBtnUp) so a hold
         // can open the picker without the press-edge activation launching first.
-        // The keyboard's Enter has no release handler behind it, so it acts here.
-        if (isMulti && e?.type === 'keydown') { primary(); return; }
+        // The keyboard has no onButtonUp behind it, so Enter / Space follows the
+        // same tap-or-hold split on its own key release.
+        if (isMulti && e?.type === 'keydown') {
+          if (e.repeat || pressTimer.current) return;
+          const key = e.key;
+          longFired.current = false;
+          const onKeyUp = (ke: KeyboardEvent) => {
+            if (ke.key !== key) return;
+            window.removeEventListener('keyup', onKeyUp, true);
+            if (pressTimer.current) {
+              clearTimeout(pressTimer.current); pressTimer.current = null;
+              if (!longFired.current) primary();
+            }
+          };
+          window.addEventListener('keyup', onKeyUp, true);
+          pressTimer.current = setTimeout(() => {
+            longFired.current = true;
+            pressTimer.current = null;
+            openVersions();
+          }, 500);
+          return;
+        }
         if (isMulti) { longFired.current = false; return; }
         primary();
       }}
