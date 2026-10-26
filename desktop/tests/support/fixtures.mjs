@@ -126,6 +126,30 @@ const GAME = {
 };
 
 export const POPULATED_FIXTURES = {
+  // Two standalone emulators beside RetroDECK, so the Emulators page has rows.
+  get_emulator_status: {
+    success: true, installed: true, kind: "retrodeck",
+    executable: "flatpak run net.retrodeck.retrodeck", core_count: 243,
+    standalone: [
+      { key: "eden", name: "Eden", installed: true, executable: "/home/t/AppImages/eden.AppImage", platforms: ["switch"] },
+      { key: "cemu", name: "Cemu", installed: true, executable: "flatpak:info.cemu.Cemu", platforms: ["wii u"] },
+    ],
+    stale_paths: [], save_dirs: {}, bios_dir: "/home/t/bios",
+    configured_paths: {}, default_paths: {}, expected_paths: {},
+  },
+  // Enough activity that the Settings page grows as it loads: rows above the
+  // ones under test arrive late, which is what a position-based focus memory
+  // gets wrong.
+  get_recent_activity: {
+    events: Array.from({ length: 10 }, (_, i) => ({
+      kind: "save", title: `Save sync — Game ${i}`, detail: "1 save uploaded",
+      timestamp: 1792449790 + i * 1000,
+    })),
+  },
+  list_emulator_builds: {
+    success: true, name: "Eden", selected: "",
+    builds: [{ path: "/home/t/AppImages/eden.AppImage", label: "Eden", kind: "appimage", current: true }],
+  },
   get_core_mappings: {
     success: true,
     available_cores: ["genesis_plus_gx", "snes9x"],

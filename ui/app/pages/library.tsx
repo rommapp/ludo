@@ -18,6 +18,7 @@ import { GameDetailPage } from "./game";
 import { SettingsPage } from "./settings";
 import { StatsPage } from "./stats";
 import { CoresPage } from "./cores";
+import { EmulatorsPage } from "./emulators";
 import { BiosPage } from "./bios";
 import { DownloadsPage } from "./downloads";
 import { PlatformsPage } from "./platforms";
@@ -1314,18 +1315,65 @@ export function InstallsRepairBanner({ status }: { status: any }) {
 // stacks the inner pages (game grid, game detail, settings family) on top as
 // internal views, so backing out of any of them re-shows the still-mounted
 // tabs tree instead of rebuilding it (see the LibView comment above).
+// What a focusable says, for recognising it again after its page is rebuilt.
+const rowText = (el: Element) => ((el as HTMLElement).innerText || '').replace(/\s+/g, ' ').trim();
+
 export function LibraryRootPage() {
   const [stack, setStack] = useState<LibView[]>([]);
   const viewRef = useRef<HTMLDivElement | null>(null);
   // The game whose detail page is on top, so backing out lands on its tile.
   const returnRomId = useRef<number | null>(null);
+  // Which row had focus in the view a push covered, so backing out lands on it
+  // rather than on the page's first row. A view is rebuilt when it comes back,
+  // so the row is recognised by what it says (its text, and which of the rows
+  // saying that it is) — NOT by its position: a page fills in as it loads, rows
+  // above this one arriving late, and a position then points at a different row
+  // for a moment before the right one exists. One entry per pushed view, popped
+  // with it.
+  type FocusSig = { text: string; nth: number };
+  const sigOf = (el: Element, host: HTMLElement): FocusSig => {
+    const text = rowText(el);
+    const same = Array.from(host.querySelectorAll('[tabindex]')).filter((e) => rowText(e) === text);
+    return { text, nth: Math.max(0, same.indexOf(el)) };
+  };
+  const findSig = (sig: FocusSig): HTMLElement | null => {
+    const host = viewRef.current;
+    if (!host) return null;
+    const same = Array.from(host.querySelectorAll('[tabindex]')).filter((e) => rowText(e) === sig.text);
+    return (same[sig.nth] as HTMLElement) ?? null;
+  };
+  const stackRef = useRef<LibView[]>([]);
+  const savedFocus = useRef<({ sig: FocusSig | null; scroll: number })[]>([]);
+  const restoreSig = useRef<FocusSig | null>(null);
+  // The page's scroll position goes with it. Rebuilt at the top and then
+  // scrolled to the focused row a moment later, the page visibly jumps.
+  const restoreScroll = useRef<number | null>(null);
+  const scroller = () => viewRef.current?.querySelector('.romm-ui') as HTMLElement | null;
   useEffect(() => {
     setLibViewHooks(
       (v) => {
         if (v === 'game') returnRomId.current = getLibGameHolder()?.rom_id ?? null;
+        const host = viewRef.current;
+        const cur = _gpFocusEl();
+        savedFocus.current.push({
+          sig: host && cur && host.contains(cur) && rowText(cur) ? sigOf(cur, host) : null,
+          scroll: scroller()?.scrollTop ?? 0,
+        });
         setStack((s) => [...s, v]);
       },
-      () => setStack((s) => {
+      () => {
+        const { sig: saved, scroll } = savedFocus.current.pop() ?? { sig: null, scroll: 0 };
+        // Only between pages like Settings and what it opens: the tabs below
+        // manage their own focus, and a grid and its game have a tile to land on.
+        const st = stackRef.current;
+        const beneath = st[st.length - 2];
+        if (beneath && beneath !== 'grid' && st[st.length - 1] !== 'game' && saved != null) {
+          restoreSig.current = saved;
+          restoreScroll.current = scroll;
+          // Pages that autofocus on mount aim at this instead of their first item.
+          setReturnFocusTarget(() => findSig(saved), null, 1000);
+        } else { restoreSig.current = null; restoreScroll.current = null; }
+        setStack((s) => {
         // Backing out of a game page: the view underneath re-runs its
         // first-item autofocus (a grid remounts outright). Point that at the
         // game the user opened, if its tile is on screen, for the autofocus
@@ -1336,7 +1384,8 @@ export function LibraryRootPage() {
           setReturnFocusTarget(() => tileElFor(romId), romId, 1000);
         }
         return s.slice(0, -1);
-      }),
+      });
+      },
     );
     return () => setLibViewHooks(null, null);
   }, []);
@@ -1356,6 +1405,16 @@ export function LibraryRootPage() {
       } catch { /* ignore */ }
     })();
   }, []);
+  stackRef.current = stack;
+  // Before the first paint of the uncovered view: it is at the saved scroll
+  // from its first frame, not at the top for one and then jumping.
+  useLayoutEffect(() => {
+    const y = restoreScroll.current;
+    if (y == null) return;
+    restoreScroll.current = null;
+    const el = scroller();
+    if (el) el.scrollTop = y;
+  }, [stack]);
   const top = stack.length ? stack[stack.length - 1] : null;
 
   // An internally pushed view gets no route-change focus pass from Steam (that
@@ -1366,6 +1425,35 @@ export function LibraryRootPage() {
   // on the first item, exactly what a route remount used to do.
   useEffect(() => {
     if (!top) return;
+    const back = restoreSig.current;
+    if (back) {
+      // Coming back: wait for the row to exist and put focus on it, and on
+      // nothing else meanwhile — a stand-in row would flash its highlight. The
+      // page's own autofocus can still land on its first item until ~320ms, so
+      // focus is held on the row until then; after that it is the user's.
+      const t0 = Date.now();
+      let got = false;
+      const iv = setInterval(() => {
+        try {
+          const age = Date.now() - t0;
+          const target = findSig(back);
+          if (target && (age < 400 || !got) && _gpFocusEl() !== target) _forceGamepadFocus(target);
+          if (target) got = true;
+          if (age >= 400 && got) { clearInterval(iv); return; }
+          if (age > 1500) {
+            clearInterval(iv);
+            // The row never came back (it is gone): fall back to the first one.
+            const host = viewRef.current;
+            const cur = _gpFocusEl();
+            if (host && !(cur && host.contains(cur))) {
+              const first = host.querySelector('[tabindex]') as HTMLElement | null;
+              if (first) _forceGamepadFocus(first);
+            }
+          }
+        } catch { /* ignore */ }
+      }, 16);
+      return () => clearInterval(iv);
+    }
     const timers = [80, 240, 500].map((d) => setTimeout(() => {
       try {
         const host = viewRef.current;
@@ -1395,6 +1483,7 @@ export function LibraryRootPage() {
           {top === 'settings' && <SettingsPage />}
           {top === 'stats' && <StatsPage />}
           {top === 'cores' && <CoresPage />}
+          {top === 'emulators' && <EmulatorsPage />}
           {top === 'bios' && <BiosPage />}
           {top === 'downloads' && <DownloadsPage />}
           {top === 'platforms' && <PlatformsPage />}

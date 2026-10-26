@@ -43,7 +43,7 @@ let _returnFocusExpiry: any = null;
 /** Aim autofocus at `fn`'s element for `ms`. A new target replaces the old one
  *  and its expiry: going back again within the window must not have the
  *  previous back's timer clear this one partway through. */
-export function setReturnFocusTarget(fn: () => any, romId: number, ms: number) {
+export function setReturnFocusTarget(fn: () => any, romId: number | null, ms: number) {
   clearTimeout(_returnFocusExpiry);
   _returnFocusTarget = fn;
   _returnFocusRomId = romId;
