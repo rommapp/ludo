@@ -17699,6 +17699,11 @@ class AutoSyncManager:
                                         _fp = final_path.stat()
                                         _auto_sync.last_uploaded[str(final_path)] = (_fp.st_size, _fp.st_mtime)
                                         _auto_sync.upload_debounce[str(final_path)] = time.time() + 30
+                                        # On disk too: kept only in memory, the next start
+                                        # reads the old fingerprint, calls this state changed
+                                        # and uploads it, and the server's newer copy comes
+                                        # back down on the start after that.
+                                        _auto_sync._save_upload_fingerprints()
                                     # Notification sent once at end of sync (see summary block below)
 
                                     # Download screenshot if available
