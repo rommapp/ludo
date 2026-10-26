@@ -11,7 +11,7 @@ import { _libGamesCache, libCacheSetDownloaded, _focusedPlatform, _setFocusedPla
 import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImageBg } from "./media";
 import { PlatformIcon, ProgressRing, UserMenuRow, MODAL_SCRIM_INSET, PickerModal, ToastCover} from "./kit";
-import { FaBookmark, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
+import { FaBookmark, FaBoxOpen, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
 import { _broadcastLibRefresh } from "./events";
 import { MdFlashOn } from "react-icons/md";
 import { _forceGamepadFocus } from "./shell";
@@ -231,25 +231,32 @@ function regionToEmoji(region: string): string {
 
 function openRegionPicker(
   romId: number, gameName: string,
-  siblings: { rom_id: number; name: string }[],
+  siblings: { rom_id: number; name: string; fs_name_no_ext?: string }[],
   downloadedIds: Set<number>,
   lastUsedId?: number,
   onSelected?: (sibRomId: number) => void,
+  mainFile?: string,
+  mainDownloaded?: boolean,
 ) {
-  const mainEntry = { rom_id: romId, name: gameName };
+  const mainEntry = { rom_id: romId, name: gameName, file: mainFile?.replace(/\.[^.]+$/, '') };
   const sorted = [...siblings].sort((a, b) => {
     const aDl = downloadedIds.has(a.rom_id) ? 0 : 1;
     const bDl = downloadedIds.has(b.rom_id) ? 0 : 1;
     if (aDl !== bDl) return aDl - bDl;
     return a.name.localeCompare(b.name);
   });
-  const all = [mainEntry, ...sorted];
+  const all = [mainEntry, ...sorted.map((s) => ({ ...s, file: s.fs_name_no_ext }))];
+  // Versions of one game usually share its title (two Wii U formats of Terraria
+  // are both "Terraria"), so the title cannot tell the rows apart. Their file
+  // names can, and are only shown when the titles actually collide.
+  const names = all.map((e) => e.name);
+  const clash = names.some((n, i) => names.indexOf(n) !== i);
 
   showModal(
     <PickerModal title="Select region" items={all.map((entry) => ({
       key: entry.rom_id,
-      label: entry.name
-        + (entry.rom_id !== romId && !downloadedIds.has(entry.rom_id) ? ' (not downloaded)' : ''),
+      label: (clash && entry.file ? entry.file : entry.name)
+        + (!(entry.rom_id === romId ? mainDownloaded : downloadedIds.has(entry.rom_id)) ? ' (not downloaded)' : ''),
       active: entry.rom_id === lastUsedId,
       onSelect: () => onSelected?.(entry.rom_id),
     }))} />
@@ -364,13 +371,26 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       setDiscLast(r?.last || '');
     } catch { /* leave empty */ }
   };
-  const ensureSiblings = async (force?: boolean) => {
-    if ((siblingFetchTried.current && !force) || !isMultiRegion) return;
+  const ensureSiblings = async (force?: boolean): Promise<Set<number> | null> => {
+    if ((siblingFetchTried.current && !force) || !isMultiRegion) return null;
     siblingFetchTried.current = true;
     try {
       const r = await getLocalSiblings(game.rom_id);
-      if (r?.success) setDownloadedRegionIds(new Set(r.downloaded_ids || []));
+      if (r?.success) {
+        const ids = new Set<number>(r.downloaded_ids || []);
+        setDownloadedRegionIds(ids);
+        if (r.last) setActiveRegionId(r.last);
+        return ids;
+      }
     } catch { /* leave empty */ }
+    return null;
+  };
+  // The picker must show what is on disk now, not what was there when the tile
+  // was first focused: a delete or a download since then would read stale.
+  const showRegionPicker = async () => {
+    const ids = (await ensureSiblings(true)) || downloadedRegionIds;
+    openRegionPicker(game.rom_id, game.name, game.sibling_roms || [], ids,
+      activeRegionId, handleRegionSelected, game.file_name, dl);
   };
   // Hold A to open the disc/region picker; a quick press launches. The OK
   // button's onActivate fires on the PRESS edge on Steam Deck, so we can't let
@@ -385,6 +405,14 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
   // multi-game OK handlers below run on the PARENT and aren't stopped by the
   // child's stopPropagation, so without this a tap on Details would also launch.
   const subPress = useRef(false);
+  const openVersions = () => {
+    if (isMultiRegion) {
+      void showRegionPicker();
+    } else {
+      openDiscPicker(game.rom_id, game.name, discs, discLast, setBusy,
+        () => ensureDiscs(true));
+    }
+  };
   const onBtnDown = (e: any) => {
     if (subPress.current) return;
     if (e?.detail?.button === GamepadButton.OK && isMulti) {
@@ -393,14 +421,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       pressTimer.current = setTimeout(() => {
         longFired.current = true;
         pressTimer.current = null;
-        if (isMultiRegion) {
-          const allSiblings = game.sibling_roms || [];
-          openRegionPicker(game.rom_id, game.name, allSiblings, downloadedRegionIds,
-            activeRegionId, handleRegionSelected);
-        } else {
-          openDiscPicker(game.rom_id, game.name, discs, discLast, setBusy,
-            () => ensureDiscs(true));
-        }
+        openVersions();
       }, 500);
     }
   };
@@ -495,7 +516,6 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
     finally { setBusy(null); }
   };
   const handleRegionSelected = async (selectedRomId: number) => {
-    setActiveRegionId(selectedRomId);
     const isMainRom = selectedRomId === game.rom_id;
     const isAlreadyDownloaded = isMainRom ? dl : downloadedRegionIds.has(selectedRomId);
     if (!isAlreadyDownloaded) {
@@ -517,7 +537,9 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
         const res = await awaitDownload(selectedRomId);
         if (res.ok) {
           setDownloadedRegionIds(prev => new Set([...prev, selectedRomId]));
-          if (isMainRom) { setDl(true); libCacheSetDownloaded(game.rom_id, true); }
+          // Any version counts: the backend marks the whole game downloaded
+          // once one of its versions is on disk.
+          setDl(true); libCacheSetDownloaded(game.rom_id, true);
           // The main rom's art even when a regional sibling was the download —
           // it's the same game, and only `game` carries a known has_cover.
           if (!res.warning) toaster.toast({
@@ -542,10 +564,10 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       if (discList.length > 1 || pickable.length > 1) {
         openDiscPicker(selectedRomId, game.name, discList, localDiscs?.last || '', setBusy);
       } else {
-        await runLaunch(selectedRomId, game.name, null, game.name, setBusy);
+        await runLaunch(game.rom_id, game.name, null, game.name, setBusy, undefined, selectedRomId);
       }
     } catch {
-      await runLaunch(selectedRomId, game.name, null, game.name, setBusy);
+      await runLaunch(game.rom_id, game.name, null, game.name, setBusy, undefined, selectedRomId);
     }
   };
   const doDelete = async () => {
@@ -553,7 +575,12 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
     setBusy('delete');
     try {
       const r = await deleteGame(game.rom_id);
-      if (r?.success) { setDl(false); libCacheSetDownloaded(game.rom_id, false); }
+      if (r?.success) {
+        setDl(false); libCacheSetDownloaded(game.rom_id, false);
+        // The backend takes the other versions with it.
+        setDownloadedRegionIds(new Set());
+        toaster.toast({ title: 'Deleted', body: game.name });
+      }
       else toaster.toast({ title: 'Delete failed', body: r?.message || 'Error' });
     } catch (e) { toaster.toast({ title: 'Delete failed', body: String(e) }); }
     finally { setConfirmDelete(false); setBusy(null); }
@@ -561,7 +588,10 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
   // Two-step confirm on the cover (matching the details page): the first delete
   // press arms it (button turns into a check), the second within 3s commits.
   const requestDelete = () => {
-    if (busy) return;
+    if (busy) {
+      if (busy === 'delete') toaster.toast({ title: 'Deleting…', body: game.name });
+      return;
+    }
     // An orphan's local copy is the only one left, and a two-press gesture on a
     // cover tile is too easy to fire by accident for something unrecoverable.
     // Send it to the details page, which has room to say why.
@@ -571,6 +601,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       return;
     }
     if (confirmDelete) { doDelete(); return; }
+    toaster.toast({ title: 'Delete?', body: `Press again to delete ${game.name}.` });
     setConfirmDelete(true);
     if (confirmTimer.current) clearTimeout(confirmTimer.current);
     confirmTimer.current = setTimeout(() => setConfirmDelete(false), 3000);
@@ -626,6 +657,28 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
         if (typeof e?.detail === 'number' && e.detail > 0) { onOpen(game); return; }
         // Multi games drive launch from the release handler (onBtnUp) so a hold
         // can open the picker without the press-edge activation launching first.
+        // The keyboard has no onButtonUp behind it, so Enter / Space follows the
+        // same tap-or-hold split on its own key release.
+        if (isMulti && e?.type === 'keydown') {
+          if (e.repeat || pressTimer.current) return;
+          const key = e.key;
+          longFired.current = false;
+          const onKeyUp = (ke: KeyboardEvent) => {
+            if (ke.key !== key) return;
+            window.removeEventListener('keyup', onKeyUp, true);
+            if (pressTimer.current) {
+              clearTimeout(pressTimer.current); pressTimer.current = null;
+              if (!longFired.current) primary();
+            }
+          };
+          window.addEventListener('keyup', onKeyUp, true);
+          pressTimer.current = setTimeout(() => {
+            longFired.current = true;
+            pressTimer.current = null;
+            openVersions();
+          }, 500);
+          return;
+        }
         if (isMulti) { longFired.current = false; return; }
         primary();
       }}
@@ -808,6 +861,9 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             display: 'flex', alignItems: 'center', gap: '4px',
             maxWidth: 'calc(100% - 14px)', overflow: 'hidden',
             opacity: focused ? 0 : 1, transition: 'opacity 0.18s ease',
+            // Faded is not gone: an invisible chip still takes the click, and this
+            // corner is where the action overlay puts Delete and Versions.
+            pointerEvents: focused ? 'none' : 'auto',
           }}>
             {([['regions', game.regions, regionToEmoji],
                ['languages', game.languages, languageToEmoji]] as const)
@@ -879,7 +935,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             </div>
           )}
           {downloading
-            ? <FaDownload size={15} />
+            ? (dlProgress?.state === 'extracting' ? <FaBoxOpen size={15} /> : <FaDownload size={15} />)
             : busy === 'launch'
               ? <FaSync size={16} style={{ animation: 'spin 1s linear infinite' }} />
               /* Ranked below launching: if you just pressed Play, what that
@@ -900,6 +956,18 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             onClick={(e: any) => { e.stopPropagation(); subPress.current = false; onOpen(game); }} className="romm-gt-btn" style={roundBtn(30, 'glass')}>
             <FaInfoCircle size={13} />
           </div>
+          {/* The picker is otherwise a gamepad hold only (OK for 500ms); this is
+              the way to it from a mouse or keyboard. Same picker, same handler. */}
+          {isMultiRegion && (
+            <div onPointerDown={() => { subPress.current = true; }}
+              onClick={(e: any) => {
+                e.stopPropagation(); subPress.current = false;
+                void showRegionPicker();
+              }}
+              title="Versions" className="romm-gt-btn" style={roundBtn(30, 'glass')}>
+              <FaGlobe size={13} />
+            </div>
+          )}
           {dl && (
             <div onPointerDown={() => { subPress.current = true; }}
               onClick={(e: any) => { e.stopPropagation(); subPress.current = false; requestDelete(); }}

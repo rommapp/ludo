@@ -73,7 +73,7 @@ try:
         platform_folder_candidates,
         flatpak_app_installed,
         STANDALONE_EMULATORS, find_standalone_builds,
-        _extract_archive, _archive_member_names,
+        _extract_archive, _archive_member_names, WIIU_SLUGS, resolve_wiiu_rom,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
         push_notification as _push_notification,
@@ -4373,6 +4373,15 @@ class LudoBackend:
         keep working exactly as before. Returns the local_path to use.
         """
         try:
+            if dest.suffix.lower() in ('.zip', '.7z') and not dest.exists():
+                # The engine already unpacked it and removed the archive (it
+                # always does for a Wii U download, which Cemu cannot read in
+                # an archive). `dest` is then a path to nothing: recording it
+                # made Play say "No launchable file found" until a restart
+                # rebuilt the path from disk. Hand back the folder it made.
+                unpacked = dest.with_suffix('')
+                if unpacked.is_dir():
+                    return unpacked
             if not dest.is_file() or dest.suffix.lower() not in ('.zip', '.7z'):
                 return dest
             if not self._archive_needs_extract(dest):
@@ -7343,7 +7352,7 @@ class LudoBackend:
             logging.warning(f"_list_local_discs error: {e}")
             return []
 
-    def _resolve_launch_path(self, local_path, disc=None):
+    def _resolve_launch_path(self, local_path, disc=None, platform_slug=None):
         """Resolve a game's local_path (file or folder) to the file to boot.
 
         - Single-file ROM: returns local_path unchanged.
@@ -7356,6 +7365,13 @@ class LudoBackend:
         p = Path(local_path)
         if p.is_file():
             return str(p)
+        # A Wii U title is not a disc set, and the disc lister below would read
+        # one as such: it lists a .bin under content/, or a .wua beside a larger
+        # .wux. An unpacked download holds a .wua/.wux/.wud, an unpacked title a
+        # code/*.rpx; Cemu is handed that one file, never the folder.
+        if p.is_dir() and str(platform_slug or '').lower() in WIIU_SLUGS:
+            target, _root = resolve_wiiu_rom(p)
+            return str(target) if target.is_file() else None
         discs = self._list_local_discs(local_path)
         if not discs:
             return None
@@ -7404,6 +7420,9 @@ class LudoBackend:
             g = self._games_index().get(rom_id)
             if not g or not g.get('is_downloaded') or not g.get('local_path'):
                 return {'success': True, 'discs': [], 'last': ''}
+            if str(g.get('platform_slug') or '').lower() in WIIU_SLUGS:
+                # One launch file per Wii U title; there is nothing to pick.
+                return {'success': True, 'discs': [], 'last': ''}
             discs = self._list_local_discs(g['local_path'])
             last = self._get_last_disc(rom_id)
             # Drop a stale remembered name if that disc no longer exists.
@@ -7446,6 +7465,10 @@ class LudoBackend:
             g = idx.get(rom_id)
             if not g:
                 return {'success': True, 'downloaded_ids': []}
+            try:
+                last = int(self._settings.get('LastVersion', str(rom_id), '') or 0)
+            except Exception:
+                last = 0
             sibling_roms = g.get('sibling_roms', [])
             ids = [rom_id] + [s.get('id') for s in sibling_roms if s.get('id')]
             downloaded = [rid for rid in ids if idx.get(rid, {}).get('is_downloaded')]
@@ -7455,7 +7478,8 @@ class LudoBackend:
             for vid, v in self._variant_downloads(g).items():
                 if vid not in downloaded and v.get('local_path'):
                     downloaded.append(vid)
-            return {'success': True, 'downloaded_ids': downloaded}
+            return {'success': True, 'downloaded_ids': downloaded,
+                    'last': last if last in downloaded else 0}
         except Exception as e:
             logging.error(f"get_local_siblings error: {e}", exc_info=True)
             return {'success': False, 'downloaded_ids': [], 'message': str(e)}
@@ -7623,9 +7647,13 @@ class LudoBackend:
             s['disc_count'] = g.get('disc_count', 0)
         if g.get('sibling_roms'):
             s['sibling_roms'] = [
-                {'rom_id': sib.get('id'), 'name': sib.get('name') or sib.get('fs_name_no_ext') or 'Variant'}
+                {'rom_id': sib.get('id'), 'name': sib.get('name') or sib.get('fs_name_no_ext') or 'Variant',
+                 'fs_name_no_ext': sib.get('fs_name_no_ext')}
                 for sib in g['sibling_roms']
             ]
+            # Only for games with versions: the picker tells same-titled rows
+            # apart by file name, and a name on every entry would fatten the cache.
+            s['file_name'] = g.get('file_name')
             s['region_count'] = len(g['sibling_roms']) + 1
         return s
 
@@ -7694,9 +7722,11 @@ class LudoBackend:
                     sibs = r.get('sibling_roms') or (local or {}).get('sibling_roms') or []
                     if sibs:
                         entry['sibling_roms'] = [
-                            {'rom_id': s.get('id'), 'name': s.get('name') or 'Variant'}
+                            {'rom_id': s.get('id'), 'name': s.get('name') or 'Variant',
+                             'fs_name_no_ext': s.get('fs_name_no_ext')}
                             for s in sibs
                         ]
+                        entry['file_name'] = r.get('fs_name') or (local or {}).get('file_name')
                         entry['region_count'] = len(sibs) + 1
                     games.append(entry)
                     if rid and rid not in idx and r.get('path_cover_small'):
@@ -7816,9 +7846,11 @@ class LudoBackend:
                     sibs = r.get('sibling_roms') or (local or {}).get('sibling_roms') or []
                     if sibs:
                         entry['sibling_roms'] = [
-                            {'rom_id': s.get('id'), 'name': s.get('name') or 'Variant'}
+                            {'rom_id': s.get('id'), 'name': s.get('name') or 'Variant',
+                             'fs_name_no_ext': s.get('fs_name_no_ext')}
                             for s in sibs
                         ]
+                        entry['file_name'] = r.get('fs_name') or (local or {}).get('file_name')
                         entry['region_count'] = len(sibs) + 1
                     out.append(entry)
                     if rid and rid not in idx and r.get('path_cover_small'):
@@ -9771,6 +9803,14 @@ class LudoBackend:
             def _worker():
                 def _on_progress(info):
                     try:
+                        if info.get('extracting') is not None:
+                            # Unpacking after the transfer (a Wii U archive).
+                            self._download_progress[rom_id] = {
+                                'percent': int(info['extracting']), 'downloaded': 0,
+                                'total': 0, 'speed': 0, 'eta': 0,
+                                'state': 'extracting', 'message': 'Extracting…',
+                            }
+                            return
                         prog = info.get('progress')  # 0..1
                         self._download_progress[rom_id] = {
                             'percent': int(round((prog or 0) * 100)),
@@ -10487,11 +10527,11 @@ class LudoBackend:
                 return {'success': False, 'message': 'RetroArch not available'}
             # A bare Play resumes the remembered disc; an explicit pick overrides.
             effective_disc = disc or self._get_last_disc(effective_rom_id) or None
-            launch_path = self._resolve_launch_path(g['local_path'], effective_disc)
+            launch_path = self._resolve_launch_path(g['local_path'], effective_disc, g.get('platform_slug'))
             if not launch_path and effective_disc:
                 # Remembered disc vanished — fall back to the default resolution.
                 effective_disc = None
-                launch_path = self._resolve_launch_path(g['local_path'], None)
+                launch_path = self._resolve_launch_path(g['local_path'], None, g.get('platform_slug'))
             if not launch_path:
                 return {'success': False, 'message': 'No launchable file found'}
             launch_path, why = await self._ready_to_boot(g, launch_path)
@@ -10545,6 +10585,12 @@ class LudoBackend:
                     self._settings.set('LastDisc', str(effective_rom_id), disc)
                 except Exception as e:
                     logging.warning(f"could not persist last disc: {e}")
+            # And which version of the game ran, so the version picker marks it.
+            if ok:
+                try:
+                    self._settings.set('LastVersion', str(rom_id), str(effective_rom_id))
+                except Exception as e:
+                    logging.warning(f"could not persist last version: {e}")
             out = {'success': bool(ok),
                    'message': msg or ('Launched' if ok else 'Launch failed')}
             if bios:
@@ -11428,10 +11474,10 @@ class LudoBackend:
                 return {'success': False, 'steam_host': False,
                         'message': 'Game not downloaded'}
             effective_disc = disc or self._get_last_disc(effective_rom_id) or None
-            launch_path = self._resolve_launch_path(g['local_path'], effective_disc)
+            launch_path = self._resolve_launch_path(g['local_path'], effective_disc, g.get('platform_slug'))
             if not launch_path and effective_disc:
                 effective_disc = None
-                launch_path = self._resolve_launch_path(g['local_path'], None)
+                launch_path = self._resolve_launch_path(g['local_path'], None, g.get('platform_slug'))
             if not launch_path:
                 return {'success': False, 'steam_host': False,
                         'message': 'No launchable file found'}

@@ -1264,7 +1264,88 @@ STANDALONE_EMULATORS = {
         'binaries': ('eden',),
         'args': ('-f', '-g', '{rom}'),
     },
+    'cemu': {
+        'name': 'Cemu',
+        # "wii u" before anything shorter: the plain Wii is a Dolphin platform
+        # and must never land here. A RomM slug is 'wiiu'; names vary.
+        'platforms': ('wii u', 'wiiu', 'wii-u'),
+        # Upstream publishes both: Flathub's info.cemu.Cemu and
+        # Cemu-<ver>-x86_64.AppImage. The AppImage stem starts with 'cemu'.
+        'flatpak_id': 'info.cemu.Cemu',
+        'binaries': ('cemu',),
+        'args': ('-f', '-g', '{rom}'),
+        # A decrypted title is a folder (code/ content/ meta/), not a file.
+        'resolve_rom': 'wiiu',
+        'prelaunch': 'cemu_audio',
+    },
 }
+
+
+def fix_cemu_audio_device(executable):
+    """Blank Cemu's TV audio device when it is the unusable placeholder.
+
+    A fresh Cemu stores ``<TVDevice>default</TVDevice>``; no such device exists
+    to its audio backend ("failed to find selected device"), and the game then
+    sits on its loading screen with idle emulation threads. An empty value means
+    the system's default output. A device the user picked is left alone.
+    Returns True when the file was changed.
+    """
+    home = Path(os.path.expanduser('~'))
+    if executable.startswith('flatpak:'):
+        cfg = home / '.var/app' / executable.split(':', 1)[1] / 'config/Cemu'
+    else:
+        cfg = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config') / 'Cemu'
+    settings = cfg / 'settings.xml'
+    try:
+        text = settings.read_text(encoding='utf-8')
+        if '<TVDevice>default</TVDevice>' not in text:
+            return False
+        backup = settings.with_name('settings.xml.bak-ludo-audio')
+        if not backup.exists():
+            backup.write_text(text, encoding='utf-8')
+        settings.write_text(
+            text.replace('<TVDevice>default</TVDevice>', '<TVDevice></TVDevice>'),
+            encoding='utf-8')
+        return True
+    except OSError:
+        return False
+
+
+_WIIU_IMAGE_SUFFIXES = ('.wua', '.wux', '.wud')
+
+
+def resolve_wiiu_rom(rom_path):
+    """(launch_file, grant_root) for a Wii U title.
+
+    Cemu is handed a single file: a .wua/.wux/.wud/.wup as-is, or the .rpx of
+    an unpacked title (code/<name>.rpx). ``grant_root`` is the folder a
+    sandboxed Cemu must be able to read -- for an unpacked title that is the
+    title's root, NOT code/: the emulator also reads the sibling content/ and
+    meta/ folders, and a grant on code/ alone launches into a black screen.
+    """
+    path = Path(rom_path)
+    if path.is_dir():
+        # A folder game holding a disc image or .wua at its top level: the
+        # largest one wins, as in argosy-launcher's findPrimaryRomInFolder
+        # (its tiebreak is size, with no preference between the formats).
+        images = sorted((f for f in path.iterdir()
+                         if f.is_file() and f.suffix.lower() in _WIIU_IMAGE_SUFFIXES),
+                        key=lambda f: f.stat().st_size, reverse=True)
+        if images:
+            return images[0], path
+        for code in sorted(p for p in path.iterdir()
+                           if p.is_dir() and p.name.lower() == 'code'):
+            rpx = sorted((f for f in code.iterdir()
+                          if f.is_file() and f.suffix.lower() == '.rpx'),
+                         key=lambda f: f.stat().st_size, reverse=True)
+            if rpx:
+                return rpx[0], path
+        rpx = sorted(f for f in path.iterdir()
+                     if f.is_file() and f.suffix.lower() == '.rpx')
+        return (rpx[0] if rpx else path), path
+    if path.suffix.lower() == '.rpx' and path.parent.name.lower() == 'code':
+        return path, path.parent.parent
+    return path, path.parent
 
 
 def _standalone_appimage_dirs():
@@ -2404,6 +2485,37 @@ def _extract_archive(archive_path, dest_dir, on_progress=None):
     except Exception as e:
         logging.warning(f"Failed to extract {archive_path}: {e}")
     return False
+
+
+# A Wii U download is always unpacked, as in argosy-launcher (its wiiu entry in
+# ALWAYS_EXTRACT_ZIP_PLATFORMS): Cemu cannot open a .zip or a .7z, only the
+# .wua/.wux/.wud inside or an unpacked title folder.
+WIIU_SLUGS = ('wiiu', 'wii-u', 'wii_u')
+# Scene leftovers Argosy prunes after extracting (ZipExtractor.COMPANION_EXTENSIONS).
+_ARCHIVE_COMPANION_SUFFIXES = ('.m3u', '.nfo', '.sfv', '.md5', '.sha1',
+                               '.diz', '.url', '.jpg', '.jpeg')
+
+
+def _extract_wiiu_archive(archive_path, on_progress=None):
+    """Unpack a Wii U .zip/.7z into a folder named after it. (ok, message).
+
+    The folder is <archive stem> next to the archive; the archive is removed
+    only once it has unpacked, so a failure leaves the download in place.
+    resolve_wiiu_rom then picks the launch file inside the folder.
+    """
+    archive_path = Path(archive_path)
+    dest = archive_path.parent / archive_path.stem
+    if not _extract_archive(archive_path, dest, on_progress):
+        return False, (f"Downloaded {archive_path.name} but could not unpack it "
+                       "(a .7z needs 7z or py7zr); Cemu cannot open an archive")
+    for f in dest.rglob('*'):
+        if f.is_file() and f.suffix.lower() in _ARCHIVE_COMPANION_SUFFIXES:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    archive_path.unlink()
+    return True, ''
 
 
 def _sevenzip_total_size(exe, archive_path):
@@ -5230,6 +5342,11 @@ class RomMClient:
                 # and the truncated file failed in the emulator instead of
                 # here. A partial must not be able to impersonate a ROM.
                 partial_path = download_path.with_name(download_path.name + '.part')
+                if download_path.is_dir():
+                    # Another version of this game unpacked under the same name.
+                    # Replace it, as argosy does on promote: the rename below
+                    # cannot land on a folder.
+                    shutil.rmtree(download_path, ignore_errors=True)
                 with open(partial_path, 'wb') as f:
                     _seen = {'n': 0}
 
@@ -5279,7 +5396,18 @@ class RomMClient:
                 # single-file archives: .zip or .7z). Console ROM archives are left
                 # as-is (RetroArch loads them natively); only directory-based PC games
                 # are extracted.
-                if download_path.suffix.lower() in ('.zip', '.7z') and actual_downloaded > 0:
+                wiiu_archive = (download_path.suffix.lower() in ('.zip', '.7z')
+                                and actual_downloaded > 0
+                                and str(rom_details.get('platform_slug') or '').lower()
+                                in WIIU_SLUGS)
+                if wiiu_archive:
+                    def _unpack_pct(pct):
+                        if progress_callback:
+                            progress_callback({'extracting': pct})
+                    unpacked, why = _extract_wiiu_archive(download_path, _unpack_pct)
+                    if not unpacked:
+                        return False, why
+                elif download_path.suffix.lower() in ('.zip', '.7z') and actual_downloaded > 0:
                     file_list = _archive_member_names(download_path)
 
                     # Only extract if it looks like a directory-based game
@@ -8751,13 +8879,18 @@ class RetroArchInterface:
 
     def build_standalone_launch_command(self, rom_path, key, spec, executable):
         """argv for a standalone emulator, from its args template."""
+        grant_root = Path(rom_path).parent
+        if spec.get('resolve_rom') == 'wiiu':
+            rom_path, grant_root = resolve_wiiu_rom(rom_path)
         args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
+        if spec.get('prelaunch') == 'cemu_audio':
+            fix_cemu_audio_device(executable)
         if executable.startswith('flatpak:'):
             # The sandbox can't see a ROM outside the paths its manifest grants
             # (Eden then says "ROM format not supported", rommapp/ludo#34).
             # Grant the ROM's folder for this run only, read-only, rather than
             # writing a lasting `flatpak override` into the user's setup.
-            grant = f'--filesystem={Path(rom_path).parent}:ro'
+            grant = f'--filesystem={grant_root}:ro'
             return ['flatpak', 'run', grant, executable.split(':', 1)[1]] + args
         return [executable] + args
 

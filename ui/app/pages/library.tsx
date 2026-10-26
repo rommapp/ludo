@@ -24,7 +24,7 @@ import { PlatformsPage } from "./platforms";
 import { _LS_REOPEN_HOME } from "../storage";
 import { lastLaunchedRomId } from "../launch";
 import { CollectionActionsModal, NAV_ORDER, UserMenuModal, V2NavBar, useNavChrome } from "../topbar";
-import { v2Page } from "../focus";
+import { v2Page, V2Focus } from "../focus";
 import { _dlActive, runCollectionBatch, useBatchJob } from "../downloads";
 import { EmuStalePath, InstallProgressBar, installSize, loadEmulatorStatus, publishEmulatorStatus, startEmulatorInstall, useEmulatorInstall, useEmulatorStatus } from "../emulator";
 // The library: home, platforms, collections, search, and the grid underneath.
@@ -1052,13 +1052,24 @@ export function StaleLibraryBanner({ status }: { status: any }) {
     try { await _applyStaleUpdate(); } finally { setBusy(false); }
   };
 
+  // The whole bar is the focus target, not just the pill: spatial navigation
+  // from the covers below picks by horizontal overlap, and a small pill at the
+  // far right never overlapped the first cover, so Up skipped it for the nav.
   return (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: '10px',
-      margin: '0 16px 8px', padding: '8px 12px',
-      background: V2.surface, border: `1px solid ${V2.borderStrong}`,
-      borderRadius: V2.radiusMd, fontSize: '12px',
-    }}>
+    <Focusable noFocusRing
+      onActivate={onUpdate} onClick={onUpdate}
+      onOKActionDescription="Update"
+      onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}
+      onMouseEnter={() => setFocused(true)} onMouseLeave={() => setFocused(false)}
+      style={{
+        display: 'flex', alignItems: 'center', gap: '10px',
+        margin: '0 16px 8px', padding: '8px 12px', cursor: busy ? 'default' : 'pointer',
+        background: focused ? V2.surfaceHover : V2.surface,
+        border: `1px solid ${focused ? V2.brand : V2.borderStrong}`,
+        borderRadius: V2.radiusMd, fontSize: '12px',
+        transition: 'background 0.15s, border-color 0.15s, box-shadow 0.15s',
+        ...V2Focus.flat(focused, { glow: true }),
+      }}>
       <div style={{
         width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0,
         background: V2.brand, boxShadow: `0 0 6px ${V2.brand}`,
@@ -1076,21 +1087,18 @@ export function StaleLibraryBanner({ status }: { status: any }) {
             : "You're still seeing your last sync."}
         </div>
       </div>
-      <Focusable noFocusRing
-        onActivate={onUpdate} onClick={onUpdate}
-        onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}
-        onMouseEnter={() => setFocused(true)} onMouseLeave={() => setFocused(false)}
-        style={{
-          flexShrink: 0, padding: '5px 14px', borderRadius: V2.radiusPill,
-          cursor: busy ? 'default' : 'pointer', fontSize: '12px', fontWeight: 700,
-          whiteSpace: 'nowrap', opacity: busy ? 0.6 : 1,
-          background: focused ? V2.brandHover : V2.brand, color: '#fff',
-          border: `1px solid ${focused ? V2.brandHover : V2.brand}`,
-          transition: 'background 0.15s, border-color 0.15s',
-        }}>
+      <div style={{
+        flexShrink: 0, padding: '5px 14px', borderRadius: V2.radiusPill,
+        fontSize: '12px', fontWeight: 700, whiteSpace: 'nowrap',
+        filter: busy ? 'opacity(0.6)' : undefined,
+        background: focused ? '#fff' : V2.brand, color: focused ? V2.brand : '#fff',
+        border: `1px solid ${focused ? '#fff' : V2.brand}`,
+        transform: focused ? 'scale(1.06)' : 'none',
+        transition: 'background 0.15s, color 0.15s, transform 0.15s',
+      }}>
         {busy ? 'Updating…' : 'Update'}
-      </Focusable>
-    </div>
+      </div>
+    </Focusable>
   );
 }
 

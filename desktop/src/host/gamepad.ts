@@ -692,6 +692,10 @@ function center(el: HTMLElement) {
 // The content element focus left when an Up entered the top bar — restored when
 // Down comes back out, so you return to the same cover.
 let _preNavFocus: HTMLElement | null = null;
+// Same idea for a content element that an Up landed on (the library-changed
+// banner above the first row): Down returns to the element Up came from, not
+// whichever target the geometry scores best from the banner's wide box.
+let _upReturn: { at: HTMLElement; from: HTMLElement } | null = null;
 
 function move(dir: "up" | "down" | "left" | "right", smooth = true) {
   // Publish the travel axis so the plugin's letter-glimpse (index.tsx's
@@ -756,6 +760,14 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
   if (dir === "down" && inStickyTopBar(active) && _preNavFocus &&
       document.contains(_preNavFocus) && isVisible(_preNavFocus)) {
     moveFocus(_preNavFocus, false, smooth);
+    return;
+  }
+
+  if (dir === "down" && _upReturn && _upReturn.at === active &&
+      document.contains(_upReturn.from) && isVisible(_upReturn.from)) {
+    const back = _upReturn.from;
+    _upReturn = null;
+    moveFocus(back, false, smooth);
     return;
   }
 
@@ -935,7 +947,10 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
     }
   }
 
-  if (best) moveFocus(best, horizontal, smooth);
+  if (best) {
+    _upReturn = dir === "up" && !inStickyTopBar(best) ? { at: best, from: active } : null;
+    moveFocus(best, horizontal, smooth);
+  }
 }
 
 // A sticky/fixed bar counts as "pinned to the top" when its box sits within this
@@ -1307,6 +1322,7 @@ export function startGamepad() {
   // Whether the OK press matching the next OK release was seen here — see the
   // release branch of button().
   let okPressSeen = false;
+  let okPressTarget: Element | null = null;
   // The focused element at the moment the window went to the background, so it
   // can be restored when we come back (see the focus listener below).
   let focusBeforeBlur: HTMLElement | null = null;
@@ -1344,7 +1360,7 @@ export function startGamepad() {
       // PRESS even though activation happens on release: the click feedback has
       // to be immediate, and sound.ts's dedupe absorbs the synthetic .click()
       // that follows.
-      if (id === GamepadButtonId.OK) { playSound("activate"); okPressSeen = true; }
+      if (id === GamepadButtonId.OK) { playSound("activate"); okPressSeen = true; okPressTarget = document.activeElement; }
       const claimed = routeButton("down", id, false,
         id === GamepadButtonId.OK ? undefined : dedicatedFor(id));
       // B only sounds when it actually took the user somewhere. It can't be
@@ -1362,8 +1378,11 @@ export function startGamepad() {
         // a tap: it can be the tail of a press that belonged to something else
         // (a game we just quit, an alt-tabbed window), and activating on it
         // fires whatever happens to hold focus here.
-        const tap = okPressSeen;
+        // Nor when focus moved while A was down: a hold that opened a picker
+        // puts focus on its first option, and the release would pick it.
+        const tap = okPressSeen && document.activeElement === okPressTarget;
         okPressSeen = false;
+        okPressTarget = null;
         if (tap) (document.activeElement as HTMLElement | null)?.click();
       }
     }

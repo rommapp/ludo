@@ -369,7 +369,10 @@ export async function runLaunch(romId: number, gameName: string, disc: string | 
     // is already watching happen. The BIOS branch above still fires, because
     // that one is not about the launch -- it explains a longer-than-usual wait
     // and files written to disk.
-    else if (offerCoreInstall(r, () => void runLaunch(
+    else if (r?.success) {
+      // Nothing to say: the branch exists so a success is not read as a failure
+      // below, which toasted "Launch failed" over "Launched <game>".
+    } else if (offerCoreInstall(r, () => void runLaunch(
       romId, gameName, disc, label, setBusy, onDone, siblingRomId))) {
       // The picker owns the outcome now — no toast.
     } else {
