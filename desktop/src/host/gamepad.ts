@@ -692,6 +692,10 @@ function center(el: HTMLElement) {
 // The content element focus left when an Up entered the top bar — restored when
 // Down comes back out, so you return to the same cover.
 let _preNavFocus: HTMLElement | null = null;
+// Same idea for a content element that an Up landed on (the library-changed
+// banner above the first row): Down returns to the element Up came from, not
+// whichever target the geometry scores best from the banner's wide box.
+let _upReturn: { at: HTMLElement; from: HTMLElement } | null = null;
 
 function move(dir: "up" | "down" | "left" | "right", smooth = true) {
   // Publish the travel axis so the plugin's letter-glimpse (index.tsx's
@@ -756,6 +760,14 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
   if (dir === "down" && inStickyTopBar(active) && _preNavFocus &&
       document.contains(_preNavFocus) && isVisible(_preNavFocus)) {
     moveFocus(_preNavFocus, false, smooth);
+    return;
+  }
+
+  if (dir === "down" && _upReturn && _upReturn.at === active &&
+      document.contains(_upReturn.from) && isVisible(_upReturn.from)) {
+    const back = _upReturn.from;
+    _upReturn = null;
+    moveFocus(back, false, smooth);
     return;
   }
 
@@ -935,7 +947,10 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
     }
   }
 
-  if (best) moveFocus(best, horizontal, smooth);
+  if (best) {
+    _upReturn = dir === "up" && !inStickyTopBar(best) ? { at: best, from: active } : null;
+    moveFocus(best, horizontal, smooth);
+  }
 }
 
 // A sticky/fixed bar counts as "pinned to the top" when its box sits within this
