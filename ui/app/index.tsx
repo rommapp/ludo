@@ -20,6 +20,7 @@ import { RouteGuard } from "./nav";
 import { StatsPage } from "./pages/stats";
 import { DownloadsPage } from "./pages/downloads";
 import { CoresPage } from "./pages/cores";
+import { EmulatorsPage } from "./pages/emulators";
 import { ConfigPage } from "./pages/config";
 import { SetupWizard } from "./pages/setup";
 import { primePlatformSummary, SettingsPage } from "./pages/settings";
@@ -94,6 +95,7 @@ export function startApp(): { stop: () => void } {
   routerHook.addRoute("/romm-sync-settings", () => <RouteGuard><SettingsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-stats", () => <RouteGuard><StatsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-cores", () => <RouteGuard><CoresPage /></RouteGuard>, { exact: true });
+  routerHook.addRoute("/romm-sync-emulators", () => <RouteGuard><EmulatorsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-bios", () => <RouteGuard><BiosPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-platforms", () => <RouteGuard><PlatformsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-downloads", () => <RouteGuard><DownloadsPage /></RouteGuard>, { exact: true });
@@ -251,6 +253,7 @@ export function startApp(): { stop: () => void } {
       routerHook.removeRoute("/romm-sync-settings");
       routerHook.removeRoute("/romm-sync-stats");
       routerHook.removeRoute("/romm-sync-cores");
+      routerHook.removeRoute("/romm-sync-emulators");
       routerHook.removeRoute("/romm-sync-bios");
       routerHook.removeRoute("/romm-sync-platforms");
       routerHook.removeRoute("/romm-sync-downloads");

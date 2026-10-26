@@ -49,6 +49,7 @@ const ROUTES = [
   { path: "/romm-sync-settings", says: "Settings" },
   { path: "/romm-sync-stats", says: "PLATFORMS" },
   { path: "/romm-sync-cores", says: "Emulator Cores" },
+  { path: "/romm-sync-emulators", says: "Emulators" },
   { path: "/romm-sync-bios", says: "BIOS" },
   { path: "/romm-sync-platforms", says: "Platforms" },
   { path: "/romm-sync-downloads", says: "No active downloads" },
@@ -130,6 +131,67 @@ describe("rendering with a populated library", { skip: SKIP }, () => {
       assert.ok(r.text.includes(says), `expected ${says} in: ${r.text.slice(0, 300)}`);
     });
   }
+
+  test("Settings ▸ Emulators: rows match, and Back lands on the row it left", async () => {
+    // The Emulators page is a view stacked on Settings, and a view comes back
+    // rebuilt — so without remembering where focus was, Back dropped the user on
+    // Settings' first row. The row text is the check: every emulator reads the
+    // same way (name, where it lives, how it was found).
+    const r = await openRoute(browser, srv.origin, "/romm-sync-library");
+    try {
+      // The account pill is the focusable right after the Search tab.
+      await r.page.evaluate(() => {
+        const els = [...document.querySelectorAll(".desk-focusable[tabindex]")];
+        els[els.findIndex((e) => (e.innerText || "").trim() === "Search") + 1]?.click();
+      });
+      await r.page.waitForTimeout(800);
+      await r.activateText("Settings");
+      await r.activateText("Emulators");
+      const p = await r.probe();
+      for (const says of ["RetroDECK", "243 cores", "Eden", "Cemu", "detected automatically"]) {
+        assert.ok(p.text.includes(says), `emulators page: expected ${says} in ${p.text.slice(0, 300)}`);
+      }
+      // Slow the activity list, as a real backend is: Settings then rebuilds
+      // with rows missing above the one to land on. Record EVERY focus change on
+      // the way back, not just where it ends — landing on the wrong row first
+      // and correcting itself is the bug, and an end-state check passes it.
+      await r.page.route("**/api/get_recent_activity", async (route) => {
+        await new Promise((ok) => setTimeout(ok, 500));
+        route.continue();
+      });
+      await r.page.evaluate(() => {
+        window.__focusLog = [];
+        // Where the row sits on screen, frame by frame: a page that rebuilds at
+        // the top and then scrolls, or fills in above the row, makes it move.
+        window.__rowY = [];
+        setInterval(() => {
+          const row = [...document.querySelectorAll(".desk-focusable[tabindex]")]
+            .find((e) => (e.innerText || "").trim().startsWith("Emulators") && e.getBoundingClientRect().width < window.innerWidth);
+          if (row) window.__rowY.push(Math.round(row.getBoundingClientRect().top));
+        }, 10);
+        setInterval(() => {
+          const el = document.activeElement;
+          const text = (el?.innerText || "").replace(/\s+/g, " ").trim();
+          // The page-wide container takes focus for a frame with no highlight;
+          // a row is anything narrower than the window.
+          if (!el || el.getBoundingClientRect().width >= window.innerWidth) return;
+          const log = window.__focusLog;
+          if (!log.length || log[log.length - 1] !== text) log.push(text);
+        }, 10);
+      });
+      await r.pressPad(PAD.CANCEL, { settleMs: 1800 });
+      const seen = await r.page.evaluate(() => window.__focusLog);
+      assert.ok(seen.length > 0, "focus never landed on a row");
+      const ys = await r.page.evaluate(() => window.__rowY);
+      assert.ok(ys.length > 0 && new Set(ys).size === 1,
+        `the Emulators row moved while the page came back: ${JSON.stringify([...new Set(ys)])}`);
+      assert.ok(seen.every((t) => t.startsWith("Emulators")),
+        `focus visited other rows on the way back: ${JSON.stringify(seen)}`);
+      assert.deepEqual(r.errors, []);
+    } finally {
+      await r.close();
+    }
+  });
 
   test("library → platform → game detail → every tab", async () => {
     // The whole point of the populated profile. The grid, the detail header and

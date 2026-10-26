@@ -349,8 +349,15 @@ export function RemovedFromRomMSection() {
   );
 }
 
+type ActivityEvent = { kind: string, title: string, detail: string, timestamp: number, action?: { kind: string, label: string, platform?: string, done?: boolean } };
+// Last list seen. The page is rebuilt each time it is uncovered (backing out of
+// Emulators, say), and a list that starts empty and fills a moment later pushes
+// every section below it down — a visible redraw. Start from this instead.
+let _activityCache: ActivityEvent[] = [];
+
 export function RecentActivitySection() {
-  const [events, setEvents] = useState<Array<{ kind: string, title: string, detail: string, timestamp: number, action?: { kind: string, label: string, platform?: string, done?: boolean } }>>([]);
+  const [events, setEventsState] = useState<ActivityEvent[]>(_activityCache);
+  const setEvents = (e: ActivityEvent[]) => { _activityCache = e; setEventsState(e); };
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
