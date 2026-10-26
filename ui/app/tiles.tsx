@@ -379,6 +379,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       if (r?.success) {
         const ids = new Set<number>(r.downloaded_ids || []);
         setDownloadedRegionIds(ids);
+        if (r.last) setActiveRegionId(r.last);
         return ids;
       }
     } catch { /* leave empty */ }
@@ -515,7 +516,6 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
     finally { setBusy(null); }
   };
   const handleRegionSelected = async (selectedRomId: number) => {
-    setActiveRegionId(selectedRomId);
     const isMainRom = selectedRomId === game.rom_id;
     const isAlreadyDownloaded = isMainRom ? dl : downloadedRegionIds.has(selectedRomId);
     if (!isAlreadyDownloaded) {

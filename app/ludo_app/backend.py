@@ -7465,6 +7465,10 @@ class LudoBackend:
             g = idx.get(rom_id)
             if not g:
                 return {'success': True, 'downloaded_ids': []}
+            try:
+                last = int(self._settings.get('LastVersion', str(rom_id), '') or 0)
+            except Exception:
+                last = 0
             sibling_roms = g.get('sibling_roms', [])
             ids = [rom_id] + [s.get('id') for s in sibling_roms if s.get('id')]
             downloaded = [rid for rid in ids if idx.get(rid, {}).get('is_downloaded')]
@@ -7474,7 +7478,8 @@ class LudoBackend:
             for vid, v in self._variant_downloads(g).items():
                 if vid not in downloaded and v.get('local_path'):
                     downloaded.append(vid)
-            return {'success': True, 'downloaded_ids': downloaded}
+            return {'success': True, 'downloaded_ids': downloaded,
+                    'last': last if last in downloaded else 0}
         except Exception as e:
             logging.error(f"get_local_siblings error: {e}", exc_info=True)
             return {'success': False, 'downloaded_ids': [], 'message': str(e)}
@@ -10580,6 +10585,12 @@ class LudoBackend:
                     self._settings.set('LastDisc', str(effective_rom_id), disc)
                 except Exception as e:
                     logging.warning(f"could not persist last disc: {e}")
+            # And which version of the game ran, so the version picker marks it.
+            if ok:
+                try:
+                    self._settings.set('LastVersion', str(rom_id), str(effective_rom_id))
+                except Exception as e:
+                    logging.warning(f"could not persist last version: {e}")
             out = {'success': bool(ok),
                    'message': msg or ('Launched' if ok else 'Launch failed')}
             if bios:
