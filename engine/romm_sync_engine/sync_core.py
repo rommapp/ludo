@@ -1276,8 +1276,39 @@ STANDALONE_EMULATORS = {
         'args': ('-f', '-g', '{rom}'),
         # A decrypted title is a folder (code/ content/ meta/), not a file.
         'resolve_rom': 'wiiu',
+        'prelaunch': 'cemu_audio',
     },
 }
+
+
+def fix_cemu_audio_device(executable):
+    """Blank Cemu's TV audio device when it is the unusable placeholder.
+
+    A fresh Cemu stores ``<TVDevice>default</TVDevice>``; no such device exists
+    to its audio backend ("failed to find selected device"), and the game then
+    sits on its loading screen with idle emulation threads. An empty value means
+    the system's default output. A device the user picked is left alone.
+    Returns True when the file was changed.
+    """
+    home = Path(os.path.expanduser('~'))
+    if executable.startswith('flatpak:'):
+        cfg = home / '.var/app' / executable.split(':', 1)[1] / 'config/Cemu'
+    else:
+        cfg = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config') / 'Cemu'
+    settings = cfg / 'settings.xml'
+    try:
+        text = settings.read_text(encoding='utf-8')
+        if '<TVDevice>default</TVDevice>' not in text:
+            return False
+        backup = settings.with_name('settings.xml.bak-ludo-audio')
+        if not backup.exists():
+            backup.write_text(text, encoding='utf-8')
+        settings.write_text(
+            text.replace('<TVDevice>default</TVDevice>', '<TVDevice></TVDevice>'),
+            encoding='utf-8')
+        return True
+    except OSError:
+        return False
 
 
 _WIIU_IMAGE_SUFFIXES = ('.wua', '.wux', '.wud')
@@ -8852,6 +8883,8 @@ class RetroArchInterface:
         if spec.get('resolve_rom') == 'wiiu':
             rom_path, grant_root = resolve_wiiu_rom(rom_path)
         args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
+        if spec.get('prelaunch') == 'cemu_audio':
+            fix_cemu_audio_device(executable)
         if executable.startswith('flatpak:'):
             # The sandbox can't see a ROM outside the paths its manifest grants
             # (Eden then says "ROM format not supported", rommapp/ludo#34).
