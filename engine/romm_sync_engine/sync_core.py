@@ -7220,6 +7220,10 @@ class RetroArchInterface:
             'ppsspp': 'PPSSPP',
             'desmume': 'DeSmuME',
             'melonds': 'melonDS',
+            # melonDS DS is a different core from melonDS. RomM records it as
+            # either name (Ludo uploads melonds_ds, Argosy melondsds).
+            'melondsds': 'melonDS DS',
+            'melonds_ds': 'melonDS DS',
             'citra': 'Citra',
             'dolphin': 'Dolphin',
             'flycast': 'Flycast',
@@ -11062,6 +11066,14 @@ class RetroArchInterface:
         if mapped_name:
             return mapped_name
 
+        # The core's .info file names the folder RetroArch itself sorts into
+        # (corename, which matches the core's library_name), so a core missing
+        # from the map still lands where RetroArch reads. Title-casing guesses
+        # wrong for most of them.
+        info_name = self._core_library_name(romm_emulator_name)
+        if info_name:
+            return info_name
+
         # Already a RetroArch directory name (the map's output, not its input):
         # callers that hand us a resolved folder like "Beetle PSX HW" must get it
         # back unchanged. The pattern fallback below would title-case it into
@@ -11086,6 +11098,39 @@ class RetroArchInterface:
         fallback_name = ' '.join(word.capitalize() for word in fallback_name.split())
         
         return fallback_name
+
+    def _core_library_name(self, romm_emulator_name):
+        """The core's name from its .info file (corename), or None if there isn't one.
+
+        Tried as given and without underscores, since RomM spells some cores
+        with one (melonds_ds) that their filename doesn't have (melondsds).
+        """
+        cache = self.__dict__.setdefault('_library_name_cache', {})
+        key = romm_emulator_name.lower()
+        if key in cache:
+            return cache[key]
+        found = None
+        try:
+            info_dir = self.get_retroarch_config_setting('libretro_info_path', '')
+            if not info_dir:
+                cfg_dir = self.find_retroarch_config_dir()
+                info_dir = cfg_dir / 'info' if cfg_dir else None
+            if info_dir:
+                for core in dict.fromkeys((key, key.replace('_', ''))):
+                    info = Path(info_dir) / f'{core}_libretro.info'
+                    if not info.is_file():
+                        continue
+                    for line in info.read_text(errors='replace').splitlines():
+                        name, sep, value = line.partition('=')
+                        if sep and name.strip() == 'corename':
+                            found = value.strip().strip('"') or None
+                            break
+                    if found:
+                        break
+        except Exception:
+            found = None
+        cache[key] = found
+        return found
 
     def get_romm_emulator_name(self, retroarch_directory_name):
         """Convert RetroArch directory name to RomM emulator name using standard convention"""
@@ -11410,7 +11455,8 @@ class RetroArchInterface:
         
         return save_files
 
-    def resolve_restore_dest(self, game, entry, save_type, as_copy=False, local_name=None):
+    def resolve_restore_dest(self, game, entry, save_type, as_copy=False, local_name=None,
+                             default_dir=None):
         """Resolve the local destination (dir, filename) for a restored version.
 
         Mirrors the on-disk naming RetroArch expects. For an as-copy state it
@@ -11434,6 +11480,12 @@ class RetroArchInterface:
             dest_dir = Path(exact[0]['path']).parent
         elif candidates:
             dest_dir = Path(candidates[0]['path']).parent
+        elif default_dir:
+            # No copy on disk to follow: the folder a sync would download to
+            # (AutoSyncManager._download_dir), which knows the game's content
+            # folder. The guess below can't, and in content mode it dropped
+            # the file in the save root, where RetroArch never reads it.
+            dest_dir = Path(default_dir)
         else:
             base_dir = (getattr(self, 'save_dirs', {}) or {}).get(save_type)
             if not base_dir:
@@ -11455,7 +11507,8 @@ class RetroArchInterface:
         return dest_dir, tgt_name
 
     def restore_save_version(self, romm_client, game, entry, save_type,
-                             as_copy=False, log=None, local_name=None):
+                             as_copy=False, log=None, local_name=None,
+                             default_dir=None):
         """Restore a server save/state version to local disk.
 
         Backs up the current file (in-place restore only), downloads the chosen
@@ -11474,7 +11527,8 @@ class RetroArchInterface:
                 logging.info(msg)
         try:
             dest_dir, tgt_name = self.resolve_restore_dest(game, entry, save_type, as_copy,
-                                                           local_name=local_name)
+                                                           local_name=local_name,
+                                                           default_dir=default_dir)
             if not dest_dir or not tgt_name:
                 return {'success': False, 'dest': None, 'tgt_name': None,
                         'error': 'Could not determine restore location (download the game first).'}
@@ -16930,6 +16984,34 @@ class AutoSyncManager:
             return first_mapped
         return None
 
+    def _download_dir(self, save_type, game, romm_emulator, core_name=None,
+                      content_dir=None):
+        """The folder RetroArch reads this game's saves or states from.
+
+        Shared by the pre-launch download and by restoring a version from the
+        game page, so a restore lands where a sync would have put it.
+        `content_dir` is _content_dir_for_game(game), when the caller already
+        has it. None when there is no save root or no core folder to use.
+        """
+        base_dir = self.retroarch.save_dirs.get(save_type)
+        if not base_dir:
+            return None
+        base_dir = Path(base_dir)
+        mode = self.retroarch.get_save_subdir_mode(save_type)
+        if mode == 'core':
+            return self._target_core_dir(base_dir, game, romm_emulator, core_name)
+        if mode == 'content':
+            # The ROM's own folder when it has one; for a flat ROM the content
+            # dir IS the platform folder, which is the ES-DE folder name rather
+            # than the raw RomM slug when the two differ (dreamcast vs dc).
+            slug = (game or {}).get('platform_slug', '')
+            if content_dir is None and game:
+                content_dir = self._content_dir_for_game(game)
+            subdir = (content_dir or platform_folder_name(slug)
+                      or self.get_platform_slug_from_emulator(romm_emulator))
+            return base_dir / subdir if subdir else base_dir
+        return base_dir
+
     def _content_dir_for_game(self, game):
         """The ROM's content directory (its parent folder name), or None.
 
@@ -17483,22 +17565,8 @@ class AutoSyncManager:
                     final_path = None
                     emulator_save_dir = None
                     if original_filename:
-                        subdir_mode = self.retroarch.get_save_subdir_mode('saves')
-                        if subdir_mode == 'core':
-                            emulator_save_dir = self._target_core_dir(
-                                save_base_dir, game, romm_emulator, core_name)
-                        elif subdir_mode == 'content':
-                            # Use the ROM's actual parent folder name (what RetroArch uses as content dir)
-                            # rather than the stored emulator field, which may be from a different device/mode.
-                            # For a flat ROM the content dir IS the platform folder, which is
-                            # the ES-DE folder name rather than the raw RomM slug when the two
-                            # differ (dreamcast vs dc); prefer that over the emulator-derived
-                            # name so saves land where RetroArch reads.
-                            subdir_name = (_content_dir or platform_folder_name(_platform_slug)
-                                           or self.get_platform_slug_from_emulator(romm_emulator))
-                            emulator_save_dir = save_base_dir / subdir_name
-                        else:
-                            emulator_save_dir = save_base_dir
+                        emulator_save_dir = self._download_dir(
+                            'saves', game, romm_emulator, core_name, _content_dir)
                         if emulator_save_dir:
                             retroarch_filename = (
                                 self._local_save_name(rom_id, original_filename,
@@ -17618,20 +17686,8 @@ class AutoSyncManager:
                     if original_filename:
                         subdir_mode = self.retroarch.get_save_subdir_mode('states')
                         self.log(f"  [DEBUG] states subdir_mode={subdir_mode!r}, romm_emulator={romm_emulator!r}, content_dir={_content_dir!r}")
-                        if subdir_mode == 'core':
-                            emulator_state_dir = self._target_core_dir(
-                                state_base_dir, game, romm_emulator, core_name)
-                        elif subdir_mode == 'content':
-                            # Use the ROM's actual parent folder name (what RetroArch uses as content dir).
-                            # For a flat ROM the content dir IS the platform folder, which is
-                            # the ES-DE folder name rather than the raw RomM slug when the two
-                            # differ; prefer that over the emulator-derived name so states land
-                            # where RetroArch reads.
-                            subdir_name = (_content_dir or platform_folder_name(_platform_slug)
-                                           or self.get_platform_slug_from_emulator(romm_emulator))
-                            emulator_state_dir = state_base_dir / subdir_name
-                        else:
-                            emulator_state_dir = state_base_dir
+                        emulator_state_dir = self._download_dir(
+                            'states', game, romm_emulator, core_name, _content_dir)
                         if emulator_state_dir:
                             retroarch_filename = self.retroarch.convert_to_retroarch_filename(
                                 original_filename, 'states', emulator_state_dir, slot=state_slot
