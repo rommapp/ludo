@@ -6197,9 +6197,23 @@ class LudoBackend:
                         rom_id, entry.get('file_name', ''), entry.get('slot'))
                 except Exception as e:
                     logging.debug(f"could not name the restored save locally: {e}")
+            # Where a sync would download it, for when there's no copy on
+            # disk yet to restore over.
+            default_dir = None
+            if self._auto_sync:
+                try:
+                    auto = self._auto_sync
+                    game = auto._game_for_rom(rom_id)
+                    if game:
+                        default_dir = auto._download_dir(
+                            save_type, game, entry.get('emulator'),
+                            core_name=auto._core_for_game(game))
+                except Exception as e:
+                    logging.debug(f"could not resolve the restore folder: {e}")
             result = self._retroarch.restore_save_version(
                 self._romm_client, None, entry, save_type, as_copy,
-                log=lambda m: logging.info(m), local_name=local_name)
+                log=lambda m: logging.info(m), local_name=local_name,
+                default_dir=default_dir)
             if result.get('success'):
                 _record_activity('save',
                                  'State restored' if save_type == 'states' else 'Save restored',
