@@ -4,6 +4,7 @@ import { V2, fmtBytes, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
 import { FaWrench, FaChevronDown, FaChevronRight, FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
+import { peekDetail, storeDetail } from "../detailcache";
 import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns, setSwitchAddOnEnabled, setSwitchDlc, setSwitchUpdate, fetchSwitchAddOn} from "../rpc";
 import { _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, PlatformIcon, V2Button, V2CardRow, V2SettingsRow, V2Switch, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage, useArmedPress} from "../kit";
@@ -1581,8 +1582,9 @@ export function SaveDataTab({ romId }: { romId: number }) {
 
 export function GameDetailPage() {
   const game = getLibGameHolder();
-  const [detail, setDetail] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
+  const cached = game ? peekDetail(game.rom_id) : undefined;
+  const [detail, setDetail] = useState<any>(cached ?? null);
+  const [loading, setLoading] = useState(!cached);
   const [busy, setBusy] = useState<null | 'download' | 'delete' | 'launch'>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [isDownloaded, setIsDownloaded] = useState<boolean>(!!game?.is_downloaded);
@@ -1645,6 +1647,7 @@ export function GameDetailPage() {
     try {
       const res = await getGameDetail(rid);
       if (res?.success) {
+        storeDetail(rid, res);
         setDetail(res);
         // get_game_detail reports is_downloaded from the in-memory games index,
         // which a just-finished download may not have reached yet (and which
@@ -1673,7 +1676,7 @@ export function GameDetailPage() {
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(!!cached); }, []);
 
   // If a download for this game finishes on another surface (e.g. its cover
   // tile), refresh so the CTA flips Download → Play here too.
@@ -1960,7 +1963,11 @@ export function GameDetailPage() {
         <Focusable noFocusRing flow-children="vertical" style={{ flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <div>
             <div style={{ fontSize: '30px', fontWeight: 800, lineHeight: '1.15', letterSpacing: '-0.01em' }}>{name}</div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0', marginTop: '8px', fontSize: '13.5px', color: V2.fg2 }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0', marginTop: '8px', fontSize: '13.5px', color: V2.fg2,
+              // The row is as tall as its tag chips from the first paint: the chips
+              // arrive with the detail, and without this everything below them
+              // (actions, tabs) drops a few pixels when they do.
+              minHeight: '24px' }}>
               {/* Platform icon leads the meta row (RomM GameHeader). */}
               {game.platform_slug && (
                 <span style={{ display: 'inline-flex', width: '16px', height: '16px', marginRight: '6px', alignItems: 'center', justifyContent: 'center' }}>
@@ -2114,7 +2121,10 @@ export function GameDetailPage() {
 
           {/* Tabbed panel (RomM GameDetails: RTabNav + tab content). L1/R1 page tabs. */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <div style={{ flex: '1 1 auto', minWidth: 0 }}><V2TabNav tabs={tabList} active={tab} onTab={setTab} /></div>
+            {/* Hidden until the detail is in: Files / Media / Achievements are only
+                known then, and tabs appearing in the middle of the strip shift the
+                ones after them. The row keeps its height either way. */}
+            <div style={{ flex: '1 1 auto', minWidth: 0, visibility: loading ? 'hidden' : 'visible' }}><V2TabNav tabs={tabList} active={tab} onTab={setTab} /></div>
             <Bumper label="L1" />
             <Bumper label="R1" />
           </div>

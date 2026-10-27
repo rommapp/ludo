@@ -146,8 +146,15 @@ export const POPULATED_FIXTURES = {
       timestamp: 1792449790 + i * 1000,
     })),
   },
+  // Enough platforms that the list is taller than the window.
+  get_platform_sync: {
+    success: true, connected: true, unavailable: false, disabled: ["atari2600"],
+    platforms: Array.from({ length: 18 }, (_, i) => ({
+      slug: i === 3 ? "atari2600" : `plat${i}`, name: `Platform ${i}`, rom_count: 10 + i,
+    })),
+  },
   list_emulator_builds: {
-    success: true, name: "Eden", selected: "",
+    success: true, name: "Eden", selected: "", selected: "",
     builds: [{ path: "/home/t/AppImages/eden.AppImage", label: "Eden", kind: "appimage", current: true }],
   },
   get_core_mappings: {

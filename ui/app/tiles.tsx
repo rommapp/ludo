@@ -10,6 +10,7 @@ import { maybePromptSwitchFirmware } from "./firmware";
 import { _libGamesCache, libCacheSetDownloaded, _focusedPlatform, _setFocusedPlatform, libCacheDelete, libCacheDrop, openGameById} from "./libcache";
 import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImageBg } from "./media";
+import { cancelDetailPrefetch, scheduleDetailPrefetch } from "./detailcache";
 import { PlatformIcon, ProgressRing, UserMenuRow, MODAL_SCRIM_INSET, PickerModal, ToastCover} from "./kit";
 import { FaBookmark, FaBoxOpen, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
 import { _broadcastLibRefresh } from "./events";
@@ -690,8 +691,8 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       onOptionsButton={dl ? requestDelete : undefined}
       onOptionsActionDescription={dl ? (confirmDelete ? 'Confirm delete' : 'Delete') : undefined}
       onOKActionDescription={dl ? (isMultiRegion ? 'Launch (hold: regions)' : isMultiDisc ? (discsAreRegion ? 'Launch (hold: regions)' : 'Launch (hold: discs)') : (resume ? 'Resume' : 'Launch')) : 'Download'}
-      onFocus={() => { setFocused(true); activate(); ensureDiscs(); ensureSiblings(); if (index !== undefined) onFocusIdx?.(index); _tileFocusScrub(selfRef.current, game.name); }}
-      onBlur={() => setFocused(false)}
+      onFocus={() => { setFocused(true); activate(); ensureDiscs(); ensureSiblings(); scheduleDetailPrefetch(game.rom_id); if (index !== undefined) onFocusIdx?.(index); _tileFocusScrub(selfRef.current, game.name); }}
+      onBlur={() => { setFocused(false); cancelDetailPrefetch(); }}
       onMouseEnter={() => { setFocused(true); activate(); ensureDiscs(); ensureSiblings(); }}
       onMouseLeave={() => setFocused(false)}
       style={{

@@ -142,7 +142,7 @@ const PROBE = () => {
  * The caller must `close()`. Use this when a test needs to keep interacting;
  * `renderRoute` below is the open-probe-close shorthand.
  */
-export async function openRoute(browser, origin, path, { settleMs = 1200 } = {}) {
+export async function openRoute(browser, origin, path, { settleMs = 1200, waitUntil = "networkidle" } = {}) {
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   const errors = [];
   const record = (text) => { if (!isBenign(text)) errors.push(text); };
@@ -151,7 +151,7 @@ export async function openRoute(browser, origin, path, { settleMs = 1200 } = {})
   page.on("pageerror", (e) => record(`pageerror: ${e.message}`));
   page.on("requestfailed", (r) => record(`requestfailed: ${r.url()}`));
 
-  await page.goto(origin + path, { waitUntil: "networkidle" });
+  await page.goto(origin + path, { waitUntil });
   await page.waitForTimeout(settleMs);
 
   return {
@@ -216,6 +216,65 @@ export async function openRoute(browser, origin, path, { settleMs = 1200 } = {})
     },
     close: () => page.close(),
   };
+}
+
+
+/**
+ * Record a page transition frame by frame, so a test can say how it LOOKED and
+ * not only where it ended up.
+ *
+ * Install with `startTrace(page)` right before the action, read with
+ * `endTrace(page)` after it settles. `watch` lists strings to report in `seen`
+ * if they ever showed up, however briefly. Each entry in `frames` is one change of
+ * something a user would see: the focused row, the scroll offset of the visible
+ * page, or what the page says. Layout shifts are the hard thing to see in an
+ * end-state check, so `rowY` follows one named row's top edge too.
+ *
+ * Pair with `delayRpc` — a transition that is clean against an instant backend
+ * and a rebuild against a real one is the usual shape of these bugs.
+ */
+export async function startTrace(page, { row = null, watch = [] } = {}) {
+  await page.evaluate(([rowName, watched]) => {
+    const t0 = performance.now();
+    const t = (window.__trace = { frames: [], focus: [], rowY: [], seen: [], stop: false });
+    const scroller = () => [...document.querySelectorAll(".romm-ui")]
+      .filter((e) => e.offsetParent !== null && e.scrollHeight > e.clientHeight).pop();
+    let last = "";
+    const tick = () => {
+      if (t.stop) return;
+      const el = document.activeElement;
+      const wide = !el || el.getBoundingClientRect().width >= window.innerWidth;
+      const f = wide ? "" : (el.innerText || "").replace(/\s+/g, " ").trim().slice(0, 40);
+      if (f && t.focus[t.focus.length - 1] !== f) t.focus.push(f);
+      const sc = scroller()?.scrollTop ?? 0;
+      const text = document.body.innerText.replace(/\s+/g, " ").trim();
+      for (const w of watched) if (text.includes(w) && !t.seen.includes(w)) t.seen.push(w);
+      const key = `${f}|${Math.round(sc)}|${text.length}`;
+      if (key !== last) {
+        last = key;
+        t.frames.push({ ms: Math.round(performance.now() - t0), focus: f, scroll: Math.round(sc), textLen: text.length, text: text.slice(0, 60) });
+      }
+      if (rowName) {
+        const r = [...document.querySelectorAll(".desk-focusable[tabindex]")].find((e) =>
+          (e.innerText || "").replace(/\s+/g, " ").trim().startsWith(rowName) && e.getBoundingClientRect().width < window.innerWidth);
+        if (r) t.rowY.push(Math.round(r.getBoundingClientRect().top));
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }, [row, watch]);
+}
+
+export async function endTrace(page) {
+  return page.evaluate(() => { window.__trace.stop = true; return window.__trace; });
+}
+
+/** Make one RPC slow, the way a real backend is. */
+export async function delayRpc(page, method, ms) {
+  await page.route(`**/api/${method}`, async (route) => {
+    await new Promise((ok) => setTimeout(ok, ms));
+    route.continue();
+  });
 }
 
 /** Open a route, probe it once, close it. */

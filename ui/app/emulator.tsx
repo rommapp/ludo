@@ -242,12 +242,19 @@ export function standaloneFor(status: EmuStatus | null,
 // Switching one off never deletes anything: downloaded games stay on disk and
 // stay in the library, and only listings for games that were never downloaded
 // go. That is why the copy below says "stop syncing", never "remove".
+// The last answer, kept for the next time the page opens. Back from another page
+// rebuilds this one, and a list that starts empty and fills in half a second
+// later is a visible redraw — so it opens on what it showed last and corrects
+// itself when the fresh answer lands.
+let _platformSyncCache: any = null;
+
 export function usePlatformSync() {
-  const [rows, setRows] = useState<any[]>([]);
-  const [off, setOff] = useState<Set<string>>(new Set());
-  const [loading, setLoading] = useState(true);
-  const [connected, setConnected] = useState(true);
-  const [unavailable, setUnavailable] = useState(false);
+  const seed = _platformSyncCache;
+  const [rows, setRows] = useState<any[]>(seed?.platforms || []);
+  const [off, setOff] = useState<Set<string>>(new Set(seed?.disabled || []));
+  const [loading, setLoading] = useState(!seed);
+  const [connected, setConnected] = useState(seed ? !!seed.connected : true);
+  const [unavailable, setUnavailable] = useState(!!seed?.unavailable);
   // Slugs with a write in flight. A set, not a single slug: switches are quick
   // to flip and each write is a round-trip, so several are routinely open at
   // once and a scalar would blank the first one's "Saving…" the moment the
@@ -257,7 +264,7 @@ export function usePlatformSync() {
   // is a render snapshot, so building the next set from it would let two quick
   // toggles each send a set that omits the other's change — last write wins and
   // silently reverts one of them.
-  const offRef = useRef<Set<string>>(new Set());
+  const offRef = useRef<Set<string>>(new Set(seed?.disabled || []));
   // A platform coming back ON needs a walk to bring its games in. Deferred to
   // the moment the user leaves rather than fired per toggle: turning three
   // platforms back on should cost one walk, not three — and re-fetching under
@@ -271,10 +278,11 @@ export function usePlatformSync() {
     // Set on every call, not just the first: the wizard re-runs this once the
     // connection exists, and a reload that left `loading` false would let the
     // caller read the previous (unconnected, empty) answer as the real one.
-    setLoading(true);
+    if (!_platformSyncCache) setLoading(true);
     try {
       const r = await getPlatformSync();
       if (r?.success) {
+        _platformSyncCache = r.connected && !r.unavailable ? r : null;
         setRows(r.platforms || []);
         const stored = new Set<string>(r.disabled || []);
         offRef.current = stored;
@@ -302,6 +310,14 @@ export function usePlatformSync() {
     return next;
   });
 
+  // Keeps the remembered answer in step, so reopening the page shows the
+  // switches where they were left.
+  const commit = (next: Set<string>) => {
+    offRef.current = next;
+    setOff(next);
+    if (_platformSyncCache) _platformSyncCache = { ..._platformSyncCache, disabled: [...next] };
+  };
+
   const toggle = async (slug: string) => {
     // Built from the ref, so a toggle started while another is still in flight
     // sends both changes rather than clobbering the earlier one.
@@ -310,8 +326,7 @@ export function usePlatformSync() {
     if (turningOff) next.add(slug); else next.delete(slug);
     // Optimistic: the switch has to move under the thumb. A failed write puts
     // it back, which is the only honest thing to show if nothing was stored.
-    offRef.current = next;
-    setOff(next);
+    commit(next);
     mark(slug, true);
     try {
       const r = await setPlatformSync([...next]);
@@ -324,8 +339,7 @@ export function usePlatformSync() {
       // user made while it was in flight — including ones that succeeded.
       const undone = new Set(offRef.current);
       if (turningOff) undone.delete(slug); else undone.add(slug);
-      offRef.current = undone;
-      setOff(undone);
+      commit(undone);
     } finally {
       mark(slug, false);
     }
