@@ -60,6 +60,7 @@ def main():
         home = Path(tmp) / 'home'
         home.mkdir()
         os.environ['HOME'] = str(home)
+        os.environ['XDG_CONFIG_HOME'] = str(home / '.config')
         installed = set()
         sync_core.flatpak_app_installed = lambda app: app in installed
         sync_core.shutil.which = lambda n: None
@@ -191,25 +192,31 @@ def main():
         check('corrupt archive reports failure', ok, False)
         check('corrupt archive left in place', bad.exists(), True)
 
-        # --- a placeholder TV audio device is blanked, a real one is not -----
-        def audio(cfg_dir, exe, body):
+        # --- launch preparation must not rewrite Cemu's audio settings -------
+        def audio(cfg_dir, exe, device, label):
             cfg_dir.mkdir(parents=True, exist_ok=True)
             f = cfg_dir / 'settings.xml'
-            f.write_text(f'<Audio>{body}</Audio>')
+            original = (f'<Audio>\r\n<TVDevice>{device}</TVDevice>\r\n</Audio>\r\n'
+                        ).encode('utf-8')
+            f.write_bytes(original)
             ra.build_standalone_launch_command(str(home / 'g.wua'), 'cemu', spec, exe)
-            return f.read_text()
-        fp = home / '.var/app/info.cemu.Cemu/config/Cemu'
-        check('flatpak: placeholder audio device blanked',
-              audio(fp, 'flatpak:info.cemu.Cemu', '<TVDevice>default</TVDevice>'),
-              '<Audio><TVDevice></TVDevice></Audio>')
-        check('flatpak: backup kept', (fp / 'settings.xml.bak-ludo-audio').exists(), True)
-        check('flatpak: chosen audio device kept',
-              audio(fp, 'flatpak:info.cemu.Cemu', '<TVDevice>alsa_x</TVDevice>'),
-              '<Audio><TVDevice>alsa_x</TVDevice></Audio>')
-        os.environ.pop('XDG_CONFIG_HOME', None)
-        check('appimage: placeholder audio device blanked',
-              audio(home / '.config/Cemu', '/x/Cemu.AppImage', '<TVDevice>default</TVDevice>'),
-              '<Audio><TVDevice></TVDevice></Audio>')
+            check(f'{label}: {device} settings unchanged', f.read_bytes(), original)
+            backup = cfg_dir / 'settings.xml.bak-ludo-audio'
+            check(f'{label}: {device} no audio backup', backup.exists(), False)
+            # Keep cases independent even when running against the old rewrite.
+            if backup.exists():
+                backup.unlink()
+        for label, exe, cfg_dir, xdg in (
+                ('flatpak', 'flatpak:info.cemu.Cemu',
+                 home / '.var/app/info.cemu.Cemu/config/Cemu', home / '.config'),
+                ('appimage', str(app), home / '.config/Cemu', None),
+                ('native XDG', '/usr/bin/cemu', home / 'xdg/Cemu', home / 'xdg')):
+            if xdg is None:
+                os.environ.pop('XDG_CONFIG_HOME', None)
+            else:
+                os.environ['XDG_CONFIG_HOME'] = str(xdg)
+            for device in ('default', 'alsa_x'):
+                audio(cfg_dir, exe, device, label)
 
         # --- Eden is untouched by the new resolver ---------------------------
         nsp = touch(home / 'Ludo' / 'roms' / 'switch' / 'g.nsp')
