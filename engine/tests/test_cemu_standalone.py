@@ -218,6 +218,35 @@ def main():
             for device in ('default', 'alsa_x'):
                 audio(cfg_dir, exe, device, label)
 
+        # --- beta.23 blanked the device; its backup puts 'default' back once --
+        def repair(cfg_dir, exe, device, label):
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            f = cfg_dir / 'settings.xml'
+            backup = cfg_dir / 'settings.xml.bak-ludo-audio'
+            f.write_bytes(f'<Audio>\r\n<TVDevice>{device}</TVDevice>\r\n</Audio>\r\n'.encode())
+            backup.write_bytes(b'<Audio>\r\n<TVDevice>default</TVDevice>\r\n</Audio>\r\n')
+            ra.build_standalone_launch_command(str(home / 'g.wua'), 'cemu', spec, exe)
+            check(f'{label}: backup removed after repair', backup.exists(), False)
+            return f.read_bytes()
+        os.environ['XDG_CONFIG_HOME'] = str(home / '.config')
+        fp = home / '.var/app/info.cemu.Cemu/config/Cemu'
+        check('flatpak: blanked device restored, CRLF kept',
+              repair(fp, 'flatpak:info.cemu.Cemu', '', 'flatpak'),
+              b'<Audio>\r\n<TVDevice>default</TVDevice>\r\n</Audio>\r\n')
+        check('flatpak: device chosen since is left alone',
+              repair(fp, 'flatpak:info.cemu.Cemu', 'alsa_x', 'flatpak'),
+              b'<Audio>\r\n<TVDevice>alsa_x</TVDevice>\r\n</Audio>\r\n')
+        os.environ.pop('XDG_CONFIG_HOME', None)
+        check('appimage: blanked device restored',
+              repair(home / '.config/Cemu', str(app), '', 'appimage'),
+              b'<Audio>\r\n<TVDevice>default</TVDevice>\r\n</Audio>\r\n')
+        # Once the backup is gone, a deliberately empty device stays empty.
+        f = home / '.config/Cemu/settings.xml'
+        f.write_bytes(b'<Audio>\r\n<TVDevice></TVDevice>\r\n</Audio>\r\n')
+        ra.build_standalone_launch_command(str(home / 'g.wua'), 'cemu', spec, str(app))
+        check('no backup: an empty device is left empty', f.read_bytes(),
+              b'<Audio>\r\n<TVDevice></TVDevice>\r\n</Audio>\r\n')
+
         # --- Eden is untouched by the new resolver ---------------------------
         nsp = touch(home / 'Ludo' / 'roms' / 'switch' / 'g.nsp')
         check('eden argv unchanged',

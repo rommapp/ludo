@@ -1276,8 +1276,44 @@ STANDALONE_EMULATORS = {
         'args': ('-f', '-g', '{rom}'),
         # A decrypted title is a folder (code/ content/ meta/), not a file.
         'resolve_rom': 'wiiu',
+        'prelaunch': 'cemu_audio_repair',
     },
 }
+
+
+def repair_cemu_audio_device(executable):
+    """Undo beta.23's blanking of Cemu's TV audio device, once.
+
+    beta.23 replaced <TVDevice>default</TVDevice> with an empty value before
+    each launch, keeping the original as settings.xml.bak-ludo-audio. On real
+    hardware 'default' is the system output and empty is no sound at all.
+    While that backup exists and the device is still empty, put 'default'
+    back. A device chosen since is left alone. Either way the backup goes, so
+    this runs at most once. Returns True when the file was changed.
+    """
+    home = Path(os.path.expanduser('~'))
+    if executable.startswith('flatpak:'):
+        cfg = home / '.var/app' / executable.split(':', 1)[1] / 'config/Cemu'
+    else:
+        cfg = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config') / 'Cemu'
+    settings = cfg / 'settings.xml'
+    backup = settings.with_name('settings.xml.bak-ludo-audio')
+    try:
+        if not backup.exists():
+            return False
+        changed = False
+        # Bytes, not text: Cemu writes CRLF, and a text round trip would
+        # rewrite every line ending in a file this only means to touch once.
+        data = settings.read_bytes()
+        if (b'<TVDevice></TVDevice>' in data
+                and b'<TVDevice>default</TVDevice>' in backup.read_bytes()):
+            settings.write_bytes(data.replace(
+                b'<TVDevice></TVDevice>', b'<TVDevice>default</TVDevice>', 1))
+            changed = True
+        backup.unlink()
+        return changed
+    except OSError:
+        return False
 
 
 _WIIU_IMAGE_SUFFIXES = ('.wua', '.wux', '.wud')
@@ -8852,6 +8888,8 @@ class RetroArchInterface:
         if spec.get('resolve_rom') == 'wiiu':
             rom_path, grant_root = resolve_wiiu_rom(rom_path)
         args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
+        if spec.get('prelaunch') == 'cemu_audio_repair':
+            repair_cemu_audio_device(executable)
         if executable.startswith('flatpak:'):
             # The sandbox can't see a ROM outside the paths its manifest grants
             # (Eden then says "ROM format not supported", rommapp/ludo#34).
