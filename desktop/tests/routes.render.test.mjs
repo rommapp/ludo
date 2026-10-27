@@ -17,7 +17,7 @@ import test, { before, after, describe } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  DIST, PAD, distIsBuilt, launchBrowser, openRoute, renderRoute, startServer,
+  DIST, PAD, delayRpc, distIsBuilt, endTrace, launchBrowser, openRoute, renderRoute, startServer, startTrace,
 } from "./support/render-harness.mjs";
 import { POPULATED_FIXTURES } from "./support/fixtures.mjs";
 
@@ -187,6 +187,131 @@ describe("rendering with a populated library", { skip: SKIP }, () => {
         `the Emulators row moved while the page came back: ${JSON.stringify([...new Set(ys)])}`);
       assert.ok(seen.every((t) => t.startsWith("Emulators")),
         `focus visited other rows on the way back: ${JSON.stringify(seen)}`);
+      assert.deepEqual(r.errors, []);
+    } finally {
+      await r.close();
+    }
+  });
+
+  // ── Transitions ─────────────────────────────────────────────────────────
+  //
+  // A page that is right once it has settled can still be wrong on the way
+  // there: rows that appear late and shove the ones below, a list that empties
+  // and refills, focus visiting the wrong row first. These run each hop against
+  // a backend that takes its time and look at every frame, not the last one.
+  // Add one for each new page or stacked view.
+  const SLOW = ["get_platform_sync", "get_game_detail", "get_library_games", "get_library_groups",
+    "get_recent_activity", "get_ra_earned", "get_local_discs", "get_local_siblings", "get_save_history"];
+
+  async function openSettings(r) {
+    await r.page.evaluate(() => {
+      const els = [...document.querySelectorAll(".desk-focusable[tabindex]")];
+      els[els.findIndex((e) => (e.innerText || "").trim() === "Search") + 1]?.click();
+    });
+    await r.page.waitForTimeout(800);
+    await r.activateText("Settings");
+  }
+
+  test("Settings ▸ Platforms: reopening shows the list at once, and Back lands on the row", async () => {
+    const r = await openRoute(browser, srv.origin, "/romm-sync-library");
+    try {
+      await openSettings(r);
+      // First visit has to ask. Let it finish so there is an answer to remember.
+      await r.activateText("Choose which platforms");
+      await r.pressPad(PAD.CANCEL, { settleMs: 800 });
+      for (const m of SLOW) await delayRpc(r.page, m, 500);
+
+      await startTrace(r.page, { watch: ["Reading your platforms"] });
+      await r.activateText("Choose which platforms", { settleMs: 1200 });
+      const enter = await endTrace(r.page);
+      assert.deepEqual(enter.seen, [], "the platform list emptied and refilled on reopen");
+
+      await startTrace(r.page, { row: "Platforms Choose" });
+      await r.pressPad(PAD.CANCEL, { settleMs: 1500 });
+      const back = await endTrace(r.page);
+      assert.ok(back.focus.length > 0 && back.focus.every((t) => t.startsWith("Platforms Choose")),
+        `focus visited other rows on the way back: ${JSON.stringify(back.focus)}`);
+      assert.equal(new Set(back.rowY).size, 1, `the row moved on the way back: ${JSON.stringify([...new Set(back.rowY)])}`);
+      assert.deepEqual(r.errors, []);
+    } finally {
+      await r.close();
+    }
+  });
+
+  test("game detail: nothing under the title moves while the detail arrives", async () => {
+    const r = await openRoute(browser, srv.origin, "/romm-sync-library");
+    try {
+      await r.activateText("Platforms");
+      await r.activateText("Test Platform");
+      for (const m of SLOW) await delayRpc(r.page, m, 400);
+      await startTrace(r.page, { row: "Play" });
+      await r.activateText("Harness Test Game", { key: "Shift+Enter", settleMs: 1500 });
+      const t = await endTrace(r.page);
+      assert.ok(t.rowY.length > 0, "the Play button never showed");
+      // The date, region and language chips come with the detail; the actions
+      // below them have to be where they will stay from the first frame.
+      assert.equal(new Set(t.rowY).size, 1,
+        `Play moved while the detail loaded: ${JSON.stringify([...new Set(t.rowY)])}`);
+      assert.deepEqual(r.errors, []);
+    } finally {
+      await r.close();
+    }
+  });
+
+  test("game detail: a game seen before opens with its details, not a loader", async () => {
+    const r = await openRoute(browser, srv.origin, "/romm-sync-library");
+    try {
+      await r.activateText("Platforms");
+      await r.activateText("Test Platform");
+      await r.activateText("Harness Test Game", { key: "Shift+Enter" });
+      await r.pressPad(PAD.CANCEL, { settleMs: 800 });
+      for (const m of SLOW) await delayRpc(r.page, m, 500);
+      await startTrace(r.page, { watch: ["Loading details"] });
+      await r.activateText("Harness Test Game", { key: "Shift+Enter", settleMs: 1200 });
+      const t = await endTrace(r.page);
+      assert.deepEqual(t.seen, [], "the detail page showed its loader for a game it already knew");
+      assert.deepEqual(r.errors, []);
+    } finally {
+      await r.close();
+    }
+  });
+
+  test("game detail: warming up on focus waits for a pause and never piles up", async () => {
+    const r = await openRoute(browser, srv.origin, "/romm-sync-library");
+    try {
+      const games = [1, 2, 3, 4, 5].map((i) => ({
+        rom_id: 100 + i, name: `Warm Game ${i}`, platform: "Test Platform",
+        platform_slug: "test", is_downloaded: true, has_cover: false,
+      }));
+      await r.page.route("**/api/get_library_games", (route) =>
+        route.fulfill({ contentType: "application/json", body: JSON.stringify({ result: { success: true, games } }) }));
+      await r.activateText("Platforms");
+      await r.activateText("Test Platform", { settleMs: 1200 });
+      const asked = [];
+      r.page.on("request", (q) => {
+        if (q.url().endsWith("/api/get_game_detail")) asked.push(q.postData());
+      });
+      // Sweep every tile faster than the dwell: nothing may be asked.
+      await r.page.evaluate(async () => {
+        const tiles = [...document.querySelectorAll(".desk-focusable[tabindex]")]
+          .filter((e) => e.offsetParent && /Warm Game/.test(e.innerText) && !e.innerText.includes("\n\n"));
+        const seen = new Set();
+        for (const t of tiles) {
+          const key = t.innerText.trim();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          t.focus();
+          await new Promise((ok) => setTimeout(ok, 60));
+        }
+      });
+      await r.page.waitForTimeout(150);
+      assert.equal(asked.length, 0, `asked for details while moving quickly: ${asked.join(" ")}`);
+      // Rest on one: after the dwell, exactly one request for it.
+      await r.page.evaluate(() => [...document.querySelectorAll(".desk-focusable[tabindex]")]
+        .findLast((e) => e.offsetParent && /Warm Game 4/.test(e.innerText))?.focus());
+      await r.page.waitForTimeout(900);
+      assert.equal(asked.length, 1, `expected one warm-up request, saw ${asked.length}`);
+      assert.match(asked[0], /104/);
       assert.deepEqual(r.errors, []);
     } finally {
       await r.close();
