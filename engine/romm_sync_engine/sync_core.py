@@ -7215,6 +7215,10 @@ class RetroArchInterface:
             'ppsspp': 'PPSSPP',
             'desmume': 'DeSmuME',
             'melonds': 'melonDS',
+            # melonDS DS is a different core from melonDS. RomM records it as
+            # either name (Ludo uploads melonds_ds, Argosy melondsds).
+            'melondsds': 'melonDS DS',
+            'melonds_ds': 'melonDS DS',
             'citra': 'Citra',
             'dolphin': 'Dolphin',
             'flycast': 'Flycast',
@@ -11057,6 +11061,14 @@ class RetroArchInterface:
         if mapped_name:
             return mapped_name
 
+        # The core's .info file names the folder RetroArch itself sorts into
+        # (corename, which matches the core's library_name), so a core missing
+        # from the map still lands where RetroArch reads. Title-casing guesses
+        # wrong for most of them.
+        info_name = self._core_library_name(romm_emulator_name)
+        if info_name:
+            return info_name
+
         # Already a RetroArch directory name (the map's output, not its input):
         # callers that hand us a resolved folder like "Beetle PSX HW" must get it
         # back unchanged. The pattern fallback below would title-case it into
@@ -11081,6 +11093,39 @@ class RetroArchInterface:
         fallback_name = ' '.join(word.capitalize() for word in fallback_name.split())
         
         return fallback_name
+
+    def _core_library_name(self, romm_emulator_name):
+        """The core's name from its .info file (corename), or None if there isn't one.
+
+        Tried as given and without underscores, since RomM spells some cores
+        with one (melonds_ds) that their filename doesn't have (melondsds).
+        """
+        cache = self.__dict__.setdefault('_library_name_cache', {})
+        key = romm_emulator_name.lower()
+        if key in cache:
+            return cache[key]
+        found = None
+        try:
+            info_dir = self.get_retroarch_config_setting('libretro_info_path', '')
+            if not info_dir:
+                cfg_dir = self.find_retroarch_config_dir()
+                info_dir = cfg_dir / 'info' if cfg_dir else None
+            if info_dir:
+                for core in dict.fromkeys((key, key.replace('_', ''))):
+                    info = Path(info_dir) / f'{core}_libretro.info'
+                    if not info.is_file():
+                        continue
+                    for line in info.read_text(errors='replace').splitlines():
+                        name, sep, value = line.partition('=')
+                        if sep and name.strip() == 'corename':
+                            found = value.strip().strip('"') or None
+                            break
+                    if found:
+                        break
+        except Exception:
+            found = None
+        cache[key] = found
+        return found
 
     def get_romm_emulator_name(self, retroarch_directory_name):
         """Convert RetroArch directory name to RomM emulator name using standard convention"""
