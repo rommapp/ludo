@@ -108,21 +108,33 @@ const _sc = (): any => (typeof window !== 'undefined' ? (window as any).SteamCli
 // AppIds of all non-Steam shortcuts. deckDesktopApps.apps is a Map keyed by
 // appid on this build; the map values are not overviews, so we resolve each
 // overview separately via appStore.GetAppOverviewByAppID.
+// app_type of a non-Steam shortcut overview.
+const SHORTCUT_APP_TYPE = 1073741824;
+
 function _shortcutAppIds(): number[] {
   const m = (window as any).collectionStore?.deckDesktopApps?.apps;
   try { if (m?.keys) return Array.from(m.keys()).map((k: any) => Number(k)); } catch { /* ignore */ }
+  // deckDesktopApps is null outside the Deck's own build (desktop Steam with
+  // Decky, e.g. Bazzite), so read the overviews themselves. Without this every
+  // lookup came back empty: duplicates were never collapsed and the forced
+  // last retry added a fresh "Ludo" on every plugin load.
+  try {
+    const all = (window as any).appStore?.m_mapApps;
+    if (all?.values) {
+      return Array.from(all.values())
+        .filter((o: any) => o?.app_type === SHORTCUT_APP_TYPE)
+        .map((o: any) => Number(o.appid));
+    }
+  } catch { /* ignore */ }
   return [];
 }
 
 // True once Steam's shortcut store is actually populated. Early in Steam
-// startup deckDesktopApps.apps can be missing or still empty; creating a
-// shortcut then duplicates a tile that already exists on disk but isn't
-// visible yet — the root cause of multiple "Ludo" entries piling up.
+// startup the stores can be missing or still empty; creating a shortcut then
+// duplicates a tile that already exists on disk but isn't visible yet — the
+// root cause of multiple "Ludo" entries piling up.
 function _shortcutStoreReady(): boolean {
-  try {
-    const m = (window as any).collectionStore?.deckDesktopApps?.apps;
-    return !!m?.keys && Array.from(m.keys()).length > 0;
-  } catch { return false; }
+  try { return _shortcutAppIds().length > 0; } catch { return false; }
 }
 
 function _appName(appid: number): string {
