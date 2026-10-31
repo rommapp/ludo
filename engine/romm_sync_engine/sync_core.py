@@ -16290,20 +16290,33 @@ class AutoSyncManager:
         # writing it there is what seeds the stray .srm the inventory now
         # refuses to sync.
         try:
-            slug = next(
-                (g.get('platform_slug') or (g.get('romm_data') or {}).get('platform_slug')
-                 for g in (self.get_games() or [])
-                 if g.get('rom_id') == op.get('rom_id')), None)
+            game = next((g for g in (self.get_games() or [])
+                         if g.get('rom_id') == op.get('rom_id')), None)
         except Exception:
-            slug = None
+            game = None
+        slug = game and (game.get('platform_slug')
+                         or (game.get('romm_data') or {}).get('platform_slug'))
         if standalone_emulator_for_platform(slug):
             return None
-        target_dir = Path(saves_dir)
         emulator = op.get('emulator')
-        if emulator:
-            mapped = self.retroarch.emulator_directory_map.get(emulator.lower())
-            if mapped:
-                target_dir = target_dir / mapped
+        # The folder RetroArch actually reads, by its sorting mode -- the same
+        # rule the pre-launch reconcile files saves by. Always using the core
+        # folder put a downloaded save in saves/<Core>/ while a content-sorted
+        # RetroArch (RetroDECK's default) wrote saves/<platform>/: two local
+        # copies of one slot, each tied to its own server record, conflicting
+        # on every launch.
+        target_dir = None
+        if game:
+            try:
+                target_dir = self._download_dir('saves', game, emulator)
+            except Exception:
+                target_dir = None
+        if target_dir is None:
+            target_dir = Path(saves_dir)
+            if emulator:
+                mapped = self.retroarch.emulator_directory_map.get(emulator.lower())
+                if mapped:
+                    target_dir = target_dir / mapped
         target_dir.mkdir(parents=True, exist_ok=True)
         # A game's battery save is read under this device's name for the
         # game, not the uploader's; see _local_save_name.

@@ -19,7 +19,7 @@ import { ScreenshotViewer } from "../shots";
 import { viewerOpen } from "../glass";
 import { MdVerified } from "react-icons/md";
 import { getLibGameHolder, getLibGameOrigin, libCacheSetDownloaded, openGameById} from "../libcache";
-import { cannotLaunch, runLaunch } from "../launch";
+import { cannotLaunch, runLaunch, useResumable } from "../launch";
 import { standaloneFor, useEmulatorStatus } from "../emulator";
 import { LocalDisc, discDisplayLabel, openDiscPicker } from "../tiles";
 import { useSaveActivityFor } from "../status";
@@ -1587,6 +1587,7 @@ export function GameDetailPage() {
   const [detail, setDetail] = useState<any>(cached ?? null);
   const [loading, setLoading] = useState(!cached);
   const [busy, setBusy] = useState<null | 'download' | 'delete' | 'launch'>(null);
+  const resumable = useResumable(game?.rom_id);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [isDownloaded, setIsDownloaded] = useState<boolean>(!!game?.is_downloaded);
   const [discs, setDiscs] = useState<LocalDisc[]>([]);
@@ -2071,7 +2072,7 @@ export function GameDetailPage() {
                   onFocused={() => setCtaFocused(true)} onBlurred={() => setCtaFocused(false)}
                   onOptionsButton={isMultiDisc && !noEmulator ? openDiscMenu : undefined}
                   optionsHint={isMultiDisc && !noEmulator}
-                  label={busy === 'launch' ? 'Launching…' : 'Play'}
+                  label={busy === 'launch' ? 'Launching…' : resumable ? 'Resume' : 'Play'}
                   icon={busy === 'launch'
                     ? <FaSync size={15} style={{ animation: 'spin 1s linear infinite' }} />
                     : <FaPlay size={14} style={{ marginLeft: '2px' }} />} />

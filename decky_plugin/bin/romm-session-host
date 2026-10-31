@@ -44,6 +44,8 @@ SESSION_DIR = SESSION_DIRS[0]
 LOG = os.path.join(SESSION_DIR, "host.log")
 # How recent the spec must be to count as "this launch" rather than a leftover.
 FRESH_SECONDS = 30
+# How long to outlive the emulator; see the note after proc.wait().
+LINGER_SECONDS = 3.0
 
 
 def _log(msg):
@@ -152,6 +154,13 @@ def main():
                                     stdout=logfh, stderr=logfh)
         rc = proc.wait()
         _log("launcher exited rc=%s" % rc)
+        # Stay the running game a moment longer. Steam applies a navigation
+        # ~2s late after a game window closes, and once the app has EXITED it
+        # first shows its own library page for the tile -- the "back to Big
+        # Picture for a second" flash. While we are still running, the plugin
+        # sees the emulator window go (a focus change) and routes to Ludo, so
+        # by the time we exit Ludo is already the page on screen.
+        time.sleep(LINGER_SECONDS)
         return 0 if rc == 0 else 1
     except OSError as exc:
         _log("launch FAILED: %s" % exc)

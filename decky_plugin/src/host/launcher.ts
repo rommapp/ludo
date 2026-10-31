@@ -100,6 +100,15 @@ function armReturnFocus() {
   _returnFocusSubs.forEach((f) => { try { f(); } catch { /* ignore */ } });
 }
 let _rommLifetimeReg: { unregister: () => void } | null = null;
+let _rommFocusReg: { unregister: () => void } | null = null;
+// Steam's own gamepad UI, as gamescope reports it.
+const STEAM_UI_APPID = 769;
+// The emulator's window has closed and the session host is only lingering:
+// still a running app to Steam, but nothing to resume.
+let _rommWindowGone = false;
+// ...which only means something once the window has existed: at launch Steam
+// reports focus on itself before the emulator has mapped one.
+let _rommWindowSeen = false;
 const _sc = (): any => (typeof window !== 'undefined' ? (window as any).SteamClient : undefined);
 
 // Enumerate all non-Steam shortcut overviews. This build does NOT expose
@@ -491,7 +500,11 @@ function registerRommSessionEndWatch() {
         };
         _rommNavTimer = setTimeout(() => {
           _rommNavTimer = null;
-          nav();
+          // Usually already done: the window-gone watch routed here while the
+          // session host was still lingering. Navigating again would only
+          // re-push the route under the user.
+          const here = _currentPath();
+          if (!(_rommWindowGone && here && _hooks?.isOwnRoute(here))) nav();
           [500, 1100, 1900].forEach((d) => setTimeout(() => {
             try {
               const p = _currentPath();
@@ -509,6 +522,41 @@ function registerRommSessionEndWatch() {
 }
 
 
+// Go back to Ludo the moment the emulator window closes, not when Steam
+// reports the app exited. Steam applies a navigation ~2s after the game window
+// goes, and after an EXIT it first routes to the tile's own library page, so
+// waiting for the lifetime notification showed that page for a couple of
+// seconds ("back to Big Picture, then Ludo"). bin/romm-session-host outlives
+// the emulator for a moment so that this fires while the app still runs, and
+// Steam never gets to put its page up.
+function registerRommWindowGoneWatch() {
+  try {
+    if (_rommFocusReg) return;
+    const ui = _sc()?.System?.UI;
+    if (!ui?.RegisterForFocusChangeEvents) return;
+    _rommFocusReg = ui.RegisterForFocusChangeEvents((f: any) => {
+      try {
+        if (!_rommSessionActive || !_sessionRunning()) return;
+        if (Number(f?.focusedApp?.appid) !== STEAM_UI_APPID) {
+          if (Number(f?.focusedApp?.appid) === _rommAppId) _rommWindowSeen = true;
+          return;
+        }
+        // Still focusable means the game is up and the user opened Steam's
+        // menu over it; only a game with no window left has ended.
+        const ours = (f?.rgFocusable ?? []).some((w: any) => Number(w?.appid) === _rommAppId);
+        if (ours) { _rommWindowSeen = true; return; }
+        if (!_rommWindowSeen) return;
+        // Steam's placeholder for the running game -- anywhere else, the user
+        // has already gone somewhere on purpose.
+        if (_currentPath() !== '/apprunning') return;
+        _rommWindowGone = true;
+        armReturnFocus();
+        _hooks?.openLibrary();
+      } catch (e) { console.error('[RomM] windowGone', e); }
+    });
+  } catch (e) { console.error('[RomM] registerRommWindowGoneWatch', e); }
+}
+
 // ── The contract ────────────────────────────────────────────────────────────
 
 export const launcher: HostLauncher = {
@@ -523,6 +571,7 @@ export const launcher: HostLauncher = {
     _hooks = hooks;
     registerRommLaunchIntercept();
     registerRommSessionEndWatch();
+    registerRommWindowGoneWatch();
   },
 
   stop() {
@@ -530,6 +579,8 @@ export const launcher: HostLauncher = {
     _rommActionReg = null;
     try { _rommLifetimeReg?.unregister(); } catch { /* ignore */ }
     _rommLifetimeReg = null;
+    try { _rommFocusReg?.unregister(); } catch { /* ignore */ }
+    _rommFocusReg = null;
     if (_rommNavTimer != null) { try { clearTimeout(_rommNavTimer); } catch { /* ignore */ } }
     _rommNavTimer = null;
     _hooks = null;
@@ -552,6 +603,8 @@ export const launcher: HostLauncher = {
   async launchTile(): Promise<boolean> {
     if (_rommAppId == null) return false;
     _rommLaunchPending = true;
+    _rommWindowGone = false;
+    _rommWindowSeen = false;
     // Mark the session active HERE, not only in the GameActionStart intercept:
     // on some Steam builds RunGame-initiated launches don't fire
     // GameActionStart, and then the app-lifetime end-watch would never navigate
@@ -587,4 +640,32 @@ export const launcher: HostLauncher = {
     _returnFocusSubs.add(cb);
     return () => { _returnFocusSubs.delete(cb); };
   },
+
+  sessionRunning: () => _sessionRunning(),
+
+  resumeSession(): boolean {
+    if (!_sessionRunning()) return false;
+    try {
+      // The same call Steam's own "Resume" makes: route the main window to the
+      // running app, which gamescope follows by focusing its window. Measured
+      // on a Deck: focus moves from Steam (769) back to the tile's app id.
+      (window as any).SteamUIStore.NavigateToRunningApp(true);
+      return true;
+    } catch (e) {
+      console.error('[RomM] resumeSession', e);
+      return false;
+    }
+  },
 };
+
+// Our session flag alone can outlive the game (a lifetime notification Steam
+// never sent), so it also has to be one of Steam's running apps.
+function _sessionRunning(): boolean {
+  if (!_rommSessionActive || _rommWindowGone || _rommAppId == null) return false;
+  try {
+    const apps: any[] = (window as any).SteamUIStore?.RunningApps ?? [];
+    return apps.some((a) => Number(a?.appid) === _rommAppId);
+  } catch {
+    return false;
+  }
+}

@@ -169,6 +169,17 @@ export type HostLauncher = {
    * sessions to return from never calls back, and returns a no-op teardown.
    */
   onReturnFocus(cb: () => void): () => void;
+
+  /**
+   * Whether a game this shell launched is still running. Behind the platform's
+   * own UI the emulator is otherwise unreachable: the switcher lists it under
+   * the tile's name, and Play on the same game asks Steam to launch an app that
+   * is already up ("Game already running").
+   */
+  sessionRunning(): boolean;
+
+  /** Bring that running game back to the front. False if there is none. */
+  resumeSession(): boolean;
 };
 
 /**

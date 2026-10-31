@@ -56,6 +56,26 @@ function writeIdentity(id: NavIdentity) {
 
 const _LS_IDENTITY = 'romm:identity:v1';
 
+// The brand marks, kept for the life of the app and across launches. The bar
+// remounts whenever the library page does -- notably on the way back from a
+// game -- and each mount used to fetch both SVGs from RomM again. Right after a
+// game that request queues behind the session's save sync, so the bar came back
+// without its logo and it popped in seconds later. Same marks every time, so
+// paint the remembered pair at once; the fetch still runs and replaces them.
+const _LS_BRAND = 'romm:brand:v1';
+let _brand: { iso: string | null; word: string | null } = (() => {
+  if (!_lsAvail) return { iso: null, word: null };
+  try {
+    const o = JSON.parse(localStorage.getItem(_LS_BRAND) || 'null');
+    return { iso: o?.iso || null, word: o?.word || null };
+  } catch { return { iso: null, word: null }; }
+})();
+function rememberBrand(next: Partial<typeof _brand>) {
+  _brand = { ..._brand, ...next };
+  if (!_lsAvail) return;
+  try { localStorage.setItem(_LS_BRAND, JSON.stringify(_brand)); } catch { }
+}
+
 // Not exported: this is the plugin's rollup ENTRY, and decky's config declares
 // output.exports "default". A second named export off the entry fails the whole
 // bundle ("default" was specified … has the following exports: clearIdentityCache
@@ -125,8 +145,8 @@ export function NavLaunchButton({ iconSrc, label, onActivate }:
 }
 
 export function useNavChrome(): NavChrome {
-  const [iso, setIso] = useState<string | null>(null);
-  const [word, setWord] = useState<string | null>(null);
+  const [iso, setIso] = useState<string | null>(_brand.iso);
+  const [word, setWord] = useState<string | null>(_brand.word);
   // Last session's identity if we have one, else empty — NOT 'Guest': the fetch
   // answers a beat after first paint, and seeding the real default made every
   // cold launch flash "Guest" + a "G" avatar before snapping to the actual
@@ -190,8 +210,15 @@ export function useNavChrome(): NavChrome {
       else if (known) clearIdentityCache();
     })();
     const chrome = (async () => {
-      try { const a = await getImage('/assets/isotipo.svg'); if (alive) setIso(a?.data_uri || null); } catch { }
-      try { const b = await getImage('/assets/logotipo.svg'); if (alive) setWord(b?.data_uri || null); } catch { }
+      // A failed fetch keeps the remembered mark rather than blanking it.
+      try {
+        const a = (await getImage('/assets/isotipo.svg'))?.data_uri;
+        if (a) { rememberBrand({ iso: a }); if (alive) setIso(a); }
+      } catch { }
+      try {
+        const b = (await getImage('/assets/logotipo.svg'))?.data_uri;
+        if (b) { rememberBrand({ word: b }); if (alive) setWord(b); }
+      } catch { }
       await readRd();
     })();
     void Promise.all([identity, chrome]);
