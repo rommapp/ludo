@@ -112,7 +112,7 @@ export async function launchBrowser(playwright) {
 const isBenign = () => false;
 
 /** The subset of src/host/gamepad-buttons.ts the harness needs. */
-export const PAD = { OK: 1, CANCEL: 2, SECONDARY: 3, BUMPER_LEFT: 9, BUMPER_RIGHT: 10 };
+export const PAD = { OK: 1, CANCEL: 2, SECONDARY: 3, START: 5, BUMPER_LEFT: 9, BUMPER_RIGHT: 10 };
 
 // What the page looks like, from inside it. Deliberately structural rather
 // than pixel-based: a screenshot diff would fail on every legitimate style

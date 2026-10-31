@@ -1,11 +1,12 @@
 import { Focusable, GamepadButton, ModalRoot, showModal, Navigation } from "@ludo/host";
 import { toaster } from "../toast";
-import { V2, fmtBytes, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
+import { V2, DEVICE_COLORS, fmtBytes, fmtPlayTime, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
 import { FaWrench, FaChevronDown, FaChevronRight, FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
 import { peekDetail, storeDetail } from "../detailcache";
-import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns, setSwitchAddOnEnabled, setSwitchDlc, setSwitchUpdate, fetchSwitchAddOn} from "../rpc";
+import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns, setSwitchAddOnEnabled, setSwitchDlc, setSwitchUpdate, fetchSwitchAddOn, getGamePlayTime } from "../rpc";
+import { _libRefreshListeners } from "../events";
 import { _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, PlatformIcon, V2Button, V2CardRow, V2SettingsRow, V2Switch, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage, useArmedPress} from "../kit";
 import { _dlSucceeded, _setDlActive, awaitDownload, cancelDownload, claimDownloadStart, releaseDownloadStart, useDownloadProgress, useIsDownloading, downloadOne} from "../downloads";
@@ -1592,6 +1593,17 @@ export function GameDetailPage() {
   const [discLast, setDiscLast] = useState<string>('');
   const [bgUri, setBgUri] = useState<string | null>(null);
   const [tab, setTab] = useState('overview');
+  const [playTime, setPlayTime] = useState<any>(null);
+  useEffect(() => {
+    const romId = game?.rom_id;
+    if (!romId) return;
+    let alive = true;
+    const load = () => getGamePlayTime(romId).then((r) => { if (alive && r?.success) setPlayTime(r); }).catch(() => { });
+    load();
+    // A play session that just ended changes the total.
+    _libRefreshListeners.add(load);
+    return () => { alive = false; _libRefreshListeners.delete(load); };
+  }, [game?.rom_id]);
   const dlProg = useDownloadProgress(game?.rom_id ?? -1, busy === 'download');
   const dlPct = dlProg?.percent ?? null;
   const extracting = dlProg?.state === 'extracting';
@@ -2145,6 +2157,58 @@ export function GameDetailPage() {
                   const lpStr = lp && !isNaN(lp.getTime()) ? lp.toLocaleString() : null;
                   const rows: { label: string; field: any }[] = [];
                   if (lpStr) rows.push({ label: 'Last played', field: <span style={{ fontSize: '13px', color: V2.fg2 }}>{lpStr}</span> });
+                  // Play time across every device (engine play_sessions). The
+                  // device split only appears once a second device has played.
+                  if (playTime?.played) {
+                    rows.push({
+                      label: 'Time played',
+                      field: (
+                        <>
+                          <span style={{ fontSize: '15px', fontWeight: 700, color: V2.fg }}>{fmtPlayTime(playTime.total_ms)}</span>
+                          <span style={{ fontSize: '12.5px', color: V2.fgMuted }}>
+                            {playTime.sessions} {playTime.sessions === 1 ? 'session' : 'sessions'}
+                            {playTime.sessions > 1 && ` · avg ${fmtPlayTime(playTime.average_ms)} · longest ${fmtPlayTime(playTime.longest_ms)}`}
+                          </span>
+                        </>
+                      ),
+                    });
+                    // The top three devices by name, the rest as one grey "Other
+                    // devices" chip, as on the Play time page's Devices band:
+                    // past three the chips wrap and the colours stop telling
+                    // devices apart.
+                    const devs = playTime.devices || [];
+                    if (devs.length > 1) {
+                      const shown = devs.slice(0, devs.length > 4 ? 3 : 4)
+                        .map((d: any) => ({ ...d, color: DEVICE_COLORS[d.rank] || 'rgba(255,255,255,0.3)' }));
+                      const rest = devs.slice(shown.length);
+                      if (rest.length) shown.push({
+                        id: 'others', name: `${rest.length} other devices`, color: 'rgba(255,255,255,0.3)',
+                        ms: rest.reduce((a: number, d: any) => a + d.ms, 0),
+                        share: rest.reduce((a: number, d: any) => a + d.share, 0),
+                      });
+                      rows.push({
+                        label: 'On devices',
+                        field: (
+                          <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                            <div style={{ width: '200px', height: '6px', borderRadius: '3px', overflow: 'hidden', display: 'flex', background: V2.surface }}>
+                              {shown.map((d: any) => <div key={d.id} style={{ width: `${d.share * 100}%`, background: d.color }} />)}
+                            </div>
+                            {shown.map((d: any) => (
+                              <span key={d.id} style={{
+                                display: 'inline-flex', alignItems: 'center', gap: '7px', padding: '4px 10px',
+                                background: V2.surface, border: `1px solid ${V2.borderStrong}`, borderRadius: V2.radiusPill,
+                                fontSize: '11.5px', fontWeight: 600, color: V2.fg2,
+                              }}>
+                                <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: d.color }} />
+                                {d.name}
+                                <span style={{ color: V2.fgMuted, fontWeight: 500 }}>{fmtPlayTime(d.ms)}</span>
+                              </span>
+                            ))}
+                          </div>
+                        ),
+                      });
+                    }
+                  }
                   if (detail?.player_count) rows.push({ label: 'Players', field: <PlayerCountBadge value={String(detail.player_count)} /> });
                   if (ageRatings.length) rows.push({ label: 'Age rating', field: <AgeRatingBadges items={ageRatings} /> });
                   if (userCollections.length) rows.push({

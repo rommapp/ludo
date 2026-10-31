@@ -352,6 +352,10 @@ function createWindow(url, fullscreen) {
   win.on("resize", applyZoom);
   win.on("enter-full-screen", applyZoom);
   win.on("leave-full-screen", applyZoom);
+  // A window manager that maximises the window (or re-maximises it when the
+  // display mode changes) reports that as maximize, not always as resize.
+  win.on("maximize", applyZoom);
+  win.on("unmaximize", applyZoom);
 
   // F11 toggles fullscreen. before-input-event fires
   // ahead of the renderer, so anything preventDefault'd here never reaches the

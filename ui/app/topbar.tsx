@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Focusable, GamepadButton, ModalRoot, host, showModal } from "@ludo/host";
 import { toaster } from "./toast";
 import { V2 } from "./theme";
-import { FaBookmark, FaChartBar, FaCheck, FaChevronDown, FaCog, FaDownload, FaExternalLinkAlt, FaGamepad, FaHome, FaMicrochip, FaPlay, FaPowerOff, FaPuzzlePiece, FaRegClock, FaSearch, FaSync, FaTrash } from "react-icons/fa";
+import { FaBookmark, FaChartBar, FaClock, FaCheck, FaChevronDown, FaCog, FaDownload, FaExternalLinkAlt, FaGamepad, FaHome, FaMicrochip, FaPlay, FaPowerOff, FaPuzzlePiece, FaRegClock, FaSearch, FaSync, FaTrash } from "react-icons/fa";
 import { getAccountUsername, getAvatar, getImage, getRetrodeckButtonEnabled, getRetrodeckLogo, refreshFromRomm } from "./rpc";
 import { NavId, libNavigate } from "./nav";
 import { Bumper, ProgressRing, UserMenuRow, MODAL_SCRIM_INSET} from "./kit";
@@ -498,16 +498,19 @@ export function UserMenuModal({ username, role, avatar, closeModal }:
             </div>
           </div>
           <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
-          <UserMenuRow icon={<FaChartBar size={15} />} label="Stats" onSelect={() => go("/romm-sync-stats")} />
-          <UserMenuRow icon={<FaPuzzlePiece size={15} />} label="Emulator Cores" onSelect={() => go("/romm-sync-cores")} />
-          <UserMenuRow icon={<FaMicrochip size={15} />} label="Firmware / BIOS" onSelect={() => go("/romm-sync-bios")} />
-          <UserMenuRow icon={<FaCog size={15} />} label="Settings" onSelect={() => go("/romm-sync-settings")} />
-          <UserMenuRow
-            icon={<FaSync size={15} style={refreshing ? { animation: 'spin 1s linear infinite' } : undefined} />}
-            label={refreshing ? 'Refreshing…' : 'Refresh library'} disabled={refreshing} onSelect={doRefresh} />
           <UserMenuRow icon={<FaDownload size={15} />}
             label={`Downloads${dlGlimpse.count > 0 ? ` (${dlGlimpse.count})` : ''}`}
             onSelect={() => go("/romm-sync-downloads")} />
+          <UserMenuRow
+            icon={<FaSync size={15} style={refreshing ? { animation: 'spin 1s linear infinite' } : undefined} />}
+            label={refreshing ? 'Refreshing…' : 'Refresh library'} disabled={refreshing} onSelect={doRefresh} />
+          <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
+          <UserMenuRow icon={<FaClock size={15} />} label="Play time" onSelect={() => go("/romm-sync-playtime")} />
+          <UserMenuRow icon={<FaChartBar size={15} />} label="Stats" onSelect={() => go("/romm-sync-stats")} />
+          <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
+          <UserMenuRow icon={<FaPuzzlePiece size={15} />} label="Emulator Cores" onSelect={() => go("/romm-sync-cores")} />
+          <UserMenuRow icon={<FaMicrochip size={15} />} label="Firmware / BIOS" onSelect={() => go("/romm-sync-bios")} />
+          <UserMenuRow icon={<FaCog size={15} />} label="Settings" onSelect={() => go("/romm-sync-settings")} />
           {canExit && (
             <>
               <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />

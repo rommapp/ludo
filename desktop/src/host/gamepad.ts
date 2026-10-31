@@ -607,6 +607,15 @@ function springScroll(map: WeakMap<HTMLElement, SpringAnim>, el: HTMLElement,
 // so a burst of presses accumulates into one glide instead of oscillating.
 const _vAnims = new WeakMap<HTMLElement, SpringAnim>();
 
+// Nothing focusable sits above `el` in its scroller.
+function isTopmost(sc: HTMLElement, el: HTMLElement, r: DOMRect): boolean {
+  for (const o of sc.querySelectorAll<HTMLElement>(FOCUS_SELECTOR)) {
+    if (o === el || el.contains(o) || o.contains(el) || !isVisible(o)) continue;
+    if (o.getBoundingClientRect().bottom <= r.top + 1) return false;
+  }
+  return true;
+}
+
 function revealVertical(sc: HTMLElement, el: HTMLElement, smooth: boolean) {
   const isPage = sc === document.scrollingElement;
   const cs = getComputedStyle(sc);
@@ -627,6 +636,9 @@ function revealVertical(sc: HTMLElement, el: HTMLElement, smooth: boolean) {
     // Taller than the view: align its top rather than its bottom.
     target = Math.min(top - padTop, bottom + padBot - viewH);
   }
+  // Back on the topmost control: show the page as it opened, from the very
+  // top, rather than stopping as soon as the control is in view.
+  if (target < base && isTopmost(sc, el, r)) target = 0;
   target = Math.max(0, Math.min(max, target));
   if (!smooth) {
     if (cur) { cancelAnimationFrame(cur.raf); cur.end(); }
@@ -814,7 +826,11 @@ function move(dir: "up" | "down" | "left" | "right", smooth = true) {
     // Browse button — rendered a few px higher (align-items:flex-end) with
     // nothing genuinely above — instead of doing nothing. Right still reaches
     // Browse (it cross-overlaps the field's row, so penalty is 0).
-    if (penalty && Math.abs(along) < Math.abs(cross)) continue;
+    // A target wholly above/below is genuinely ahead however far to the side:
+    // Up from Play time's calendar arrow has to reach the header's Back, off to
+    // the left, as Up from Settings' first row does. It still scores last.
+    const wholly = dir === "up" ? r.bottom <= ar.top + 1 : dir === "down" ? r.top >= ar.bottom - 1 : false;
+    if (penalty && Math.abs(along) < Math.abs(cross) && !wholly) continue;
     // Weight the travel axis above the cross axis so the NEAREST row/column
     // wins among aligned candidates — not a control that's further along but
     // better column-aligned. On the Folders step the footer's Next sits in the

@@ -120,3 +120,7 @@ engine/.venv-tests/
 
 # Build-time embedded release token (scripts/embed-token.sh)
 app/ludo_app/_token.py
+
+# Core dumps
+core
+core.[0-9]*

@@ -47,6 +47,18 @@ export const V2 = {
   font: '"Motiva Sans","Inter Variable","Segoe UI",system-ui,-apple-system,sans-serif',
 };
 
+// Play time as the Play time page and game page show it: "14h 05m", "38m",
+// "<1m". Hours keep two-digit minutes so a column of totals lines up.
+export function fmtPlayTime(ms: number | null | undefined): string {
+  const m = Math.floor((Number(ms) || 0) / 60000);
+  if (m < 1) return '<1m';
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+}
+
+// One colour per device, in share order; also used by the Play time page.
+export const DEVICE_COLORS = ['#8b74e8', '#38bdf8', '#f59e0b', '#4ade80', '#f472b6', '#a3a3a3'];
+
 export function fmtBytes(n: number | null | undefined): string {
   if (!n || isNaN(n as any)) return '';
   let v = Number(n);

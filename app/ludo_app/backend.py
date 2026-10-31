@@ -958,6 +958,8 @@ class LudoBackend:
                 rom_removed_callback=self._on_rom_removed_from_server,
                 parent_window=None,
             )
+            # Play sessions are recorded offline too, before sync can start.
+            self._auto_sync.start_play_watch()
 
         # Cold-start hydration: seed the library from the last persisted snapshot
         # so the Game Browser is populated immediately — before the retry thread
@@ -2087,8 +2089,11 @@ class LudoBackend:
                     rom_removed_callback=self._on_rom_removed_from_server,
                     parent_window=None,
                 )
+                self._auto_sync.start_play_watch()
             else:
                 self._auto_sync.romm_client = self._romm_client
+            # A heartbeat told the device is gone registers it again.
+            self._auto_sync.play_sessions.on_device_missing = self._ensure_device_registered
 
             # Same hold as the library walk, for the same reason. The connect
             # negotiate is bidirectional: it sends an empty local inventory and
@@ -4224,6 +4229,291 @@ class LudoBackend:
         except Exception as e:
             logging.error(f"get_avatar error: {e}", exc_info=True)
             return {'data_uri': None}
+
+    # -----------------------------------------------------------------------
+    # Play time
+    # -----------------------------------------------------------------------
+    #
+    # Sessions are tracked and synced by the engine (play_sessions); figures
+    # come from play_stats. A variant (region, disc) is folded onto the game
+    # the library shows, so one game has one total wherever it appears.
+
+    def _play_sessions(self):
+        auto = self._auto_sync
+        return getattr(auto, 'play_sessions', None) if auto else None
+
+    def _play_rows(self):
+        """Sessions with variants folded onto their library game, plus the
+        naming map play_stats wants."""
+        ps = self._play_sessions()
+        if not ps:
+            return [], {}, {}, {}
+        rows, devices, meta = ps.store.snapshot()
+        parent = self._variant_parent_index()
+        for r in rows:
+            if r.get('rom_id') in parent:
+                r['rom_id'] = parent[r['rom_id']]
+        games = {}
+        for rom_id, g in self._games_index().items():
+            games[rom_id] = {
+                'name': g.get('display_name') or g.get('name') or '',
+                'platform_name': self._platform_name_for(g),
+                'platform_slug': g.get('platform_slug') or '',
+            }
+        return rows, games, devices, meta
+
+    def _this_device(self):
+        return self._settings.get('Device', 'device_id', '') if self._settings else ''
+
+    async def get_play_time(self):
+        """Everything the Play time page shows."""
+        try:
+            from romm_sync_engine import play_stats
+            rows, games, devices, meta = self._play_rows()
+            out = play_stats.compute(rows, games, self._this_device(), devices, meta)
+            out['online'] = bool(self._romm_client and self._romm_client.authenticated)
+            out['recap_auto'] = meta.get('recap_auto') is not False
+            out['most_played_home'] = meta.get('most_played_home') is not False
+            return {'success': True, **out}
+        except Exception as e:
+            logging.error(f"get_play_time error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def get_game_play_time(self, rom_id: int):
+        """One game's play time, for its page. played=False when never played."""
+        try:
+            from romm_sync_engine import play_stats
+            rows, _games, devices, _meta = self._play_rows()
+            g = play_stats.for_game(rows, int(rom_id), self._this_device(), devices)
+            return {'success': True, 'played': g is not None, **(g or {})}
+        except Exception as e:
+            logging.error(f"get_game_play_time error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def get_most_played(self, limit: int = 20):
+        """[{rom_id, ms, game}] for the home row, games still in the library only."""
+        try:
+            from romm_sync_engine import play_stats
+            rows, games, _devices, meta = self._play_rows()
+            if meta.get('most_played_home') is False:
+                return {'success': True, 'games': []}
+            top = play_stats.top_games([r for r in rows if r.get('rom_id') in games], int(limit))
+            # The game itself too: Home may not have loaded its platform (a game
+            # played on another device and not downloaded here).
+            index = self._games_index()
+            return {'success': True, 'games': [
+                {'rom_id': k, 'ms': ms, 'game': self._serialize_game(index[k]) if k in index else None}
+                for k, ms in top]}
+        except Exception as e:
+            logging.error(f"get_most_played error: {e}", exc_info=True)
+            return {'success': False, 'games': []}
+
+    async def play_time_upload(self):
+        """Upload now. Returns the counts, or why it could not run."""
+        ps = self._play_sessions()
+        if not ps:
+            return {'success': False, 'message': 'Play time is not ready yet'}
+        r = await asyncio.to_thread(ps.upload_now)
+        if r is None:
+            return {'success': False, 'message': 'Connect to RomM to upload'}
+        sent, dup, failed, stopped = r
+        if stopped:
+            return {'success': False, 'message': f'Upload stopped: {stopped}'}
+        return {'success': True, 'sent': sent, 'duplicates': dup, 'failed': failed}
+
+    async def play_time_refresh(self):
+        """Pull every device's sessions from RomM now."""
+        ps = self._play_sessions()
+        if not ps:
+            return {'success': False, 'message': 'Play time is not ready yet'}
+        r = await asyncio.to_thread(ps.refresh_now)
+        if r is None:
+            return {'success': False, 'message': 'Connect to RomM to refresh'}
+        added, devices, stopped = r
+        if stopped:
+            return {'success': False, 'message': f'Refresh stopped: {stopped}'}
+        return {'success': True, 'added': added, 'devices': devices}
+
+    def _recap_ra(self, ps, played, month=None):
+        """RetroAchievements progression for the recap, and the games behind
+        it. RomM's progression names a game only by its RA id and an unlock
+        only by its badge id, so the games are resolved through their RomM
+        detail (which lists every achievement) and kept in ra_games.json:
+        the games played here first, then, for unlocks still unnamed, one
+        has_ra listing a day. Offline, the last progression is used."""
+        path = ps.store.path.parent / 'ra_games.json'
+        try:
+            cache = json.loads(path.read_text())
+        except Exception:
+            cache = {}
+        by_rom = cache.setdefault('by_rom', {})        # str(rom_id) -> ra_id | None
+        ra_games = cache.setdefault('games', {})       # str(ra_id) -> {rom_id, name, achievements}
+        client = self._romm_client
+        online = bool(client and client.authenticated)
+        changed = False
+
+        def get(url, **params):
+            return client.session.get(urljoin(client.base_url, url), params=params or None, timeout=20)
+
+        def resolve(rom_id):
+            r = get(f'/api/roms/{rom_id}')
+            if r.status_code != 200:
+                return
+            d = r.json()
+            ra_id = d.get('ra_id')
+            by_rom[str(rom_id)] = ra_id
+            if ra_id:
+                ra_games[str(ra_id)] = {
+                    'rom_id': rom_id,
+                    'name': d.get('name') or '',
+                    'achievements': {str(a['badge_id']): {
+                        'title': a.get('title'), 'description': a.get('description'),
+                        'points': a.get('points'), 'badge_url': a.get('badge_url')}
+                        for a in ((d.get('merged_ra_metadata') or {}).get('achievements') or [])
+                        if a.get('badge_id') is not None},
+                }
+
+        if online:
+            try:
+                r = get('/api/users/me')
+                if r.status_code == 200:
+                    cache['progression'] = ((r.json().get('ra_progression') or {}).get('results') or [])
+                    changed = True
+                for rom_id in played:
+                    if str(rom_id) not in by_rom:
+                        resolve(rom_id)
+                        changed = True
+                if month:
+                    from romm_sync_engine.play_stats import _month_bounds, _parse_utc
+                    start, end = _month_bounds(month)[:2]
+                    wanted = {p.get('rom_ra_id') for p in cache.get('progression') or []
+                              if any(start <= (_parse_utc(e.get('date')) or 0) < end
+                                     for e in p.get('earned_achievements') or [])}
+                    missing = {w for w in wanted if w and str(w) not in ra_games}
+                    if missing and time.time() - cache.get('scan_at', 0) > 86400:
+                        cache['scan_at'] = time.time()
+                        changed = True
+                        offset, found = 0, {}
+                        while True:
+                            r = get('/api/roms', has_ra='true', limit=100, offset=offset)
+                            items = (r.json().get('items') or []) if r.status_code == 200 else []
+                            for it in items:
+                                if it.get('ra_id') in missing:
+                                    found[it['ra_id']] = it['id']
+                            offset += len(items)
+                            if len(items) < 100 or len(found) == len(missing):
+                                break
+                        for rom_id in found.values():
+                            resolve(rom_id)
+            except Exception as e:
+                logging.debug(f"recap RetroAchievements lookup: {e}")
+        if changed:
+            try:
+                path.write_text(json.dumps(cache))
+            except Exception as e:
+                logging.debug(f"ra_games.json write: {e}")
+        return cache.get('progression') or [], {int(k): v for k, v in ra_games.items()}
+
+    async def get_monthly_recap(self, month: str = ''):
+        """The monthly recap (Argosy's): month 'YYYY-MM', last month when
+        empty. Achievements need RomM; play time does not."""
+        try:
+            from romm_sync_engine import play_stats
+            ps = self._play_sessions()
+            rows, games, _devices, _meta = self._play_rows()
+            if not month:
+                month = play_stats._shift_month(time.strftime('%Y-%m'), -1)
+            played = sorted({r['rom_id'] for r in rows if r.get('rom_id') in games})
+            progression, ra_games = (await asyncio.to_thread(self._recap_ra, ps, played, month)
+                                     if ps else ([], {}))
+            out = play_stats.month_recap(rows, games, month, progression, ra_games)
+            out['months'] = play_stats.recap_months(rows, progression)
+            out['current'] = time.strftime('%Y-%m')
+            return {'success': True, **out}
+        except Exception as e:
+            logging.error(f"get_monthly_recap error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def play_time_sync_if_due(self, wait: float = 0):
+        """Upload then pull when the last pull is over 15 minutes old (Home
+        shown, Play time or the recap opened). Waits up to `wait` seconds and
+        answers whether new data came in; a slower pull finishes in the
+        background."""
+        ps = self._play_sessions()
+        if not ps or not ps.pull_due():
+            return {'success': True, 'pulled': False}
+        task = asyncio.ensure_future(asyncio.to_thread(ps.sync_if_due))
+        try:
+            r = await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, float(wait)))
+        except asyncio.TimeoutError:
+            return {'success': True, 'pulled': False, 'pending': True}
+        pulled = bool(r and r[1] and r[1][0])
+        return {'success': True, 'pulled': pulled}
+
+    async def get_recap_due(self):
+        """The month Home's recap banner offers, with a teaser, or none."""
+        try:
+            from romm_sync_engine import play_stats
+            # Testing: open this month's recap on every launch, due or not
+            # (Argosy's MonthlyRecapOverride).
+            forced = os.environ.get('LUDO_FORCE_RECAP', '').strip()
+            ps = self._play_sessions()
+            if not ps and not forced:
+                return {'success': True, 'month': None}
+            rows, games, _devices, _meta = self._play_rows()
+
+            def has_sessions(month):
+                start, end = play_stats._month_bounds(month)[:2]
+                return any(r.get('rom_id') is not None and start <= r['start'] < end for r in rows)
+            month = forced or ps.recap_due(has_sessions)
+            if not month:
+                return {'success': True, 'month': None}
+            # The banner's teaser: the month's play time and most played game.
+            r = play_stats.month_recap(rows, games, month)
+            top = [{'rom_id': t['rom_id'], 'name': t['name'], 'ms': t['ms']} for t in r.get('top_games') or []]
+            return {'success': True, 'month': month, 'total_ms': r['total_ms'],
+                    'sessions': r['sessions'], 'days_played': r['days_played'],
+                    'longest_ms': r['longest_ms'], 'games': len(top) + r['other_games'],
+                    'top': top}
+        except Exception as e:
+            logging.error(f"get_recap_due error: {e}", exc_info=True)
+            return {'success': False, 'month': None}
+
+    async def dismiss_recap(self, month: str):
+        """Home's recap banner was opened or closed: don't offer it again."""
+        ps = self._play_sessions()
+        if ps and month:
+            ps.recap_seen(month)
+        return {'success': True}
+
+    async def set_recap_auto(self, enabled: bool):
+        """Whether Home opens last month's recap by itself."""
+        ps = self._play_sessions()
+        if not ps:
+            return {'success': False}
+        ps.store.set_meta(recap_auto=bool(enabled))
+        return {'success': True}
+
+    async def set_most_played_home(self, enabled: bool):
+        """Whether Home shows the Most played row."""
+        ps = self._play_sessions()
+        if not ps:
+            return {'success': False}
+        ps.store.set_meta(most_played_home=bool(enabled))
+        return {'success': True}
+
+    async def play_time_delete_game(self, rom_id: int):
+        """Delete one game's play records on this device (Argosy: "Delete play
+        records?"). Sessions before now are not pulled back."""
+        ps = self._play_sessions()
+        if not ps:
+            return {'success': False, 'message': 'Play time is not ready yet'}
+        rom_id = int(rom_id)
+        # The game and every variant of it.
+        ids = {rom_id} | {v for v, p in self._variant_parent_index().items() if p == rom_id}
+        removed = sum(ps.delete_game(i) for i in ids)
+        logging.info(f"Play records deleted: rom {rom_id} ({removed} sessions)")
+        return {'success': True, 'removed': removed}
 
     async def get_plugin_stats(self):
         """Plugin-local stats for the user-menu Stats page. Computed live from

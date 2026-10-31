@@ -759,6 +759,17 @@ def eden_pids():
     Cheap /proc scan rather than a dependency -- a false negative only costs
     the caller its guard, and a false positive only defers what it guards.
     """
+    return _pids_named('eden')
+
+
+def cemu_is_running():
+    """True when a Cemu process appears to be running. The play-session
+    tracker's only way to see a Wii U game end: nothing else watches Cemu."""
+    return bool(_pids_named('cemu'))
+
+
+def _pids_named(prefix):
+    """PIDs whose process name starts with `prefix`, zombies excluded."""
     pids = []
     try:
         for entry in Path('/proc').iterdir():
@@ -768,7 +779,7 @@ def eden_pids():
                 comm = (entry / 'comm').read_text().strip().lower()
             except OSError:
                 continue
-            if not comm.startswith('eden'):
+            if not comm.startswith(prefix):
                 continue
             # A ZOMBIE is not a running emulator. Ludo launches Eden with
             # subprocess.Popen and does not wait on it, so when the player
@@ -791,7 +802,7 @@ def eden_pids():
                 continue
             pids.append(int(entry.name))
     except OSError as e:
-        log.debug("could not scan /proc for Eden: %s", e)
+        log.debug("could not scan /proc for %s: %s", prefix, e)
     return pids
 
 

@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { LibGame, LibGroup } from "./types";
 import { _dlSucceeded, _setDlActive, awaitDownload, claimDownloadStart, releaseDownloadStart, runCollectionBatch, useDownloadProgress, useIsDownloading } from "./downloads";
-import { V2, roundBtn} from "./theme";
+import { V2, fmtPlayTime, roundBtn} from "./theme";
 import { useCollectionSync, useOffline, useSaveActivityFor} from "./status";
 import { deleteCollectionRoms, deleteGame, downloadGame, getLibraryGames, getLocalDiscs, getLocalSiblings, resyncPlatform, toggleCollectionSync, getStateThumbnails, resolveSaveConflict } from "./rpc";
 import { Focusable, GamepadButton, Menu, MenuItem, showContextMenu, showModal, ModalRoot } from "@ludo/host";
@@ -12,7 +12,7 @@ import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImageBg } from "./media";
 import { cancelDetailPrefetch, scheduleDetailPrefetch } from "./detailcache";
 import { PlatformIcon, ProgressRing, UserMenuRow, MODAL_SCRIM_INSET, PickerModal, ToastCover} from "./kit";
-import { FaBookmark, FaBoxOpen, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
+import { FaBookmark, FaBoxOpen, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip, FaStopwatch} from "react-icons/fa";
 import { _broadcastLibRefresh } from "./events";
 import { MdFlashOn } from "react-icons/md";
 import { _forceGamepadFocus } from "./shell";
@@ -299,8 +299,8 @@ const REGION_EMOJI: Record<string, string> = {
   w: '🌎', global: '🌎', world: '🌎',
 };
 
-export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef, index, onFocusIdx, focusable, resume, stateThumb }:
-  { game: LibGame; onOpen: (g: LibGame) => void; onActiveCover: (uri: string | null) => void; focusRef?: React.Ref<any>; index?: number; onFocusIdx?: (i: number) => void; focusable?: boolean; resume?: boolean; stateThumb?: string | null }) {
+export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef, index, onFocusIdx, focusable, resume, stateThumb, playMs }:
+  { game: LibGame; onOpen: (g: LibGame) => void; onActiveCover: (uri: string | null) => void; focusRef?: React.Ref<any>; index?: number; onFocusIdx?: (i: number) => void; focusable?: boolean; resume?: boolean; stateThumb?: string | null; playMs?: number }) {
   const wide = !!game.screenshot || !!stateThumb;
   // Wide cards adopt the screenshot's NATURAL aspect ratio (RomM derives the
   // card width from the cover's true shape at a fixed height); 16:9 until loaded.
@@ -828,9 +828,23 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             shown for downloaded multi-disc games so the hold-A picker is
             discoverable. Shows the actual count once fetched, otherwise a
             generic disc icon. */}
-        {dl && isMultiDisc && (
+        {/* Play time (Home's Most played row) — bottom-left; a disc-count
+            pill, when there is one, steps up above it. */}
+        {playMs != null && (
           <div style={{
             position: 'absolute', left: '7px', bottom: '7px', zIndex: 2,
+            display: 'inline-flex', alignItems: 'center', gap: '4px',
+            padding: '3px 7px', borderRadius: V2.radiusPill, fontSize: '11px', fontWeight: 700,
+            ...coverPill(iconDark),
+            opacity: focused ? 0 : 1,
+            transition: 'opacity 0.18s ease, background 0.2s ease, border-color 0.2s ease',
+          }}>
+            <FaStopwatch size={9} />{fmtPlayTime(playMs)}
+          </div>
+        )}
+        {dl && isMultiDisc && (
+          <div style={{
+            position: 'absolute', left: '7px', bottom: playMs != null ? '32px' : '7px', zIndex: 2,
             display: 'inline-flex', alignItems: 'center', gap: '4px',
             padding: '2px 6px', borderRadius: V2.radiusPill, fontSize: '10px', fontWeight: 600,
             ...coverPill(iconDark),
@@ -855,7 +869,8 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             On a wide (continue-playing) card the same corner already holds the
             CoverPip box art, so the chips step to the left of it — 46px pip +
             its 6px inset + a 6px gap — instead of covering the cover. */}
-        {((game.regions?.length || 0) > 0 || (game.languages?.length || 0) > 0) && (
+        {/* Not on Most played covers: the play time pill is the point there. */}
+        {playMs == null && ((game.regions?.length || 0) > 0 || (game.languages?.length || 0) > 0) && (
           <div style={{
             position: 'absolute', bottom: '7px', zIndex: 2,
             right: wide && game.has_cover ? '58px' : '7px',

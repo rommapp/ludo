@@ -1,18 +1,20 @@
 import { LibGame, LibGroup } from "../types";
 import { viewerOpen } from "../glass";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { deleteCollectionRoms, getConfig, getDownloadProgress, getHomeData, getLibraryGames, getLibraryGroups, getResumeStateEnabled, getServiceStatus, repairEmulatorPaths, searchGames, toggleCollectionSync, checkLibraryStale, refreshFromRomm} from "../rpc";
+import { deleteCollectionRoms, getConfig, getMostPlayed, getRecapDue, dismissRecap, playTimeSyncIfDue, getDownloadProgress, getHomeData, getLibraryGames, getLibraryGroups, getResumeStateEnabled, getServiceStatus, repairEmulatorPaths, searchGames, toggleCollectionSync, checkLibraryStale, refreshFromRomm} from "../rpc";
 import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _setResumeStatesPref, _stateThumbListeners, _stateThumbs, loadStateThumbs, tileElFor} from "../tiles";
 import { _autoFocusFirstRef, _forceGamepadFocus, _gpFocusEl, playSteamSound, returnFocusRomId, setReturnFocusTarget, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, V2SearchField, useEtaFromPct, Shimmer} from "../kit";
-import { V2, formatEta, formatSpeed } from "../theme";
+import { V2, fmtPlayTime, formatEta, formatSpeed } from "../theme";
 import { Focusable, GamepadButton, Navigation, host, showModal } from "@ludo/host";
 import { toaster } from "../toast";
-import { FaBookmark, FaCheck, FaChevronRight, FaDownload, FaEllipsisH, FaExclamationTriangle, FaGamepad, FaLayerGroup, FaPlay, FaRegClock, FaSync } from "react-icons/fa";
+import { FaBookmark, FaCheck, FaChevronRight, FaDownload, FaEllipsisH, FaExclamationTriangle, FaGamepad, FaLayerGroup, FaPlay, FaRegClock, FaStopwatch, FaSync, FaTimes } from "react-icons/fa";
 import { LibView, NavId, libBack, libNavigate, navExitPlugin, pushLibView, setLibViewHooks } from "../nav";
-import { _groupsCache, _libGamesCache, getHomeCache, getLibGameHolder, getLibGroupHolder, getLibGroupsHolder, getLibLastTab, libCacheSet, libCacheSetDownloaded, persistGroupsCache, persistHomeCache, setHomeCache, setLibGameHolder, setLibGameOrigin, setLibGroupHolder, setLibGroupsHolder, setLibLastTab, _focusedPlatformSubs, _focusedPlatform, libCacheDelete} from "../libcache";
+import { _groupsCache, _libGamesCache, libCacheFindGame, getHomeCache, getLibGameHolder, getLibGroupHolder, getLibGroupsHolder, getLibLastTab, libCacheSet, libCacheSetDownloaded, persistGroupsCache, persistHomeCache, setHomeCache, setLibGameHolder, setLibGameOrigin, setLibGroupHolder, setLibGroupsHolder, setLibLastTab, _focusedPlatformSubs, _focusedPlatform, libCacheDelete} from "../libcache";
 import { useOffline, useServiceStatus, StaleInfo, _STALE_CHECK_MS, _STALE_RANK, _setStale, _staleInfo, _staleSubs, _clearStale, lastStaleCheck, markStaleChecked} from "../status";
 import { _broadcastLibRefresh, _libRefreshListeners } from "../events";
+import { openRecapNext } from "./recap";
+import { GameCover } from "../media";
 import { ScrubOverlay, letterJump, setLetterJump, setScrubGlimpse, _scrubLetterOf, _scrubTargetIdx, NAV_MAINTAIN_X} from "../scrub";
 import { GameDetailPage } from "./game";
 import { SettingsPage } from "./settings";
@@ -22,6 +24,7 @@ import { EmulatorsPage } from "./emulators";
 import { BiosPage } from "./bios";
 import { DownloadsPage } from "./downloads";
 import { PlatformsPage } from "./platforms";
+import { PlayTimePage } from "./playtime";
 import { _LS_REOPEN_HOME } from "../storage";
 import { lastLaunchedRomId } from "../launch";
 import { CollectionActionsModal, NAV_ORDER, UserMenuModal, V2NavBar, useNavChrome } from "../topbar";
@@ -124,6 +127,8 @@ export async function _applyStaleUpdate(): Promise<boolean> {
 }
 
 let _seenScanAt = 0;
+// Whether this launch already asked if a monthly recap is due.
+let _recapChecked = false;
 
 export async function _maybeCheckStale(svcStatus: any) {
   if (!svcStatus || svcStatus.connection === 'offline_cached'
@@ -519,6 +524,69 @@ export function EmulatorBanner() {
   );
 }
 
+// Last month's recap, offered atop Home (see get_recap_due) until opened or
+// closed. Module-level so it survives Home remounting.
+type RecapDue = {
+  month: string; total_ms: number; sessions: number; days_played: number; longest_ms: number; games: number;
+  top: Array<{ rom_id: number; name: string; ms: number }>;
+};
+let _recapBanner: RecapDue | null = null;
+const _recapBannerSubs = new Set<() => void>();
+function setRecapBanner(r: RecapDue | null) { _recapBanner = r; _recapBannerSubs.forEach((f) => f()); }
+
+function RecapBanner() {
+  const [r, setR] = useState(_recapBanner);
+  useEffect(() => { const f = () => setR(_recapBanner); _recapBannerSubs.add(f); return () => { _recapBannerSubs.delete(f); }; }, []);
+  if (!r) return null;
+  const name = new Date(`${r.month}-01T00:00`).toLocaleString(undefined, { month: 'long' });
+  const done = () => { dismissRecap(r.month).catch(() => { }); setRecapBanner(null); };
+  const open = () => { done(); openRecapNext(r.month); libNavigate('/romm-sync-playtime'); };
+  return <RecapBannerStrip r={r} name={name} open={open} done={done} />;
+}
+
+type BannerProps = { r: RecapDue; name: string; open: () => void; done: () => void };
+const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
+
+// A strip led by the month's most played game, its art bleeding in from the right.
+function RecapBannerStrip({ r, name, open, done }: BannerProps) {
+  const top = r.top[0];
+  return (
+    <div style={{ padding: '4px 20px 12px' }}>
+      <div style={{
+        position: 'relative', overflow: 'hidden', display: 'flex', alignItems: 'center', gap: '16px',
+        padding: '14px 16px', borderRadius: V2.radiusCard, border: `1px solid ${V2.border}`,
+        background: `linear-gradient(100deg, ${V2.brand}40, ${V2.surface} 55%)`,
+      }}>
+        {top && (
+          <div style={{
+            position: 'absolute', right: 0, top: 0, bottom: 0, width: '55%', opacity: 0.6,
+            filter: 'blur(10px) saturate(1.4)', transform: 'scale(1.2)',
+            maskImage: 'linear-gradient(90deg, transparent, #000 45%)', WebkitMaskImage: 'linear-gradient(90deg, transparent, #000 45%)',
+          }}><GameCover romId={top.rom_id} hasCover large radius="0" /></div>
+        )}
+        <div style={{ position: 'relative', flexShrink: 0, width: '48px', height: '64px', borderRadius: V2.radiusMd, overflow: 'hidden', boxShadow: '0 4px 14px rgba(0,0,0,.45)' }}>
+          {top ? <GameCover romId={top.rom_id} hasCover radius="0" /> : null}
+        </div>
+        <div style={{ position: 'relative', flex: '1 1 auto', minWidth: 0 }}>
+          <div style={{ fontSize: '12px', fontWeight: 700, letterSpacing: '.08em', textTransform: 'uppercase', color: V2.brandHover }}>
+            Your {name} recap
+          </div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', marginTop: '2px' }}>
+            <span style={{ fontSize: '24px', fontWeight: 800 }}>{fmtPlayTime(r.total_ms)}</span>
+            <span style={{ fontSize: '13px', color: V2.fgMuted }}>
+              {plural(r.sessions, 'session')} · {plural(r.games, 'game')}{top ? ` · mostly ${top.name}` : ''}
+            </span>
+          </div>
+        </div>
+        <Focusable noFocusRing flow-children="horizontal" style={{ position: 'relative', display: 'flex', gap: '8px', flexShrink: 0 }}>
+          <GameActionButton variant="emphasized" onClick={open} label="See recap" icon={<FaChevronRight size={14} />} />
+          <GameActionButton variant="surface" onClick={done} icon={<FaTimes size={14} />} />
+        </Focusable>
+      </div>
+    </div>
+  );
+}
+
 export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   { onOpen: (g: LibGame) => void; onOpenGroup: (mode: string, g: LibGroup, gs: LibGroup[]) => void; onBg: (uri: string | null) => void; visible: boolean }) {
   // Seed from the module-level cache so re-mounting (tab switch back to Home)
@@ -530,6 +598,33 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   const [platforms, setPlatforms] = useState<LibGroup[]>(c0?.platforms || []);
   const [collections, setCollections] = useState<LibGroup[]>(c0?.collections || []);
   const [loading, setLoading] = useState(!c0);
+  // Most played, from the play sessions of every device. Games no longer in
+  // the library are skipped; the row only shows once something was played.
+  const [mostPlayed, setMostPlayed] = useState<Array<{ g: LibGame; ms: number }>>([]);
+  // Home shown: pull other devices' play when the last pull is old (at most
+  // every 15 minutes, as Argosy does), then, once a month, open last month's
+  // recap as a banner atop Home. The recap check runs once per launch.
+  useEffect(() => {
+    let alive = true;
+    playTimeSyncIfDue(4).then((r) => { if (r?.pulled) _broadcastLibRefresh(); }).catch(() => { }).finally(() => {
+      if (!alive || _recapChecked) return;
+      _recapChecked = true;
+      getRecapDue().then((r) => { if (r?.month) setRecapBanner(r); }).catch(() => { });
+    });
+    return () => { alive = false; };
+  }, []);
+  useEffect(() => {
+    let alive = true;
+    const load = () => getMostPlayed(20).then((r) => {
+      if (!alive || !r?.success) return;
+      const rows = r.games.map((x) => ({ g: libCacheFindGame(x.rom_id) || x.game || null, ms: x.ms }))
+        .filter((x): x is { g: LibGame; ms: number } => !!x.g);
+      setMostPlayed((prev) => JSON.stringify(prev.map((p) => [p.g.rom_id, p.ms])) === JSON.stringify(rows.map((p) => [p.g.rom_id, p.ms])) ? prev : rows);
+    }).catch(() => { });
+    load();
+    _libRefreshListeners.add(load);
+    return () => { alive = false; _libRefreshListeners.delete(load); };
+  }, [loading]);
   const offline = useOffline();
   // Whether the last payload said the first library fetch is still running, so
   // an empty Home can tell "you have no games" apart from "the games haven't
@@ -676,6 +771,7 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   return (
     <div style={{ paddingTop: '8px' }}>
       <EmulatorBanner />
+      <RecapBanner />
       {/* Continue playing — per-user last_played from RomM (cross-device). */}
       {continuePlaying.length > 0 && (
         <CardRow icon={<FaPlay size={14} />} title="Continue playing" count={continuePlaying.length}>
@@ -693,6 +789,17 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
                 // lands; the value itself carries no meaning.
                 stateThumb={resumeStates && thumbTick >= 0 ? (_stateThumbs.get(g.rom_id) ?? null) : null}
                 focusRef={firstList === 'cp' && i === 0 ? firstRef : undefined} focusable={visible} />
+            </div>
+          ))}
+        </CardRow>
+      )}
+
+      {/* Most played — total time across every device (Settings ▸ Play time). */}
+      {mostPlayed.length > 0 && (
+        <CardRow icon={<FaStopwatch size={14} />} title="Most played" count={mostPlayed.length}>
+          {mostPlayed.map(({ g, ms }) => (
+            <div key={g.rom_id} style={{ width: '132px', flexShrink: 0 }}>
+              <GameTile game={g} playMs={ms} onOpen={onOpen} onActiveCover={onBg} focusable={visible} />
             </div>
           ))}
         </CardRow>
@@ -1487,6 +1594,7 @@ export function LibraryRootPage() {
           {top === 'bios' && <BiosPage />}
           {top === 'downloads' && <DownloadsPage />}
           {top === 'platforms' && <PlatformsPage />}
+          {top === 'playtime' && <PlayTimePage />}
         </div>
       )}
     </>

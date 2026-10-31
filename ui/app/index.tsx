@@ -26,6 +26,7 @@ import { SetupWizard } from "./pages/setup";
 import { primePlatformSummary, SettingsPage } from "./pages/settings";
 import { BiosPage } from "./pages/bios";
 import { PlatformsPage } from "./pages/platforms";
+import { PlayTimePage } from "./pages/playtime";
 import { GameDetailPage } from "./pages/game";
 import { LibraryRootPage, LibraryGamesPage } from "./pages/library";
 import { refreshStatusNow } from "./status";
@@ -98,6 +99,7 @@ export function startApp(): { stop: () => void } {
   routerHook.addRoute("/romm-sync-emulators", () => <RouteGuard><EmulatorsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-bios", () => <RouteGuard><BiosPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-platforms", () => <RouteGuard><PlatformsPage /></RouteGuard>, { exact: true });
+  routerHook.addRoute("/romm-sync-playtime", () => <RouteGuard><PlayTimePage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-downloads", () => <RouteGuard><DownloadsPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-config", () => <RouteGuard><ConfigPage /></RouteGuard>, { exact: true });
   routerHook.addRoute("/romm-sync-library", () => <RouteGuard><LibraryRootPage /></RouteGuard>, { exact: true });

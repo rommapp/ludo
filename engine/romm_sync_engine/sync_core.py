@@ -16,7 +16,8 @@ from pathlib import Path
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
 from .save_channels import snapshots_supported
 from . import (eden_config, emulator_saves, folder_saves, gamecube_saves,
-               ps2_memcard, save_channels, switch_content, switch_nsz, title_ids)
+               play_sessions, ps2_memcard, save_channels, switch_content, switch_nsz,
+               title_ids)
 from urllib.parse import urljoin, quote, urlparse
 import socket
 import configparser
@@ -11957,6 +11958,16 @@ class AutoSyncManager:
         # rows built from that data stayed stale until the app restarted.
         self.session_epoch = 0
 
+        # Time played, reported to RomM per launch (see play_sessions).
+        self.play_sessions = play_sessions.PlaySessions(
+            cache_dir() / 'play_sessions.json',
+            client_fn=lambda: self.romm_client,
+            device_fn=lambda: self.settings.get('Device', 'device_id', '') or None)
+        # When the RetroArch monitor last ran a loop. The play watcher stands
+        # in for it while it is not running (see start_play_watch).
+        self._monitor_beat = 0.0
+        self._play_watch = None
+
         # Launched-content aliases: on-disk stem -> rom_id. A ROM downloaded as
         # an archive can extract to files named nothing like the RomM entry (a
         # GDI dump's "<title> v1.004 ...gdi" inside "<title>.zip"), and RetroArch
@@ -12480,6 +12491,9 @@ class AutoSyncManager:
             # RomM session-based sync on connect: pull saves changed on other
             # devices (and push any local changes) as a single batch negotiate.
             self.trigger_session_save_sync("connect")
+            # Sessions that ended while offline or before the last quit go
+            # up, and the other devices' sessions come down.
+            self.play_sessions.sync_async()
 
             self.log("🔄 Auto-sync started (file monitoring + RetroArch + playlist monitoring)")
             
@@ -12680,6 +12694,14 @@ class AutoSyncManager:
                     # the save is both final and worth confirming to the user.
                     eden_running = emulator_saves.eden_is_running()
                     self.game_running = bool(retroarch_running or eden_running)
+                    # Cemu is not part of game_running: nothing syncs on its
+                    # close yet. It only ends a play session.
+                    self._monitor_beat = time.time()
+                    try:
+                        self.play_sessions.observe(
+                            self.game_running or emulator_saves.cemu_is_running())
+                    except Exception as e:
+                        logging.warning(f"play session tracking: {e}")
                     if eden_running != eden_was_running:
                         if eden_running:
                             self.log("🎮 Eden launched")
@@ -12752,6 +12774,37 @@ class AutoSyncManager:
             
         threading.Thread(target=monitor_retroarch, daemon=True).start()
         self.log("🔄 RetroArch monitoring started (network priority + history fallback)")
+
+    def start_play_watch(self):
+        """Track play sessions even while save sync is not running.
+
+        The RetroArch monitor, which feeds play_sessions, only starts with
+        auto-sync, and auto-sync only starts once RomM is reachable: a game
+        played offline (a Deck on a plane), during setup, or while the other
+        Ludo shell holds the sync lock was never recorded. This watcher looks
+        at the emulators itself whenever the monitor has not run for a few
+        seconds, and stands aside while it does. It cannot double-count:
+        only the process that launched a game has a launch to attribute.
+        """
+        if self._play_watch and self._play_watch.is_alive():
+            return
+
+        def watch():
+            while True:
+                time.sleep(1)
+                if time.time() - self._monitor_beat < 5:
+                    continue
+                try:
+                    running = (self.is_retroarch_running()
+                               or emulator_saves.eden_is_running()
+                               or emulator_saves.cemu_is_running())
+                    self.play_sessions.observe(running)
+                except Exception as e:
+                    logging.warning(f"play watch: {e}")
+                    time.sleep(5)
+
+        self._play_watch = threading.Thread(target=watch, daemon=True, name='romm-play-watch')
+        self._play_watch.start()
 
     def is_retroarch_running(self):
         """Check if RetroArch process is actually running (not just flatpak containers)"""
@@ -16644,6 +16697,11 @@ class AutoSyncManager:
                 self._launch_aliases.popitem(last=False)
         except Exception as e:
             logging.debug(f"could not record launch alias: {e}")
+            return
+        try:
+            self.play_sessions.launched(rom_id)
+        except Exception as e:
+            logging.warning(f"could not start play session: {e}")
 
     def _local_save_name(self, rom_id, server_file_name, slot, game=None):
         """The filename a server save is written under on this device.
