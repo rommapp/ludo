@@ -194,6 +194,9 @@ export function ProgressRing({ pct, size = 40, stroke = 3, glow = false, color =
 // /assets/platforms/{slug}.svg (the RPlatformIcon fallback chain:
 // fsSlug.svg → fsSlug.ico → slug.svg → slug.ico). Each candidate is fetched
 // via the backend get_image RPC; falls back to a gamepad glyph if none load.
+// Platform icon uri → "icon is dark" (see the tone effect below).
+const _iconTone = new Map<string, boolean>();
+
 export function PlatformIcon({ slug, fsSlug, size, onTone }: { slug?: string | null; fsSlug?: string | null; size: number; onTone?: (dark: boolean) => void }) {
   const key = `${(fsSlug || '').toLowerCase().trim()}|${(slug || '').toLowerCase().trim()}`;
   // Resolved-icon cache: which candidate URL actually exists is unknown up
@@ -233,6 +236,10 @@ export function PlatformIcon({ slug, fsSlug, size, onTone }: { slug?: string | n
   // field would wash every icon toward "light".
   useEffect(() => {
     if (!uri || !onTone) return;
+    // Every tile showing this platform asks for the same icon's tone; decoding
+    // and sampling it per mount added up to ~0.5s when Home opened on a Deck.
+    const known = _iconTone.get(uri);
+    if (known !== undefined) { onTone(known); return; }
     let alive = true;
     const img = new Image();
     img.onload = () => {
@@ -250,7 +257,9 @@ export function PlatformIcon({ slug, fsSlug, size, onTone }: { slug?: string | n
           lum += (0.2126 * d[k] + 0.7152 * d[k + 1] + 0.0722 * d[k + 2]) * w;
           a += w;
         }
-        if (alive) onTone(a > 4 ? lum / a < 120 : false);
+        const tone = a > 4 ? lum / a < 120 : false;
+        _iconTone.set(uri, tone);
+        if (alive) onTone(tone);
       } catch { /* tainted canvas: leave the default scrim */ }
     };
     img.src = uri;

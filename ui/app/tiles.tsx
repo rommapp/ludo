@@ -1425,8 +1425,8 @@ export function Tag({ children }: { children: any }) {
 // horizontal-scroll track. Gamepad focus scrolls the track natively; the
 // gradient chevron arrows (RomM style) appear only when the track overflows
 // in that direction, signaling "more to the right".
-export function CardRow({ icon, title, count, children }:
-  { icon: any; title: string; count?: number; children: any }) {
+export function CardRow({ icon, title, count, onNearEnd, children }:
+  { icon: any; title: string; count?: number; onNearEnd?: () => void; children: any }) {
   const trackRef = useRef<HTMLDivElement | null>(null);
   const [canLeft, setCanLeft] = useState(false);
   const [canRight, setCanRight] = useState(false);
@@ -1436,6 +1436,8 @@ export function CardRow({ icon, title, count, children }:
     if (!el) return;
     setCanLeft(el.scrollLeft > 8);
     setCanRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 8);
+    // Windowed rows mount more tiles once a touch/mouse scroll nears the end.
+    if (onNearEnd && el.scrollLeft + 2 * el.clientWidth >= el.scrollWidth) onNearEnd();
   };
   useEffect(() => {
     const el = trackRef.current;
