@@ -3619,6 +3619,7 @@ class RomMClient:
                 urljoin(self.base_url, f'/api/devices/{device_id}/installs/{request_id}'),
                 json=body, timeout=15)
             if r.status_code == 200:
+                logging.info(f"[INSTALL] reported {request_id} -> {status}")
                 return True
             logging.info(f"install report {request_id} -> {status}: HTTP "
                          f"{r.status_code} {r.text[:200]}")
