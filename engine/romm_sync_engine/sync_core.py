@@ -23,7 +23,6 @@ from urllib.parse import urljoin, quote, urlparse
 import socket
 import configparser
 import html
-import webbrowser
 import base64
 import datetime
 import psutil
