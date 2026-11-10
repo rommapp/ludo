@@ -6,7 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
 import { peekDetail, storeDetail } from "../detailcache";
 import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns, setSwitchAddOnEnabled, setSwitchDlc, setSwitchUpdate, fetchSwitchAddOn, getGamePlayTime } from "../rpc";
-import { _libRefreshListeners } from "../events";
+import { _libRefreshListeners, _switchModsChangedListeners } from "../events";
 import { _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, PlatformIcon, V2Button, V2CardRow, V2SettingsRow, V2Switch, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage, useArmedPress} from "../kit";
 import { _dlSucceeded, _setDlActive, awaitDownload, cancelDownload, claimDownloadStart, releaseDownloadStart, useDownloadProgress, useIsDownloading, downloadOne} from "../downloads";
@@ -24,6 +24,7 @@ import { standaloneFor, useEmulatorStatus } from "../emulator";
 import { LocalDisc, discDisplayLabel, openDiscPicker } from "../tiles";
 import { useSaveActivityFor } from "../status";
 import { SwitchDlcModal, addOnLabel, fetchLabel, openUpdatePicker, runEdenChange, useFetchProgress } from "../switchAddOns";
+import { SwitchModPackagesSection } from "../switchModPackages";
 // One game, in full: the hero art, the actions, and the four metadata tabs.
 //
 // The tabs are where most of this lives — overview, files, save data,
@@ -497,6 +498,11 @@ function SwitchAddOnsSection({ romId }: { romId: number }) {
     catch (e) { console.error('switch_add_ons failed', e); setState(null); }
   };
   useEffect(() => { load(); }, [romId]);
+  useEffect(() => {
+    const changed = (id: number) => { if (id === romId) void load(); };
+    _switchModsChangedListeners.add(changed);
+    return () => { _switchModsChangedListeners.delete(changed); };
+  }, [romId]);
   // Up here, before the early returns: a hook has to run on every render.
   const fetchProgress = useFetchProgress(romId, fetching !== null);
 
@@ -2293,6 +2299,7 @@ export function GameDetailPage() {
                     the actionable half: the list says what exists, this says
                     what Eden will actually apply. Renders nothing off Switch. */}
                 <SwitchAddOnsSection romId={game.rom_id} />
+                {game.platform_slug === 'switch' ? <SwitchModPackagesSection key={game.rom_id} romId={game.rom_id} /> : null}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   {isMultiDisc && <SectionHeading icon={<FaBoxOpen size={12} />}>Files</SectionHeading>}
                   <FilesTab detail={detail} />

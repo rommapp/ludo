@@ -45,6 +45,7 @@ _paths.set_client_name("Ludo")
 _paths.set_library_dir_name("Ludo")
 from romm_sync_engine import (  # noqa: E402
     eden_config, emulator_saves, switch_content, switch_nsz, title_ids)
+from . import mod_packages  # noqa: E402
 
 
 def _default_roms_dir() -> str:
@@ -7978,6 +7979,13 @@ class LudoBackend:
 
         Returns (path, None) or (None, the reason to show).
         """
+        if self._platform_slug_for(g) == 'switch':
+            if any(p.get('kind') == 'mod' for p in self._switch_fetch_state.values()):
+                return None, 'Wait for the mod package operation to finish before playing.'
+            reason = await asyncio.get_event_loop().run_in_executor(
+                None, mod_packages.recover_before_launch)
+            if reason:
+                return None, reason
         archive = Path(launch_path or '')
         if archive.suffix.lower() in ('.zip', '.7z') and archive.is_file():
             # Already unpacked by hand beside the archive: use that, not a copy.
@@ -10195,6 +10203,61 @@ class LudoBackend:
     async def switch_fetch_progress(self, rom_id: int):
         """Progress of the add-on fetch_switch_add_on is downloading for a game."""
         return self._switch_fetch_state.get(rom_id) or {}
+
+    async def _switch_mod_title(self, rom_id):
+        sync = self._auto_sync
+        if not sync:
+            return None
+        game = self._games_index().get(rom_id) or {}
+        info = await asyncio.get_event_loop().run_in_executor(
+            None, self._switch_identity, sync, game)
+        return info['base_id'] if info and info.get('kind') == 'base' else None
+
+    async def switch_mod_packages(self, rom_id: int):
+        title = await self._switch_mod_title(rom_id)
+        if not title:
+            return {'title_id': None, 'server': [], 'installed': []}
+        return await asyncio.get_event_loop().run_in_executor(
+            None, mod_packages.state, self._romm_client, rom_id, title)
+
+    async def recover_switch_mod_packages(self):
+        try:
+            return await asyncio.get_event_loop().run_in_executor(None, mod_packages.recover)
+        except Exception as e:
+            return {'status': 'failed', 'message': str(e)}
+
+    async def install_switch_mod_package(self, rom_id: int, file_id: int, profile: str = 'original'):
+        if rom_id in self._switch_fetch_state:
+            return {'status': 'busy'}
+        progress = {'file_name': 'Mod package', 'percent': 0, 'state': 'preparing', 'kind': 'mod'}
+        self._switch_fetch_state[rom_id] = progress
+        try:
+            title = await self._switch_mod_title(rom_id)
+            if not title:
+                return {'status': 'not-switch'}
+            return await asyncio.get_event_loop().run_in_executor(
+                None, mod_packages.install, self._romm_client, rom_id, title, file_id, progress, profile)
+        except Exception as e:
+            logging.error('install_switch_mod_package failed: %s', e)
+            return {'status': 'failed', 'message': str(e)}
+        finally:
+            self._switch_fetch_state.pop(rom_id, None)
+
+    async def remove_switch_mod_package(self, rom_id: int, package_id: str):
+        if rom_id in self._switch_fetch_state:
+            return {'status': 'busy'}
+        self._switch_fetch_state[rom_id] = {'file_name': 'Mod package', 'state': 'removing', 'kind': 'mod'}
+        try:
+            title = await self._switch_mod_title(rom_id)
+            if not title:
+                return {'status': 'not-switch'}
+            return await asyncio.get_event_loop().run_in_executor(
+                None, mod_packages.remove, title, package_id)
+        except Exception as e:
+            logging.error('remove_switch_mod_package failed: %s', e)
+            return {'status': 'failed', 'message': str(e)}
+        finally:
+            self._switch_fetch_state.pop(rom_id, None)
 
     async def fetch_switch_add_on(self, rom_id: int, rom_ref: int, file_id=None,
                                   file_name: str = ''):

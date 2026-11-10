@@ -28,3 +28,8 @@ export const _downloadedListeners = new Set<(romId: number, downloaded: boolean)
 export function _broadcastDownloaded(romId: number, downloaded: boolean) {
   _downloadedListeners.forEach((l) => { try { l(romId, downloaded); } catch { } });
 }
+
+export const _switchModsChangedListeners = new Set<(romId: number) => void>();
+export function _broadcastSwitchModsChanged(romId: number) {
+  _switchModsChangedListeners.forEach(l => { try { l(romId); } catch { } });
+}

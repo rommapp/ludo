@@ -531,6 +531,15 @@ def mod_load_root(extra_config_dir=None):
     return dirs[0] / 'load' if dirs else None
 
 
+def mod_sdmc_root(extra_config_dir=None):
+    """The emulated SD root, including Eden's configured override."""
+    configured = _setting('[Data%20Storage]', 'sdmc_directory', extra_config_dir)
+    if configured:
+        return Path(configured).expanduser()
+    dirs = eden_data_dirs()
+    return dirs[0] / 'sdmc' if dirs else None
+
+
 def mods_for(title_id, extra_config_dir=None):
     """[{'name', 'enabled'}] for each mod folder Eden has for a base title."""
     root = mod_load_root(extra_config_dir)

@@ -38,8 +38,9 @@ function askCloseEden(): Promise<boolean> {
 
 // Runs a change to Eden's settings, closing Eden first if the user agrees, and
 // says why when it did not happen. Returns the final status.
-export async function runEdenChange(apply: () => Promise<any>): Promise<string> {
-  let status = String((await apply())?.status ?? 'failed');
+export async function runEdenChange(apply: () => Promise<any>, failureTitle = 'Could not change Eden settings'): Promise<string> {
+  let result = await apply();
+  let status = String(result?.status ?? 'failed');
   if (status === 'running') {
     if (!(await askCloseEden())) return status;
     const r = await closeEden();
@@ -47,12 +48,13 @@ export async function runEdenChange(apply: () => Promise<any>): Promise<string> 
       toaster.toast({ title: 'Eden is still open', body: 'Close it from its own menu, then try again.' });
       return status;
     }
-    status = String((await apply())?.status ?? 'failed');
+    result = await apply();
+    status = String(result?.status ?? 'failed');
   }
   if (status === 'no-config') {
     toaster.toast({ title: 'Open Eden once first', body: 'Eden has not created its settings yet.' });
   } else if (status !== 'ok' && status !== 'running') {
-    toaster.toast({ title: 'Could not change Eden settings', body: status });
+    toaster.toast({ title: failureTitle, body: String(result?.message || status) });
   }
   return status;
 }
