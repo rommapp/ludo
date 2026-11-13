@@ -12873,6 +12873,7 @@ class AutoSyncManager:
                         config_dir = Path.home() / '.var/app/net.retrodeck.retrodeck/config/retroarch'
 
                     if not config_dir:
+                        self.should_stop.wait(3)
                         continue
 
                     # Find all playlist files
@@ -12898,11 +12899,11 @@ class AutoSyncManager:
                                 self.log(f"🎯 Library launch: {Path(recent_content).name}")
                                 self.sync_saves_for_rom_file(recent_content)
                     
-                    time.sleep(3)
+                    self.should_stop.wait(3)
                     
                 except Exception as e:
                     self.log(f"Playlist monitoring error: {e}")
-                    time.sleep(10)
+                    self.should_stop.wait(10)
         
         threading.Thread(target=monitor_playlists, daemon=True).start()
 
