@@ -11,6 +11,8 @@ import threading
 import pickle
 import time
 import logging
+import copy
+from functools import wraps
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
@@ -3000,12 +3002,71 @@ class ReachabilityLatch:
 DEVICE_CAPABILITIES = {'remote_install': True}
 
 
+_io_local = threading.local()
+
+
+@contextmanager
+def romm_io_cancellation(check):
+    previous = getattr(_io_local, 'check', None)
+    _io_local.check = check
+    try:
+        yield
+    finally:
+        _io_local.check = previous
+
+
+class _OperationSession(requests.Session):
+    def request(self, *args, **kwargs):
+        check = getattr(_io_local, 'check', None)
+        if check:
+            check()
+        owner = getattr(self, '_auth_owner', None)
+        if owner is not None:
+            with owner._auth_lock:
+                authorization = owner._session.headers.get('Authorization')
+                if authorization is None:
+                    self.headers.pop('Authorization', None)
+                else:
+                    self.headers['Authorization'] = authorization
+                self.cookies = copy.deepcopy(owner._session.cookies)
+        # A successful refresh must persist its rotated tokens before cancel.
+        return super().request(*args, **kwargs)
+
+
+def _auth_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        check = getattr(_io_local, 'check', None)
+        if check and method.__name__ != '_watch_auth':
+            check()
+        with self._auth_lock:
+            if check and method.__name__ != '_watch_auth':
+                check()
+            owned = getattr(self._session_local, 'session', None)
+            # Refresh tokens rotate: all authentication uses the original session.
+            self._session_local.session = None
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                self._session_local.session = owned
+                if owned is not None:
+                    authorization = self._session.headers.get('Authorization')
+                    if authorization is None:
+                        owned.headers.pop('Authorization', None)
+                    else:
+                        owned.headers['Authorization'] = authorization
+                    owned.cookies = copy.deepcopy(self._session.cookies)
+    return locked
+
+
 class RomMClient:
     """Client for interacting with RomM API"""
     
     def __init__(self, base_url, username=None, password=None, client_token=None):
         self.base_url = base_url.rstrip('/')
-        self.session = requests.Session()
+        self._auth_lock = threading.RLock()
+        self._session_local = threading.local()
+        self.session = _OperationSession()
         self.authenticated = False
         self.client_token = None  # RomM Client API Token (rmm_...) if used
         # Save types whose /downloaded endpoint this server answered 404 for —
@@ -3029,7 +3090,7 @@ class RomMClient:
         # sign in again instead of telling them the server is down.
         self.auth_rejected = False
         self._refreshing = False
-        self.session.hooks['response'].append(self._watch_auth)
+        self.session.hooks['response'].extend([self._watch_cookies, self._watch_auth])
         # What /api/heartbeat says the server can do; see get_server_features.
         self.server_features = {}
         # The device a QR pairing's token is bound to (RomM creates one per
@@ -3083,16 +3144,87 @@ class RomMClient:
         
         # Prefer a Client API Token (RomM's recommended companion-app auth) over
         # storing the user's password. Fall back to Basic auth if no token.
-        if client_token:
-            self.authenticate_with_token(client_token)
-        elif username and password:
-            self.authenticate(username, password)
+        try:
+            if client_token:
+                self.authenticate_with_token(client_token)
+            elif username and password:
+                self.authenticate(username, password)
+        except BaseException:
+            self.session.close()
+            raise
+
+    @property
+    def session(self):
+        return getattr(self._session_local, 'session', None) or self._session
+
+    @session.setter
+    def session(self, value):
+        # Some engine consumers build a lightweight client via __new__ + session.
+        if not hasattr(self, '_session_local'):
+            self._session_local = threading.local()
+        if not hasattr(self, '_auth_lock'):
+            self._auth_lock = threading.RLock()
+        self._session = value
+
+    @contextmanager
+    def isolated_session(self):
+        """Own HTTP transport for one worker, with one authoritative auth state.
+
+        Ordinary session users retain their API; thread-local selection never
+        swaps another thread's transport. Legacy background HTTP users still
+        share their original transport, but cannot independently rotate auth.
+        """
+        previous = getattr(self._session_local, 'session', None)
+        owned = _OperationSession()
+        try:
+            with self._auth_lock:
+                source = self._session
+                for attr in requests.Session.__attrs__:
+                    if attr not in ('adapters', 'hooks'):
+                        setattr(owned, attr, copy.deepcopy(getattr(source, attr)))
+                for prefix, adapter in source.adapters.items():
+                    owned.mount(prefix, requests.adapters.HTTPAdapter(
+                        pool_connections=adapter._pool_connections,
+                        pool_maxsize=adapter._pool_maxsize,
+                        max_retries=copy.deepcopy(adapter.max_retries),
+                        pool_block=adapter._pool_block))
+                # Do not copy bound hooks from another transport/client.
+                owned.hooks['response'] = [self._watch_cookies, self._watch_auth]
+                owned._auth_owner = self
+            self._session_local.session = owned
+            yield owned
+        finally:
+            self._session_local.session = previous
+            owned.close()
 
     # Endpoints whose 401 means "these credentials are wrong", answered while
     # signing in or pairing, not "the session we had is gone".
     _AUTH_PATHS = ('/api/token', '/api/login', '/api/client-tokens/exchange',
                    '/api/auth/device')
 
+    def _canonical_cookie_header(self, request):
+        probe = copy.copy(request)
+        probe.headers = request.headers.copy()
+        probe.headers.pop('Cookie', None)
+        return requests.cookies.get_cookie_header(self._session.cookies, probe)
+
+    def _watch_cookies(self, response, *args, **kwargs):
+        request = getattr(response, 'request', None)
+        if request is None:
+            return
+        with self._auth_lock:
+            current = (request.headers.get('Authorization') ==
+                       self._session.headers.get('Authorization') and
+                       request.headers.get('Cookie') == self._canonical_cookie_header(request))
+            response._romm_credentials_current = current
+            if current:
+                # Extract the raw headers too: expired cookies remove old entries.
+                # Requests invokes response hooks for each redirect response.
+                requests.cookies.extract_cookies_to_jar(
+                    self._session.cookies, request, response.raw)
+            response._romm_cookie_header = self._canonical_cookie_header(request)
+
+    @_auth_locked
     def _watch_auth(self, response, *args, **kwargs):
         """Session hook: notice the server revoking us mid-session.
 
@@ -3105,6 +3237,12 @@ class RomMClient:
         401 still fails, the next one goes out with the new token. A Client API
         Token has nothing to refresh, so it is marked rejected straight away.
         """
+        check = getattr(_io_local, 'check', None)
+        if check:
+            try:
+                check()
+            except BaseException:
+                return  # Do not start a refresh for an abandoned operation.
         try:
             if (response.status_code != 401 or not self.authenticated
                     or self._refreshing):
@@ -3112,6 +3250,15 @@ class RomMClient:
             path = urlparse(response.url).path
             if not path.startswith('/api/') or path.startswith(self._AUTH_PATHS):
                 return
+            request = getattr(response, 'request', None)
+            if request is not None and request.headers.get('Authorization') != \
+                    self.session.headers.get('Authorization'):
+                return  # A late 401 must not revoke freshly rotated credentials.
+            if request is not None and (
+                    not getattr(response, '_romm_credentials_current', True) or
+                    getattr(response, '_romm_cookie_header', self._canonical_cookie_header(request))
+                    != self._canonical_cookie_header(request)):
+                return  # Likewise for a cookie-only session rotated by another response.
             if self.refresh_token and not self.client_token:
                 self._refreshing = True
                 try:
@@ -3126,6 +3273,7 @@ class RomMClient:
         except Exception as e:
             logging.debug(f"auth watch failed: {e}")
 
+    @_auth_locked
     def authenticate_with_token(self, client_token):
         """Authenticate using a RomM Client API Token (Authorization: Bearer rmm_...).
 
@@ -3276,6 +3424,7 @@ class RomMClient:
             print(f"⚠️ device/token poll error (will retry): {e}")
             return ('pending', None)
 
+    @_auth_locked
     def authenticate(self, username, password):
         """Authenticate with RomM using Basic Auth, Token, or Session fallback"""
         try:
@@ -3380,6 +3529,7 @@ class RomMClient:
             self.authenticated = False
             return False
 
+    @_auth_locked
     def refresh_access_token(self):
         """Refresh the access token using refresh_token"""
         if not self.refresh_token:
@@ -3425,6 +3575,7 @@ class RomMClient:
             self.authenticated = False
             return False
 
+    @_auth_locked
     def ensure_authenticated(self):
         """Ensure token is valid, refresh if needed"""
         import time
