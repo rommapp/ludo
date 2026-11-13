@@ -194,6 +194,9 @@ export function ProgressRing({ pct, size = 40, stroke = 3, glow = false, color =
 // /assets/platforms/{slug}.svg (the RPlatformIcon fallback chain:
 // fsSlug.svg → fsSlug.ico → slug.svg → slug.ico). Each candidate is fetched
 // via the backend get_image RPC; falls back to a gamepad glyph if none load.
+// Platform icon uri → "icon is dark" (see the tone effect below).
+const _iconTone = new Map<string, boolean>();
+
 export function PlatformIcon({ slug, fsSlug, size, onTone }: { slug?: string | null; fsSlug?: string | null; size: number; onTone?: (dark: boolean) => void }) {
   const key = `${(fsSlug || '').toLowerCase().trim()}|${(slug || '').toLowerCase().trim()}`;
   // Resolved-icon cache: which candidate URL actually exists is unknown up
@@ -233,6 +236,10 @@ export function PlatformIcon({ slug, fsSlug, size, onTone }: { slug?: string | n
   // field would wash every icon toward "light".
   useEffect(() => {
     if (!uri || !onTone) return;
+    // Every tile showing this platform asks for the same icon's tone; decoding
+    // and sampling it per mount added up to ~0.5s when Home opened on a Deck.
+    const known = _iconTone.get(uri);
+    if (known !== undefined) { onTone(known); return; }
     let alive = true;
     const img = new Image();
     img.onload = () => {
@@ -250,7 +257,9 @@ export function PlatformIcon({ slug, fsSlug, size, onTone }: { slug?: string | n
           lum += (0.2126 * d[k] + 0.7152 * d[k + 1] + 0.0722 * d[k + 2]) * w;
           a += w;
         }
-        if (alive) onTone(a > 4 ? lum / a < 120 : false);
+        const tone = a > 4 ? lum / a < 120 : false;
+        _iconTone.set(uri, tone);
+        if (alive) onTone(tone);
       } catch { /* tainted canvas: leave the default scrim */ }
     };
     img.src = uri;
@@ -337,6 +346,7 @@ export function CancelDownloadButton({ onCancel }: { onCancel: () => void }) {
 export function DownloadStatusRow({ romId, name, onCancel }: { romId: number; name: string; onCancel?: () => void }) {
   const prog = useDownloadProgress(romId, true);
   const pct = Math.max(0, Math.min(100, prog?.percent ?? 0));
+  const fill = Math.max(0, Math.min(100, prog?.exact ?? prog?.percent ?? 0));
   const extracting = prog?.state === 'extracting';
   const bytes = prog && prog.total > 0 ? `${fmtBytes(prog.downloaded)} / ${fmtBytes(prog.total)}` : '';
   const eta = prog ? formatEta(prog.eta) : '';
@@ -363,7 +373,7 @@ export function DownloadStatusRow({ romId, name, onCancel }: { romId: number; na
         </span>
       </div>
       <div style={{ height: '4px', borderRadius: '2px', background: V2.surface, marginTop: '7px', overflow: 'hidden' }}>
-        <div style={{ height: '100%', width: `${pct}%`, background: barColor, borderRadius: '2px', transition: 'width 0.3s ease, background 0.3s ease' }} />
+        <div style={{ height: '100%', width: `${fill}%`, background: barColor, borderRadius: '2px', transition: 'width 0.3s ease, background 0.3s ease' }} />
       </div>
       {sub && <div style={{ fontSize: '10.5px', color: V2.fgMuted, marginTop: '5px', fontVariantNumeric: 'tabular-nums' }}>{sub}</div>}
       </div>
@@ -1262,10 +1272,13 @@ export function ScrollFade({ maxHeight, refresh, children, style }: {
 // `message` is a line of explanation under the title, for a picker that is
 // really a question. `onDismiss` runs when it is closed without a choice (B,
 // Escape, the scrim) -- a caller waiting on the answer needs to hear "none".
-export function PickerModal({ title, message, items, onDismiss, closeModal }: {
+export function PickerModal({ title, message, children, items, onDismiss, closeModal }: {
   title: string;
   message?: string;
-  items: { key: string | number; label: string; active?: boolean; danger?: boolean; onSelect: () => void }[];
+  // Shown between the message and the rows (e.g. a QR code).
+  children?: any;
+  // keepOpen: the row acts inside the modal (e.g. retry) instead of closing it.
+  items: { key: string | number; label: string; active?: boolean; danger?: boolean; keepOpen?: boolean; onSelect: () => void }[];
   onDismiss?: () => void;
   closeModal?: () => void;
 }) {
@@ -1310,12 +1323,13 @@ export function PickerModal({ title, message, items, onDismiss, closeModal }: {
           {message && (
             <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.4, padding: '0 8px 10px' }}>{message}</div>
           )}
+          {children}
           <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
           {items.map((it) => (
             <UserMenuRow key={it.key}
               icon={it.active ? <FaCheck size={14} style={{ color: V2.brand }} /> : null}
               label={it.label} danger={it.danger}
-              onSelect={() => { closeModal?.(); it.onSelect(); }} />
+              onSelect={() => { if (!it.keepOpen) closeModal?.(); it.onSelect(); }} />
           ))}
         </Focusable>
       </Focusable>

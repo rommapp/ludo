@@ -10,7 +10,9 @@
 import { createElement, useState, useEffect } from "react";
 import { ToastCover } from "./kit";
 import { toaster } from "./toast";
-import { cancelDownloadRpc, downloadGame, getDownloadProgress } from "./rpc";
+import { cancelDownloadRpc, downloadGame, getDownloads } from "./rpc";
+import { watchTopic } from "./push";
+import { libCacheFindGame } from "./libcache";
 import { _broadcastLibRefresh, _broadcastDownloaded } from "./events";
 
 // A single library grid card: art-only with a centered, single-line label
@@ -19,6 +21,106 @@ import { _broadcastLibRefresh, _broadcastDownloaded } from "./events";
 // to the page's background art. When `game.screenshot` is set (continue-playing
 // rail), the art is a landscape screenshot with the box-art floated as a PIP,
 // matching RomM's Home — otherwise it's the portrait cover.
+// ── Live progress: one store, one poller ─────────────────────────────────────
+//
+// A download in flight is on screen in several places at once (cover ring,
+// detail-page button, top-bar ring, Downloads row, collection header) and each
+// used to poll get_download_progress on its own clock, 350-600ms apart: several
+// calls per game per tick, and views that disagreed by a few percent and
+// finished a beat apart. Now one poller reads every download in one call while
+// anyone is watching, and every view reads the same snapshot. Phase changes
+// (start, extracting, done, error) also arrive as the backend's 'downloads'
+// nudge, so they land the moment they happen rather than at the next tick.
+const PROGRESS_MS = 250;
+const _prog = new Map<number, any>();
+const _progListeners = new Set<() => void>();
+let _progWatchers = 0;
+let _progTimer: ReturnType<typeof setInterval> | null = null;
+let _progStopNudge: (() => void) | null = null;
+let _progInFlight: Promise<void> | null = null;
+
+/** Fetch every tracked download now and notify subscribers. Concurrent calls share one fetch. */
+export function refreshProgress(): Promise<void> {
+  if (_progInFlight) return _progInFlight;
+  _progInFlight = (async () => {
+    try {
+      const all = await getDownloads();
+      _prog.clear();
+      for (const [k, v] of Object.entries(all || {})) _prog.set(Number(k), v);
+      _progListeners.forEach((l) => { try { l(); } catch { /* one view's bug isn't the rest's */ } });
+    } catch { /* transient: next tick */ }
+    finally { _progInFlight = null; }
+  })();
+  return _progInFlight;
+}
+
+/** Latest backend entry for a game, or undefined when nothing is tracked for it. */
+export const progressOf = (romId: number): any => _prog.get(romId);
+
+/** Keep the shared poller running while the caller needs live progress. Returns release. */
+export function watchProgress(): () => void {
+  if (_progWatchers++ === 0) {
+    refreshProgress();
+    _progTimer = setInterval(refreshProgress, PROGRESS_MS);
+    // Fast fallback is the same 250ms: nothing to gain from waiting longer.
+    _progStopNudge = watchTopic('downloads', refreshProgress, 60000, 60000);
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (--_progWatchers === 0) {
+      if (_progTimer) clearInterval(_progTimer);
+      _progTimer = null;
+      _progStopNudge?.(); _progStopNudge = null;
+    }
+  };
+}
+
+/** Subscribe to every progress snapshot. Returns unsubscribe. */
+export function onProgress(fn: () => void): () => void {
+  _progListeners.add(fn);
+  return () => { _progListeners.delete(fn); };
+}
+
+// Downloads this UI didn't start — an install requested from RomM's web UI —
+// are shown exactly like one started here: entered in the registry while they
+// run (cover ring, detail-page progress, top-bar ring, Downloads row), marked
+// installed when they land. Their start and end arrive as 'downloads' nudges.
+// The backend raises the toast, since nobody here asked for it.
+const _lastState = new Map<number, string>();
+const _bgOwned = new Set<number>();
+let _bgInstallsWatched = false;
+export function watchBackgroundInstalls() {
+  if (_bgInstallsWatched) return;
+  _bgInstallsWatched = true;
+  let baseline = true;
+  onProgress(() => {
+    for (const [id, p] of _prog) {
+      const st = p?.state, was = _lastState.get(id);
+      _lastState.set(id, st);
+      if (baseline && st !== 'downloading' && st !== 'extracting') continue;
+      const running = st === 'downloading' || st === 'extracting' || st === 'preparing';
+      if (running && !_dlActive.has(id)) {
+        _bgOwned.add(id);
+        _setDlActive(id, true, libCacheFindGame(id)?.name);
+      } else if (!running && _bgOwned.has(id)) {
+        _bgOwned.delete(id);
+        if (st === 'done' && was !== 'done') {
+          _dlSucceeded.add(id);
+          _broadcastDownloaded(id, true);
+        }
+        _setDlActive(id, false);
+      }
+    }
+    baseline = false;
+  });
+  watchTopic('downloads', refreshProgress, 60000, 60000);
+  refreshProgress();
+}
+
+const _nextSnapshot = () => new Promise<void>((r) => { const off = onProgress(() => { off(); r(); }); });
+
 // Polls get_download_progress until the background download reaches a terminal
 // state, resolving with the outcome. The download itself is kicked off by
 // download_game (which returns immediately); this drives completion + the toast.
@@ -31,10 +133,16 @@ import { _broadcastLibRefresh, _broadcastDownloaded } from "./events";
 // A cancelled download is reported once here too, so callers only need to
 // leave their failure toast out when `cancelled` is set.
 export async function awaitDownload(romId: number): Promise<{ ok: boolean; message?: string; removed?: boolean; warning?: boolean; cancelled?: boolean }> {
+  const release = watchProgress();
+  try {
+    await refreshProgress();
+    return await _awaitTerminal(romId);
+  } finally { release(); }
+}
+
+async function _awaitTerminal(romId: number): Promise<{ ok: boolean; message?: string; removed?: boolean; warning?: boolean; cancelled?: boolean }> {
   for (; ;) {
-    let p: any;
-    try { p = await getDownloadProgress(romId); }
-    catch { await new Promise((r) => setTimeout(r, 500)); continue; }
+    const p: any = progressOf(romId) ?? { state: 'idle' };
     if (p?.state === 'done') {
       if (!p.warning) return { ok: true };
       toaster.toast({ title: p.warning.title, body: p.warning.body, duration: 10000 });
@@ -52,7 +160,7 @@ export async function awaitDownload(romId: number): Promise<{ ok: boolean; messa
       return { ok: false, cancelled: true };
     }
     if (p?.state === 'idle') return { ok: false, message: 'Download did not start' };
-    await new Promise((r) => setTimeout(r, 400));
+    await _nextSnapshot();
   }
 }
 
@@ -273,7 +381,7 @@ export function useIsDownloading(romId: number): boolean {
 // `message` names the phase when it is not the game's own download -- an
 // add-on fetched with it, or a Switch file being decompressed -- and `detail`
 // says why, for the Downloads row. Both are absent for a plain download.
-export interface DlProgress { percent: number; speed: number; eta: number; downloaded: number; total: number; state?: string; message?: string; detail?: string; }
+export interface DlProgress { percent: number; exact?: number; speed: number; eta: number; downloaded: number; total: number; state?: string; message?: string; detail?: string; }
 
 export function useDownloadProgress(romId: number, active: boolean): DlProgress | null {
   const globalActive = useIsDownloading(romId);
@@ -281,18 +389,26 @@ export function useDownloadProgress(romId: number, active: boolean): DlProgress 
   const [prog, setProg] = useState<DlProgress | null>(null);
   useEffect(() => {
     if (!on) { setProg(null); return; }
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const p = await getDownloadProgress(romId);
-        if (!cancelled && p && typeof p.percent === 'number') {
-          setProg({ percent: p.percent, speed: p.speed || 0, eta: p.eta || 0, downloaded: p.downloaded || 0, total: p.total || 0, state: p.state, message: p.message || undefined, detail: p.detail || undefined });
-        }
-      } catch { /* transient */ }
+    const read = () => {
+      const p = progressOf(romId);
+      if (!p || typeof p.percent !== 'number') return;
+      const exact = typeof p.exact === 'number' ? p.exact : p.percent;
+      setProg((prev) => {
+        // Same snapshot for this game: keep the object so the view doesn't re-render.
+        if (prev && prev.exact === exact && prev.state === p.state && prev.message === (p.message || undefined)
+          && prev.speed === (p.speed || 0)) return prev;
+        return {
+          // Shown as a whole number, floored so it never reads 100% before it's done.
+          percent: Math.floor(exact), exact,
+          speed: p.speed || 0, eta: p.eta || 0, downloaded: p.downloaded || 0, total: p.total || 0,
+          state: p.state, message: p.message || undefined, detail: p.detail || undefined,
+        };
+      });
     };
-    tick();
-    const id = setInterval(tick, 400);
-    return () => { cancelled = true; clearInterval(id); };
+    read();
+    const off = onProgress(read);
+    const release = watchProgress();
+    return () => { off(); release(); };
   }, [romId, on]);
   return prog;
 }

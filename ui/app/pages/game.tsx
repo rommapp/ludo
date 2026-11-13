@@ -1,10 +1,12 @@
 import { Focusable, GamepadButton, ModalRoot, showModal, Navigation } from "@ludo/host";
 import { toaster } from "../toast";
-import { V2, fmtBytes, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
-import { FaWrench, FaChevronDown, FaChevronRight, FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
+import { V2, DEVICE_COLORS, fmtBytes, fmtPlayTime, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
+import { FaBan, FaWrench, FaChevronDown, FaChevronRight, FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
-import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns, setSwitchAddOnEnabled, setSwitchDlc, setSwitchUpdate, fetchSwitchAddOn} from "../rpc";
+import { peekDetail, storeDetail } from "../detailcache";
+import { deleteGame, downloadGame, getGameDetail, refreshGameMetadata, getLocalDiscs, getRaEarned, getSaveHistory, getSaveScreenshot, restoreSaveVersion, getSwitchAddOns, setSwitchAddOnEnabled, setSwitchDlc, setSwitchUpdate, fetchSwitchAddOn, getGamePlayTime } from "../rpc";
+import { _libRefreshListeners } from "../events";
 import { _forceGamepadFocus, _gpFocusEl, playSteamSound, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, PlatformIcon, V2Button, V2CardRow, V2SettingsRow, V2Switch, MODAL_SCRIM_INSET, SectionHeading, ToastCover, useRommImage, useArmedPress} from "../kit";
 import { _dlSucceeded, _setDlActive, awaitDownload, cancelDownload, claimDownloadStart, releaseDownloadStart, useDownloadProgress, useIsDownloading, downloadOne} from "../downloads";
@@ -17,7 +19,7 @@ import { ScreenshotViewer } from "../shots";
 import { viewerOpen } from "../glass";
 import { MdVerified } from "react-icons/md";
 import { getLibGameHolder, getLibGameOrigin, libCacheSetDownloaded, openGameById} from "../libcache";
-import { cannotLaunch, runLaunch } from "../launch";
+import { cannotLaunch, runLaunch, useResumable } from "../launch";
 import { standaloneFor, useEmulatorStatus } from "../emulator";
 import { LocalDisc, discDisplayLabel, openDiscPicker } from "../tiles";
 import { useSaveActivityFor } from "../status";
@@ -1581,15 +1583,28 @@ export function SaveDataTab({ romId }: { romId: number }) {
 
 export function GameDetailPage() {
   const game = getLibGameHolder();
-  const [detail, setDetail] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
+  const cached = game ? peekDetail(game.rom_id) : undefined;
+  const [detail, setDetail] = useState<any>(cached ?? null);
+  const [loading, setLoading] = useState(!cached);
   const [busy, setBusy] = useState<null | 'download' | 'delete' | 'launch'>(null);
+  const resumable = useResumable(game?.rom_id);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [isDownloaded, setIsDownloaded] = useState<boolean>(!!game?.is_downloaded);
   const [discs, setDiscs] = useState<LocalDisc[]>([]);
   const [discLast, setDiscLast] = useState<string>('');
   const [bgUri, setBgUri] = useState<string | null>(null);
   const [tab, setTab] = useState('overview');
+  const [playTime, setPlayTime] = useState<any>(null);
+  useEffect(() => {
+    const romId = game?.rom_id;
+    if (!romId) return;
+    let alive = true;
+    const load = () => getGamePlayTime(romId).then((r) => { if (alive && r?.success) setPlayTime(r); }).catch(() => { });
+    load();
+    // A play session that just ended changes the total.
+    _libRefreshListeners.add(load);
+    return () => { alive = false; _libRefreshListeners.delete(load); };
+  }, [game?.rom_id]);
   const dlProg = useDownloadProgress(game?.rom_id ?? -1, busy === 'download');
   const dlPct = dlProg?.percent ?? null;
   const extracting = dlProg?.state === 'extracting';
@@ -1645,6 +1660,7 @@ export function GameDetailPage() {
     try {
       const res = await getGameDetail(rid);
       if (res?.success) {
+        storeDetail(rid, res);
         setDetail(res);
         // get_game_detail reports is_downloaded from the in-memory games index,
         // which a just-finished download may not have reached yet (and which
@@ -1673,7 +1689,7 @@ export function GameDetailPage() {
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(!!cached); }, []);
 
   // If a download for this game finishes on another surface (e.g. its cover
   // tile), refresh so the CTA flips Download → Play here too.
@@ -1960,7 +1976,11 @@ export function GameDetailPage() {
         <Focusable noFocusRing flow-children="vertical" style={{ flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <div>
             <div style={{ fontSize: '30px', fontWeight: 800, lineHeight: '1.15', letterSpacing: '-0.01em' }}>{name}</div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0', marginTop: '8px', fontSize: '13.5px', color: V2.fg2 }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0', marginTop: '8px', fontSize: '13.5px', color: V2.fg2,
+              // The row is as tall as its tag chips from the first paint: the chips
+              // arrive with the detail, and without this everything below them
+              // (actions, tabs) drops a few pixels when they do.
+              minHeight: '24px' }}>
               {/* Platform icon leads the meta row (RomM GameHeader). */}
               {game.platform_slug && (
                 <span style={{ display: 'inline-flex', width: '16px', height: '16px', marginRight: '6px', alignItems: 'center', justifyContent: 'center' }}>
@@ -2027,9 +2047,12 @@ export function GameDetailPage() {
           {/* Entered from anywhere (Up from the tabs), focus lands on the
               primary action — Play/Download — never on Delete beside it. */}
           <Focusable noFocusRing flow-children="horizontal" {...NAV_ENTER_FIRST} style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
-            {!isDownloaded ? (
+            {!isDownloaded && detail?.no_server_file ? (
+              <GameActionButton variant="emphasized" focusRef={ctaRef} disabled label="No file" icon={<FaBan size={15} />}
+                onClick={() => {}} />
+            ) : !isDownloaded ? (
               <GameActionButton variant="emphasized" focusRef={ctaRef} disabled={!!busy || downloading} onClick={doDownload}
-                progress={downloading ? (dlPct ?? 0) : undefined}
+                progress={downloading ? (dlProg?.exact ?? dlPct ?? 0) : undefined}
                 label={downloading
                   ? (extracting ? `${dlProg?.message || 'Extracting…'}${dlPct != null ? ` ${padPct(dlPct)}%` : ''}`
                      : `${dlProg?.message || 'Downloading…'}${dlPct != null ? ` ${padPct(smoothPct)}%` : ''}`)
@@ -2052,7 +2075,7 @@ export function GameDetailPage() {
                   onFocused={() => setCtaFocused(true)} onBlurred={() => setCtaFocused(false)}
                   onOptionsButton={isMultiDisc && !noEmulator ? openDiscMenu : undefined}
                   optionsHint={isMultiDisc && !noEmulator}
-                  label={busy === 'launch' ? 'Launching…' : 'Play'}
+                  label={busy === 'launch' ? 'Launching…' : resumable ? 'Resume' : 'Play'}
                   icon={busy === 'launch'
                     ? <FaSync size={15} style={{ animation: 'spin 1s linear infinite' }} />
                     : <FaPlay size={14} style={{ marginLeft: '2px' }} />} />
@@ -2114,7 +2137,10 @@ export function GameDetailPage() {
 
           {/* Tabbed panel (RomM GameDetails: RTabNav + tab content). L1/R1 page tabs. */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <div style={{ flex: '1 1 auto', minWidth: 0 }}><V2TabNav tabs={tabList} active={tab} onTab={setTab} /></div>
+            {/* Hidden until the detail is in: Files / Media / Achievements are only
+                known then, and tabs appearing in the middle of the strip shift the
+                ones after them. The row keeps its height either way. */}
+            <div style={{ flex: '1 1 auto', minWidth: 0, visibility: loading ? 'hidden' : 'visible' }}><V2TabNav tabs={tabList} active={tab} onTab={setTab} /></div>
             <Bumper label="L1" />
             <Bumper label="R1" />
           </div>
@@ -2135,6 +2161,58 @@ export function GameDetailPage() {
                   const lpStr = lp && !isNaN(lp.getTime()) ? lp.toLocaleString() : null;
                   const rows: { label: string; field: any }[] = [];
                   if (lpStr) rows.push({ label: 'Last played', field: <span style={{ fontSize: '13px', color: V2.fg2 }}>{lpStr}</span> });
+                  // Play time across every device (engine play_sessions). The
+                  // device split only appears once a second device has played.
+                  if (playTime?.played) {
+                    rows.push({
+                      label: 'Time played',
+                      field: (
+                        <>
+                          <span style={{ fontSize: '15px', fontWeight: 700, color: V2.fg }}>{fmtPlayTime(playTime.total_ms)}</span>
+                          <span style={{ fontSize: '12.5px', color: V2.fgMuted }}>
+                            {playTime.sessions} {playTime.sessions === 1 ? 'session' : 'sessions'}
+                            {playTime.sessions > 1 && ` · avg ${fmtPlayTime(playTime.average_ms)} · longest ${fmtPlayTime(playTime.longest_ms)}`}
+                          </span>
+                        </>
+                      ),
+                    });
+                    // The top three devices by name, the rest as one grey "Other
+                    // devices" chip, as on the Play time page's Devices band:
+                    // past three the chips wrap and the colours stop telling
+                    // devices apart.
+                    const devs = playTime.devices || [];
+                    if (devs.length > 1) {
+                      const shown = devs.slice(0, devs.length > 4 ? 3 : 4)
+                        .map((d: any) => ({ ...d, color: DEVICE_COLORS[d.rank] || 'rgba(255,255,255,0.3)' }));
+                      const rest = devs.slice(shown.length);
+                      if (rest.length) shown.push({
+                        id: 'others', name: `${rest.length} other devices`, color: 'rgba(255,255,255,0.3)',
+                        ms: rest.reduce((a: number, d: any) => a + d.ms, 0),
+                        share: rest.reduce((a: number, d: any) => a + d.share, 0),
+                      });
+                      rows.push({
+                        label: 'On devices',
+                        field: (
+                          <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                            <div style={{ width: '200px', height: '6px', borderRadius: '3px', overflow: 'hidden', display: 'flex', background: V2.surface }}>
+                              {shown.map((d: any) => <div key={d.id} style={{ width: `${d.share * 100}%`, background: d.color }} />)}
+                            </div>
+                            {shown.map((d: any) => (
+                              <span key={d.id} style={{
+                                display: 'inline-flex', alignItems: 'center', gap: '7px', padding: '4px 10px',
+                                background: V2.surface, border: `1px solid ${V2.borderStrong}`, borderRadius: V2.radiusPill,
+                                fontSize: '11.5px', fontWeight: 600, color: V2.fg2,
+                              }}>
+                                <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: d.color }} />
+                                {d.name}
+                                <span style={{ color: V2.fgMuted, fontWeight: 500 }}>{fmtPlayTime(d.ms)}</span>
+                              </span>
+                            ))}
+                          </div>
+                        ),
+                      });
+                    }
+                  }
                   if (detail?.player_count) rows.push({ label: 'Players', field: <PlayerCountBadge value={String(detail.player_count)} /> });
                   if (ageRatings.length) rows.push({ label: 'Age rating', field: <AgeRatingBadges items={ageRatings} /> });
                   if (userCollections.length) rows.push({

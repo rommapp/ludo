@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { applyAppImageUpdate, checkForUpdate, clearRecentActivity, downloadUpdate, enablePlatform, refreshFromRomm, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, getScreenshotMode, setScreenshotModeRpc, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
+import { applyAppImageUpdate, getPlayTime, setMostPlayedHome, checkForUpdate, clearRecentActivity, downloadUpdate, enablePlatform, refreshFromRomm, deleteOrphanGame, getAccountUsername, getCheckOnStartup, getConfig, getFetchBenchmark, getLibraryAutoUpdate, getLoggingEnabled, getOrphanGames, getPlatformSync, getPluginVersion, getRecentActivity, getResumeStateEnabled, getRetrodeckButtonEnabled, getSteamTileStatus, getUpdateChannel, getVirtualCollectionsVisible, getScreenshotMode, setScreenshotModeRpc, isDebugMode, logout, rebuildLibrary, setCheckOnStartup, setLibraryAutoUpdate, setResumeStateEnabled, setRetrodeckButtonEnabled, setSteamTile, setSyncIndicatorRpc, setUpdateChannel, setVirtualCollectionsVisibleRpc, timeColdFetch, updateLoggingEnabled, getSyncIndicator} from "../rpc";
+import { getRegionOrder } from "../rpc";
 import { GameActionButton, UpdateActionBtn, V2Button, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, _gameLabel, V2CardRow, RSwitchTrack} from "../kit";
-import { V2, fmtAgo, fmtBytes } from "../theme";
-import { FaBell, FaBookmark, FaBug, FaCameraRetro, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaLayerGroup, FaPlay, FaRedo, FaRegWindowMaximize, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaWifi, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
+import { V2, fmtAgo, fmtBytes, fmtPlayTime } from "../theme";
+import { FaGlobe, FaBell, FaBookmark, FaBug, FaCameraRetro, FaCheck, FaCheckCircle, FaChevronDown, FaChevronLeft, FaChevronRight, FaClock, FaCloudUploadAlt, FaDownload, FaExternalLinkAlt, FaGithub, FaHistory, FaLayerGroup, FaPlay, FaRedo, FaRegWindowMaximize, FaStopwatch, FaSync, FaTimes, FaTimesCircle, FaTrash, FaUndo, FaWifi, FaExclamationTriangle, FaSave, FaUser} from "react-icons/fa";
 import { Focusable, Navigation, host } from "@ludo/host";
 import { toaster, notificationPrefs, saveNotificationPrefs, loadNotificationPrefs } from "../toast";
 import { useAutoFocus } from "../shell";
@@ -106,7 +107,7 @@ function _startBenchPoll(before: string | null) {
 // persisted backend activity log (get_recent_activity), so it covers background
 // work that happened while no UI was open.
 const ACTIVITY_ICONS: Record<string, any> = {
-  download: FaDownload, sync: FaSync, save: FaSave, delete: FaTrash,
+  download: FaDownload, install: FaDownload, sync: FaSync, save: FaSave, delete: FaTrash,
   account: FaUser, error: FaExclamationTriangle,
 };
 
@@ -489,6 +490,14 @@ export function SettingsPage() {
   // is destroyed, but it costs a full walk of the server, so it must not
   // happen on one stray press.
   const [refetchArmed, setRefetchArmed] = useState(false);
+  const [regionSummary, setRegionSummary] = useState('Which version a game opens with.');
+  useEffect(() => {
+    getRegionOrder().then((r: any) => {
+      if (!r?.success) return;
+      const shown = (r.follow ? r.server : r.order).slice(0, 4).join(', ');
+      if (shown) setRegionSummary(`${r.follow ? 'Following RomM' : 'This device'}: ${shown}`);
+    }).catch(() => { });
+  }, []);
   const [refetching, setRefetching] = useState(false);
   useEffect(() => {
     if (!refetchArmed) return;
@@ -683,6 +692,17 @@ export function SettingsPage() {
       .catch(() => { /* keep the default */ });
   }, []);
   const [showVirtual, setShowVirtual] = useState<boolean>(_settingsToggles.showVirtual ?? true);
+  const [playTotal, setPlayTotal] = useState<{ total_ms: number; games: number } | null>(null);
+  const [mostPlayedHome, setMostPlayedHomeState] = useState(true);
+  useEffect(() => {
+    getPlayTime()
+      .then((r) => {
+        if (!r?.success) return;
+        setMostPlayedHomeState(r.most_played_home !== false);
+        if (r.has_data) setPlayTotal({ total_ms: r.summary.total_ms, games: r.games.length });
+      })
+      .catch(() => { });
+  }, []);
   useEffect(() => {
     getVirtualCollectionsVisible()
       .then((r) => {
@@ -1262,12 +1282,20 @@ export function SettingsPage() {
           />
           <V2CardRow
             divider
-            last
             icon={<FaLayerGroup size={16} />}
             title="Platforms"
             subtitle={platformSummary
               || 'Choose which platforms Ludo syncs.'}
             onClick={() => libNavigate("/romm-sync-platforms")}
+            right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
+          />
+          <V2CardRow
+            divider
+            last
+            icon={<FaGlobe size={16} />}
+            title="Region order"
+            subtitle={regionSummary}
+            onClick={() => libNavigate("/romm-sync-regions")}
             right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
           />
         </div>
@@ -1276,13 +1304,42 @@ export function SettingsPage() {
       <RemovedFromRomMSection />
 
       <V2SettingsSection title="Gameplay">
-        <V2SettingsRow
-          icon={<FaPlay size={16} />}
-          title="Resume from your last save state"
-          subtitle="Continue playing boots into the newest save state."
-          onClick={() => handleResumeStatesToggle(!resumeStates)}
-          right={<V2Switch checked={resumeStates} />}
-        />
+        <div style={{
+          borderRadius: V2.radiusCard, background: V2.surface,
+          border: `1px solid ${V2.border}`, overflow: 'hidden',
+        }}>
+          <V2CardRow
+            first
+            icon={<FaPlay size={16} />}
+            title="Resume from your last save state"
+            subtitle="Continue playing boots into the newest save state."
+            onClick={() => handleResumeStatesToggle(!resumeStates)}
+            right={<V2Switch checked={resumeStates} />}
+          />
+          <V2CardRow
+            divider
+            icon={<FaClock size={16} />}
+            title="Play time"
+            subtitle={playTotal
+              ? `${fmtPlayTime(playTotal.total_ms)} across ${playTotal.games} ${playTotal.games === 1 ? 'game' : 'games'} · synced with RomM`
+              : 'How long you play, on every device.'}
+            onClick={() => libNavigate("/romm-sync-playtime")}
+            right={<FaChevronRight size={12} style={{ color: V2.fgFaint }} />}
+          />
+          <V2CardRow
+            divider
+            last
+            icon={<FaStopwatch size={16} />}
+            title="Show Most played on Home"
+            subtitle="A row of the games you've played the longest."
+            onClick={() => {
+              const v = !mostPlayedHome;
+              setMostPlayedHomeState(v);
+              setMostPlayedHome(v).then(() => _broadcastLibRefresh()).catch(() => setMostPlayedHomeState(!v));
+            }}
+            right={<V2Switch checked={mostPlayedHome} />}
+          />
+        </div>
       </V2SettingsSection>
 
       {rdDetected && (

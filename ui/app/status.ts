@@ -8,8 +8,10 @@
 // unmounts, and the hooks below are views onto its result.
 
 import { useState, useEffect, useRef} from "react";
-import { getServiceStatus, getDownloadProgress, getPendingUploads} from "./rpc";
-import { _dlActive, _dlListeners, _dlQueue } from "./downloads";
+import { getServiceStatusSince, getPendingUploads, gameRunning} from "./rpc";
+import { watchTopic } from "./push";
+import { host } from "@ludo/host";
+import { _dlActive, _dlListeners, _dlQueue, onProgress, progressOf, watchProgress } from "./downloads";
 
 // Shared per-collection sync state, polled ONCE for the whole grid (not one poll
 // per tile) from get_service_status, broadcast to every CollectionTile. Lets the
@@ -87,10 +89,18 @@ export function useSaveActivity(): SaveActivity | null {
 }
 
 
+let _lastStatusSig = 'null';
 export async function _colSyncTick() {
   try {
-    const st = await getServiceStatus();
-    _lastStatus = st ?? null;
+    let st = await getServiceStatusSince(false, _lastStatus?.collections_rev ?? null);
+    // Unchanged list left out of the reply: carry the one we have forward.
+    if (st?.collections_unchanged) st = { ...st, collections: _lastStatus?.collections ?? [] };
+    // details.last_update moves on every poll; it isn't a change worth a render.
+    // The list is represented by its rev when the backend sends one, so the
+    // signature doesn't re-serialise hundreds of collections each tick.
+    const sig = JSON.stringify(st ? { ...st, details: undefined, collections: st.collections_rev ?? st.collections } : null);
+    // Keep the same object when nothing changed, so memo'd consumers stay put.
+    if (sig !== _lastStatusSig) { _lastStatus = st ?? null; _lastStatusSig = sig; }
     _connState = st?.connection ?? null;
     _pushSaveActivity(st?.save_activity);
     _colSync.clear();
@@ -107,16 +117,48 @@ export async function _colSyncTick() {
   } catch { /* transient */ }
 }
 
+// Paused while a game is in front of this window. On a desktop, Ludo's window
+// stays open behind the game for the whole session, so this poll would keep
+// running for nobody. A game running is not enough on its own — someone may
+// switch back to Ludo mid-game to start a download — so it takes both: a game
+// up AND this window not focused. Focus coming back, or the game ending
+// ('game' nudge), refreshes at once. On a Deck, leaving Ludo for a game
+// unmounts the subscribers and stops the poll anyway.
+let _gameUp = false;
+let _stopGameWatch: (() => void) | null = null;
+// The UI's own document (Big Picture's on a Deck, not the plugin context's).
+const _paused = () => {
+  if (!_gameUp) return false;
+  try { return !host.uiDocument().hasFocus(); } catch { return false; }
+};
+const _tickUnlessPaused = () => { if (!_paused()) _colSyncTick(); };
+const _onFocus = () => _colSyncTick();
+async function _checkGame() {
+  const was = _gameUp;
+  _gameUp = !!(await gameRunning())?.running;
+  if (was && !_gameUp) _colSyncTick();
+}
+
 // Subscribe a component to the shared status poll, starting/stopping the timer
 // via the shared ref count. Returns the unsubscribe cleanup.
 export function _subscribeStatus(listener: () => void): () => void {
   _colSyncListeners.add(listener);
   _colSyncRefs++;
-  if (!_colSyncTimer) { _colSyncTick(); _colSyncTimer = setInterval(_colSyncTick, 1500); }
+  if (!_colSyncTimer) {
+    _colSyncTick();
+    _colSyncTimer = setInterval(_tickUnlessPaused, 1500);
+    _checkGame().catch(() => { });
+    _stopGameWatch = watchTopic('game', _checkGame, 30000, 30000);
+    try { window.addEventListener('focus', _onFocus); } catch { /* no window */ }
+  }
   return () => {
     _colSyncListeners.delete(listener);
     _colSyncRefs--;
-    if (_colSyncRefs <= 0 && _colSyncTimer) { clearInterval(_colSyncTimer); _colSyncTimer = null; }
+    if (_colSyncRefs <= 0 && _colSyncTimer) {
+      clearInterval(_colSyncTimer); _colSyncTimer = null;
+      _stopGameWatch?.(); _stopGameWatch = null;
+      try { window.removeEventListener('focus', _onFocus); } catch { /* no window */ }
+    }
   };
 }
 
@@ -163,9 +205,14 @@ export function useOffline(): boolean {
 }
 
 // Full service status from the shared poll (one poller for the whole UI).
+// Re-renders only when the status actually changes: the page that holds this
+// sits above every Home panel, and a blind force on each 1.5s tick re-rendered
+// the whole tree for nothing while idle.
 export function useServiceStatus(): any {
   const [, force] = useState(0);
-  useEffect(() => _subscribeStatus(() => force((n) => n + 1)), []);
+  const rendered = useRef('');
+  rendered.current = _lastStatusSig;
+  useEffect(() => _subscribeStatus(() => { if (_lastStatusSig !== rendered.current) force((n) => n + 1); }), []);
   return _lastStatus;
 }
 
@@ -236,12 +283,12 @@ export function useDownloadGlimpse(): { count: number; pct: number | null } {
       for (const id of seenIds.current) {
         if (!_dlActive.has(id) && !_dlQueue.has(id)) done += 1; // finished (or failed) unit
       }
-      await Promise.all(Array.from(_dlActive).map(async (id) => {
-        try {
-          const p = await getDownloadProgress(id);
-          if (typeof p?.percent === 'number') done += p.percent / 100;
-        } catch { /* transient */ }
-      }));
+      // Same shared snapshot every other view of these downloads reads.
+      for (const id of _dlActive) {
+        const p = progressOf(id);
+        const v = typeof p?.exact === 'number' ? p.exact : p?.percent;
+        if (typeof v === 'number') done += v / 100;
+      }
       for (const c of ((_lastStatus?.collections || []) as any[])) {
         if (c.sync_state === 'syncing' && typeof c.downloaded_pct === 'number') {
           units += 1; done += c.downloaded_pct / 100;
@@ -250,8 +297,9 @@ export function useDownloadGlimpse(): { count: number; pct: number | null } {
       if (alive) setPct(units > 0 ? Math.min(100, (done / units) * 100) : null);
     };
     tick();
-    const iv = setInterval(tick, 600);
-    return () => { alive = false; clearInterval(iv); };
+    const off = onProgress(() => { tick(); });
+    const release = watchProgress();
+    return () => { alive = false; off(); release(); };
   }, [on]);
   return { count, pct: on ? pct : null };
 }

@@ -1,10 +1,11 @@
+import { watchTopic } from "./push";
 import { host, showModal, Focusable, GamepadButton, ModalRoot } from "@ludo/host";
 import { toaster } from "./toast";
 import { libNavigate } from "./nav";
 import { libCacheSetDownloaded } from "./libcache";
 import { launchGame, prepareSteamLaunch, downloadCore, getSyncEpoch, setCoreOverride, resolveSaveConflict } from "./rpc";
 import { askSaveConflict } from "./saveConflict";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { V2_FOCUS_STYLE } from "./focus";
 import { V2 } from "./theme";
 import { FaChevronRight, FaCog, FaPlay, FaPuzzlePiece, FaDownload, FaSync, FaTimes} from "react-icons/fa";
@@ -29,6 +30,21 @@ let _rommLastLaunchedRomId: number | null = null;
 
 /** The rom the last launch was for, for the post-session focus restore. */
 export function lastLaunchedRomId(): number | null { return _rommLastLaunchedRomId; }
+
+/** True while `romId` is the game running behind the platform UI, so its Play
+ *  button can read Resume. Polled: Steam has no cheap event the page could
+ *  hold, and the check is a synchronous lookup. */
+export function useResumable(romId: number | null | undefined): boolean {
+  const check = () => romId != null && romId === _rommLastLaunchedRomId
+    && host.launcher.sessionRunning();
+  const [on, setOn] = useState(check);
+  useEffect(() => {
+    setOn(check());
+    const t = setInterval(() => setOn(check()), 1000);
+    return () => clearInterval(t);
+  }, [romId]);
+  return on;
+}
 
 // The name RetroArch itself shows for a core, when the backend could read it
 // out of the core's .info. Worth the lookup because the two names can share no
@@ -278,15 +294,14 @@ function MissingCoreModal({ gap, onPlay, closeModal }:
 
 function watchForSessionEnd() {
   if (_sessionWatch) return;   // one watcher is enough; launches are serial
-  const POLL_MS = 5000;
   // ~4h. A session longer than this is possible, but a watcher that outlives
   // its usefulness should stop rather than poll for the rest of the session.
-  const MAX_TICKS = 2880;
-  let ticks = 0;
+  const MAX_MS = 4 * 60 * 60 * 1000;
+  const started = Date.now();
   let base: number | null = null;
-  const stop = () => { clearInterval(_sessionWatch); _sessionWatch = null; };
-  _sessionWatch = setInterval(async () => {
-    if (++ticks > MAX_TICKS) { stop(); return; }
+  const stop = () => { _sessionWatch?.(); _sessionWatch = null; };
+  const check = async () => {
+    if (Date.now() - started > MAX_MS) { stop(); return; }
     try {
       const e = (await getSyncEpoch())?.epoch;
       if (typeof e !== 'number') return;
@@ -296,7 +311,11 @@ function watchForSessionEnd() {
       invalidateStateThumbs();
       _broadcastLibRefresh();
     } catch { /* transient — keep watching */ }
-  }, POLL_MS);
+  };
+  // The backend nudges 'session' when a play session's sync lands; 5s is the
+  // pace against one that can't. Baseline right away, at launch.
+  _sessionWatch = watchTopic('session', check, 5000, 60000);
+  check();
 }
 
 export async function runLaunch(romId: number, gameName: string, disc: string | null,
@@ -402,6 +421,16 @@ export async function runLaunch(romId: number, gameName: string, disc: string | 
 // unavailable) it falls back to the direct daemon launch.
 export async function launchGameSmart(romId: number, disc: string | null = null,
   siblingRomId: number | null = null, resume: boolean = false): Promise<any> {
+  // A game is already up behind the platform UI. Launching again only earns
+  // "Game already running", so bring it back instead -- or, for a different
+  // game, say why nothing starts.
+  if (host.launcher.sessionRunning()) {
+    if (romId === _rommLastLaunchedRomId && host.launcher.resumeSession()) {
+      return { success: true, resumed: true };
+    }
+    return { success: false, title: 'A game is still running',
+      message: 'Quit it before starting another one.' };
+  }
   // Armed here rather than per caller so every way into a game — tile, disc
   // picker, region picker, resume — gets its rows refreshed when it ends. A
   // launch that never starts is harmless: the watcher gives up on its own.

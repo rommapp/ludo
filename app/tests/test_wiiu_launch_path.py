@@ -79,3 +79,26 @@ def test_a_download_the_engine_already_unpacked_points_at_its_folder(backend, tm
 def test_a_missing_archive_with_no_folder_is_left_alone(backend, tmp_path):
     gone = tmp_path / 'Nothing.7z'
     assert backend._maybe_unzip_download(gone) == gone
+
+
+def _zip(path, members):
+    import zipfile
+    with zipfile.ZipFile(path, 'w') as z:
+        for m in members:
+            z.writestr(m, b'x')
+    return path
+
+
+def test_an_arcade_romset_keeps_its_zip(backend, tmp_path, monkeypatch):
+    monkeypatch.setattr(backend, '_games_index',
+                        lambda: {7: {'platform_slug': 'arcade'}})
+    romset = _zip(tmp_path / 'mslug3.zip', ['a.bin', 'b.rom', 'c.bin'])
+    assert backend._maybe_unzip_download(romset, 7) == romset
+    assert romset.is_file()
+
+
+def test_the_same_zip_on_a_console_still_unpacks(backend, tmp_path, monkeypatch):
+    monkeypatch.setattr(backend, '_games_index',
+                        lambda: {7: {'platform_slug': 'psx'}})
+    disc = _zip(tmp_path / 'Game.zip', ['Game.cue', 'Game.bin'])
+    assert backend._maybe_unzip_download(disc, 7) == tmp_path / 'Game'

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Focusable, GamepadButton, ModalRoot, host, showModal } from "@ludo/host";
 import { toaster } from "./toast";
 import { V2 } from "./theme";
-import { FaBookmark, FaChartBar, FaCheck, FaChevronDown, FaCog, FaDownload, FaExternalLinkAlt, FaGamepad, FaHome, FaMicrochip, FaPlay, FaPowerOff, FaPuzzlePiece, FaRegClock, FaSearch, FaSync, FaTrash } from "react-icons/fa";
+import { FaBookmark, FaChartBar, FaClock, FaCheck, FaChevronDown, FaCog, FaDownload, FaExternalLinkAlt, FaGamepad, FaHome, FaMicrochip, FaPlay, FaPowerOff, FaPuzzlePiece, FaRegClock, FaSearch, FaSync, FaTrash } from "react-icons/fa";
 import { getAccountUsername, getAvatar, getImage, getRetrodeckButtonEnabled, getRetrodeckLogo, refreshFromRomm } from "./rpc";
 import { NavId, libNavigate } from "./nav";
 import { Bumper, ProgressRing, UserMenuRow, MODAL_SCRIM_INSET} from "./kit";
@@ -55,6 +55,26 @@ function writeIdentity(id: NavIdentity) {
 }
 
 const _LS_IDENTITY = 'romm:identity:v1';
+
+// The brand marks, kept for the life of the app and across launches. The bar
+// remounts whenever the library page does -- notably on the way back from a
+// game -- and each mount used to fetch both SVGs from RomM again. Right after a
+// game that request queues behind the session's save sync, so the bar came back
+// without its logo and it popped in seconds later. Same marks every time, so
+// paint the remembered pair at once; the fetch still runs and replaces them.
+const _LS_BRAND = 'romm:brand:v1';
+let _brand: { iso: string | null; word: string | null } = (() => {
+  if (!_lsAvail) return { iso: null, word: null };
+  try {
+    const o = JSON.parse(localStorage.getItem(_LS_BRAND) || 'null');
+    return { iso: o?.iso || null, word: o?.word || null };
+  } catch { return { iso: null, word: null }; }
+})();
+function rememberBrand(next: Partial<typeof _brand>) {
+  _brand = { ..._brand, ...next };
+  if (!_lsAvail) return;
+  try { localStorage.setItem(_LS_BRAND, JSON.stringify(_brand)); } catch { }
+}
 
 // Not exported: this is the plugin's rollup ENTRY, and decky's config declares
 // output.exports "default". A second named export off the entry fails the whole
@@ -125,8 +145,8 @@ export function NavLaunchButton({ iconSrc, label, onActivate }:
 }
 
 export function useNavChrome(): NavChrome {
-  const [iso, setIso] = useState<string | null>(null);
-  const [word, setWord] = useState<string | null>(null);
+  const [iso, setIso] = useState<string | null>(_brand.iso);
+  const [word, setWord] = useState<string | null>(_brand.word);
   // Last session's identity if we have one, else empty — NOT 'Guest': the fetch
   // answers a beat after first paint, and seeding the real default made every
   // cold launch flash "Guest" + a "G" avatar before snapping to the actual
@@ -190,8 +210,15 @@ export function useNavChrome(): NavChrome {
       else if (known) clearIdentityCache();
     })();
     const chrome = (async () => {
-      try { const a = await getImage('/assets/isotipo.svg'); if (alive) setIso(a?.data_uri || null); } catch { }
-      try { const b = await getImage('/assets/logotipo.svg'); if (alive) setWord(b?.data_uri || null); } catch { }
+      // A failed fetch keeps the remembered mark rather than blanking it.
+      try {
+        const a = (await getImage('/assets/isotipo.svg'))?.data_uri;
+        if (a) { rememberBrand({ iso: a }); if (alive) setIso(a); }
+      } catch { }
+      try {
+        const b = (await getImage('/assets/logotipo.svg'))?.data_uri;
+        if (b) { rememberBrand({ word: b }); if (alive) setWord(b); }
+      } catch { }
       await readRd();
     })();
     void Promise.all([identity, chrome]);
@@ -498,16 +525,19 @@ export function UserMenuModal({ username, role, avatar, closeModal }:
             </div>
           </div>
           <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
-          <UserMenuRow icon={<FaChartBar size={15} />} label="Stats" onSelect={() => go("/romm-sync-stats")} />
-          <UserMenuRow icon={<FaPuzzlePiece size={15} />} label="Emulator Cores" onSelect={() => go("/romm-sync-cores")} />
-          <UserMenuRow icon={<FaMicrochip size={15} />} label="Firmware / BIOS" onSelect={() => go("/romm-sync-bios")} />
-          <UserMenuRow icon={<FaCog size={15} />} label="Settings" onSelect={() => go("/romm-sync-settings")} />
-          <UserMenuRow
-            icon={<FaSync size={15} style={refreshing ? { animation: 'spin 1s linear infinite' } : undefined} />}
-            label={refreshing ? 'Refreshing…' : 'Refresh library'} disabled={refreshing} onSelect={doRefresh} />
           <UserMenuRow icon={<FaDownload size={15} />}
             label={`Downloads${dlGlimpse.count > 0 ? ` (${dlGlimpse.count})` : ''}`}
             onSelect={() => go("/romm-sync-downloads")} />
+          <UserMenuRow
+            icon={<FaSync size={15} style={refreshing ? { animation: 'spin 1s linear infinite' } : undefined} />}
+            label={refreshing ? 'Refreshing…' : 'Refresh library'} disabled={refreshing} onSelect={doRefresh} />
+          <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
+          <UserMenuRow icon={<FaClock size={15} />} label="Play time" onSelect={() => go("/romm-sync-playtime")} />
+          <UserMenuRow icon={<FaChartBar size={15} />} label="Stats" onSelect={() => go("/romm-sync-stats")} />
+          <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />
+          <UserMenuRow icon={<FaPuzzlePiece size={15} />} label="Emulator Cores" onSelect={() => go("/romm-sync-cores")} />
+          <UserMenuRow icon={<FaMicrochip size={15} />} label="Firmware / BIOS" onSelect={() => go("/romm-sync-bios")} />
+          <UserMenuRow icon={<FaCog size={15} />} label="Settings" onSelect={() => go("/romm-sync-settings")} />
           {canExit && (
             <>
               <div style={{ height: '1px', background: V2.border, margin: '4px 4px' }} />

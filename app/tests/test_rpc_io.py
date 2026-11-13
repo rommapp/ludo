@@ -20,6 +20,42 @@ def remote():
         yield server
 
 
+@pytest.mark.parametrize('read_only', [False, True])
+def test_read_only_policy_is_preserved_in_owned_sessions(remote, monkeypatch, read_only):
+    from contextlib import nullcontext
+    import requests
+
+    if read_only:
+        monkeypatch.setenv('LUDO_DEV_READ_ONLY', '1')
+    else:
+        monkeypatch.delenv('LUDO_DEV_READ_ONLY', raising=False)
+    client = mod.RomMClient(remote.url)
+    # Policy is fixed when the root client is constructed, not when cloned.
+    if read_only:
+        monkeypatch.delenv('LUDO_DEV_READ_ONLY')
+    else:
+        monkeypatch.setenv('LUDO_DEV_READ_ONLY', '1')
+    try:
+        for isolated in (False, True):
+            with (client.isolated_session() if isolated else nullcontext(client.session)) as session:
+                for method in ('GET', 'HEAD', 'OPTIONS'):
+                    with session.request(method, remote.url + '/api/roms', timeout=10) as response:
+                        # Loopback implements GET; 501 still proves HEAD/OPTIONS reached it.
+                        assert response.status_code == (200 if method == 'GET' else 501)
+                for method in ('POST', 'put', 'PATCH', 'DELETE'):
+                    before = len(remote.requests)
+                    if read_only:
+                        with pytest.raises(requests.exceptions.ConnectionError) as error:
+                            session.request(method, remote.url + '/api/roms', timeout=10)
+                        assert str(error.value) == f'LUDO_DEV_READ_ONLY blocked {method} {remote.url}/api/roms'
+                        assert len(remote.requests) == before
+                    else:
+                        with session.request(method, remote.url + '/api/roms', timeout=10) as response:
+                            assert response.status_code == (200 if method == 'POST' else 501)
+    finally:
+        client.session.close()
+
+
 @pytest.fixture
 async def backend(remote, tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "GITHUB_API", remote.url)

@@ -226,6 +226,29 @@ def main():
                 if fresh_mode == 'flat':
                     f.unlink()
 
+        # ── a stray copy outside the card (#77) ───────────────────────
+        # Dolphin reads only GC/<region>/Card X. A newer copy dropped in the
+        # save folder must not stand in for the card's save, nor draw the
+        # server's save away from the card.
+        for f in card.glob('*.gci'):
+            f.unlink()
+        old = write(card, a.name, gci(b'GALE', b'SuperSmashBros0110290334', b'old' * 80))
+        stray = write(saves, a.name, MELEE_A)
+        import os
+        os.utime(old, (1_000_000_000, 1_000_000_000))
+        m = manager(tmp, saves, games)
+        check('the stray copy is found by the scan',
+              str(stray) in {e['path'] for e in m.retroarch.get_save_files()['saves']}, True)
+        inventory = m.build_sync_inventory()
+        check('the inventory reports the card\'s save, not the stray copy',
+              [e['_path'] for e in inventory if e['rom_id'] == 1], [str(old)])
+        check('a restore goes to the card, not beside the stray copy',
+              m._gci_card_dir(1, 'GALE', str(saves)), card)
+        check('the unit hash is the card\'s',
+              m._gci_unit_hash(1), RomMClient.compute_content_hash(old))
+        check('a stray copy is not in a card', G.in_card(stray), False)
+        check('a Card B file is', G.in_card(saves / 'User' / 'GC' / 'JAP' / 'Card B' / 'x.gci'), True)
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {', '.join(FAILURES)}")

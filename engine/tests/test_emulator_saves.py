@@ -165,15 +165,19 @@ def main():
         # never fired and Switch saves only reached the server after a Ludo
         # restart. A real zombie is spawned here because that is the only way
         # to exercise the state that actually shipped.
-        import shutil, subprocess
+        import subprocess
         fake = d / 'edenfake'
-        shutil.copy('/bin/sleep', fake)
-        proc = subprocess.Popen([str(fake), '30'],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # A shell script, not a renamed copy of a binary: the copy exited at
+        # once on GitHub's runners. The process name is the script's name.
+        fake.write_text('#!/bin/sh\nwhile :; do sleep 1; done\n')
+        fake.chmod(0o755)
+        proc = subprocess.Popen([str(fake)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(0.5)
             check('a live eden* process reads as running',
                   E.eden_is_running(), True)
+            if proc.poll() is not None:
+                print(f"    fake Eden exited {proc.returncode}: {proc.stderr.read()!r}")
             proc.kill()
             # Deliberately NOT waited on: this IS the shipped state.
             for _ in range(20):

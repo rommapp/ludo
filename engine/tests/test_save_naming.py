@@ -224,6 +224,7 @@ def main():
         # title; the ROM's own ID from RomM's scan does.
         unpacked = {}
         sync_core.emulator_saves.eden_is_running = lambda: False
+        sync_core.emulator_saves.eden_restore_dir = lambda *a, **k: Path('d')
         sync_core.emulator_saves.unpack_save = lambda staged, tid, **kw: (
             unpacked.setdefault('tid', tid) and {'files': 1, 'backup': Path('b')})
         sync_core.cache_dir = lambda: tmp / 'cache'
@@ -237,7 +238,8 @@ def main():
             with _z.ZipFile(target, 'w') as z:
                 z.writestr('010093801237C000/save.bin', b'x')
             return True
-        m.romm_client = type('C', (), {'download_save_by_id': staticmethod(fetch)})()
+        m.romm_client = type('C', (), {'download_save_by_id': staticmethod(fetch),
+                                       'confirm_save_downloaded': staticmethod(lambda *a, **k: True)})()
         m._restore_standalone_save({'rom_id': 9, 'save_id': 3,
                                     'file_name': 'Metroid Dread [2026-09-30_10-00-00].zip'},
                                    'dev-1', 's1')

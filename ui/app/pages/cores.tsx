@@ -237,6 +237,7 @@ export function CoresPage() {
   // Which of those cases it is ('retrodeck', 'no_builds', …) — the picker words
   // its advice per case rather than pattern-matching the reason text.
   const [noDownloadKind, setNoDownloadKind] = useState('');
+  const [listUnavailable, setListUnavailable] = useState(false);
 
   const emu = useEmulatorStatus();
 
@@ -249,6 +250,7 @@ export function CoresPage() {
         setCanDownload(!!r.can_download_cores);
         setNoDownloadReason(r.download_unavailable_reason || '');
         setNoDownloadKind(r.download_unavailable_kind || '');
+        setListUnavailable(!!r.core_list_unavailable);
       }
     } catch { /* ignore */ }
     finally { setLoading(false); }
@@ -332,6 +334,11 @@ export function CoresPage() {
           rows that can't be resolved, so it collapses to the install prompt. */}
       {emu && !emu.installed ? <NoEmulatorSection status={emu} /> : (
       <V2SettingsSection title="Per-platform core">
+        {!loading && listUnavailable && (
+          <V2SettingsRow icon={<FaPuzzlePiece size={16} />}
+            title="Online core list not available"
+            subtitle="Showing the cores already installed. Ludo will try again in a few minutes." />
+        )}
         {loading ? (
           <V2SettingsRow icon={<FaPuzzlePiece size={16} />} title="Loading cores…" />
         ) : rows.length === 0 ? (

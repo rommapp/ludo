@@ -16,7 +16,7 @@
  * reason `src/host/contract.ts` is one.
  */
 import { definePlugin } from "@decky/api";
-import { FaGamepad } from "react-icons/fa";
+import { ROMM_ICON } from "./romm-icon";
 
 import { startApp } from "./app";
 import { QuickAccessPanel, QuickAccessTitle } from "./quick-access";
@@ -27,10 +27,8 @@ export default definePlugin(() => {
     name: "Ludo",
     titleView: <QuickAccessTitle />,
     content: <QuickAccessPanel />,
-    // The controller, matching the panel's own "Open Ludo" button. A sync
-    // arrow described one job Ludo does in the background; the plugin list is
-    // where the user goes to reach the library.
-    icon: <FaGamepad />,
+    // RomM's mark: the plugin list is where you look for your RomM library.
+    icon: <img src={ROMM_ICON} style={{ width: '1em', height: '1em', display: 'block' }} />,
     onDismount: () => app.stop(),
   };
 });

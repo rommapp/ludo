@@ -2,9 +2,11 @@
 # Build the current code and launch it as the desktop app against your RomM,
 # without touching your setup.
 #
-# Uses a throwaway copy of ~/.config/ludo (in .dev-sandbox/) with auto-sync and
-# auto-download off and saves redirected, so nothing uploads or overwrites your
-# real saves. Electron's profile lives in the sandbox too, so it doesn't collide
+# Uses a throwaway copy of ~/.config/ludo (in .dev-sandbox/). LUDO_DEV_READ_ONLY
+# turns save sync off and makes the RomM client refuse anything but reads, so
+# nothing uploads or overwrites your saves. RetroArch is still your real one:
+# launching a game can add its core and BIOS there.
+# Electron's profile lives in the sandbox too, so it doesn't collide
 # with your installed Ludo's single-instance lock — both can be open at once.
 #
 # UI changes (ui/, desktop/src/) hot-reload into the open window as you save,
@@ -37,6 +39,7 @@ for arg in "$@"; do
 done
 # Its own backend port, away from the installed app's.
 export ROMM_PORT="${ROMM_PORT:-8799}"
+export LUDO_DEV_READ_ONLY=1
 
 # Ludo keys its config off $HOME, so the app runs with HOME=$SANDBOX. Mirror
 # everything else in your real home as links, so RetroArch/RetroDECK/Steam

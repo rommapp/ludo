@@ -53,6 +53,13 @@ async function loadShell(entry, { deckyUi } = {}) {
               };
               export const toaster = {
                 toast: (o) => (globalThis.__toasts ??= []).push(o),
+              };
+              export const addEventListener = (e, fn) => {
+                ((globalThis.__deckyListeners ??= {})[e] ??= new Set()).add(fn);
+                return fn;
+              };
+              export const removeEventListener = (e, fn) => {
+                globalThis.__deckyListeners?.[e]?.delete(fn);
               };`,
             loader: "js",
           }));
@@ -598,4 +605,50 @@ test("decky: wakeInput spends the press Steam would have swallowed", async () =>
   const { host } = await loadShell(DECKY, { deckyUi: true });
   host.focus.wakeInput();
   assert.deepEqual(presses, [[0, true]], "button 0 is INVALID — deliberately unbound");
+});
+
+// ── Change nudges (host.events) ────────────────────────────────────────────
+
+test("decky: backend nudges arrive through Decky's event bridge", async () => {
+  stubSteam();
+  globalThis.__deckyListeners = {};
+  const { host } = await loadShell(DECKY, { deckyUi: true });
+  const got = [];
+  const off = host.events.subscribe((t) => got.push(t));
+  for (const fn of globalThis.__deckyListeners.ludo_changed) fn("conflicts");
+  off();
+  assert.equal(globalThis.__deckyListeners.ludo_changed.size, 0, "unsubscribe detaches the listener");
+  assert.deepEqual(got, ["conflicts"]);
+});
+
+test("desktop: nudges come over a long-poll, the first answer being only a baseline", async () => {
+  const replies = [
+    { seq: 7, topics: ["notifications"] },  // backlog from before we connected
+    { seq: 9, topics: ["connection", "session"] },
+    { seq: 0, topics: [], reset: true },     // backend restarted under us
+  ];
+  const asked = [];
+  const realFetch = globalThis.fetch;
+  let release;
+  const done = new Promise((r) => (release = r));
+  globalThis.fetch = async (url) => {
+    asked.push(String(url));
+    const next = replies.shift();
+    if (!next) { release(); return new Promise(() => { }); }  // hold, as the server would
+    return { ok: true, json: async () => next };
+  };
+  try {
+    const { host } = await loadShell(DESKTOP);
+    const got = [];
+    const off = host.events.subscribe((t) => got.push(t));
+    await done;
+    off();
+    assert.deepEqual(got, ["connection", "session", "*"],
+      "backlog skipped, topics delivered, a reset asks for a full resync");
+    assert.ok(asked[0].endsWith("/api/_events?after=0"));
+    assert.ok(asked[1].endsWith("after=7") && asked[2].endsWith("after=9"),
+      "each poll resumes after the last seq it saw");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

@@ -64,6 +64,13 @@ export type HostCapabilities = {
    * is Ludo's choice to offer. False where the platform owns toast presentation.
    */
   toastPlacement: boolean;
+
+  /**
+   * The shell's focus engine glides card rows itself (centred spring). False
+   * where the platform reveals focus with plain scrollIntoView, so the shared
+   * UI drives row scrolling for it.
+   */
+  rowScroll: boolean;
 };
 
 /**
@@ -169,6 +176,17 @@ export type HostLauncher = {
    * sessions to return from never calls back, and returns a no-op teardown.
    */
   onReturnFocus(cb: () => void): () => void;
+
+  /**
+   * Whether a game this shell launched is still running. Behind the platform's
+   * own UI the emulator is otherwise unreachable: the switcher lists it under
+   * the tile's name, and Play on the same game asks Steam to launch an app that
+   * is already up ("Game already running").
+   */
+  sessionRunning(): boolean;
+
+  /** Bring that running game back to the front. False if there is none. */
+  resumeSession(): boolean;
 };
 
 /**
@@ -232,6 +250,21 @@ export type LauncherHooks = {
   isOwnRoute(path: string): boolean;
 };
 
+/**
+ * Change nudges from the backend: a topic name each time something it owns
+ * changes ('notifications', 'conflicts', 'session', 'connection', 'game'; see
+ * romm_sync_engine/events.py). Data never rides along — the UI refetches
+ * through the usual RPC. Delivered through Decky's event bridge on a Deck and a
+ * long-poll on the desktop.
+ */
+export type HostEvents = {
+  /**
+   * Calls `fn(topic)` per nudge. The topic `'*'` means nudges may have been
+   * missed (the channel reconnected): refetch everything. Returns unsubscribe.
+   */
+  subscribe(fn: (topic: string) => void): () => void;
+};
+
 /** The shell, as the shared UI sees it. */
 export type HostShell = {
   /** Short identifier for logs and bug reports — never for branching. */
@@ -241,6 +274,7 @@ export type HostShell = {
   readonly app: HostApp;
   readonly launcher: HostLauncher;
   readonly focus: HostFocus;
+  readonly events: HostEvents;
 
   /**
    * The document the UI's focused element actually lives in.

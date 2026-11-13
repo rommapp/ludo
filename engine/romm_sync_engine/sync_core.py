@@ -17,8 +17,10 @@ from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
 from .save_channels import snapshots_supported
+from . import events as _events
 from . import (eden_config, emulator_saves, folder_saves, gamecube_saves,
-               ps2_memcard, save_channels, switch_content, switch_nsz, title_ids)
+               play_sessions, ps2_memcard, save_channels, switch_content, switch_nsz,
+               title_ids)
 from urllib.parse import urljoin, quote, urlparse
 import socket
 import configparser
@@ -270,6 +272,7 @@ def push_notification(kind, title, body, rom_id=None, has_cover=False,
             'action':     action,
             'timestamp':  time.time(),
         })
+    _events.publish('notifications')
     if activity_kind:
         _record_activity(activity_kind, title, body)
 
@@ -1256,6 +1259,13 @@ def _is_own_appimage(name):
 # "Nintendo - Switch" all land on the same entry.
 # `args` is the argv after the executable; '{rom}' is replaced with the ROM path.
 # ---------------------------------------------------------------------------
+# Names the libretro PS2 core reports, which RetroArch uses for its per-core
+# folders: older and RetroDECK builds first, the current buildbot build second.
+PS2_CORE_NAMES = ('LRPS2', 'ParaLLEl PS2')
+
+# How long a failed core list fetch stands before anything asks again.
+BUILDBOT_RETRY_SECONDS = 300
+
 STANDALONE_EMULATORS = {
     'eden': {
         'name': 'Eden',
@@ -1278,19 +1288,20 @@ STANDALONE_EMULATORS = {
         'args': ('-f', '-g', '{rom}'),
         # A decrypted title is a folder (code/ content/ meta/), not a file.
         'resolve_rom': 'wiiu',
-        'prelaunch': 'cemu_audio',
+        'prelaunch': 'cemu_audio_repair',
     },
 }
 
 
-def fix_cemu_audio_device(executable):
-    """Blank Cemu's TV audio device when it is the unusable placeholder.
+def repair_cemu_audio_device(executable):
+    """Undo beta.23's blanking of Cemu's TV audio device, once.
 
-    A fresh Cemu stores ``<TVDevice>default</TVDevice>``; no such device exists
-    to its audio backend ("failed to find selected device"), and the game then
-    sits on its loading screen with idle emulation threads. An empty value means
-    the system's default output. A device the user picked is left alone.
-    Returns True when the file was changed.
+    beta.23 replaced <TVDevice>default</TVDevice> with an empty value before
+    each launch, keeping the original as settings.xml.bak-ludo-audio. On real
+    hardware 'default' is the system output and empty is no sound at all.
+    While that backup exists and the device is still empty, put 'default'
+    back. A device chosen since is left alone. Either way the backup goes, so
+    this runs at most once. Returns True when the file was changed.
     """
     home = Path(os.path.expanduser('~'))
     if executable.startswith('flatpak:'):
@@ -1298,17 +1309,21 @@ def fix_cemu_audio_device(executable):
     else:
         cfg = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config') / 'Cemu'
     settings = cfg / 'settings.xml'
+    backup = settings.with_name('settings.xml.bak-ludo-audio')
     try:
-        text = settings.read_text(encoding='utf-8')
-        if '<TVDevice>default</TVDevice>' not in text:
-            return False
-        backup = settings.with_name('settings.xml.bak-ludo-audio')
         if not backup.exists():
-            backup.write_text(text, encoding='utf-8')
-        settings.write_text(
-            text.replace('<TVDevice>default</TVDevice>', '<TVDevice></TVDevice>'),
-            encoding='utf-8')
-        return True
+            return False
+        changed = False
+        # Bytes, not text: Cemu writes CRLF, and a text round trip would
+        # rewrite every line ending in a file this only means to touch once.
+        data = settings.read_bytes()
+        if (b'<TVDevice></TVDevice>' in data
+                and b'<TVDevice>default</TVDevice>' in backup.read_bytes()):
+            settings.write_bytes(data.replace(
+                b'<TVDevice></TVDevice>', b'<TVDevice>default</TVDevice>', 1))
+            changed = True
+        backup.unlink()
+        return changed
     except OSError:
         return False
 
@@ -1843,6 +1858,7 @@ class SettingsManager:
             self._stamp()
             # Migrate settings from older versions
             self._migrate_settings()
+            self._secure_stored_credentials()
         else:
             # Create default settings
             self.config['RomM'] = {
@@ -1898,6 +1914,28 @@ class SettingsManager:
             }
 
             self.save_settings()
+
+    def _secure_stored_credentials(self):
+        """Close the file to other users and encrypt anything left in the clear.
+
+        Builds whose cryptography failed to load stored credentials as plain
+        text. Without a cipher they stay that way, but still owner-only.
+        """
+        try:
+            os.chmod(self.config_file, 0o600)
+        except OSError as e:
+            logging.warning(f"could not restrict {self.config_file}: {e}")
+        if not self.cipher or 'RomM' not in self.config:
+            return
+        changed = False
+        with SettingsManager._lock:
+            for key in ('username', 'password', 'client_token'):
+                value = self.config['RomM'].get(key, '')
+                if value and not value.startswith('gAAAAA'):
+                    self.config['RomM'][key] = self._encrypt(value)
+                    changed = True
+            if changed:
+                self.save_settings()
 
     def _migrate_settings(self):
         """Migrate settings from older app versions - add missing sections/keys"""
@@ -1974,7 +2012,11 @@ class SettingsManager:
         """
         with SettingsManager._lock:
             tmp = self.config_file.with_suffix('.ini.tmp')
-            with open(tmp, 'w') as f:
+            # Created owner-only: it holds credentials, and replace() below
+            # makes this file's mode the mode of settings.ini.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, 'w') as f:
                 self.config.write(f)
                 f.flush()
                 os.fsync(f.fileno())
@@ -2489,6 +2531,25 @@ def _extract_archive(archive_path, dest_dir, on_progress=None):
     return False
 
 
+# Arcade cores identify a game by its zip's short name and read the romset from
+# inside the archive, so unpacking one makes it "romset unknown".
+ARCADE_SLUGS = ('arcade', 'mame', 'hbmame', 'fbneo', 'fba', 'fbalpha',
+                'neogeo', 'neogeoaes', 'neogeomvs', 'neo-geo-aes', 'neo-geo-mvs',
+                'cps1', 'cps2', 'cps3')
+
+
+def arcade_romset_stays_zipped(platform_slug, member_names):
+    """True for an archive on an arcade platform that IS a romset.
+
+    A RomM folder game arrives as an outer archive holding romsets (mslug.zip
+    and neogeo.zip) or a CHD. That wrapper still has to be opened.
+    """
+    if str(platform_slug or '').lower() not in ARCADE_SLUGS:
+        return False
+    return not any(Path(m).suffix.lower() in ('.zip', '.7z', '.chd')
+                   for m in member_names)
+
+
 # A Wii U download is always unpacked, as in argosy-launcher (its wiiu entry in
 # ALWAYS_EXTRACT_ZIP_PLATFORMS): Cemu cannot open a .zip or a .7z, only the
 # .wua/.wux/.wud inside or an unpacked title folder.
@@ -2706,6 +2767,55 @@ def _safe_page_limit(limit):
 # Anything _group_sibling_roms reads must be in here — it needs id, sibling_roms,
 # files, fs_extension, rom_user, name and fs_name — as must anything a caller
 # reads off the returned rows.
+# RomM's region names by its priority shortcodes (handler/filesystem/base_handler.py),
+# and the filename tags it ranks after full releases (models/base.py).
+_REGION_SHORTCODES = {
+    'au': ('Australia',), 'asi': ('Asia',), 'br': ('Brazil',), 'ca': ('Canada',),
+    'cn': ('China',), 'uk': ('England',), 'eu': ('Europe',), 'fi': ('Finland',),
+    'fr': ('France',), 'de': ('Germany',), 'gr': ('Greece',), 'nl': ('Holland', 'Netherlands'),
+    'hk': ('Hong Kong',), 'it': ('Italy',), 'jp': ('Japan',), 'kr': ('Korea',),
+    'no': ('Norway',), 'ru': ('Russia',), 'sp': ('Spain',), 'se': ('Sweden',),
+    'tw': ('Taiwan',), 'us': ('USA',), 'wor': ('World',), 'ame': ('Americas',),
+    'bg': ('Bulgaria',), 'cl': ('Chile',), 'cz': ('Czech Republic',), 'dk': ('Denmark',),
+    'hu': ('Hungary',), 'il': ('Israel',), 'kw': ('Kuwait',), 'mor': ('Middle East',),
+    'nz': ('New Zealand',), 'oce': ('Oceania',), 'pe': ('Peru',), 'pl': ('Poland',),
+    'pt': ('Portugal',), 'sk': ('Slovakia',), 'tr': ('Turkey',),
+}
+_PRERELEASE_TAGS = ('demo', 'beta', 'proto', 'sample', 'kiosk', 'preview')
+
+
+def region_ranks_for_priority(codes):
+    """{lowercase region name: rank} for RomM's SCAN_REGION_PRIORITY. Unknown
+    codes such as "ss" add nothing and don't shift the ranks after them."""
+    ranks = {}
+    rank = 0
+    for code in dict.fromkeys(str(c).lower() for c in codes or []):
+        names = _REGION_SHORTCODES.get(code)
+        if names:
+            ranks.update({n.lower(): rank for n in names})
+            rank += 1
+    return ranks
+
+
+def region_names_for_priority(codes):
+    """One display name per known code in RomM's SCAN_REGION_PRIORITY."""
+    return [_REGION_SHORTCODES[c][0]
+            for c in dict.fromkeys(str(c).lower() for c in codes or [])
+            if c in _REGION_SHORTCODES]
+
+
+ALL_REGION_NAMES = sorted(n for names in _REGION_SHORTCODES.values() for n in names[:1])
+
+
+def filename_region_rank(file_name, ranks):
+    """Best rank among a filename's region tags: "Game (USA, Europe).nds"."""
+    best = len(ranks) + 1
+    for tag in re.findall(r'\(([^)]*)\)', file_name or ''):
+        for name in tag.split(','):
+            best = min(best, ranks.get(name.strip().lower(), best))
+    return best
+
+
 ROM_TRIM_FIELDS = (
     'id', 'name', 'fs_name', 'fs_name_no_ext', 'fs_extension', 'fs_size_bytes',
     'platform_id', 'platform_slug', 'files',
@@ -2730,6 +2840,9 @@ ROM_TRIM_FIELDS = (
     # this device has never downloaded — see _rom_id_for_title_id. Absent on
     # older servers, where the trim simply drops them.
     'title_id', 'save_target',
+    # False when RomM has an entry but no file behind it, so a download can only
+    # fail. Absent on older servers, which means "has a file".
+    'has_file_on_disk',
 )
 
 
@@ -2951,10 +3064,13 @@ class ReachabilityLatch:
                 f"{self.OKS_TO_RECONNECT}) — waiting for a second success "
                 f"before calling it a reconnect")
             return False
+        dev_was = self.device_online
         self.online = True
         # The API answering proves the device has a link too — but only once we
         # believe the answer.
         self.device_online = True
+        if was is not True or dev_was is not True:
+            _events.publish('connection')
         if was is False:
             self._ok_streak = 0
             if self._on_reconnect:
@@ -2974,6 +3090,7 @@ class ReachabilityLatch:
         self._fail_streak += 1
         if self._fail_streak >= self.FAILS_TO_OFFLINE:
             self.online = False
+            _events.publish('connection')
             logging.info(
                 f"Reachability probe failed {self._fail_streak}x in a row — "
                 f"server unreachable, going offline{': ' + str(reason) if reason else ''}")
@@ -2992,10 +3109,14 @@ class ReachabilityLatch:
         if self.online is not False:
             self.online = False
             logging.info(f"Latching offline{': ' + str(reason) if reason else ''}")
+            _events.publish('connection')
 
     def set_device_online(self, online):
         """What the OS last said about the link (navigator online/offline)."""
+        was = self.device_online
         self.device_online = bool(online)
+        if was != self.device_online:
+            _events.publish('connection')
 
 
 # What this client tells RomM it can do, on registration and on connect.
@@ -3016,7 +3137,17 @@ def romm_io_cancellation(check):
 
 
 class _OperationSession(requests.Session):
-    def request(self, *args, **kwargs):
+    def __init__(self, *, read_only=None):
+        super().__init__()
+        self._read_only = (bool(os.environ.get('LUDO_DEV_READ_ONLY'))
+                           if read_only is None else read_only)
+
+    def request(self, method, url, *args, **kwargs):
+        # Sandbox policy belongs to the transport, including isolated workers.
+        if self._read_only and str(method).upper() not in ('GET', 'HEAD', 'OPTIONS'):
+            logging.info(f"[READ-ONLY] blocked {method} {url}")
+            raise requests.exceptions.ConnectionError(
+                f"LUDO_DEV_READ_ONLY blocked {method} {url}")
         check = getattr(_io_local, 'check', None)
         if check:
             check()
@@ -3030,7 +3161,7 @@ class _OperationSession(requests.Session):
                     self.headers['Authorization'] = authorization
                 self.cookies = copy.deepcopy(owner._session.cookies)
         # A successful refresh must persist its rotated tokens before cancel.
-        return super().request(*args, **kwargs)
+        return super().request(method, url, *args, **kwargs)
 
 
 def _auth_locked(method):
@@ -3175,7 +3306,7 @@ class RomMClient:
         share their original transport, but cannot independently rotate auth.
         """
         previous = getattr(self._session_local, 'session', None)
-        owned = _OperationSession()
+        owned = _OperationSession(read_only=getattr(self._session, '_read_only', False))
         try:
             with self._auth_lock:
                 source = self._session
@@ -3764,6 +3895,7 @@ class RomMClient:
                 urljoin(self.base_url, f'/api/devices/{device_id}/installs/{request_id}'),
                 json=body, timeout=15)
             if r.status_code == 200:
+                logging.info(f"[INSTALL] reported {request_id} -> {status}")
                 return True
             logging.info(f"install report {request_id} -> {status}: HTTP "
                          f"{r.status_code} {r.text[:200]}")
@@ -3993,7 +4125,7 @@ class RomMClient:
                     'with_rom_id_index': 'false',
                     'with_char_index': 'false',
                     'with_filter_values': 'false',   # only `items` is read; see _fetch_pages_parallel
-                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
+                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages,has_file_on_disk'
                 },
                 timeout=30
             )
@@ -4167,7 +4299,7 @@ class RomMClient:
                 'with_rom_id_index': 'false',
                 'with_char_index': 'false',
                 'with_filter_values': 'false',   # only `items` is read; see _fetch_pages_parallel
-                'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
+                'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages,has_file_on_disk'
             })
             response = self.session.get(
                 urljoin(self.base_url, '/api/roms'),
@@ -4227,6 +4359,42 @@ class RomMClient:
         except Exception as e:
             print(f"Error fetching virtual collection ROMs: {e}")
         return []
+
+    # This device's own region order, when it has one. Set by the app: every
+    # client it creates, for whatever reason, has to honour the same setting.
+    region_order_source = None
+
+    def server_regions(self):
+        """Region names in the server's priority order; [] when unavailable."""
+        if getattr(self, '_server_regions', None) is None:
+            source, RomMClient.region_order_source = RomMClient.region_order_source, None
+            try:
+                self.region_ranks()
+            finally:
+                RomMClient.region_order_source = source
+        return getattr(self, '_server_regions', None) or []
+
+    def region_ranks(self):
+        """The server's region priority as ranks; fetched once per client.
+        {} when unavailable, which leaves groups in their existing order."""
+        source = RomMClient.region_order_source
+        order = source() if source else None
+        if order:
+            return {str(n).lower(): i for i, n in enumerate(order)}
+        cached = getattr(self, '_region_ranks', None)
+        if cached is not None:
+            return cached
+        try:
+            r = self.session.get(urljoin(self.base_url, '/api/config'), timeout=10)
+            if r.status_code != 200:
+                return {}
+            codes = r.json().get('SCAN_REGION_PRIORITY')
+            self._server_regions = region_names_for_priority(codes)
+            self._region_ranks = region_ranks_for_priority(codes)
+            return self._region_ranks
+        except Exception as e:
+            print(f"Could not read region priority: {e}")
+            return {}
 
     def _group_sibling_roms(self, items):
         """Group sibling ROMs (regional variants) under a main ROM
@@ -4335,12 +4503,37 @@ class RomMClient:
                     return (kind, -len(rom.get('files') or []), -size)
                 candidates = sorted(candidates, key=_switch_key)
 
+            # A version RomM has no file for can't be the tile while another
+            # version can be downloaded, not even one marked as main: the whole
+            # game would read as unavailable. Stable, so the order above holds
+            # within each side.
+            def _no_file(rom):
+                return rom.get('has_file_on_disk') is False
+            candidates = sorted(candidates, key=_no_file)
+
+            # Nothing chosen by the user or the group's shape: rank like RomM's
+            # own gallery, so both show the same version. Switch keeps its
+            # base/update/DLC order above.
+            if not (any(_switch_content_row(r) for r in candidates)
+                    or any(not r.get('fs_extension')
+                           or (r.get('rom_user') or {}).get('is_main_sibling')
+                           for r in candidates if not _no_file(r))):
+                ranks = self.region_ranks() if self else {}
+                def _release_key(rom):
+                    name = (rom.get('fs_name') or '').lower()
+                    regions = rom.get('regions') or []
+                    region = str(regions[0]).lower() if regions else ''
+                    return (_no_file(rom),
+                            any(f'({t}' in name for t in _PRERELEASE_TAGS),
+                            ranks.get(region, len(ranks) + 1))
+                candidates = sorted(candidates, key=_release_key)
+
             for rom in candidates:
                 fs_extension = rom.get('fs_extension', '')
                 is_main = rom.get('rom_user', {}).get('is_main_sibling', False)
 
                 # Folder ROMs have no extension or empty extension
-                if not fs_extension or is_main:
+                if (not fs_extension or is_main) and not _no_file(rom):
                     if main_rom is None:
                         main_rom = rom
                     else:
@@ -4365,7 +4558,8 @@ class RomMClient:
             # itself is the single downloadable unit. Groups with no folder ROM
             # (e.g. separate per-region .nsp/.chd ROMs) keep all their siblings.
             has_folder = any(
-                not (r.get('fs_extension') or '') for r in group_roms
+                not (r.get('fs_extension') or '') and not _no_file(r)
+                for r in group_roms
             )
             if has_folder:
                 drop_ids = {
@@ -4960,7 +5154,7 @@ class RomMClient:
                             # so dropping the opt-outs changes nothing there.
                             'with_char_index': 'false',
                             'with_filter_values': 'false',
-                            'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
+                            'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages,has_file_on_disk'
                         },
                         timeout=timeout
                     )
@@ -5374,6 +5568,8 @@ class RomMClient:
             
             if response.status_code != 200:
                 print(f"ROM download failed with status {response.status_code}")
+                if response.status_code == 404:
+                    return False, "File not found on RomM."
                 return False, f"API download failed: HTTP {response.status_code}"
             
             # Check if we're getting HTML (error page) instead of a ROM file
@@ -5564,7 +5760,9 @@ class RomMClient:
                     # Only extract if it looks like a directory-based game
                     has_subdirs = any('/' in f and not f.endswith('/') for f in file_list)
                     has_pc_game_files = any(f.lower().endswith(('.exe', '.bat', '.cfg', '.ini', '.dll')) for f in file_list)
-                    should_extract = has_subdirs and has_pc_game_files
+                    should_extract = (has_subdirs and has_pc_game_files
+                                      and not arcade_romset_stays_zipped(
+                                          rom_details.get('platform_slug'), file_list))
 
                     if should_extract:
                         extract_dir = download_path.parent / download_path.stem
@@ -7236,6 +7434,7 @@ class RetroArchInterface:
         self._retrodeck_core_map_cache = None
         # Cache for the libretro buildbot's downloadable-core listing (lazy).
         self._buildbot_index_cache = None
+        self._buildbot_index_failed_at = None
         self.retroarch_executable = None
         self.cores_dir = None
         self.save_dirs = {}
@@ -7257,7 +7456,10 @@ class RetroArchInterface:
             'Nintendo - Nintendo DS': ['desmume', 'melonds', 'melondsds'],
             'nds': ['desmume', 'melonds', 'melondsds'], 
             'Sega Saturn': ['beetle_saturn', 'kronos'],
-            'Arcade': ['mame', 'fbneo', 'fbalpha'],
+            # FBNeo first: it finds neogeo.zip in the system directory, where
+            # BIOS files are put. MAME only looks beside the ROM, so every Neo
+            # Geo game exits with "Required files are missing" under it.
+            'Arcade': ['fbneo', 'mame', 'fbalpha'],
             'PlayStation 2': ['pcsx2', 'play'],
             'Nintendo GameCube': ['dolphin'],
             'Sega Dreamcast': ['flycast', 'redream'],
@@ -7366,6 +7568,10 @@ class RetroArchInterface:
             'ppsspp': 'PPSSPP',
             'desmume': 'DeSmuME',
             'melonds': 'melonDS',
+            # melonDS DS is a different core from melonDS. RomM records it as
+            # either name (Ludo uploads melonds_ds, Argosy melondsds).
+            'melondsds': 'melonDS DS',
+            'melonds_ds': 'melonDS DS',
             'citra': 'Citra',
             'dolphin': 'Dolphin',
             'flycast': 'Flycast',
@@ -7949,6 +8155,11 @@ class RetroArchInterface:
             'cores_dir': str(self.cores_dir or ''),
             'core_count': len(cores),
             'save_dirs': {k: str(v) for k, v in (self.save_dirs or {}).items()},
+            # A real folder here wins over Ludo's own setting (see
+            # align_retroarch_config), so the UI shows it instead of offering a
+            # choice that would have no effect. RetroDECK manages its own config.
+            'retroarch_save_dir': ('' if kind == 'retrodeck'
+                                   else self._retroarch_cfg_value('savefile_directory')),
             'bios_dir': str((self.bios_manager and self.bios_manager.system_dir) or ''),
             'stale_paths': self.stale_emulator_paths(),
             # Standalone emulators, which are a separate axis from 'installed'
@@ -8121,6 +8332,17 @@ class RetroArchInterface:
             return Path.home() / 'snap/retroarch/current/.config/retroarch'
         return Path.home() / '.config' / 'retroarch'
 
+    def _unconfigured_tree(self):
+        """The config tree of a RetroArch that hasn't run yet, or None.
+
+        RetroDECK sets itself up before it can launch anything, and on Windows
+        _install_tree's path means nothing, so neither is in this state.
+        """
+        if IS_WINDOWS or self.find_retroarch_config_dir():
+            return None
+        tree = self._install_tree()
+        return tree if tree and tree.name != 'retrodeck' else None
+
     def expected_bios_dir(self):
         """Where the DETECTED emulator looks for BIOS files, existing or not.
 
@@ -8217,7 +8439,7 @@ class RetroArchInterface:
         return str(library_dir() / ('roms' if kind == 'roms' else 'saves'))
 
     def ensure_save_dirs_exist(self):
-        """Create the emulator's saves/ and states/ folders now, not later.
+        """Create the emulator's saves/, states/ and system/ folders now, not later.
 
         Directory discovery only accepts folders that exist, and a freshly
         installed emulator has none until its first run — so the first session
@@ -8234,7 +8456,10 @@ class RetroArchInterface:
         if not expected:
             return made
         parent = Path(expected).parent
-        for d in (Path(expected), parent / 'states'):
+        dirs = [Path(expected), parent / 'states']
+        if self.expected_bios_dir():
+            dirs.append(Path(self.expected_bios_dir()))
+        for d in dirs:
             try:
                 if not d.is_dir():
                     d.mkdir(parents=True, exist_ok=True)
@@ -8726,6 +8951,10 @@ class RetroArchInterface:
             for label, core in entries:
                 if label == alt and core in available_cores:
                     return core
+        # ES-DE lists MAME first for arcade, but Ludo puts neogeo.zip in the BIOS
+        # folder, which MAME never searches. See platform_core_map's 'Arcade'.
+        if slug == 'arcade' and 'fbneo' in available_cores:
+            return 'fbneo'
         for _, core in entries:  # ES-DE priority order; first available wins
             if core in available_cores:
                 return core
@@ -8994,6 +9223,21 @@ class RetroArchInterface:
             # Not bare 'pico': that would also match the Sega Pico.
             'pico-8': ['retro8'],
             'pico8': ['retro8'],
+            # RomM's own names are often bare ("Dreamcast", "Wii"), which the
+            # exact map above does not hold.
+            'dreamcast': ['flycast', 'redream'],
+            'wii': ['dolphin'],
+            'gamecube': ['dolphin'],
+            'saturn': ['beetle_saturn', 'mednafen_saturn', 'yabasanshiro', 'yabause', 'kronos'],
+            'master system': ['genesis_plus_gx', 'picodrive'],
+            'game gear': ['genesis_plus_gx', 'picodrive'],
+            'sega cd': ['genesis_plus_gx', 'picodrive'],
+            '32x': ['picodrive'],
+            'super famicom': ['snes9x', 'bsnes', 'mesen-s'],
+            'arcade': ['fbneo', 'mame', 'fbalpha'],
+            'neo geo': ['fbneo', 'mame', 'fbalpha'],
+            'neo geo cd': ['neocd', 'fbneo'],
+            'neo geo pocket': ['beetle_ngp', 'mednafen_ngp'],
     }
 
     def standalone_emulator_status(self, platform_name, platform_slug=None):
@@ -9034,8 +9278,8 @@ class RetroArchInterface:
         if spec.get('resolve_rom') == 'wiiu':
             rom_path, grant_root = resolve_wiiu_rom(rom_path)
         args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
-        if spec.get('prelaunch') == 'cemu_audio':
-            fix_cemu_audio_device(executable)
+        if spec.get('prelaunch') == 'cemu_audio_repair':
+            repair_cemu_audio_device(executable)
         if executable.startswith('flatpak:'):
             # The sandbox can't see a ROM outside the paths its manifest grants
             # (Eden then says "ROM format not supported", rommapp/ludo#34).
@@ -9223,10 +9467,8 @@ class RetroArchInterface:
         # RetroArch keys per-game options by the core's DISPLAY name, which for
         # this core is its project name (LRPS2) rather than the library
         # filename (pcsx2_libretro.so) the rest of Ludo matches on.
-        opt_file = self._ps2_option_file(rom_path)
-        if not opt_file:
-            return
-        self._write_core_option(opt_file, self.PCSX2_BIOS_OPTION_KEY, bios)
+        for opt_file in self._ps2_option_files(rom_path):
+            self._write_core_option(opt_file, self.PCSX2_BIOS_OPTION_KEY, bios)
 
     # lrps2's option choosing between one card for everything and a card per
     # game. Its own description is "Use per-content or shared memory cards."
@@ -9254,22 +9496,24 @@ class RetroArchInterface:
         """
         if 'pcsx2' not in Path(core_path).name.lower():
             return
-        opt_file = self._ps2_option_file(rom_path)
-        if not opt_file:
-            return
-        self._write_core_option(opt_file, self.PCSX2_SHARED_CARDS_KEY, 'disabled')
+        for opt_file in self._ps2_option_files(rom_path):
+            self._write_core_option(opt_file, self.PCSX2_SHARED_CARDS_KEY, 'disabled')
 
-    def _ps2_option_file(self, rom_path):
-        """RetroArch's per-game core-options file for this ROM under lrps2.
+    def _ps2_option_files(self, rom_path):
+        """RetroArch's per-game core-options files for this ROM.
 
-        Keyed by the core's DISPLAY name, which for this core is its project
-        name (LRPS2) and not the library filename (pcsx2_libretro.so) that the
-        rest of Ludo matches cores on.
+        Keyed by the name the core reports at runtime, not the library filename
+        (pcsx2_libretro.so) Ludo matches cores on. RetroDECK's build reports
+        LRPS2 and the current buildbot one "ParaLLEl PS2", while its .info still
+        says LRPS2, so write both: RetroArch ignores the one it does not use.
         """
-        cfg_dir = self.find_retroarch_config_dir()
+        # No retroarch.cfg before the first run, but an options file is safe to
+        # write then and the first session is the one that would use shared cards.
+        cfg_dir = self.find_retroarch_config_dir() or self._unconfigured_tree()
         if not cfg_dir:
-            return None
-        return Path(cfg_dir) / 'config' / 'LRPS2' / f"{Path(rom_path).stem}.opt"
+            return []
+        return [Path(cfg_dir) / 'config' / name / f"{Path(rom_path).stem}.opt"
+                for name in PS2_CORE_NAMES]
 
     def _ps2_disc_region(self, rom_path, regions=None):
         """The region letter a PS2 disc needs ('A'/'E'/'J'/'H'), or ''.
@@ -9578,6 +9822,11 @@ class RetroArchInterface:
             combo = self._menu_toggle_combo()
             if combo:
                 lines.append(f'input_menu_toggle_gamepad_combo = "{combo}"')
+            # ensure_content_save_sorting can't run without a retroarch.cfg, so
+            # the first session gets the same two values here.
+            if self._unconfigured_tree():
+                lines += ['sort_savefiles_enable = "false"',
+                          'sort_savefiles_by_content_enable = "true"']
             overlay.write_text('\n'.join(lines) + '\n', encoding='utf-8')
             return str(overlay)
         except Exception as e:
@@ -9656,10 +9905,18 @@ class RetroArchInterface:
             self._focus_window_after_launch(
                 result, match=(standalone['key'] if standalone else 'retroarch'))
 
-            # Wait a moment to see if it fails immediately
+            # Wait a moment to see if it fails immediately. A flatpak has to
+            # start its sandbox before the core even runs, and RetroDECK fails
+            # after 2s, which used to count as a successful launch.
             import time
-            time.sleep(2)
+            deadline = time.monotonic() + (8 if cmd[0] == 'flatpak' else 2)
+            while time.monotonic() < deadline and result.poll() is None:
+                time.sleep(0.1)
 
+            if result.poll() is not None and result.returncode == 0:
+                # The player can't have quit that fast on purpose, but nothing
+                # says it failed either.
+                return True, f"{rom_path.name} closed"
             if result.poll() is not None:
                 # Process has already exited
                 stdout, stderr = result.communicate()
@@ -9676,8 +9933,11 @@ class RetroArchInterface:
                     error_msg += "2. Missing library dependencies\n"
                     error_msg += "3. Permission issues\n"
                     error_msg += f"Try running manually: {' '.join(cmd)}"
-                print(error_msg)
-                return False, error_msg
+                logging.warning(error_msg)
+                return False, (f"The emulator closed straight away (exit code "
+                               f"{result.returncode}). Files or BIOS it needs may "
+                               f"be missing, or this core can't run {rom_path.name}. "
+                               f"Try another core.")
 
             # Reap the child once it exits. Two reasons, both real:
             #
@@ -9968,6 +10228,9 @@ class RetroArchInterface:
                 pass
             return mode
 
+        # The launch overlay decides this one for a RetroArch that hasn't run.
+        if save_type == 'saves' and self._unconfigured_tree():
+            return 'content'
         # No config yet. Guessing wrong puts the save where the emulator will
         # never read it, so use the best evidence available, in order.
         remembered = ''
@@ -10338,7 +10601,7 @@ class RetroArchInterface:
             'genesis': 'genesis_plus_gx',
             'n64': 'mupen64plus_next',
             'saturn': 'beetle_saturn',
-            'arcade': 'mame',
+            'arcade': 'fbneo',
             'mame': 'mame',
             'fbneo': 'fbneo',
             'atari2600': 'stella',
@@ -10538,9 +10801,18 @@ class RetroArchInterface:
         the post-extract integrity check in download_core(). Empty dict when
         offline or on an unsupported platform: callers treat "no downloadable
         cores" as a normal state, never an error.
+
+        A failed fetch is remembered for a few minutes: the core page asks once
+        per platform, and each retry against a blocked host cost a full timeout,
+        which read as "Loading cores..." forever. An expired list still on disk
+        stands in meanwhile.
         """
         if self._buildbot_index_cache is not None and not force_refresh:
             return self._buildbot_index_cache
+        failed_at = self._buildbot_index_failed_at
+        if (failed_at is not None and not force_refresh
+                and time.monotonic() - failed_at < BUILDBOT_RETRY_SECONDS):
+            return self._stale_core_index()
         base, ext = self._buildbot_base()
         if not base:
             self._buildbot_index_cache = {}
@@ -10559,7 +10831,7 @@ class RetroArchInterface:
 
         cores = {}
         try:
-            resp = requests.get(f'{base}/.index-extended', timeout=20)
+            resp = requests.get(f'{base}/.index-extended', timeout=(5, 20))
             resp.raise_for_status()
             suffix = f'_libretro{ext}.zip'
             for line in resp.text.splitlines():
@@ -10573,8 +10845,10 @@ class RetroArchInterface:
                                                'date': date}
         except Exception as e:
             print(f"⚠️ Could not fetch libretro core index: {e}")
-            return {}
+            self._buildbot_index_failed_at = time.monotonic()
+            return self._stale_core_index()
 
+        self._buildbot_index_failed_at = None
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(json.dumps(
@@ -10584,6 +10858,20 @@ class RetroArchInterface:
             pass
         self._buildbot_index_cache = cores
         return cores
+
+    def _stale_core_index(self):
+        """The last core list saved to disk, however old, or {}."""
+        base, _ext = self._buildbot_base()
+        try:
+            blob = json.loads((cache_dir() / 'libretro_core_index.json')
+                              .read_text(encoding='utf-8'))
+            return blob['cores'] if blob.get('base') == base else {}
+        except Exception:
+            return {}
+
+    def core_index_unavailable(self):
+        """True when the last try at the online core list failed."""
+        return self._buildbot_index_failed_at is not None
 
     def repair_retroarch_assets_dir(self):
         """Undo an assets_directory left pointing at an empty folder.
@@ -11208,6 +11496,14 @@ class RetroArchInterface:
         if mapped_name:
             return mapped_name
 
+        # The core's .info file names the folder RetroArch itself sorts into
+        # (corename, which matches the core's library_name), so a core missing
+        # from the map still lands where RetroArch reads. Title-casing guesses
+        # wrong for most of them.
+        info_name = self._core_library_name(romm_emulator_name)
+        if info_name:
+            return info_name
+
         # Already a RetroArch directory name (the map's output, not its input):
         # callers that hand us a resolved folder like "Beetle PSX HW" must get it
         # back unchanged. The pattern fallback below would title-case it into
@@ -11232,6 +11528,39 @@ class RetroArchInterface:
         fallback_name = ' '.join(word.capitalize() for word in fallback_name.split())
         
         return fallback_name
+
+    def _core_library_name(self, romm_emulator_name):
+        """The core's name from its .info file (corename), or None if there isn't one.
+
+        Tried as given and without underscores, since RomM spells some cores
+        with one (melonds_ds) that their filename doesn't have (melondsds).
+        """
+        cache = self.__dict__.setdefault('_library_name_cache', {})
+        key = romm_emulator_name.lower()
+        if key in cache:
+            return cache[key]
+        found = None
+        try:
+            info_dir = self.get_retroarch_config_setting('libretro_info_path', '')
+            if not info_dir:
+                cfg_dir = self.find_retroarch_config_dir()
+                info_dir = cfg_dir / 'info' if cfg_dir else None
+            if info_dir:
+                for core in dict.fromkeys((key, key.replace('_', ''))):
+                    info = Path(info_dir) / f'{core}_libretro.info'
+                    if not info.is_file():
+                        continue
+                    for line in info.read_text(errors='replace').splitlines():
+                        name, sep, value = line.partition('=')
+                        if sep and name.strip() == 'corename':
+                            found = value.strip().strip('"') or None
+                            break
+                    if found:
+                        break
+        except Exception:
+            found = None
+        cache[key] = found
+        return found
 
     def get_romm_emulator_name(self, retroarch_directory_name):
         """Convert RetroArch directory name to RomM emulator name using standard convention"""
@@ -11322,7 +11651,10 @@ class RetroArchInterface:
             # round-trip to the verbatim suffix here.
             stripped_full = re.sub(timestamp_pattern, '', original_filename).strip()
             if stripped_full.lower().endswith('.state.auto'):
-                target_filename = stripped_full
+                # Argosy names its autosave slot in the file; RetroArch only reads
+                # "<content>.state.auto".
+                target_filename = re.sub(r'\.autosave(?=\.state\.auto$)', '',
+                                         stripped_full, flags=re.IGNORECASE)
             # Use slot info to determine correct state extension
             elif slot:
                 target_filename = self._state_filename_from_slot(base_name, slot)
@@ -11556,7 +11888,8 @@ class RetroArchInterface:
         
         return save_files
 
-    def resolve_restore_dest(self, game, entry, save_type, as_copy=False, local_name=None):
+    def resolve_restore_dest(self, game, entry, save_type, as_copy=False, local_name=None,
+                             default_dir=None):
         """Resolve the local destination (dir, filename) for a restored version.
 
         Mirrors the on-disk naming RetroArch expects. For an as-copy state it
@@ -11580,6 +11913,12 @@ class RetroArchInterface:
             dest_dir = Path(exact[0]['path']).parent
         elif candidates:
             dest_dir = Path(candidates[0]['path']).parent
+        elif default_dir:
+            # No copy on disk to follow: the folder a sync would download to
+            # (AutoSyncManager._download_dir), which knows the game's content
+            # folder. The guess below can't, and in content mode it dropped
+            # the file in the save root, where RetroArch never reads it.
+            dest_dir = Path(default_dir)
         else:
             base_dir = (getattr(self, 'save_dirs', {}) or {}).get(save_type)
             if not base_dir:
@@ -11601,7 +11940,8 @@ class RetroArchInterface:
         return dest_dir, tgt_name
 
     def restore_save_version(self, romm_client, game, entry, save_type,
-                             as_copy=False, log=None, local_name=None):
+                             as_copy=False, log=None, local_name=None,
+                             default_dir=None):
         """Restore a server save/state version to local disk.
 
         Backs up the current file (in-place restore only), downloads the chosen
@@ -11620,7 +11960,8 @@ class RetroArchInterface:
                 logging.info(msg)
         try:
             dest_dir, tgt_name = self.resolve_restore_dest(game, entry, save_type, as_copy,
-                                                           local_name=local_name)
+                                                           local_name=local_name,
+                                                           default_dir=default_dir)
             if not dest_dir or not tgt_name:
                 return {'success': False, 'dest': None, 'tgt_name': None,
                         'error': 'Could not determine restore location (download the game first).'}
@@ -12048,6 +12389,16 @@ class AutoSyncManager:
         # knows (last_played, new states): the emulator runs outside it, so
         # rows built from that data stayed stale until the app restarted.
         self.session_epoch = 0
+
+        # Time played, reported to RomM per launch (see play_sessions).
+        self.play_sessions = play_sessions.PlaySessions(
+            cache_dir() / 'play_sessions.json',
+            client_fn=lambda: self.romm_client,
+            device_fn=lambda: self.settings.get('Device', 'device_id', '') or None)
+        # When the RetroArch monitor last ran a loop. The play watcher stands
+        # in for it while it is not running (see start_play_watch).
+        self._monitor_beat = 0.0
+        self._play_watch = None
 
         # Launched-content aliases: on-disk stem -> rom_id. A ROM downloaded as
         # an archive can extract to files named nothing like the RomM entry (a
@@ -12572,6 +12923,9 @@ class AutoSyncManager:
             # RomM session-based sync on connect: pull saves changed on other
             # devices (and push any local changes) as a single batch negotiate.
             self.trigger_session_save_sync("connect")
+            # Sessions that ended while offline or before the last quit go
+            # up, and the other devices' sessions come down.
+            self.play_sessions.sync_async()
 
             self.log("🔄 Auto-sync started (file monitoring + RetroArch + playlist monitoring)")
             
@@ -12771,7 +13125,18 @@ class AutoSyncManager:
                     # on the next app start. Closing the emulator is the moment
                     # the save is both final and worth confirming to the user.
                     eden_running = emulator_saves.eden_is_running()
-                    self.game_running = bool(retroarch_running or eden_running)
+                    now_running = bool(retroarch_running or eden_running)
+                    if now_running != self.game_running:
+                        self.game_running = now_running
+                        _events.publish('game')
+                    # Cemu is not part of game_running: nothing syncs on its
+                    # close yet. It only ends a play session.
+                    self._monitor_beat = time.time()
+                    try:
+                        self.play_sessions.observe(
+                            self.game_running or emulator_saves.cemu_is_running())
+                    except Exception as e:
+                        logging.warning(f"play session tracking: {e}")
                     if eden_running != eden_was_running:
                         if eden_running:
                             self.log("🎮 Eden launched")
@@ -12844,6 +13209,37 @@ class AutoSyncManager:
             
         threading.Thread(target=monitor_retroarch, daemon=True).start()
         self.log("🔄 RetroArch monitoring started (network priority + history fallback)")
+
+    def start_play_watch(self):
+        """Track play sessions even while save sync is not running.
+
+        The RetroArch monitor, which feeds play_sessions, only starts with
+        auto-sync, and auto-sync only starts once RomM is reachable: a game
+        played offline (a Deck on a plane), during setup, or while the other
+        Ludo shell holds the sync lock was never recorded. This watcher looks
+        at the emulators itself whenever the monitor has not run for a few
+        seconds, and stands aside while it does. It cannot double-count:
+        only the process that launched a game has a launch to attribute.
+        """
+        if self._play_watch and self._play_watch.is_alive():
+            return
+
+        def watch():
+            while True:
+                time.sleep(1)
+                if time.time() - self._monitor_beat < 5:
+                    continue
+                try:
+                    running = (self.is_retroarch_running()
+                               or emulator_saves.eden_is_running()
+                               or emulator_saves.cemu_is_running())
+                    self.play_sessions.observe(running)
+                except Exception as e:
+                    logging.warning(f"play watch: {e}")
+                    time.sleep(5)
+
+        self._play_watch = threading.Thread(target=watch, daemon=True, name='romm-play-watch')
+        self._play_watch.start()
 
     def is_retroarch_running(self):
         """Check if RetroArch process is actually running (not just flatpak containers)"""
@@ -13431,6 +13827,8 @@ class AutoSyncManager:
             # Find emulator from file path
             emulator_info = self.retroarch.get_emulator_info_from_path(file_path)
             emulator = emulator_info['romm_emulator']  # Use RomM-compatible name
+            if save_type == 'states' and not emulator:
+                emulator = self._state_emulator(file_path, rom_id)
 
             # Upload the file with thumbnail and emulator info
             slot_info = f" [slot={slot}, autocleanup={autocleanup_limit}]" if slot else ""
@@ -13703,6 +14101,7 @@ class AutoSyncManager:
                            'device': op.get('device_name')},
             }
         self.log(f"⚖️ {Path(local_path).name}: conflict parked for the user")
+        _events.publish('conflicts')
         if announce:
             # Found in the background: no popup mid-whatever, just word that
             # one is waiting. It's asked when the game is next launched.
@@ -13751,6 +14150,7 @@ class AutoSyncManager:
             state['answers'][cid] = (choice, time.time())
             state['prompt'].discard(cid)
             state['seen'].discard(cid)
+        _events.publish('conflicts')
         return True
 
     def _ask_conflict_dialog(self, op, local_path):
@@ -14246,7 +14646,8 @@ class AutoSyncManager:
             # saves. The card stays the thing that changed; the zip is what
             # the server sees.
             upload_path, file_name = path, entry['name']
-            if slugs.get(rom_id) == 'ps2' and path.suffix.lower() == '.ps2':
+            is_ps2_card = slugs.get(rom_id) == 'ps2' and path.suffix.lower() == '.ps2'
+            if is_ps2_card:
                 packed = self._pack_ps2_card(path, rom_id)
                 if packed is None:
                     continue
@@ -14254,6 +14655,8 @@ class AutoSyncManager:
             # A GameCube game's GCIs are one save, packed the way Argosy packs
             # them; the unit is reported once, dated by its newest member.
             if path.suffix.lower() == gamecube_saves.GCI_SUFFIX:
+                if not gamecube_saves.in_card(path):
+                    continue
                 members = gamecube_saves.unit_members(path)
                 unit = (str(path.parent), gamecube_saves.game_code(path))
                 if unit in gci_units:
@@ -14264,7 +14667,8 @@ class AutoSyncManager:
                 updated_at = _dt.datetime.fromtimestamp(
                     max(m.stat().st_mtime for m in members),
                     tz=_dt.timezone.utc).isoformat()
-            content_hash = RomMClient.compute_content_hash(upload_path)
+            content_hash = (self._ps2_reported_hash(rom_id, upload_path) if is_ps2_card
+                            else RomMClient.compute_content_hash(upload_path))
 
             # Use the RomM core name (e.g. "Mupen64Plus-Next"), not the raw save
             # folder name (e.g. "n64"). get_save_files()' retroarch_emulator is
@@ -14400,6 +14804,7 @@ class AutoSyncManager:
         for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
             path = Path(entry['path'])
             if (path.suffix.lower() == gamecube_saves.GCI_SUFFIX
+                    and gamecube_saves.in_card(path)
                     and self.rom_id_for_save(path) == rom_id):
                 return RomMClient.compute_content_hash(
                     self._pack_gci_unit(gamecube_saves.unit_members(path), rom_id))
@@ -14421,6 +14826,7 @@ class AutoSyncManager:
         for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
             path = Path(entry['path'])
             if (path.suffix.lower() == gamecube_saves.GCI_SUFFIX
+                    and gamecube_saves.in_card(path)
                     and gamecube_saves.game_code(path) == code):
                 return path.parent
         if not saves_dir:
@@ -14487,6 +14893,84 @@ class AutoSyncManager:
                         or (g.get('romm_data') or {}).get('platform_slug'))
         return None
 
+    def _state_emulator(self, path, rom_id):
+        """The core for a state in a flat folder, which names no emulator."""
+        game = next((g for g in (self.get_games() or []) if g.get('rom_id') == rom_id), {})
+        try:
+            return self.retroarch.describe_core_resolution(
+                game.get('platform'), system_slug=game.get('platform_slug')
+            ).get('resolved_core')
+        except Exception as e:
+            logging.debug(f"no core for {Path(path).name}: {e}")
+            return None
+
+    def _is_ps2_card_op(self, op):
+        """A server save that is a whole PS2 card, as Argosy's built-in core uploads."""
+        return (str(op.get('file_name') or '').lower().endswith('.ps2')
+                and self._platform_slug_of(op.get('rom_id')) == 'ps2')
+
+    @staticmethod
+    def _ps2_baseline_file(rom_id):
+        return cache_dir() / 'ps2_saves' / str(rom_id) / 'server_card.json'
+
+    def _ps2_reported_hash(self, rom_id, packed):
+        """The hash to tell RomM for this packed card.
+
+        After a whole card is restored the server knows the card's hash, not the
+        zip's. While the card still packs to the zip it restored to, it is that
+        same save, so report the server's hash or it looks like new progress.
+        """
+        own = RomMClient.compute_content_hash(packed)
+        try:
+            baseline = json.loads(self._ps2_baseline_file(rom_id).read_text())
+            if baseline.get('zip') == own:
+                return baseline.get('server') or own
+        except (OSError, ValueError, AttributeError):
+            pass
+        return own
+
+    def _restore_ps2_card(self, op, device_id, session_id):
+        """Put a whole PS2 card from the server in place of the game's card.
+
+        Same rules as _restore_ps2_save: deferred while RetroArch runs, and the
+        previous card is kept as "<card>.backup".
+        """
+        file_name = op.get('file_name') or ''
+        if self.is_retroarch_running():
+            self.log(f"ℹ️ Save-sync: RetroArch is running; {file_name} will "
+                     f"restore once it is closed.")
+            return False
+        card_path = self._ps2_card_path(op, (self.retroarch.save_dirs or {}).get('saves'))
+        if not card_path:
+            self.log(f"⚠️ Save-sync: no memory card location for {file_name}")
+            return False
+        staged = cache_dir() / 'incoming_saves' / file_name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if not self.romm_client.download_save_by_id(
+                op.get('save_id'), 'saves', staged,
+                device_id=device_id, session_id=session_id):
+            return False
+        try:
+            ps2_memcard.Card.open(staged)
+            server_hash = RomMClient.compute_content_hash(staged)
+            card_path.parent.mkdir(parents=True, exist_ok=True)
+            if card_path.is_file():
+                shutil.copy2(card_path, str(card_path) + '.backup')
+            shutil.copyfile(staged, card_path)
+        except (ps2_memcard.CardError, OSError) as e:
+            self.log(f"⚠️ Save-sync: could not restore {file_name}: {e}")
+            return False
+        finally:
+            staged.unlink(missing_ok=True)
+        self.log(f"✅ Restored memory card {card_path.name}")
+        self._record_synced(str(card_path))
+        restored = self._pack_ps2_card(card_path, op.get('rom_id'))
+        if restored:
+            self._ps2_baseline_file(op.get('rom_id')).write_text(json.dumps({
+                'zip': RomMClient.compute_content_hash(restored), 'server': server_hash}))
+            self._record_synced(str(restored))
+        return True
+
     def _is_ps2_zip_op(self, op):
         """A server save that is a PS2 game's folders rather than a whole card."""
         return (str(op.get('file_name') or '').lower().endswith('.zip')
@@ -14519,7 +15003,10 @@ class AutoSyncManager:
         folder = Path(saves_dir)
         mode = self.retroarch.get_save_subdir_mode('saves')
         if mode == 'core':
-            folder = folder / 'LRPS2'  # the core's display name, not pcsx2
+            # The core's reported name, which depends on the build. Only the
+            # build in use has made its folder.
+            folder = next((folder / n for n in reversed(PS2_CORE_NAMES)
+                           if (folder / n).is_dir()), folder / PS2_CORE_NAMES[0])
         elif mode == 'content' and local.name:
             folder = folder / local.parent.name
         return folder / f"{stem}.ps2"
@@ -14791,6 +15278,10 @@ class AutoSyncManager:
         re-packs to the same bytes and the same content hash, and the negotiate
         engine correctly sees nothing to do.
 
+        A title in _eden_awaiting_restore is left out: its only save here is
+        what first boot wrote, and uploading that would replace the player's
+        progress on the server.
+
         Restore is the other direction and deliberately does NOT share this
         path: see _restore_standalone_save, which backs the existing save up
         before replacing it and refuses while Eden is running. Packing here
@@ -14837,8 +15328,12 @@ class AutoSyncManager:
             return entries
 
         pack_dir = cache_dir() / 'packed_saves'
+        awaiting = self._eden_awaiting_restore()
         for save in saves:
             title_id = save['title_id']
+            if title_id in awaiting and self._eden_restore_still_owed(
+                    title_id, awaiting[title_id]):
+                continue
             rom_id = self._rom_id_for_title_id(title_id)
             if not rom_id:
                 # No local ROM carries this title ID. Without Sigil the ID is
@@ -14917,6 +15412,7 @@ class AutoSyncManager:
             if written:
                 emulator_saves.write_keys_marker(
                     entry.get('file_name'), entry.get('md5_hash'))
+                self.forget_title_ids()
                 self.log(f"🔑 Installed {entry.get('file_name')}")
             return {'installed': written, 'status': 'installed'}
         except Exception as e:
@@ -15102,6 +15598,7 @@ class AutoSyncManager:
                     'message': self._NO_KEYS_MESSAGE}
 
         if result['keys']:
+            self.forget_title_ids()
             self.log(f"🔑 Installed {result['keys']} key file(s)")
 
         if not result['installed']:
@@ -15551,6 +16048,7 @@ class AutoSyncManager:
                 # have landed.
                 self.session_epoch += 1
                 self._session_sync_lock.release()
+                _events.publish('session')
 
         threading.Thread(target=_run, daemon=True, name="romm-session-sync").start()
 
@@ -15806,9 +16304,12 @@ class AutoSyncManager:
         # meanwhile (the other side caught up) drops.
         state = self._conflicts()
         with state['lock']:
-            for cid in [c for c, v in state['pending'].items()
-                        if only_rom_id is None or v['rom_id'] == only_rom_id]:
+            dropped = [c for c, v in state['pending'].items()
+                       if only_rom_id is None or v['rom_id'] == only_rom_id]
+            for cid in dropped:
                 del state['pending'][cid]
+        if dropped:
+            _events.publish('conflicts')
         self._sync_trigger = trigger
         # On a server with save channels, the saves channels can carry go
         # that way, and negotiate keeps the rest. Their (rom_id, slot) keys
@@ -16067,6 +16568,13 @@ class AutoSyncManager:
                             except Exception:
                                 pass
                         target = self._resolve_download_target(op, saves_dir)
+                        if target is None and self._is_ps2_card_op(op):
+                            if self._restore_ps2_card(op, device_id, session_id):
+                                summary['downloaded'] += 1
+                                _bump(rom_id, 'down')
+                            else:
+                                summary['deferred'] = summary.get('deferred', 0) + 1
+                            continue
                         if target is None or target is DEFER_DOWNLOAD:
                             # Nowhere RetroArch reads to put it yet; the
                             # conflict stands until the game is launched.
@@ -16175,6 +16683,50 @@ class AutoSyncManager:
                 _record_activity('error', 'Save conflict' if summary.get('conflicts') and not summary.get('errors') else 'Save sync issues', ', '.join(parts))
         return summary
 
+    # Titles whose server save could not be restored because the game had never
+    # booted here. RomM cannot protect these: with no sync history it compares
+    # timestamps, so the save written on first boot looks newer and would upload
+    # over the player's progress. Kept on disk so a restart does not forget.
+    def _eden_awaiting_restore(self):
+        try:
+            data = json.loads((cache_dir() / 'eden_awaiting_restore.json').read_text())
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _set_eden_awaiting_restore(self, title_id, op=None):
+        awaiting = self._eden_awaiting_restore()
+        title_id = title_id.upper()
+        if op is None:
+            if title_id not in awaiting:
+                return
+            del awaiting[title_id]
+        else:
+            awaiting[title_id] = {'rom_id': op.get('rom_id'), 'save_id': op.get('save_id')}
+        path = cache_dir() / 'eden_awaiting_restore.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(awaiting))
+        os.replace(tmp, path)
+
+    def _eden_restore_still_owed(self, title_id, entry):
+        """False once the server no longer has a save to restore for this title.
+
+        Otherwise deleting that save in RomM would stop this game syncing for
+        good. Any doubt, such as being offline, keeps holding the upload back.
+        """
+        try:
+            url = urljoin(self.romm_client.base_url, f"/api/roms/{entry.get('rom_id')}")
+            r = self.romm_client.session.get(url, timeout=15)
+            if r.status_code == 200 and not (r.json().get('user_saves') or []):
+                self._set_eden_awaiting_restore(title_id)
+                return False
+        except Exception as e:
+            logging.debug(f"could not check the awaited save for {title_id}: {e}")
+        logging.info(f"Eden save {title_id}: not uploading a first-boot save "
+                     f"over the server's; restoring the server's first")
+        return True
+
     def _restore_standalone_save(self, op, device_id, session_id):
         """Download a standalone emulator's save and unpack it into its tree.
 
@@ -16190,6 +16742,8 @@ class AutoSyncManager:
         """
         if self._is_ps2_zip_op(op):
             return self._restore_ps2_save(op, device_id, session_id)
+        if self._is_ps2_card_op(op):
+            return self._restore_ps2_card(op, device_id, session_id)
         if self._is_gci_op(op):
             return self._restore_gci_save(op, device_id, session_id)
         if self._is_folder_op(op):
@@ -16229,11 +16783,23 @@ class AutoSyncManager:
                      f"restore once it is closed.")
             return False
 
+        try:
+            override = (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip()
+        except Exception:
+            override = ''
+        if title_id and emulator_saves.eden_restore_dir(title_id, override or None) is None:
+            self._set_eden_awaiting_restore(title_id, op)
+            self.log(f"ℹ️ Save-sync: {title_id} hasn't booted here yet; its server "
+                     f"save will restore after the first boot.")
+            return False
+
+        # No device_id: downloading with one makes RomM record this device as
+        # synced to the save, which is only true after the unpack below works.
         staged = cache_dir() / 'incoming_saves' / file_name
         staged.parent.mkdir(parents=True, exist_ok=True)
         if not self.romm_client.download_save_by_id(
                 op.get('save_id'), 'saves', staged,
-                device_id=device_id, session_id=session_id):
+                device_id=None, session_id=session_id):
             return False
 
         # A save this client once mislabelled ('switch' instead of 'eden') was
@@ -16256,11 +16822,7 @@ class AutoSyncManager:
             staged.unlink(missing_ok=True)
             return False
 
-        try:
-            override = (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip()
-        except Exception:
-            override = ''
-
+        pack_hash = RomMClient.compute_content_hash(staged)
         try:
             result = emulator_saves.unpack_save(
                 staged, title_id, extra_data_dir=override or None,
@@ -16273,6 +16835,7 @@ class AutoSyncManager:
                      f"and will restore next sync.")
             return False
         except FileNotFoundError as e:
+            self._set_eden_awaiting_restore(title_id, op)
             self.log(f"ℹ️ Save-sync: {e}")
             return False
         except Exception as e:
@@ -16281,8 +16844,13 @@ class AutoSyncManager:
         finally:
             staged.unlink(missing_ok=True)
 
-        self.log(f"✅ Restored {result['files']} save file(s) for {title_id} "
-                 f"(previous save backed up to {result['backup'].name})")
+        self._set_eden_awaiting_restore(title_id)
+        if device_id:
+            self.romm_client.confirm_save_downloaded(
+                op.get('save_id'), 'saves', device_id, content_hash=pack_hash)
+        backed_up = (f" (previous save backed up to {result['backup'].name})"
+                     if result['backup'] else '')
+        self.log(f"✅ Restored {result['files']} save file(s) for {title_id}{backed_up}")
         return True
 
     @staticmethod
@@ -16319,7 +16887,8 @@ class AutoSyncManager:
             return None
         # A PS2 save zip is folders to merge into a card, not a file to drop;
         # a GameCube save is files for a card folder only its restore finds.
-        if self._is_ps2_zip_op(op) or self._is_gci_op(op) or self._is_folder_op(op):
+        if (self._is_ps2_zip_op(op) or self._is_ps2_card_op(op)
+                or self._is_gci_op(op) or self._is_folder_op(op)):
             return None
         # The op's emulator is the SERVER save's label, which a buggy or
         # foreign upload can set to anything ('switch' instead of 'eden'). The
@@ -16328,20 +16897,33 @@ class AutoSyncManager:
         # writing it there is what seeds the stray .srm the inventory now
         # refuses to sync.
         try:
-            slug = next(
-                (g.get('platform_slug') or (g.get('romm_data') or {}).get('platform_slug')
-                 for g in (self.get_games() or [])
-                 if g.get('rom_id') == op.get('rom_id')), None)
+            game = next((g for g in (self.get_games() or [])
+                         if g.get('rom_id') == op.get('rom_id')), None)
         except Exception:
-            slug = None
+            game = None
+        slug = game and (game.get('platform_slug')
+                         or (game.get('romm_data') or {}).get('platform_slug'))
         if standalone_emulator_for_platform(slug):
             return None
-        target_dir = Path(saves_dir)
         emulator = op.get('emulator')
-        if emulator:
-            mapped = self.retroarch.emulator_directory_map.get(emulator.lower())
-            if mapped:
-                target_dir = target_dir / mapped
+        # The folder RetroArch actually reads, by its sorting mode -- the same
+        # rule the pre-launch reconcile files saves by. Always using the core
+        # folder put a downloaded save in saves/<Core>/ while a content-sorted
+        # RetroArch (RetroDECK's default) wrote saves/<platform>/: two local
+        # copies of one slot, each tied to its own server record, conflicting
+        # on every launch.
+        target_dir = None
+        if game:
+            try:
+                target_dir = self._download_dir('saves', game, emulator)
+            except Exception:
+                target_dir = None
+        if target_dir is None:
+            target_dir = Path(saves_dir)
+            if emulator:
+                mapped = self.retroarch.emulator_directory_map.get(emulator.lower())
+                if mapped:
+                    target_dir = target_dir / mapped
         target_dir.mkdir(parents=True, exist_ok=True)
         # A game's battery save is read under this device's name for the
         # game, not the uploader's; see _local_save_name.
@@ -16736,6 +17318,11 @@ class AutoSyncManager:
                 self._launch_aliases.popitem(last=False)
         except Exception as e:
             logging.debug(f"could not record launch alias: {e}")
+            return
+        try:
+            self.play_sessions.launched(rom_id)
+        except Exception as e:
+            logging.warning(f"could not start play session: {e}")
 
     def _local_save_name(self, rom_id, server_file_name, slot, game=None):
         """The filename a server save is written under on this device.
@@ -16929,6 +17516,10 @@ class AutoSyncManager:
             return text[:4]
         return text
 
+    def forget_title_ids(self):
+        """Rebuild the title-ID index on next use."""
+        self._title_id_index = None
+
     def _rom_id_for_title_id(self, title_id):
         """rom_id owning a game-native title ID, or None.
 
@@ -16938,8 +17529,8 @@ class AutoSyncManager:
         Going through the ROM rather than querying RomM for a serial is
         deliberate: RomM's ROM payload carries no title ID, and the disc does.
 
-        Built once per session. A ROM downloaded afterwards is picked up on the
-        next start, which is the same latency the rest of the library has.
+        Built once per session, and dropped after a Switch download or a keys
+        install (forget_title_ids), which can each make a game identifiable.
         """
         if self._title_id_index is None:
             self._title_id_index = {}
@@ -17075,6 +17666,34 @@ class AutoSyncManager:
             self.log(f"  [DEBUG] core fallback: {romm_emulator!r} → using first mapped dir {first_mapped.name!r} (will be created)")
             return first_mapped
         return None
+
+    def _download_dir(self, save_type, game, romm_emulator, core_name=None,
+                      content_dir=None):
+        """The folder RetroArch reads this game's saves or states from.
+
+        Shared by the pre-launch download and by restoring a version from the
+        game page, so a restore lands where a sync would have put it.
+        `content_dir` is _content_dir_for_game(game), when the caller already
+        has it. None when there is no save root or no core folder to use.
+        """
+        base_dir = self.retroarch.save_dirs.get(save_type)
+        if not base_dir:
+            return None
+        base_dir = Path(base_dir)
+        mode = self.retroarch.get_save_subdir_mode(save_type)
+        if mode == 'core':
+            return self._target_core_dir(base_dir, game, romm_emulator, core_name)
+        if mode == 'content':
+            # The ROM's own folder when it has one; for a flat ROM the content
+            # dir IS the platform folder, which is the ES-DE folder name rather
+            # than the raw RomM slug when the two differ (dreamcast vs dc).
+            slug = (game or {}).get('platform_slug', '')
+            if content_dir is None and game:
+                content_dir = self._content_dir_for_game(game)
+            subdir = (content_dir or platform_folder_name(slug)
+                      or self.get_platform_slug_from_emulator(romm_emulator))
+            return base_dir / subdir if subdir else base_dir
+        return base_dir
 
     def _content_dir_for_game(self, game):
         """The ROM's content directory (its parent folder name), or None.
@@ -17558,7 +18177,7 @@ class AutoSyncManager:
                     # the game's card instead, unless this device already
                     # holds that version.
                     if (_platform_slug == 'ps2'
-                            and original_filename.lower().endswith('.zip')):
+                            and original_filename.lower().endswith(('.zip', '.ps2'))):
                         device_id = self.settings.get('Device', 'device_id', '') or None
                         current = any(
                             sync.get('device_id') == device_id and sync.get('is_current')
@@ -17575,13 +18194,16 @@ class AutoSyncManager:
                             packed = (self._pack_ps2_card(card, rom_id)
                                       if card and card.is_file() else None)
                             current = bool(packed) and (
-                                RomMClient.compute_content_hash(packed)
+                                self._ps2_reported_hash(rom_id, packed)
                                 == latest_save.get('content_hash'))
                         if current:
                             skipped_count += 1
                         else:
                             downloads_attempted += 1
-                            if self._restore_ps2_save(
+                            restore = (self._restore_ps2_card
+                                       if original_filename.lower().endswith('.ps2')
+                                       else self._restore_ps2_save)
+                            if restore(
                                     {'rom_id': rom_id, 'file_name': original_filename,
                                      'save_id': latest_save.get('id'),
                                      'emulator': romm_emulator},
@@ -17629,22 +18251,8 @@ class AutoSyncManager:
                     final_path = None
                     emulator_save_dir = None
                     if original_filename:
-                        subdir_mode = self.retroarch.get_save_subdir_mode('saves')
-                        if subdir_mode == 'core':
-                            emulator_save_dir = self._target_core_dir(
-                                save_base_dir, game, romm_emulator, core_name)
-                        elif subdir_mode == 'content':
-                            # Use the ROM's actual parent folder name (what RetroArch uses as content dir)
-                            # rather than the stored emulator field, which may be from a different device/mode.
-                            # For a flat ROM the content dir IS the platform folder, which is
-                            # the ES-DE folder name rather than the raw RomM slug when the two
-                            # differ (dreamcast vs dc); prefer that over the emulator-derived
-                            # name so saves land where RetroArch reads.
-                            subdir_name = (_content_dir or platform_folder_name(_platform_slug)
-                                           or self.get_platform_slug_from_emulator(romm_emulator))
-                            emulator_save_dir = save_base_dir / subdir_name
-                        else:
-                            emulator_save_dir = save_base_dir
+                        emulator_save_dir = self._download_dir(
+                            'saves', game, romm_emulator, core_name, _content_dir)
                         if emulator_save_dir:
                             retroarch_filename = (
                                 self._local_save_name(rom_id, original_filename,
@@ -17764,20 +18372,8 @@ class AutoSyncManager:
                     if original_filename:
                         subdir_mode = self.retroarch.get_save_subdir_mode('states')
                         self.log(f"  [DEBUG] states subdir_mode={subdir_mode!r}, romm_emulator={romm_emulator!r}, content_dir={_content_dir!r}")
-                        if subdir_mode == 'core':
-                            emulator_state_dir = self._target_core_dir(
-                                state_base_dir, game, romm_emulator, core_name)
-                        elif subdir_mode == 'content':
-                            # Use the ROM's actual parent folder name (what RetroArch uses as content dir).
-                            # For a flat ROM the content dir IS the platform folder, which is
-                            # the ES-DE folder name rather than the raw RomM slug when the two
-                            # differ; prefer that over the emulator-derived name so states land
-                            # where RetroArch reads.
-                            subdir_name = (_content_dir or platform_folder_name(_platform_slug)
-                                           or self.get_platform_slug_from_emulator(romm_emulator))
-                            emulator_state_dir = state_base_dir / subdir_name
-                        else:
-                            emulator_state_dir = state_base_dir
+                        emulator_state_dir = self._download_dir(
+                            'states', game, romm_emulator, core_name, _content_dir)
                         if emulator_state_dir:
                             retroarch_filename = self.retroarch.convert_to_retroarch_filename(
                                 original_filename, 'states', emulator_state_dir, slot=state_slot
@@ -19203,8 +19799,11 @@ class BiosTrackingManager:
                         self.platform_status[platform_slug]['missing'] = len(required_missing_after)
                         self.platform_status[platform_slug]['total_required'] = len(present_after) + len(required_missing_after)
             else:
-                error_msg = "unavailable_on_server"
-                self.log(f"⚠️ BIOS unavailable on server for {platform_name}")
+                # False also covers a local failure, with the files on the server.
+                local = not bios_manager.ensure_system_directory()
+                error_msg = "no_bios_folder" if local else "unavailable_on_server"
+                self.log(f"⚠️ No BIOS folder for {platform_name}" if local
+                         else f"⚠️ BIOS unavailable on server for {platform_name}")
                 with self._lock:
                     self.download_failures[platform_slug] = error_msg
 

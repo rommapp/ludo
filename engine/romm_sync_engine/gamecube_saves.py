@@ -50,6 +50,17 @@ def _header(path):
     return head if len(head) == _HEADER else None
 
 
+def in_card(path):
+    """True when ``path`` sits in a Dolphin card folder, "GC/<region>/Card X".
+
+    Dolphin reads GCIs only there. A copy anywhere else -- dropped into the
+    save folder by hand, say -- is never loaded, so it is not the game's save.
+    """
+    parent = Path(path).parent
+    return (re.fullmatch(r'Card [AB]', parent.name, re.IGNORECASE) is not None
+            and parent.parent.parent.name.upper() == 'GC')
+
+
 def game_code(path):
     """The four-character game code a GCI belongs to, or None."""
     head = _header(path)

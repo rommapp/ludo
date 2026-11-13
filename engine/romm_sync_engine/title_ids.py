@@ -29,6 +29,7 @@ matching.
 """
 
 import ctypes
+import struct
 import logging
 import os
 import re
@@ -617,7 +618,7 @@ def switch_content(path, prod_keys=None):
             # is the better evidence than nothing.
             from_cnmt = (result.source != _SIGIL_SOURCE_FILENAME
                          and result.switch_content_type != 0)
-            return {
+            return _account_for_bundle(path, {
                 'title_id': found.upper(),
                 'base_id': base,
                 'kind': kind or switch_kind(found),
@@ -625,19 +626,82 @@ def switch_content(path, prod_keys=None):
                             else switch_version_from_name(path.name)),
                 'source': 'cnmt' if from_cnmt else 'filename',
                 'compressed': compressed,
-            }
+            })
 
     tag = raw_switch_tag_in_name(path.name)
     if not tag:
         return None
-    return {
+    return _account_for_bundle(path, {
         'title_id': tag.upper(),
         'base_id': base_switch_title_id(tag),
         'kind': switch_kind(tag),
         'version': switch_version_from_name(path.name),
         'source': 'filename',
         'compressed': compressed,
-    }
+    })
+
+
+def xci_cnmt_count(path):
+    """How many content metas an .xci's secure partition lists, or 0 if unread.
+
+    The partition tables are plain HFS0, so this needs no keys. Each title in a
+    cartridge image has exactly one "*.cnmt.nca".
+    """
+    def table(fh, start):
+        fh.seek(start)
+        head = fh.read(16)
+        if len(head) < 16 or head[:4] != b'HFS0':
+            return None
+        count, names_size = struct.unpack('<II', head[4:12])
+        if count > 100000 or names_size > 16 * 1024 * 1024:
+            return None
+        raw = fh.read(count * 0x40)
+        names = fh.read(names_size)
+        if len(raw) < count * 0x40 or len(names) < names_size:
+            return None
+        data_start = start + 16 + count * 0x40 + names_size
+        entries = {}
+        for i in range(count):
+            offset, size, name_at = struct.unpack_from('<QQI', raw, i * 0x40)
+            end = names.find(b'\0', name_at)
+            name = names[name_at:end if end >= 0 else None].decode('utf-8', 'replace')
+            entries[name] = (data_start + offset, size)
+        return entries
+
+    try:
+        with open(path, 'rb') as fh:
+            # 0x1000: dumps that keep the cartridge's key area in front.
+            for shift in (0, 0x1000):
+                fh.seek(shift + 0x100)
+                if fh.read(4) != b'HEAD':
+                    continue
+                fh.seek(shift + 0x130)
+                root = table(fh, shift + struct.unpack('<Q', fh.read(8))[0])
+                secure = (root or {}).get('secure')
+                if not secure:
+                    return 0
+                names = table(fh, secure[0]) or {}
+                return sum(n.lower().endswith('.cnmt.nca') for n in names)
+    except (OSError, struct.error):
+        pass
+    return 0
+
+
+def _account_for_bundle(path, info):
+    """Treat an .xci holding several titles as a game, whichever is listed first.
+
+    Merged cartridge images hold a base game with its updates or DLC, and the
+    identification above stops at the first content meta. When that is the
+    update, the file read as an add-on: Play said "No launchable file found",
+    and add-on handling could move the whole game out of the library. Eden
+    boots these files fine. An image of only add-ons also lands here, and then
+    Eden's own error is the one the player sees.
+    """
+    if (path.suffix.lower() == '.xci' and info['kind'] in ('update', 'dlc')
+            and xci_cnmt_count(path) > 1):
+        info = dict(info, title_id=info['base_id'] or info['title_id'],
+                    kind='base', version=None)
+    return info
 
 
 def switch_content_from_name(name):

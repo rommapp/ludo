@@ -1,3 +1,4 @@
+import { watchTopic } from "./push";
 // "Keep mine or keep theirs" for a battery save that changed in two places.
 //
 // The engine never settles one on its own guess: it parks the conflict, both
@@ -186,8 +187,10 @@ async function pollOnce() {
 
 // The first look waits a little: a conflict found by the startup sync would
 // otherwise open over Home's loading skeleton, before there's a page behind it.
+// After that, the backend's 'conflicts' nudge drives it (see push.ts): the
+// interval is only the pace against a backend that can't nudge.
 export function watchSaveConflicts(intervalMs = 4000, firstMs = 8000): () => void {
-  let t: ReturnType<typeof setInterval> | undefined;
-  const first = setTimeout(() => { pollOnce(); t = setInterval(pollOnce, intervalMs); }, firstMs);
-  return () => { clearTimeout(first); if (t) clearInterval(t); };
+  let stop: (() => void) | undefined;
+  const first = setTimeout(() => { pollOnce(); stop = watchTopic('conflicts', pollOnce, intervalMs, 30000); }, firstMs);
+  return () => { clearTimeout(first); stop?.(); };
 }

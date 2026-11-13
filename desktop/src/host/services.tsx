@@ -11,7 +11,7 @@ export { routerHook } from "./router";
 // React and the widget kit.
 // Imported as well as re-exported: this module calls it itself, and a bare
 // `export ... from` creates no local binding.
-import { callable } from "./rpc";
+import { callable, subscribeEvents } from "./rpc";
 export { callable };
 
 // ── Toasts ──────────────────────────────────────────────────────────────────
@@ -39,7 +39,12 @@ async function watchGame() {
     playing = running;
   } catch { /* backend not up yet; try again next tick */ }
 }
-window.setInterval(watchGame, 2000);
+// The engine nudges 'game' the moment its emulator monitor sees one start or
+// close ('*': the channel reconnected and may have missed it). The interval
+// is only a safety net now; it used to be the whole mechanism, every 2s.
+subscribeEvents((topic) => { if (topic === "game" || topic === "*") watchGame(); });
+watchGame();
+window.setInterval(watchGame, 30000);
 
 export const toaster = {
   toast: (opts: ToastOpts) => {

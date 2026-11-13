@@ -1,0 +1,80 @@
+{
+ "month": "2026-09",
+ "prev": "2026-08",
+ "next": "2026-10",
+ "total_ms": 10800000,
+ "sessions": 6,
+ "longest_ms": 1800000,
+ "days": [
+  0,
+  0,
+  1800000,
+  1800000,
+  1800000,
+  1800000,
+  1800000,
+  1800000,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0
+ ],
+ "days_played": 6,
+ "busiest_day": {
+  "day": 3,
+  "ms": 1800000
+ },
+ "top_games": [
+  {
+   "rom_id": 1,
+   "name": "Mickey Mania",
+   "platform": "Sega Mega Drive/Genesis",
+   "ms": 5400000,
+   "sessions": 3,
+   "share": 0.5,
+   "new": true,
+   "first_play": true
+  },
+  {
+   "rom_id": 2,
+   "name": "The Lion King",
+   "platform": "Sega Mega Drive/Genesis",
+   "ms": 5400000,
+   "sessions": 3,
+   "share": 0.5,
+   "new": true,
+   "first_play": true
+  }
+ ],
+ "other_games": 0,
+ "other_ms": 0,
+ "unlocks": [],
+ "points": 0,
+ "awards": [],
+ "success": true,
+ "months": [
+  "2026-10",
+  "2026-09",
+  "2026-08",
+  "2025-07"
+ ],
+ "current": "2026-10"
+}

@@ -49,8 +49,10 @@ describe("Pair again to receive installs", { skip: SKIP }, () => {
         await r.page.screenshot({ path: process.env.LUDO_SCREENSHOT });
       }
       await r.page.getByText("Pair again", { exact: true }).dispatchEvent("click");
-      await r.page.waitForTimeout(400);
-      assert.equal((await r.probe()).path, "/romm-sync-config");
+      // Pairing opens as a QR modal over the library, not a separate page.
+      await r.page.getByText("Scan with your phone and approve", { exact: false })
+        .waitFor({ timeout: 5000 });
+      assert.equal((await r.probe()).path, "/romm-sync-library");
     } finally {
       await r.close();
     }

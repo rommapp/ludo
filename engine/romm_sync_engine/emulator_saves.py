@@ -659,6 +659,11 @@ def identify_upload(path):
             with zipfile.ZipFile(path) as archive:
                 names = [Path(m.filename).name.lower()
                          for m in archive.infolist() if not m.is_dir()]
+                # NCAs first: a firmware zip may carry its keys too, and
+                # install_firmware_zip installs both. Calling that 'keys' left
+                # the firmware uninstalled and the prompt coming back.
+                if any(n.endswith('.nca') for n in names):
+                    return 'firmware'
                 for member in archive.infolist():
                     if member.is_dir():
                         continue
@@ -667,8 +672,6 @@ def identify_upload(path):
                     with archive.open(member) as fh:
                         if looks_like_keys(fh.read(64 * 1024)):
                             return 'keys'
-                if any(n.endswith('.nca') for n in names):
-                    return 'firmware'
                 return None
         with open(path, 'rb') as fh:
             if looks_like_keys(fh.read(64 * 1024)):
@@ -759,6 +762,17 @@ def eden_pids():
     Cheap /proc scan rather than a dependency -- a false negative only costs
     the caller its guard, and a false positive only defers what it guards.
     """
+    return _pids_named('eden')
+
+
+def cemu_is_running():
+    """True when a Cemu process appears to be running. The play-session
+    tracker's only way to see a Wii U game end: nothing else watches Cemu."""
+    return bool(_pids_named('cemu'))
+
+
+def _pids_named(prefix):
+    """PIDs whose process name starts with `prefix`, zombies excluded."""
     pids = []
     try:
         for entry in Path('/proc').iterdir():
@@ -768,7 +782,7 @@ def eden_pids():
                 comm = (entry / 'comm').read_text().strip().lower()
             except OSError:
                 continue
-            if not comm.startswith('eden'):
+            if not comm.startswith(prefix):
                 continue
             # A ZOMBIE is not a running emulator. Ludo launches Eden with
             # subprocess.Popen and does not wait on it, so when the player
@@ -791,7 +805,7 @@ def eden_pids():
                 continue
             pids.append(int(entry.name))
     except OSError as e:
-        log.debug("could not scan /proc for Eden: %s", e)
+        log.debug("could not scan /proc for %s: %s", prefix, e)
     return pids
 
 
@@ -825,6 +839,31 @@ def close_eden(timeout=10.0):
     return not eden_pids()
 
 
+def eden_restore_dir(title_id, extra_data_dir=None):
+    """Where a save for ``title_id`` belongs on this device, or None if unknown.
+
+    A title that has a save uses that directory. One that has never booted can
+    still be placed when this Eden has exactly one real user: the folder is
+    then a fact, not a guess. No profile or several means Eden has to boot it
+    first, because a save under the wrong user is invisible to the player.
+    """
+    for save in find_eden_saves(extra_data_dir):
+        if save['title_id'].lower() == title_id.lower():
+            return save['path']
+    users, first = set(), None
+    for data_dir in eden_data_dirs(extra_data_dir):
+        root = data_dir.joinpath(*_EDEN_SAVE_ROOT, '0' * 16)
+        try:
+            found = [d for d in root.iterdir() if d.is_dir() and d.name.strip('0')]
+        except OSError:
+            continue
+        users.update(d.name.lower() for d in found)
+        first = first or (found[0] if found else None)
+    if len(users) == 1:
+        return first / title_id.upper()
+    return None
+
+
 def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None):
     """Restore a packed save into Eden's tree for `title_id`.
 
@@ -853,20 +892,14 @@ def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None):
     if eden_is_running():
         raise RuntimeError("Eden is running; close it before restoring a save")
 
-    existing = None
-    for save in find_eden_saves(extra_data_dir):
-        if save['title_id'].lower() == title_id.lower():
-            existing = save['path']
-            break
+    existing = eden_restore_dir(title_id, extra_data_dir)
     if existing is None:
-        # No directory for this title means the game has never booted here.
-        # Creating one would mean guessing a user ID, and a save under the
-        # wrong profile is invisible to the player -- refuse instead.
         raise FileNotFoundError(
             f"no Eden save directory for {title_id}; boot the game once first")
+    existing.mkdir(parents=True, exist_ok=True)
 
     backup = None
-    if backup_dir is not None:
+    if backup_dir is not None and _newest_mtime(existing) is not None:
         backup_dir = Path(backup_dir)
         backup_dir.mkdir(parents=True, exist_ok=True)
         backup = backup_dir / f"{title_id}-{int(time.time())}.zip"

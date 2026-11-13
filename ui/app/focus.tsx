@@ -138,7 +138,11 @@ export function v2Page(children: any, bgUri: string | null = null) {
     <div className="romm-ui" style={{
       fontFamily: V2.font, color: V2.fg, background: V2.bg,
       position: 'relative', overflowY: 'auto', height: 'calc(100vh - 40px)',
-      marginTop: '40px', scrollPaddingTop: '120px', scrollPaddingBottom: '80px',
+      // Bottom: Steam's 42px footer legend + the same ~22px clearance the
+      // content padding below gives. 80 made a Collections first-row cover,
+      // fully on screen, nudge the page 5px on focus; the tabs share this
+      // scroller, so the banners above jumped as you switched tabs.
+      marginTop: '40px', scrollPaddingTop: '120px', scrollPaddingBottom: '64px',
     }}>
       <style>{V2_FOCUS_STYLE}{V2_ROW_STYLE}</style>
       <V2Bg uri={bgUri} />

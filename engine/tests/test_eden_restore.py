@@ -144,7 +144,10 @@ def main():
 
         # --- a title that has never booted here ------------------------
         try:
-            E.unpack_save(archive, '0100AAAABBBB1000', extra_data_dir=data3)
+            # A tree with no profile yet: which user it belongs to is unknown.
+            bare = d / 'no-profile/.local/share/eden'
+            (bare / 'nand/user/save').mkdir(parents=True)
+            E.unpack_save(archive, '0100AAAABBBB1000', extra_data_dir=bare)
             check('unknown title refused', 'no exception', 'FileNotFoundError')
         except FileNotFoundError:
             check('unknown title refused', 'FileNotFoundError', 'FileNotFoundError')

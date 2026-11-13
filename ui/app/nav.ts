@@ -26,7 +26,7 @@ export type NavId = 'home' | 'platforms' | 'collections' | 'search';
 // These module hooks are only set while LibraryRootPage is mounted; when they
 // are null (e.g. Settings opened from the QAM as a real route) callers fall
 // back to genuine navigation, preserving the old behavior.
-export type LibView = 'grid' | 'game' | 'settings' | 'stats' | 'cores' | 'emulators' | 'bios' | 'downloads' | 'platforms';
+export type LibView = 'grid' | 'game' | 'settings' | 'stats' | 'cores' | 'emulators' | 'bios' | 'downloads' | 'platforms' | 'regions' | 'playtime';
 
 // ── History-aware back navigation ────────────────────────────────────────────
 // Navigation.Navigate always PUSHES a history entry. Backing out of our pages
@@ -89,6 +89,8 @@ const _libViewForRoute: Record<string, LibView> = {
   '/romm-sync-bios': 'bios',
   '/romm-sync-downloads': 'downloads',
   '/romm-sync-platforms': 'platforms',
+  '/romm-sync-regions': 'regions',
+  '/romm-sync-playtime': 'playtime',
 };
 
 
@@ -135,6 +137,17 @@ export function RouteGuard({ children }: { children: any }) {
 export function setLibViewHooks(push: ((v: LibView) => void) | null, pop: (() => void) | null) {
   _libPushView = push;
   _libPopView = pop;
+  if (push && _pendingView) { const v = _pendingView; _pendingView = null; push(v); }
+}
+
+// Open an in-library view from outside Ludo (the Quick Access panel): through
+// the library, so B from it lands on Ludo's Home like it does in-app, rather
+// than on a lone page whose Back leaves the plugin.
+let _pendingView: LibView | null = null;
+export function openInLibrary(v: LibView) {
+  if (_libPushView) { _libPushView(v); return; }
+  _pendingView = v;
+  try { Navigation.Navigate('/romm-sync-library'); } catch { _pendingView = null; }
 }
 
 /** Push an in-library view; false if no library route is hosting us. */

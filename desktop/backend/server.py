@@ -26,7 +26,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 # ── The backend ─────────────────────────────────────────────────────────────
 #
@@ -225,6 +225,42 @@ class Engine:
 ENGINE: Engine | None = None
 
 
+# ── Change nudges: engine -> UI ─────────────────────────────────────────────
+#
+# The engine publishes topic names when something the UI shows changes
+# (romm_sync_engine.events). A browser can't receive a push over plain HTTP, so
+# the UI holds one long-poll open: GET /api/_events?after=<seq> returns as soon
+# as anything newer than <seq> exists, or empty after LONG_POLL_S. The seq
+# restarts with the process; a client that sees it go backwards resyncs.
+
+class EventLog:
+    LONG_POLL_S = 25
+    KEEP = 256
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._seq = 0
+        self._items: list = []
+
+    def push(self, topic: str):
+        with self._cond:
+            self._seq += 1
+            self._items.append((self._seq, topic))
+            del self._items[:-self.KEEP]
+            self._cond.notify_all()
+
+    def wait(self, after: int) -> dict:
+        with self._cond:
+            if after > self._seq:  # backend restarted under this client
+                return {"seq": self._seq, "topics": [], "reset": True}
+            self._cond.wait_for(lambda: self._seq > after, timeout=self.LONG_POLL_S)
+            topics = sorted({t for n, t in self._items if n > after})
+            return {"seq": self._seq, "topics": topics}
+
+
+EVENTS = EventLog()
+
+
 # ── Non-plugin RPC: filesystem listing for the file picker ──────────────────
 
 def host_list_dir(path: str, include_files: bool = False) -> dict:
@@ -406,6 +442,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/_events":
+            try:
+                after = int((parse_qs(parsed.query).get("after") or ["0"])[0])
+            except ValueError:
+                after = 0
+            self._json(200, EVENTS.wait(after))
+            return
         if parsed.path.startswith("/sounds/"):
             self._sound(unquote(parsed.path[len("/sounds/"):]))
             return
@@ -439,6 +482,8 @@ def serve(host="127.0.0.1", port=8723):
     """
     global ENGINE
     ENGINE = Engine()
+    from romm_sync_engine import events as _engine_events
+    _engine_events.add_sink(EVENTS.push)
     print("[server] starting engine…", flush=True)
     ENGINE.start()
     print("[server] engine ready", flush=True)

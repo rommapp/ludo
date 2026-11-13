@@ -12,6 +12,19 @@ import { callable } from "@ludo/host";
 
 // Call backend methods
 export const getServiceStatus = callable<[], any>("get_service_status");
+export const eventsSupported = callable<[], boolean>("events_supported");
+export const gameRunning = callable<[], { running: boolean }>("game_running");
+// Full status, but the collection list only when it changed since `rev`
+// (see get_service_status). Older backends ignore the args and send it all.
+export const getServiceStatusSince = callable<[boolean, string | null], any>("get_service_status");
+// Connection state without the per-collection list. Falls back to the full call
+// against a backend that predates the flag.
+const _getServiceStatusLite = callable<[boolean], any>("get_service_status");
+let _liteOk = true;
+export async function getServiceStatusLite(): Promise<any> {
+  if (_liteOk) { try { return await _getServiceStatusLite(true); } catch { _liteOk = false; } }
+  return getServiceStatus();
+}
 export const timeColdFetch = callable<[], any>("time_cold_fetch");
 // LUDO_DEBUG=1 in the plugin's environment. Gates developer-only Settings rows.
 export const isDebugMode = callable<[], boolean>("is_debug_mode");
@@ -22,6 +35,8 @@ export const notifyNetworkState = callable<[boolean], any>("notify_network_state
 // uploads) and absent on collection-wide ones.
 export const drainNotifications = callable<[], { events: Array<{ kind: string, title: string, body: string, timestamp: number, rom_id?: number | null, has_cover?: boolean, critical?: boolean, action?: { kind: string, platform?: string } | null }> }>("drain_notifications");
 export const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
+export const getRegionOrder = callable<[], any>("get_region_order");
+export const setRegionOrder = callable<[string[]], any>("set_region_order");
 export const rebuildLibrary = callable<[], any>("rebuild_library");
 // Re-reads one platform and reconciles that slice. Takes a slug (what the
 // platform groups are keyed by) or a numeric id.
@@ -82,6 +97,13 @@ export const logout = callable<[boolean], any>("logout");
 export const getAccountUsername = callable<[], any>("get_account_username");
 export const getAvatar = callable<[], any>("get_avatar");
 export const getPluginStats = callable<[], any>("get_plugin_stats");
+// Play time (engine play_sessions + play_stats).
+export const getPlayTime = callable<[], any>("get_play_time");
+export const getGamePlayTime = callable<[number], any>("get_game_play_time");
+export const getMostPlayed = callable<[number], { success: boolean; games: Array<{ rom_id: number; ms: number; game?: any }> }>("get_most_played");
+export const playTimeUpload = callable<[], any>("play_time_upload");
+export const playTimeRefresh = callable<[], any>("play_time_refresh");
+export const playTimeDeleteGame = callable<[number], any>("play_time_delete_game");
 export const saveConfig = callable<[string, string, string, string, string, string, string], any>("save_config");
 export const testRommConnection = callable<[string, string, string], any>("test_connection");
 export const pairDevice = callable<[string, string], any>("pair_device");
@@ -124,6 +146,7 @@ export const setSwitchAddonMode = callable<[string], any>("set_switch_addon_mode
 export const toggleCollectionSync = callable<[string, boolean], any>("toggle_collection_sync");
 export const deleteCollectionRoms = callable<[string, string], any>("delete_collection_roms");
 export const getDownloadProgress = callable<[number], any>("get_download_progress");
+export const getDownloads = callable<[], Record<string, any>>("get_downloads");
 export const cancelDownloadRpc = callable<[number], any>("cancel_download");
 export const deleteGame = callable<[number], any>("delete_game");
 export const launchGame = callable<[number, (string | null)?, (number | null)?, (boolean)?], any>("launch_game");
@@ -172,3 +195,9 @@ export const downloadUpdate = callable<[string, string?], any>("download_update"
 export const applyAppImageUpdate = callable<[string], any>("apply_appimage_update");
 export const getCheckOnStartup = callable<[], boolean>("get_check_on_startup");
 export const setCheckOnStartup = callable<[boolean], boolean>("set_check_on_startup");
+export const getMonthlyRecap = callable<[string], any>("get_monthly_recap");
+export const playTimeSyncIfDue = callable<[number], any>("play_time_sync_if_due");
+export const getRecapDue = callable<[], any>("get_recap_due");
+export const dismissRecap = callable<[month: string], any>("dismiss_recap");
+export const setMostPlayedHome = callable<[boolean], any>("set_most_played_home");
+export const setRecapAuto = callable<[boolean], any>("set_recap_auto");

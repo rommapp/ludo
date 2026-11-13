@@ -115,10 +115,13 @@ export function FoldersSection() {
 
   const row = (kind: string, label: string, icon: any, hint: string) => {
     const configured = cfg[kind] || '';
-    const inUse = configured || detected[kind] || '';
+    // RetroArch's own save folder wins over ours, so a choice here would do
+    // nothing: show the real folder and send them to RetroArch to change it.
+    const owned = kind === 'saves' ? status.retroarch_save_dir || '' : '';
+    const inUse = owned || configured || detected[kind] || '';
     const bad = staleFor(kind);
     return (
-      <V2CardRow key={kind} icon={icon} danger={!!bad} title={label}
+      <V2CardRow key={kind} icon={icon} danger={!!bad} title={label} focusable
         subtitle={busy === kind ? 'Saving…' : bad ? (
           <span>
             {bad.reason} · <span style={{ textDecoration: 'line-through', opacity: 0.7 }}>{bad.value}</span>
@@ -134,7 +137,7 @@ export function FoldersSection() {
           <span style={{ wordBreak: 'break-all' }}>
             {inUse || 'Not set'}
             <span style={{ color: V2.fgFaint }}>
-              {'  ·  '}{configured ? hint
+              {'  ·  '}{owned ? 'set in RetroArch, change it there' : configured ? hint
                 : inUse ? 'detected automatically'
                   // Nothing set and nothing detected. "set by you" was plainly
                   // wrong here — it read "Not set · set by you" — and so was
@@ -144,10 +147,11 @@ export function FoldersSection() {
             </span>
           </span>
         )}
-        onClick={busy ? undefined : () => (bad ? fixStale(bad) : openActions(kind, label, inUse))}
+        onClick={busy || (owned && !bad) ? undefined
+          : () => (bad ? fixStale(bad) : openActions(kind, label, inUse))}
         right={bad
           ? <span style={{ fontSize: '13px', fontWeight: 600, color: V2.brandHover }}>Fix</span>
-          : <FaChevronRight size={12} style={{ color: V2.fgFaint }} />} />
+          : owned ? undefined : <FaChevronRight size={12} style={{ color: V2.fgFaint }} />} />
     );
   };
 
@@ -1058,6 +1062,22 @@ export function SetupWizard() {
                 ['BIOS directory', 'bios', biosDir, setBiosDir],
               ] as [string, string, string, (v: string) => void][]).map(([lbl, key, val, raw]) => {
                 const set = markDir(key, raw);
+                // RetroArch's own save folder wins, so a field here would be ignored.
+                if (key === 'saves' && emu?.retroarch_save_dir) return (
+                  <div key={lbl} style={{ display: 'flex', alignItems: 'flex-end', gap: '10px', width: '100%' }}>
+                    <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+                      <div style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase',
+                        color: V2.fgMuted, textAlign: 'center', marginBottom: '6px' }}>{lbl}</div>
+                      <div title={emu.retroarch_save_dir} style={{ boxSizing: 'border-box', height: '40px', lineHeight: '38px', padding: '0 12px',
+                        fontSize: '14px', color: V2.fgMuted, border: `1px solid ${V2.border}`, borderRadius: V2.radiusMd,
+                        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{emu.retroarch_save_dir}</div>
+                    </div>
+                    <div style={{ flexShrink: 0, width: '114px', height: '40px', display: 'flex', alignItems: 'center',
+                      justifyContent: 'center', textAlign: 'center', fontSize: '11px', lineHeight: 1.25, color: V2.fgFaint }}>
+                      Set in RetroArch
+                    </div>
+                  </div>
+                );
                 return (
                 <Focusable key={lbl} noFocusRing flow-children="horizontal"
                   style={{ display: 'flex', alignItems: 'flex-end', gap: '10px', width: '100%' }}>

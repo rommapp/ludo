@@ -1,4 +1,5 @@
-import { ackLibraryAnnouncement, drainNotifications, getServiceStatus, getSyncIndicator } from "./rpc";
+import { watchTopic } from "./push";
+import { ackLibraryAnnouncement, drainNotifications, getServiceStatusLite, getSyncIndicator } from "./rpc";
 import { Navigation } from "@ludo/host";
 import { toaster } from "./toast";
 import { _pushSaveActivity, useSaveActivity, useServiceStatus} from "./status";
@@ -278,12 +279,14 @@ function hardDismiss(t: { dismiss: () => void; data?: any } | null) {
   } catch { /* private API moved; the duration cap still bounds it */ }
 }
 
-export const checkForNotifications = async () => {
-  try {
-    // Connection-lost / restored toast — runs here (not in a component) so it
-    // fires even while the RomM app isn't open (e.g. mid-game).
+export const checkForNotifications = async () => { await checkConnection(); await drainToasts(); };
+
+// Connection-lost / restored toast — runs here (not in a component) so it
+// fires even while the RomM app isn't open (e.g. mid-game). Driven by the
+// backend's 'connection' nudge, with a slow safety poll (see push.ts).
+const checkConnection = async () => {
     try {
-      const st = await getServiceStatus();
+      const st = await getServiceStatusLite();
       const conn = st?.connection ?? null;
       if (conn && conn !== 'connecting') {
         const isOff = conn === 'offline_cached' || conn === 'disconnected';
@@ -294,6 +297,9 @@ export const checkForNotifications = async () => {
         // _prevConn untouched (rather than just skipping the toast) is what stops
         // an unreported blip from being followed by a baffling "Back online".
         const confirmed = !isOff || (_offSamples >= 2 && !_emuInstall.active);
+        // The second sample used to come from the next 2s tick. Pushed, the
+        // next nudge may be a long way off, so take it ourselves.
+        if (isOff && !confirmed && !_emuInstall.active) setTimeout(() => { checkConnection(); }, 2500);
         if (confirmed) {
           if (_prevConn === 'online' && isOff) {
             const r = st?.unreachable_reason;
@@ -463,7 +469,11 @@ export const checkForNotifications = async () => {
         finally { _annShown = false; }
       }
     } catch { /* transient */ }
+};
 
+// Toasts the backend queued. Driven by its 'notifications' nudge.
+const drainToasts = async () => {
+  try {
     const { events } = await drainNotifications();
     if (!events?.length) return;
     // A save/state upload replaces that game's state screenshot. The row's own
@@ -513,20 +523,22 @@ export const checkForNotifications = async () => {
 // Background notification polling — drains events the backend emits at the exact
 // moment a sync/removal happens. No state diffing, no transition inference: the
 // backend is the single source of truth (see CollectionSyncManager.push_notification).
-export let backgroundInterval: any = null;
+let _bgStops: Array<() => void> = [];
 
 export const startBackgroundMonitoring = () => {
-  if (backgroundInterval) {
-    clearInterval(backgroundInterval);
-  }
+  stopBackgroundMonitoring();
   console.log('[BACKGROUND] Starting background notification monitoring');
-  backgroundInterval = setInterval(checkForNotifications, 2000);
+  // 2s against a backend without nudges (the old pace); 30s safety net with.
+  _bgStops = [
+    watchTopic('connection', checkConnection, 2000, 30000),
+    watchTopic('notifications', drainToasts, 2000, 30000),
+  ];
+  checkForNotifications();
 };
 
 export const stopBackgroundMonitoring = () => {
-  if (backgroundInterval) {
-    console.log('[BACKGROUND] Stopping background notification monitoring');
-    clearInterval(backgroundInterval);
-    backgroundInterval = null;
-  }
+  if (!_bgStops.length) return;
+  console.log('[BACKGROUND] Stopping background notification monitoring');
+  _bgStops.forEach((stop) => stop());
+  _bgStops = [];
 };

@@ -62,4 +62,12 @@ export const launcher: HostLauncher = {
     // callers can return it straight out of an effect.
     return () => {};
   },
+
+  // A game here is its own desktop window, reachable like any other.
+  sessionRunning() {
+    return false;
+  },
+  resumeSession() {
+    return false;
+  },
 };

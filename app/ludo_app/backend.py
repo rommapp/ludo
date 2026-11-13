@@ -38,6 +38,7 @@ from .release_token import release_token
 # Claim our app identity before anything reads or writes engine state. Ludo
 # keeps ~/.config/ludo; it shares nothing with the GTK app.
 from romm_sync_engine import paths as _paths  # noqa: E402
+from romm_sync_engine import events as _events  # noqa: E402
 _paths.set_app_id("ludo")
 _paths.set_client_name("Ludo")
 # Downloads, covers and generated icons go under ~/Ludo rather than the GTK
@@ -68,14 +69,14 @@ except ImportError as e:
 try:
     from romm_sync_engine.sync_core import (
         SettingsManager, RomMClient, RetroArchInterface, DEVICE_CAPABILITIES,
-        AutoSyncManager, CollectionSyncManager,
+        AutoSyncManager, CollectionSyncManager, filename_region_rank, ALL_REGION_NAMES,
         BiosTrackingManager, ROM_TRIM_FIELDS, LIBRARY_PAGE_SIZE,
         SteamShortcutManager, CoverArtManager,
         build_sync_status, is_path_validly_downloaded, detect_retrodeck,
         platform_folder_candidates,
         flatpak_app_installed,
         STANDALONE_EMULATORS, find_standalone_builds,
-        _extract_archive, _archive_member_names, WIIU_SLUGS, resolve_wiiu_rom,
+        _extract_archive, _archive_member_names, arcade_romset_stays_zipped, WIIU_SLUGS, resolve_wiiu_rom,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
         push_notification as _push_notification,
@@ -152,7 +153,7 @@ snapshot_file = CONFIG_DIR / 'library_snapshot.json'
 # its count forever, so nothing would ever heal it. Hence a bump rather than a
 # migration: the grouping cannot be redone from the persisted rows, because the
 # siblings it would need were folded away when the snapshot was written.
-SNAPSHOT_SCHEMA = 3
+SNAPSHOT_SCHEMA = 4  # 4: rows and versions carry has_file_on_disk
 
 # How long the last library fetch took, so a user can report it without having
 # to reproduce it while someone watches. Diagnosing the RomM fetch has meant
@@ -218,7 +219,7 @@ resume_file = CONFIG_DIR / 'library_resume.ndjson'
 # checkpoint replayed under v3 keying would serve the first platform's rows to
 # every platform. Neither the total nor the page_size check would catch it —
 # both are unchanged by the switch.
-RESUME_SCHEMA = 3
+RESUME_SCHEMA = 4
 # Same 24h bound Argosy puts on its sync-resume generation: past that, the
 # library has probably moved on and replaying stale pages is worse than refetching.
 RESUME_TTL_SECONDS = 24 * 3600
@@ -238,6 +239,15 @@ def _platform_label(rom):
     """
     return (rom.get('platform_custom_name') or rom.get('platform_display_name')
             or rom.get('platform_name') or 'Unknown')
+
+
+NO_SERVER_FILE_MESSAGE = 'RomM has no file for this entry.'
+
+
+def _no_server_file(rom):
+    """True when RomM says this row has no file. Older servers omit the field,
+    which must read as having one."""
+    return (rom or {}).get('has_file_on_disk') is False
 
 
 def _variant_count(game):
@@ -353,6 +363,12 @@ _NON_GAME_EXTS = (
 # when they are all there is, they are the game.
 _AMBIGUOUS_GAME_EXTS = ('.md',)
 
+# What must be unpacked before a core can boot it. The second line is Dolphin's:
+# it cannot read inside an archive, and handed one RetroArch just hangs.
+_DISC_IMAGE_EXTS = ('.cue', '.bin', '.iso', '.chd', '.gdi', '.cdi',
+                    '.mdf', '.nrg', '.ccd', '.img', '.pbp',
+                    '.wbfs', '.rvz', '.gcm', '.gcz', '.wia', '.ciso', '.tgc')
+
 # Disc dumps that describe their own tracks: the descriptor is the thing to
 # boot, and every other file in the folder belongs to it. Excludes .m3u, which
 # RomM also emits for multi-FILE regional ROMs that are not discs at all.
@@ -388,6 +404,10 @@ def _list_standalone_games(folder):
         if ext.startswith('.state'):
             continue
         games.append(f)
+    # An archive beside the game it unpacks to is not a second game.
+    unpacked = [f for f in games if f.suffix.lower() not in ('.zip', '.7z')]
+    if unpacked:
+        games = unpacked
     if not games:
         games = [f for f in folder.rglob('*')
                  if f.is_file() and f.suffix.lower() in _AMBIGUOUS_GAME_EXTS]
@@ -428,6 +448,11 @@ def _resolve_download_path(download_dir, platform_slug, file_name):
                          Path(download_dir) / folder / (stem + '__extracted')):
                 if is_path_validly_downloaded(cand):
                     return cand, True
+            # Unpacked by hand, with the archive then deleted.
+            for ext in _DISC_IMAGE_EXTS:
+                cand = Path(download_dir) / folder / (stem + ext)
+                if is_path_validly_downloaded(cand):
+                    return cand, True
     # Not downloaded — report where it *would* go, i.e. the ES-DE folder.
     return Path(download_dir) / folders[0] / file_name, False
 
@@ -449,6 +474,9 @@ def _detect_multi_disc(local_path, is_downloaded):
     if p.is_dir():
         launchable = [f for f in p.rglob('*')
                       if f.is_file() and f.suffix.lower() in _LAUNCHABLE_DISC_EXTS]
+        # One disc and RomM's one-line playlist is still one disc.
+        if sum(f.suffix.lower() != '.m3u' for f in launchable) == 1:
+            return False, 0
         if len(launchable) > 1:
             return True, len(launchable)
         # No disc set — fall back to standalone game files (regional variants).
@@ -695,6 +723,34 @@ class _RPCWork:
         publish()
 
 
+class _ProgressTable(dict):
+    """rom_id -> download progress entry, which nudges the UI on what matters.
+
+    Entries are replaced wholesale (never mutated in place) on every chunk. A
+    nudge goes out only when a download starts, changes phase or message
+    (downloading -> extracting, say), ends, or is dropped: the moments a user
+    sees. Progress within a phase is read by the UI's one shared poller.
+    """
+
+    def __setitem__(self, key, value):
+        old = self.get(key)
+        super().__setitem__(key, value)
+        if (not isinstance(old, dict) or not isinstance(value, dict)
+                or old.get('state') != value.get('state')
+                or old.get('message') != value.get('message')):
+            _events.publish('downloads')
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        _events.publish('downloads')
+
+    def pop(self, key, *default):
+        had = key in self
+        out = super().pop(key, *default)
+        if had:
+            _events.publish('downloads')
+        return out
+
 class LudoBackend:
     """Every RPC the UI can call, on either shell.
 
@@ -822,7 +878,20 @@ class LudoBackend:
     # look hung. Written from the fetch's worker threads and read by the status
     # poll; a dict rebind is atomic under the GIL, so no lock — never mutate it
     # in place.
-    _library_progress: dict = None
+    _library_progress_v: dict = None
+
+    # Both feed the connection/library banner and toasts; assigning them
+    # nudges the UI (see romm_sync_engine.events) instead of it polling.
+    @property
+    def _library_progress(self):
+        return self._library_progress_v
+
+    @_library_progress.setter
+    def _library_progress(self, v):
+        changed = v != self._library_progress_v
+        self._library_progress_v = v
+        if changed:
+            _events.publish('connection')
 
     # Set between pairing and the end of the setup wizard, to hold back the
     # whole-library walk until the user has picked their platforms. Pairing has
@@ -843,7 +912,18 @@ class LudoBackend:
     # {'kind': 'failed'}, else None. Only ever set for the FIRST library load on
     # this device; the frontend calls ack_library_announcement() once it has
     # shown it, which persists the fact so a plugin reload doesn't re-toast.
-    _announce_library: dict = None
+    _announce_library_v: dict = None
+
+    @property
+    def _announce_library(self):
+        return self._announce_library_v
+
+    @_announce_library.setter
+    def _announce_library(self, v):
+        changed = v != self._announce_library_v
+        self._announce_library_v = v
+        if changed:
+            _events.publish('connection')
 
     # Reachability state, distinct from RomMClient.authenticated (which is
     # sticky — a network drop never flips it). The state machine itself lives in
@@ -871,7 +951,7 @@ class LudoBackend:
     # Live per-game download progress {rom_id: {percent, downloaded, total, speed,
     # eta, state}} populated by download_game's progress_callback and polled by the
     # frontend via get_download_progress() for the cover/button fill UI.
-    _download_progress: dict = {}
+    _download_progress: dict = _ProgressTable()
 
     # rom_ids the user asked to stop. download_rom polls this between chunks and
     # deletes its partial file when it sees the id; cleared when a download starts.
@@ -915,6 +995,7 @@ class LudoBackend:
         # base rom_id -> {'file_name', 'percent', 'state'} for the add-on
         # fetch_switch_add_on is downloading for that game.
         self._switch_fetch_state = {}
+        RomMClient.region_order_source = self._saved_region_order
         logging.info(f"Ludo backend {self._host.version} on host "
                      f"{self._host.name!r} (updates from {self._host.asset_suffix})")
 
@@ -1083,6 +1164,8 @@ class LudoBackend:
                 rom_removed_callback=self._on_rom_removed_from_server,
                 parent_window=None,
             )
+            # Play sessions are recorded offline too, before sync can start.
+            self._auto_sync.start_play_watch()
 
         # Cold-start hydration: seed the library from the last persisted snapshot
         # so the Game Browser is populated immediately — before the retry thread
@@ -1586,7 +1669,8 @@ class LudoBackend:
     # matching disc/member filenames, and falls back destructively when it finds
     # nothing), so they must stay present and complete for every game.
     _SNAPSHOT_FILE_KEYS = ('file_name', 'fs_name', 'file_size_bytes', 'size_bytes')
-    _SNAPSHOT_SIBLING_KEYS = ('id', 'name', 'fs_name', 'fs_name_no_ext', 'fs_extension')
+    _SNAPSHOT_SIBLING_KEYS = ('id', 'name', 'fs_name', 'fs_name_no_ext', 'fs_extension',
+                              'has_file_on_disk')
 
     @staticmethod
     def _project(entries, keys):
@@ -1799,6 +1883,17 @@ class LudoBackend:
                 # dropping them here would mark the game not-downloaded and
                 # offer to fetch a region the user already has.
                 variants = self._variant_downloads(g)
+                # The tile's version can change between fetches (a new region
+                # priority, a version gaining or losing its file). A file already
+                # on disk under another version must still count.
+                for s in (g.get('_sibling_files') or []):
+                    sid, fs = (s.get('id'), s.get('fs_name')) if isinstance(s, dict) else (None, None)
+                    if sid and fs and sid not in variants:
+                        p, on_disk = _resolve_download_path(download_dir, platform_slug, fs)
+                        if on_disk:
+                            variants[sid] = {'file_name': fs, 'local_path': str(p),
+                                             'name': s.get('name')}
+                            g['_variant_downloads'] = variants
                 if variants:
                     live = {str(vid): v for vid, v in variants.items()
                             if v.get('local_path')
@@ -2230,8 +2325,11 @@ class LudoBackend:
                     rom_removed_callback=self._on_rom_removed_from_server,
                     parent_window=None,
                 )
+                self._auto_sync.start_play_watch()
             else:
                 self._auto_sync.romm_client = self._romm_client
+            # A heartbeat told the device is gone registers it again.
+            self._auto_sync.play_sessions.on_device_missing = self._ensure_device_registered
 
             # Same hold as the library walk, for the same reason. The connect
             # negotiate is bidirectional: it sends an empty local inventory and
@@ -2243,6 +2341,8 @@ class LudoBackend:
             # is a decision rather than a screen in progress.)
             if self._defer_library_fetch:
                 logging.info("Setup in progress — holding save auto-sync until setup ends")
+            elif os.environ.get('LUDO_DEV_READ_ONLY'):
+                logging.info("Read-only sandbox — save auto-sync stays off")
             # Always on: Ludo has no switch for it. AutoSync/auto_enable_on_connect
             # is RomM RetroArch Sync's, and a settings file carried over from it
             # with that off left sync silently dead, with nothing in Ludo to undo it.
@@ -2448,12 +2548,20 @@ class LudoBackend:
         Drives the offline sync-queue indicator ("N saves waiting to sync").
         Best-effort: 0 when auto-sync isn't up or anything goes wrong.
         """
+        # Walks every save and state folder on disk; the status poll asks every
+        # 1.5-2s, so reuse the answer for a few seconds.
+        now = time.monotonic()
+        cached = getattr(self, '_pending_saves_cache', None)
+        if cached and now - cached[0] < 5.0:
+            return cached[1]
+        n = 0
         try:
             if self._auto_sync and hasattr(self._auto_sync, 'count_pending_saves'):
-                return self._auto_sync.count_pending_saves()
+                n = self._auto_sync.count_pending_saves()
         except Exception as e:
             logging.debug(f"_count_pending_saves failed: {e}")
-        return 0
+        self._pending_saves_cache = (now, n)
+        return n
 
     def _save_activity(self):
         """What save-sync is doing right now — feeds the live sync indicator.
@@ -2485,8 +2593,33 @@ class LudoBackend:
             logging.debug(f"get_pending_uploads failed: {e}")
         return []
 
-    async def get_service_status(self):
-        """Build and return current sync status directly from live object state."""
+    async def get_service_status(self, lite=False, collections_rev=None):
+        """Build and return current sync status directly from live object state.
+
+        ``lite`` drops the per-collection list (hundreds of entries on a big
+        library, ~100 KB): callers that only need the connection state poll
+        every couple of seconds, including mid-game.
+
+        ``collections_rev`` is the ``collections_rev`` of the caller's last
+        reply. When the list hasn't changed since, it is left out and
+        ``collections_unchanged`` is set, so the steady-state poll is a few
+        hundred bytes instead of the whole list.
+        """
+        st = await self._service_status()
+        if not isinstance(st, dict):
+            return st
+        if lite:
+            return {k: v for k, v in st.items() if k not in ('collections', 'details')}
+        cols = st.get('collections')
+        if isinstance(cols, list):
+            rev = hashlib.sha1(json.dumps(cols, sort_keys=True, default=str).encode()).hexdigest()[:16]
+            st['collections_rev'] = rev
+            if collections_rev and collections_rev == rev:
+                st = {k: v for k, v in st.items() if k != 'collections'}
+                st['collections_unchanged'] = True
+        return st
+
+    async def _service_status(self):
         try:
             if not (self._retry_thread and self._retry_thread.is_alive()):
                 return {
@@ -2657,7 +2790,9 @@ class LudoBackend:
                 # holds the auto-sync lock, so this instance is browsing only.
                 'sync_blocked':            bool(status.get('sync_blocked')),
                 'message':                 message,
-                'details':                 status,
+                # Everything but the collection list, which is already sent
+                # once below; carrying it twice doubled every status poll.
+                'details':                 {k: v for k, v in status.items() if k != 'collections'},
                 'collections':             collections,
                 'collection_count':        collection_count,
                 'actively_syncing_count':  actively_syncing_count,
@@ -2674,6 +2809,11 @@ class LudoBackend:
                 'collections':      [],
                 'collection_count': 0,
             }
+
+    async def events_supported(self):
+        """True: this backend nudges the UI on change (romm_sync_engine.events),
+        so its timers can fall back to a slow safety poll."""
+        return True
 
     async def drain_notifications(self):
         """Return and clear queued notification events from the sync engine.
@@ -3471,6 +3611,38 @@ class LudoBackend:
             return {'success': True, 'enabled': bool(enabled)}
         except Exception as e:
             logging.error(f"set_virtual_collections_visible error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    def _saved_region_order(self):
+        """This device's region order; [] means follow RomM's."""
+        try:
+            raw = self._settings.get('Library', 'region_order', '') or ''
+        except Exception:
+            return []
+        return [n for n in raw.split(',') if n in ALL_REGION_NAMES]
+
+    async def get_region_order(self):
+        """Settings ▸ Region order. `order` is always complete: the saved order,
+        or RomM's, with every other region after it."""
+        try:
+            client = self._romm_client
+            server = client.server_regions() if client else []
+            saved = self._saved_region_order()
+            start = saved or server
+            return {'success': True, 'follow': not saved, 'server': server,
+                    'order': start + [n for n in ALL_REGION_NAMES if n not in start]}
+        except Exception as e:
+            logging.error(f"get_region_order error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def set_region_order(self, order=None):
+        """Save this device's region order; empty goes back to following RomM."""
+        try:
+            names = [n for n in (order or []) if n in ALL_REGION_NAMES]
+            self._settings.set('Library', 'region_order', ','.join(names))
+            return {'success': True, 'follow': not names}
+        except Exception as e:
+            logging.error(f"set_region_order error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
     async def get_screenshot_mode(self):
@@ -4374,6 +4546,291 @@ class LudoBackend:
             logging.error(f"get_avatar error: {e}", exc_info=True)
             return {'data_uri': None}
 
+    # -----------------------------------------------------------------------
+    # Play time
+    # -----------------------------------------------------------------------
+    #
+    # Sessions are tracked and synced by the engine (play_sessions); figures
+    # come from play_stats. A variant (region, disc) is folded onto the game
+    # the library shows, so one game has one total wherever it appears.
+
+    def _play_sessions(self):
+        auto = self._auto_sync
+        return getattr(auto, 'play_sessions', None) if auto else None
+
+    def _play_rows(self):
+        """Sessions with variants folded onto their library game, plus the
+        naming map play_stats wants."""
+        ps = self._play_sessions()
+        if not ps:
+            return [], {}, {}, {}
+        rows, devices, meta = ps.store.snapshot()
+        parent = self._variant_parent_index()
+        for r in rows:
+            if r.get('rom_id') in parent:
+                r['rom_id'] = parent[r['rom_id']]
+        games = {}
+        for rom_id, g in self._games_index().items():
+            games[rom_id] = {
+                'name': g.get('display_name') or g.get('name') or '',
+                'platform_name': self._platform_name_for(g),
+                'platform_slug': g.get('platform_slug') or '',
+            }
+        return rows, games, devices, meta
+
+    def _this_device(self):
+        return self._settings.get('Device', 'device_id', '') if self._settings else ''
+
+    async def get_play_time(self):
+        """Everything the Play time page shows."""
+        try:
+            from romm_sync_engine import play_stats
+            rows, games, devices, meta = self._play_rows()
+            out = play_stats.compute(rows, games, self._this_device(), devices, meta)
+            out['online'] = bool(self._romm_client and self._romm_client.authenticated)
+            out['recap_auto'] = meta.get('recap_auto') is not False
+            out['most_played_home'] = meta.get('most_played_home') is not False
+            return {'success': True, **out}
+        except Exception as e:
+            logging.error(f"get_play_time error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def get_game_play_time(self, rom_id: int):
+        """One game's play time, for its page. played=False when never played."""
+        try:
+            from romm_sync_engine import play_stats
+            rows, _games, devices, _meta = self._play_rows()
+            g = play_stats.for_game(rows, int(rom_id), self._this_device(), devices)
+            return {'success': True, 'played': g is not None, **(g or {})}
+        except Exception as e:
+            logging.error(f"get_game_play_time error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def get_most_played(self, limit: int = 20):
+        """[{rom_id, ms, game}] for the home row, games still in the library only."""
+        try:
+            from romm_sync_engine import play_stats
+            rows, games, _devices, meta = self._play_rows()
+            if meta.get('most_played_home') is False:
+                return {'success': True, 'games': []}
+            top = play_stats.top_games([r for r in rows if r.get('rom_id') in games], int(limit))
+            # The game itself too: Home may not have loaded its platform (a game
+            # played on another device and not downloaded here).
+            index = self._games_index()
+            return {'success': True, 'games': [
+                {'rom_id': k, 'ms': ms, 'game': self._serialize_game(index[k]) if k in index else None}
+                for k, ms in top]}
+        except Exception as e:
+            logging.error(f"get_most_played error: {e}", exc_info=True)
+            return {'success': False, 'games': []}
+
+    async def play_time_upload(self):
+        """Upload now. Returns the counts, or why it could not run."""
+        ps = self._play_sessions()
+        if not ps:
+            return {'success': False, 'message': 'Play time is not ready yet'}
+        r = await asyncio.to_thread(ps.upload_now)
+        if r is None:
+            return {'success': False, 'message': 'Connect to RomM to upload'}
+        sent, dup, failed, stopped = r
+        if stopped:
+            return {'success': False, 'message': f'Upload stopped: {stopped}'}
+        return {'success': True, 'sent': sent, 'duplicates': dup, 'failed': failed}
+
+    async def play_time_refresh(self):
+        """Pull every device's sessions from RomM now."""
+        ps = self._play_sessions()
+        if not ps:
+            return {'success': False, 'message': 'Play time is not ready yet'}
+        r = await asyncio.to_thread(ps.refresh_now)
+        if r is None:
+            return {'success': False, 'message': 'Connect to RomM to refresh'}
+        added, devices, stopped = r
+        if stopped:
+            return {'success': False, 'message': f'Refresh stopped: {stopped}'}
+        return {'success': True, 'added': added, 'devices': devices}
+
+    def _recap_ra(self, ps, played, month=None):
+        """RetroAchievements progression for the recap, and the games behind
+        it. RomM's progression names a game only by its RA id and an unlock
+        only by its badge id, so the games are resolved through their RomM
+        detail (which lists every achievement) and kept in ra_games.json:
+        the games played here first, then, for unlocks still unnamed, one
+        has_ra listing a day. Offline, the last progression is used."""
+        path = ps.store.path.parent / 'ra_games.json'
+        try:
+            cache = json.loads(path.read_text())
+        except Exception:
+            cache = {}
+        by_rom = cache.setdefault('by_rom', {})        # str(rom_id) -> ra_id | None
+        ra_games = cache.setdefault('games', {})       # str(ra_id) -> {rom_id, name, achievements}
+        client = self._romm_client
+        online = bool(client and client.authenticated)
+        changed = False
+
+        def get(url, **params):
+            return client.session.get(urljoin(client.base_url, url), params=params or None, timeout=20)
+
+        def resolve(rom_id):
+            r = get(f'/api/roms/{rom_id}')
+            if r.status_code != 200:
+                return
+            d = r.json()
+            ra_id = d.get('ra_id')
+            by_rom[str(rom_id)] = ra_id
+            if ra_id:
+                ra_games[str(ra_id)] = {
+                    'rom_id': rom_id,
+                    'name': d.get('name') or '',
+                    'achievements': {str(a['badge_id']): {
+                        'title': a.get('title'), 'description': a.get('description'),
+                        'points': a.get('points'), 'badge_url': a.get('badge_url')}
+                        for a in ((d.get('merged_ra_metadata') or {}).get('achievements') or [])
+                        if a.get('badge_id') is not None},
+                }
+
+        if online:
+            try:
+                r = get('/api/users/me')
+                if r.status_code == 200:
+                    cache['progression'] = ((r.json().get('ra_progression') or {}).get('results') or [])
+                    changed = True
+                for rom_id in played:
+                    if str(rom_id) not in by_rom:
+                        resolve(rom_id)
+                        changed = True
+                if month:
+                    from romm_sync_engine.play_stats import _month_bounds, _parse_utc
+                    start, end = _month_bounds(month)[:2]
+                    wanted = {p.get('rom_ra_id') for p in cache.get('progression') or []
+                              if any(start <= (_parse_utc(e.get('date')) or 0) < end
+                                     for e in p.get('earned_achievements') or [])}
+                    missing = {w for w in wanted if w and str(w) not in ra_games}
+                    if missing and time.time() - cache.get('scan_at', 0) > 86400:
+                        cache['scan_at'] = time.time()
+                        changed = True
+                        offset, found = 0, {}
+                        while True:
+                            r = get('/api/roms', has_ra='true', limit=100, offset=offset)
+                            items = (r.json().get('items') or []) if r.status_code == 200 else []
+                            for it in items:
+                                if it.get('ra_id') in missing:
+                                    found[it['ra_id']] = it['id']
+                            offset += len(items)
+                            if len(items) < 100 or len(found) == len(missing):
+                                break
+                        for rom_id in found.values():
+                            resolve(rom_id)
+            except Exception as e:
+                logging.debug(f"recap RetroAchievements lookup: {e}")
+        if changed:
+            try:
+                path.write_text(json.dumps(cache))
+            except Exception as e:
+                logging.debug(f"ra_games.json write: {e}")
+        return cache.get('progression') or [], {int(k): v for k, v in ra_games.items()}
+
+    async def get_monthly_recap(self, month: str = ''):
+        """The monthly recap (Argosy's): month 'YYYY-MM', last month when
+        empty. Achievements need RomM; play time does not."""
+        try:
+            from romm_sync_engine import play_stats
+            ps = self._play_sessions()
+            rows, games, _devices, _meta = self._play_rows()
+            if not month:
+                month = play_stats._shift_month(time.strftime('%Y-%m'), -1)
+            played = sorted({r['rom_id'] for r in rows if r.get('rom_id') in games})
+            progression, ra_games = (await asyncio.to_thread(self._recap_ra, ps, played, month)
+                                     if ps else ([], {}))
+            out = play_stats.month_recap(rows, games, month, progression, ra_games)
+            out['months'] = play_stats.recap_months(rows, progression)
+            out['current'] = time.strftime('%Y-%m')
+            return {'success': True, **out}
+        except Exception as e:
+            logging.error(f"get_monthly_recap error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def play_time_sync_if_due(self, wait: float = 0):
+        """Upload then pull when the last pull is over 15 minutes old (Home
+        shown, Play time or the recap opened). Waits up to `wait` seconds and
+        answers whether new data came in; a slower pull finishes in the
+        background."""
+        ps = self._play_sessions()
+        if not ps or not ps.pull_due():
+            return {'success': True, 'pulled': False}
+        task = asyncio.ensure_future(asyncio.to_thread(ps.sync_if_due))
+        try:
+            r = await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, float(wait)))
+        except asyncio.TimeoutError:
+            return {'success': True, 'pulled': False, 'pending': True}
+        pulled = bool(r and r[1] and r[1][0])
+        return {'success': True, 'pulled': pulled}
+
+    async def get_recap_due(self):
+        """The month Home's recap banner offers, with a teaser, or none."""
+        try:
+            from romm_sync_engine import play_stats
+            # Testing: open this month's recap on every launch, due or not
+            # (Argosy's MonthlyRecapOverride).
+            forced = os.environ.get('LUDO_FORCE_RECAP', '').strip()
+            ps = self._play_sessions()
+            if not ps and not forced:
+                return {'success': True, 'month': None}
+            rows, games, _devices, _meta = self._play_rows()
+
+            def has_sessions(month):
+                start, end = play_stats._month_bounds(month)[:2]
+                return any(r.get('rom_id') is not None and start <= r['start'] < end for r in rows)
+            month = forced or ps.recap_due(has_sessions)
+            if not month:
+                return {'success': True, 'month': None}
+            # The banner's teaser: the month's play time and most played game.
+            r = play_stats.month_recap(rows, games, month)
+            top = [{'rom_id': t['rom_id'], 'name': t['name'], 'ms': t['ms']} for t in r.get('top_games') or []]
+            return {'success': True, 'month': month, 'total_ms': r['total_ms'],
+                    'sessions': r['sessions'], 'days_played': r['days_played'],
+                    'longest_ms': r['longest_ms'], 'games': len(top) + r['other_games'],
+                    'top': top}
+        except Exception as e:
+            logging.error(f"get_recap_due error: {e}", exc_info=True)
+            return {'success': False, 'month': None}
+
+    async def dismiss_recap(self, month: str):
+        """Home's recap banner was opened or closed: don't offer it again."""
+        ps = self._play_sessions()
+        if ps and month:
+            ps.recap_seen(month)
+        return {'success': True}
+
+    async def set_recap_auto(self, enabled: bool):
+        """Whether Home opens last month's recap by itself."""
+        ps = self._play_sessions()
+        if not ps:
+            return {'success': False}
+        ps.store.set_meta(recap_auto=bool(enabled))
+        return {'success': True}
+
+    async def set_most_played_home(self, enabled: bool):
+        """Whether Home shows the Most played row."""
+        ps = self._play_sessions()
+        if not ps:
+            return {'success': False}
+        ps.store.set_meta(most_played_home=bool(enabled))
+        return {'success': True}
+
+    async def play_time_delete_game(self, rom_id: int):
+        """Delete one game's play records on this device (Argosy: "Delete play
+        records?"). Sessions before now are not pulled back."""
+        ps = self._play_sessions()
+        if not ps:
+            return {'success': False, 'message': 'Play time is not ready yet'}
+        rom_id = int(rom_id)
+        # The game and every variant of it.
+        ids = {rom_id} | {v for v, p in self._variant_parent_index().items() if p == rom_id}
+        removed = sum(ps.delete_game(i) for i in ids)
+        logging.info(f"Play records deleted: rom {rom_id} ({removed} sessions)")
+        return {'success': True, 'removed': removed}
+
     async def get_plugin_stats(self):
         """Plugin-local stats for the user-menu Stats page. Computed live from
         in-memory state (no API calls): library size, what's downloaded on this
@@ -4485,8 +4942,7 @@ class LudoBackend:
     # the core (block_extract lives inside the core binary, not any readable
     # metadata), so peeking the archive is both simpler and more accurate than
     # maintaining a core/platform table.
-    _DISC_IMAGE_EXTS = ('.cue', '.bin', '.iso', '.chd', '.gdi', '.cdi',
-                        '.mdf', '.nrg', '.ccd', '.img', '.pbp')
+    _DISC_IMAGE_EXTS = _DISC_IMAGE_EXTS
 
     def _archive_needs_extract(self, archive_path: Path) -> bool:
         """True when this archive must be unpacked for RetroArch to launch it.
@@ -4532,6 +4988,9 @@ class LudoBackend:
                 if unpacked.is_dir():
                     return unpacked
             if not dest.is_file() or dest.suffix.lower() not in ('.zip', '.7z'):
+                return dest
+            slug = (self._games_index().get(rom_id) or {}).get('platform_slug')
+            if arcade_romset_stays_zipped(slug, _archive_member_names(dest)):
                 return dest
             if not self._archive_needs_extract(dest):
                 return dest
@@ -4847,7 +5306,8 @@ class LudoBackend:
             return {'success': True, 'available_cores': available, 'mappings': rows,
                     'can_download_cores': support['available'],
                     'download_unavailable_reason': support['reason'],
-                    'download_unavailable_kind': support.get('kind') or ''}
+                    'download_unavailable_kind': support.get('kind') or '',
+                    'core_list_unavailable': ra.core_index_unavailable()}
         except Exception as e:
             logging.error(f"get_core_mappings error: {e}", exc_info=True)
             return {'success': False, 'mappings': [], 'available_cores': [], 'message': str(e)}
@@ -5535,7 +5995,9 @@ class LudoBackend:
             logging.info(f"[INSTALL] RomM asked for {name} (request {rid})")
             if rid in self._install_cancelled:
                 return  # cancelled before it started; RomM has already ended it
-            _record_activity('download', 'Install requested from RomM', name, rom_id=rom_id)
+            # Its own kind: the Downloads page lists every 'download' entry under
+            # "Recently completed", so this one showed there while still running.
+            _record_activity('install', 'Install requested from RomM', name, rom_id=rom_id)
             started = asyncio.run(self.download_game(rom_id))
             if not started.get('success'):
                 client.report_install(device_id, rid, 'failed',
@@ -5568,6 +6030,10 @@ class LudoBackend:
                     device_id, rid, 'failed',
                     'Cancelled on the device' if prog.get('state') == 'cancelled'
                     else prog.get('message') or 'Download failed')
+            # The request came from RomM's web UI, so nobody here started it or
+            # is watching it: say how it ended. A cancel made on this device
+            # already raises its own toast.
+            self._toast_remote_install(rom_id, g, name, prog)
         except Exception as e:
             logging.error(f"[INSTALL] request {rid} failed: {e}", exc_info=True)
             try:
@@ -5578,6 +6044,22 @@ class LudoBackend:
             active.discard(rid)
             self._install_jobs.pop(rid, None)
             self._install_cancelled.discard(rid)
+
+    def _toast_remote_install(self, rom_id, g, name, prog):
+        if not SYNC_CORE_AVAILABLE:
+            return
+        state = prog.get('state')
+        has_cover = bool(g and (g.get('cover_path') or g.get('path_cover_small')))
+        try:
+            if state == 'done':
+                _push_notification('install', 'Installed from RomM', name,
+                                   rom_id=rom_id, has_cover=has_cover)
+            elif state == 'error':
+                _push_notification('install', 'Install from RomM failed',
+                                   f"{name} — {prog.get('message') or 'download failed'}",
+                                   rom_id=rom_id, has_cover=has_cover, critical=True)
+        except Exception as e:
+            logging.debug(f"remote install toast failed: {e}")
 
     def _on_romm_scan_done(self, stats):
         """A scan finished in RomM: tell the frontend to check the library now.
@@ -5689,6 +6171,34 @@ class LudoBackend:
                 pass
         return r
 
+    def _pairing_identifier(self, settings, name):
+        """The identifier to start QR pairing with.
+
+        On approval RomM reuses the device whose client_device_identifier
+        matches this one, binds the new sign-in to it, and otherwise creates a
+        fresh device. Installs pushed from RomM only reach the device the
+        sign-in is bound to, so re-pairing must name the device Ludo already
+        syncs as. That device's identifier is not always its id: one carried
+        over from an older client keeps that client's identifier, and sending
+        the id instead made RomM create a second device, leaving Ludo syncing
+        as one and signed in as the other (installs refused as not_bound).
+        """
+        device_id = settings.get('Device', 'device_id', '')
+        if not device_id:
+            return f"ludo-{hashlib.sha256(name.encode()).hexdigest()[:24]}"
+        client = self._romm_client
+        if client and client.authenticated:
+            try:
+                device = client.get_device(device_id)
+                ident = ((device or {}).get('client_device_identifier') or '').strip()
+                if ident:
+                    if ident != settings.get('Device', 'client_identifier', ''):
+                        settings.set('Device', 'client_identifier', ident)
+                    return ident
+            except Exception as e:
+                logging.debug(f"[DEVICE] identifier lookup failed: {e}")
+        return settings.get('Device', 'client_identifier', '') or device_id
+
     def _ensure_device_registered(self):
         """Ensure this device is registered with RomM and device_id is stored.
 
@@ -5705,6 +6215,12 @@ class LudoBackend:
                 device = self._romm_client.get_device(existing)
                 if device:
                     logging.info(f"[DEVICE] verified on server: {existing}")
+                    # Remember the identifier RomM matches this device by, so a
+                    # later QR pairing lands on this same device (see
+                    # _pairing_identifier).
+                    ident = (device.get('client_device_identifier') or '').strip()
+                    if ident and ident != self._settings.get('Device', 'client_identifier', ''):
+                        self._settings.set('Device', 'client_identifier', ident)
                     # Reconcile a rename made while offline. set_device_name
                     # pushes immediately when it can, but the wizard often runs
                     # before the first connect, so the server would otherwise
@@ -5824,12 +6340,8 @@ class LudoBackend:
             import socket as _socket
             name = (settings.get('Device', 'device_name', '')
                     or _socket.gethostname())
-            # Reuse the stored device_id when we have one so re-pairing updates
-            # the same RomM device rather than littering the user's device list.
-            ident = (settings.get('Device', 'device_id', '')
-                     or f"ludo-{hashlib.sha256(name.encode()).hexdigest()[:24]}")
-
             loop = asyncio.get_event_loop()
+            ident = await loop.run_in_executor(None, lambda: self._pairing_identifier(settings, name))
             info, reason = await loop.run_in_executor(
                 None,
                 lambda: RomMClient(url).device_auth_init(
@@ -5903,7 +6415,11 @@ class LudoBackend:
                 settings = self._require_settings()
                 # ...unless the user re-paired to receive installs, which only
                 # reach the device the sign-in is bound to.
-                if poller.paired_device_id and (
+                if poller.paired_device_id and poller.paired_device_id == settings.get('Device', 'device_id', ''):
+                    # RomM bound the new sign-in to the device we already sync
+                    # as: nothing to move, installs reach it from now on.
+                    self._install_not_bound = False
+                elif poller.paired_device_id and (
                         not settings.get('Device', 'device_id', '')
                         or getattr(self, '_install_not_bound', False)):
                     # Sync once more as the old device first, so every save on
@@ -6364,9 +6880,23 @@ class LudoBackend:
                         rom_id, entry.get('file_name', ''), entry.get('slot'))
                 except Exception as e:
                     logging.debug(f"could not name the restored save locally: {e}")
+            # Where a sync would download it, for when there's no copy on
+            # disk yet to restore over.
+            default_dir = None
+            if self._auto_sync:
+                try:
+                    auto = self._auto_sync
+                    game = auto._game_for_rom(rom_id)
+                    if game:
+                        default_dir = auto._download_dir(
+                            save_type, game, entry.get('emulator'),
+                            core_name=auto._core_for_game(game))
+                except Exception as e:
+                    logging.debug(f"could not resolve the restore folder: {e}")
             result = self._retroarch.restore_save_version(
                 self._romm_client, None, entry, save_type, as_copy,
-                log=lambda m: logging.info(m), local_name=local_name)
+                log=lambda m: logging.info(m), local_name=local_name,
+                default_dir=default_dir)
             if result.get('success'):
                 _record_activity('save',
                                  'State restored' if save_type == 'states' else 'Save restored',
@@ -6920,6 +7450,9 @@ class LudoBackend:
             v = [x for x in (rom.get(k) or []) if x]
             if v:
                 flags[k] = v
+        # Only kept when true, like the flags above.
+        if _no_server_file(rom):
+            flags['no_server_file'] = True
         return {
             **flags,
             'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
@@ -6948,6 +7481,9 @@ class LudoBackend:
             # Ids only — the pieces grouping dropped from sibling_roms (folder
             # members / per-region ROMs). Kept so raw server rows can be folded
             # back onto this entry; see _variant_parent_index.
+            '_no_file_variant_ids': [s.get('id') for s
+                                     in (rom.get('_region_save_siblings') or [])
+                                     if _no_server_file(s)],
             '_region_variant_ids': [s.get('id') for s
                                     in (rom.get('_region_save_siblings') or [])
                                     if s.get('id')],
@@ -7377,15 +7913,48 @@ class LudoBackend:
             parent['is_downloaded'] = True
             parent['local_path'] = entry['local_path']
 
+    def _playable_parent(self, idx: dict, rom: dict):
+        """The library entry to show instead of a version RomM has no file for.
+
+        None for a row with a file, or when its game has nothing better.
+        """
+        if not _no_server_file(rom):
+            return None
+        parent = idx.get(self._variant_parent_index().get(rom.get('id')))
+        return parent if parent and not parent.get('no_server_file') else None
+
+    def _collection_tile_count(self, col: dict, count):
+        """The number of tiles a collection opens to.
+
+        RomM counts rows, but no-file versions fold onto their game's entry when
+        the collection opens (see _playable_parent). Without ids, keep RomM's.
+        """
+        ids = col.get('rom_ids') or col.get('roms') or []
+        if not ids or not all(isinstance(i, int) for i in ids):
+            return count
+        idx = self._games_index()
+        parents = self._variant_parent_index()
+        tiles = set()
+        for rid in ids:
+            parent = idx.get(parents.get(rid)) if rid not in idx else None
+            no_file = parent and (rid in (parent.get('_no_file_variant_ids') or []) or any(
+                s.get('id') == rid and _no_server_file(s)
+                for s in (parent.get('_sibling_files') or []) if isinstance(s, dict)))
+            tiles.add(parents[rid] if no_file and not parent.get('no_server_file') else rid)
+        return len(tiles)
+
     def _variant_game(self, idx: dict, rom_id: int, variant_id: int):
         """A launchable game dict for a regional/disc variant of `rom_id`, or
         None. The variant has no library entry by design (see
         _record_variant_download), so build one from the parent plus the file
         the parent recorded — parent metadata, variant path.
+
+        `rom_id` may itself be a variant: a collection or Continue playing opens
+        the game by the variant's own id, which has no index entry.
         """
-        if not variant_id or variant_id == rom_id:
+        if not variant_id:
             return None
-        parent = idx.get(rom_id) or {}
+        parent = idx.get(rom_id) or idx.get(self._variant_parent_index().get(rom_id)) or {}
         v = self._variant_downloads(parent).get(variant_id) or {}
         path = v.get('local_path')
         if not path or not is_path_validly_downloaded(Path(path)):
@@ -7500,6 +8069,11 @@ class LudoBackend:
                               'is_m3u': False, 'is_region': False}]
                             if base else [])
                 if len(games) > 1:
+                    # First is what a plain Play boots and what the picker
+                    # defaults to, so the server's preferred region goes first.
+                    ranks = getattr(self._romm_client, 'region_ranks', dict)()
+                    if isinstance(ranks, dict) and ranks:
+                        games = sorted(games, key=lambda f: filename_region_rank(f.name, ranks))
                     return [{'name': f.name, 'path': str(f),
                              'is_m3u': False, 'is_region': True} for f in games]
                 if len(games) == 1:
@@ -7512,6 +8086,11 @@ class LudoBackend:
                     # could not be booted at all.
                     return [{'name': games[0].name, 'path': str(games[0]),
                              'is_m3u': False, 'is_region': False}]
+                # One disc: boot it, not RomM's one-line playlist. The PS2 core
+                # only follows a .cue when it is the content itself; through an
+                # .m3u the VM fails and RetroArch spins with no window.
+                if disc_images:
+                    return disc_images
             # Float the .m3u to the top so it is the default "all discs" entry.
             discs.sort(key=lambda d: (not d['is_m3u'], d['name'].lower()))
             return discs
@@ -7549,13 +8128,44 @@ class LudoBackend:
             return None
         return discs[0]['path']  # .m3u sorts first, else first disc
 
+    def _refresh_local_path(self, g):
+        """Re-derive a game's path when its file has gone, e.g. unpacked by hand.
+        Otherwise Play kept the old path until a restart re-read the disk."""
+        if not Path(g.get('local_path') or '').exists():
+            self._reconcile_downloads([g])
+
     async def _ready_to_boot(self, g, launch_path):
         """Decompress a still-compressed Switch file before it is launched.
 
         Normally done on download; this is the retry for a download whose
         decompression failed, so Play never hands Eden a file it cannot read.
+        An archive holding a disc image gets the same treatment, for a download
+        made before it was unpacked on arrival: no core can boot it as it is.
+
         Returns (path, None) or (None, the reason to show).
         """
+        archive = Path(launch_path or '')
+        if archive.suffix.lower() in ('.zip', '.7z') and archive.is_file():
+            # Already unpacked by hand beside the archive: use that, not a copy.
+            for ext in _DISC_IMAGE_EXTS:
+                sibling = archive.with_suffix(ext)
+                if sibling.is_file():
+                    return str(sibling), None
+            loop = asyncio.get_event_loop()
+            unpacked = await loop.run_in_executor(
+                None, self._maybe_unzip_download, archive, g.get('rom_id'))
+            self._download_progress.pop(g.get('rom_id'), None)
+            if Path(unpacked) == archive:
+                if self._archive_needs_extract(archive):
+                    return None, f"Could not unpack {archive.name}."
+                return launch_path, None
+            if Path(g.get('local_path') or '') == archive:
+                g['local_path'] = str(unpacked)
+                self._persist_snapshot_throttled()
+            resolved = self._resolve_launch_path(str(unpacked), None, g.get('platform_slug'))
+            if not resolved:
+                return None, f"Nothing launchable inside {archive.name}."
+            return resolved, None
         if not (launch_path and switch_nsz.is_compressed(launch_path)):
             return launch_path, None
         loop = asyncio.get_event_loop()
@@ -7631,13 +8241,18 @@ class LudoBackend:
             idx = self._games_index()
             g = idx.get(rom_id)
             if not g:
-                return {'success': True, 'downloaded_ids': []}
+                return {'success': True, 'downloaded_ids': [], 'no_file_ids': []}
             try:
                 last = int(self._settings.get('LastVersion', str(rom_id), '') or 0)
             except Exception:
                 last = 0
             sibling_roms = g.get('sibling_roms', [])
             ids = [rom_id] + [s.get('id') for s in sibling_roms if s.get('id')]
+            no_file = [r.get('id') for key in ('_sibling_files', '_region_save_siblings')
+                       for r in (g.get(key) or [])
+                       if isinstance(r, dict) and _no_server_file(r)]
+            if g.get('no_server_file'):
+                no_file.append(rom_id)
             downloaded = [rid for rid in ids if idx.get(rid, {}).get('is_downloaded')]
             # Variants have no entry in the index (they're folded into this
             # game), so the region picker learns which ones are already on disk
@@ -7646,6 +8261,7 @@ class LudoBackend:
                 if vid not in downloaded and v.get('local_path'):
                     downloaded.append(vid)
             return {'success': True, 'downloaded_ids': downloaded,
+                    'no_file_ids': [i for i in no_file if i not in downloaded],
                     'last': last if last in downloaded else 0}
         except Exception as e:
             logging.error(f"get_local_siblings error: {e}", exc_info=True)
@@ -7714,6 +8330,7 @@ class LudoBackend:
                     count = col.get('rom_count')
                     if count is None:
                         count = len(col.get('roms') or col.get('rom_ids') or [])
+                    count = self._collection_tile_count(col, count)
                     # Kind drives the badge (favorite/smart/virtual) and section,
                     # mirroring RomM's collection index.
                     if col.get('is_favorite'):
@@ -7747,6 +8364,7 @@ class LudoBackend:
                         count = col.get('rom_count')
                         if count is None:
                             count = len(col.get('rom_ids') or [])
+                        count = self._collection_tile_count(col, count)
                         covers = (col.get('path_covers_small')
                                   or col.get('path_covers_large') or [])[:4]
                         vgroups.append({'key': vid, 'label': name,
@@ -7802,6 +8420,9 @@ class LudoBackend:
         # across a library this size.
         if g.get('is_orphan'):
             s['is_orphan'] = True
+        # A local copy stays playable whatever the server has.
+        if g.get('no_server_file') and not dl:
+            s['no_server_file'] = True
         # Region/language flag chips. Capped at 3 each — the tile only ever
         # draws three (RomM's Card Flags.vue does the same), so shipping more
         # would only fatten the localStorage cache.
@@ -7815,7 +8436,8 @@ class LudoBackend:
         if g.get('sibling_roms'):
             s['sibling_roms'] = [
                 {'rom_id': sib.get('id'), 'name': sib.get('name') or sib.get('fs_name_no_ext') or 'Variant',
-                 'fs_name_no_ext': sib.get('fs_name_no_ext')}
+                 'fs_name_no_ext': sib.get('fs_name_no_ext'),
+                 'fs_extension': sib.get('fs_extension')}
                 for sib in g['sibling_roms']
             ]
             # Only for games with versions: the picker tells same-titled rows
@@ -7866,6 +8488,14 @@ class LudoBackend:
                     if shot and self._is_nintendo_row(r):
                         continue
                     rid = r.get('id')
+                    # A collection can hold a version RomM has no file for. Show
+                    # the game's playable entry, so one that is available or
+                    # already downloaded doesn't read as "No file".
+                    playable = self._playable_parent(idx, r)
+                    if playable:
+                        if not any(x.get('rom_id') == playable['rom_id'] for x in games):
+                            games.append(self._serialize_game(playable))
+                        continue
                     local = idx.get(rid)
                     is_downloaded = bool(local and local.get('is_downloaded'))
                     if not local:
@@ -7887,6 +8517,8 @@ class LudoBackend:
                         'has_cover': bool(r.get('path_cover_small') or (local or {}).get('cover_path')),
                         'platform_slug': (local or {}).get('platform_slug') or r.get('platform_slug'),
                     }
+                    if _no_server_file(r) and not is_downloaded:
+                        entry['no_server_file'] = True
                     # Flag chips come off the raw row here, falling back to the
                     # cached entry for a game the library walk already saw.
                     for fk in ('regions', 'languages'):
@@ -7901,12 +8533,14 @@ class LudoBackend:
                     if sibs:
                         entry['sibling_roms'] = [
                             {'rom_id': s.get('id'), 'name': s.get('name') or 'Variant',
-                             'fs_name_no_ext': s.get('fs_name_no_ext')}
+                             'fs_name_no_ext': s.get('fs_name_no_ext'),
+                             'fs_extension': s.get('fs_extension')}
                             for s in sibs
                         ]
                         entry['file_name'] = r.get('fs_name') or (local or {}).get('file_name')
                         entry['region_count'] = len(sibs) + 1
-                    games.append(entry)
+                    if not any(x.get('rom_id') == rid for x in games):
+                        games.append(entry)
                     if rid and rid not in idx and r.get('path_cover_small'):
                         covers[rid] = r.get('path_cover_small')
                 games.sort(key=lambda x: (x.get('name') or '').lower())
@@ -8036,6 +8670,8 @@ class LudoBackend:
                         'has_cover': bool(r.get('path_cover_small') or (local or {}).get('cover_path')),
                         'platform_slug': (local or {}).get('platform_slug') or r.get('platform_slug'),
                     }
+                    if _no_server_file(r) and not (local and local.get('is_downloaded')):
+                        entry['no_server_file'] = True
                     # Flag chips come off the raw row here, falling back to the
                     # cached entry for a game the library walk already saw.
                     for fk in ('regions', 'languages'):
@@ -8050,7 +8686,8 @@ class LudoBackend:
                     if sibs:
                         entry['sibling_roms'] = [
                             {'rom_id': s.get('id'), 'name': s.get('name') or 'Variant',
-                             'fs_name_no_ext': s.get('fs_name_no_ext')}
+                             'fs_name_no_ext': s.get('fs_name_no_ext'),
+                             'fs_extension': s.get('fs_extension')}
                             for s in sibs
                         ]
                         entry['file_name'] = r.get('fs_name') or (local or {}).get('file_name')
@@ -8846,7 +9483,8 @@ class LudoBackend:
                         out.append(str(x))
                 return [x for x in out if x]
 
-            local = self._games_index().get(rom_id) or {}
+            idx = self._games_index()
+            local = idx.get(rom_id) or self._variant_game(idx, rom_id, rom_id) or {}
 
             # Names present on this device, so each file row can say whether it
             # is actually here — RomM's Files table marks per-file state too.
@@ -9043,6 +9681,7 @@ class LudoBackend:
                 'ra_id': ra_id,
                 'fs_size_bytes': d.get('fs_size_bytes') or 0,
                 'is_downloaded': bool(local.get('is_downloaded')),
+                'no_server_file': _no_server_file(d) and not local.get('is_downloaded'),
                 'has_cover': bool(d.get('path_cover_small') or local.get('cover_path')),
             }
         except Exception as e:
@@ -9171,6 +9810,7 @@ class LudoBackend:
             path = Path(path)
             if not sync:
                 return
+            sync.forget_title_ids()
 
             # A folder ROM. RomM folds a base game and its patch into ONE entry
             # whose download is a directory, so the add-ons arrive inside it and
@@ -9968,10 +10608,14 @@ class LudoBackend:
                 # 'name' is the filename stem (save-sync matching keys on it);
                 # the activity feed wants the metadata title.
                 display_name = g.get('display_name') or name
+                if g.get('no_server_file'):
+                    return {'success': False, 'message': NO_SERVER_FILE_MESSAGE}
             else:
                 r = self._romm_client.session.get(
                     urljoin(self._romm_client.base_url, f'/api/roms/{rom_id}'), timeout=15)
                 d = r.json() if r.status_code == 200 else {}
+                if _no_server_file(d):
+                    return {'success': False, 'message': NO_SERVER_FILE_MESSAGE}
                 platform_slug = d.get('platform_slug', 'Unknown')
                 file_name = d.get('fs_name') or f"{d.get('name', 'rom')}.rom"
                 name = d.get('name')
@@ -10011,6 +10655,9 @@ class LudoBackend:
                         prog = info.get('progress')  # 0..1
                         self._download_progress[rom_id] = {
                             'percent': int(round((prog or 0) * 100)),
+                            # Unrounded, for fills that should move every
+                            # chunk rather than in 1% steps (100 MB on 10 GB).
+                            'exact': round((prog or 0) * 100, 2),
                             'downloaded': info.get('downloaded', 0),
                             'total': info.get('total', 0),
                             'speed': info.get('speed', 0),
@@ -10231,6 +10878,12 @@ class LudoBackend:
         self._download_cancels.add(rom_id)
         return {'success': True}
 
+    async def get_downloads(self):
+        """Every tracked download in one call: {rom_id: entry}, same entries as
+        get_download_progress. The UI's single shared progress poller reads
+        this while anything downloads, instead of one poll per view per game."""
+        return {str(k): v for k, v in list(self._download_progress.items())}
+
     async def get_download_progress(self, rom_id: int):
         """Live progress for an in-flight download (polled by the cover/button fill UI).
 
@@ -10399,7 +11052,7 @@ class LudoBackend:
                     'with_rom_id_index': 'false',
                     'with_char_index': 'false',
                     'with_filter_values': 'false',
-                    'fields': 'id,name,fs_name,platform_name,platform_slug,path_cover_small,merged_screenshots,rom_user',
+                    'fields': 'id,name,fs_name,platform_name,platform_slug,path_cover_small,merged_screenshots,rom_user,has_file_on_disk',
                 },
                 timeout=30,
             )
@@ -10426,7 +11079,8 @@ class LudoBackend:
             if self._platform_sync_off(rom, disabled):
                 continue
             rid = rom.get('id')
-            local = idx.get(rid)
+            local = (self._playable_parent(idx, rom) or idx.get(rid)
+                     or self._variant_game(idx, rid, rid))
             if local:
                 item = self._serialize_game(local)
             else:
@@ -10438,6 +11092,8 @@ class LudoBackend:
                     'has_cover': bool(rom.get('path_cover_small')),
                     'platform_slug': rom.get('platform_slug'),
                 }
+                if _no_server_file(rom):
+                    item['no_server_file'] = True
             # RomM's Home paints continue-playing cards with the game's
             # screenshot (landscape) and floats the box-art as a PIP. Carry the
             # first merged screenshot path so the frontend can do the same; the
@@ -10722,6 +11378,9 @@ class LudoBackend:
                 return {'success': False, 'message': 'Game not downloaded'}
             if not self._retroarch:
                 return {'success': False, 'message': 'RetroArch not available'}
+            self._refresh_local_path(g)
+            if not g.get('local_path'):
+                return {'success': False, 'message': 'Game not downloaded'}
             # A bare Play resumes the remembered disc; an explicit pick overrides.
             effective_disc = disc or self._get_last_disc(effective_rom_id) or None
             launch_path = self._resolve_launch_path(g['local_path'], effective_disc, g.get('platform_slug'))
@@ -10773,9 +11432,11 @@ class LudoBackend:
             # that just came down from the server, and reconcile has to have
             # filed it under the launching core first.
             entry_slot = self._resume_entry_slot(g, core) if resume else None
-            ok, msg = self._retroarch.launch_game(Path(launch_path), platform_name,
-                                                  entry_slot=entry_slot,
-                                                  platform_slug=self._platform_slug_for(g))
+            # Off the event loop: it waits to see whether the emulator survives.
+            ok, msg = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._retroarch.launch_game(
+                    Path(launch_path), platform_name, entry_slot=entry_slot,
+                    platform_slug=self._platform_slug_for(g)))
             # Remember an explicit disc choice so the next plain Play resumes it.
             if ok and disc:
                 try:
@@ -11205,22 +11866,22 @@ class LudoBackend:
             if not core:
                 return {}          # no core at all — _core_gap owns that message
             entry = self._server_firmware().get(slug.lower()) or {}
-            wanted = [f['file_name'] for f in entry.get('files') or []]
+            wanted = [(f['file_name'], f['file_name']) for f in entry.get('files') or []]
             required = self._required_firmware_for_core(core)
             if not wanted:
                 # Nothing on the server to compare against (platform has no
                 # firmware uploaded, or we're offline) — fall back to the core's
                 # own required list so the check still works without RomM.
-                wanted = [desc or path for path, desc in required]
+                wanted = [(path, desc or path) for path, desc in required]
             if not wanted:
                 return {}
             rel, base = self._installed_bios_index()
             missing = []
-            for w in wanted:
-                key = w.replace('\\', '/').strip('/').lower()
+            for path, label in wanted:
+                key = path.replace('\\', '/').strip('/').lower()
                 if key in rel or ('/' not in key and key in base):
                     continue
-                missing.append(w)
+                missing.append(label)
             if not missing:
                 return {}
             return {'missing_bios': missing, 'core': core,
@@ -11668,6 +12329,10 @@ class LudoBackend:
                 # Regional/disc variants live on their parent, not in the index.
                 g = self._variant_game(idx, rom_id, effective_rom_id) or g
             if not g or not g.get('is_downloaded') or not g.get('local_path'):
+                return {'success': False, 'steam_host': False,
+                        'message': 'Game not downloaded'}
+            self._refresh_local_path(g)
+            if not g.get('local_path'):
                 return {'success': False, 'steam_host': False,
                         'message': 'Game not downloaded'}
             effective_disc = disc or self._get_last_disc(effective_rom_id) or None

@@ -7,9 +7,11 @@
  */
 import { launcher } from "./launcher";
 import { focus } from "./focus";
+import { subscribeEvents } from "./rpc";
 import type {
   HostApp,
   HostCapabilities,
+  HostEvents,
   HostKeyboard,
   HostShell,
   LaunchSpec,
@@ -99,7 +101,10 @@ const capabilities: HostCapabilities = {
   },
   // ToastHost draws our toasts, so their corner is ours to offer.
   toastPlacement: true,
+  rowScroll: true,
 };
+
+const events: HostEvents = { subscribe: subscribeEvents };
 
 export const host: HostShell = {
   name: "desktop",
@@ -108,6 +113,7 @@ export const host: HostShell = {
   app,
   launcher,
   focus,
+  events,
   // One window, one document — the UI renders straight into it.
   uiDocument: () => document,
 };

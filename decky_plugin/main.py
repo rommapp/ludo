@@ -68,3 +68,28 @@ class Plugin(LudoBackend):
 
     def __init__(self):
         super().__init__(host=_decky_host())
+        self._events_off = None
+
+    async def _main(self):
+        # Engine change nudges (romm_sync_engine.events) ride Decky's own
+        # backend->frontend event bridge. Published from engine worker threads,
+        # so hop onto Decky's loop before emitting.
+        try:
+            import asyncio
+            import decky
+            from romm_sync_engine import events
+            loop = asyncio.get_running_loop()
+
+            def _sink(topic):
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(decky.emit("ludo_changed", topic)))
+            self._events_off = events.add_sink(_sink)
+        except Exception as e:
+            logging.warning(f"Change events unavailable, UI will poll: {e}")
+        await super()._main()
+
+    async def _unload(self):
+        if self._events_off:
+            self._events_off()
+            self._events_off = None
+        await super()._unload()

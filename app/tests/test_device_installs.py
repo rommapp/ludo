@@ -201,8 +201,11 @@ def test_an_unreadable_rom_is_installed_as_before(c64_off):
         return {'success': True}
     b.download_game = fake_download
     assert _handle(b) == [('req-1', 'done', None)]
-    assert started == [ROM] and not toasts
-    assert [r[0][0] for r in rows] == ['download']
+    assert started == [ROM]
+    # Only the 'installed' toast: nothing declined, nothing critical.
+    assert [t[0][1] for t in toasts] == ['Installed from RomM']
+    assert not toasts[0][1].get('critical')
+    assert [r[0][0] for r in rows] == ['install']  # not 'download': that kind is listed as completed
 
 
 def test_turn_on_switches_the_platform_back_on(backend, monkeypatch):

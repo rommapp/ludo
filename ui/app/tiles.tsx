@@ -1,17 +1,18 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { LibGame, LibGroup } from "./types";
 import { _dlSucceeded, _setDlActive, awaitDownload, claimDownloadStart, releaseDownloadStart, runCollectionBatch, useDownloadProgress, useIsDownloading } from "./downloads";
-import { V2, roundBtn} from "./theme";
+import { V2, fmtPlayTime, roundBtn} from "./theme";
 import { useCollectionSync, useOffline, useSaveActivityFor} from "./status";
 import { deleteCollectionRoms, deleteGame, downloadGame, getLibraryGames, getLocalDiscs, getLocalSiblings, resyncPlatform, toggleCollectionSync, getStateThumbnails, resolveSaveConflict } from "./rpc";
-import { Focusable, GamepadButton, Menu, MenuItem, showContextMenu, showModal, ModalRoot } from "@ludo/host";
+import { host, Focusable, GamepadButton, Menu, MenuItem, showContextMenu, showModal, ModalRoot } from "@ludo/host";
 import { toaster } from "./toast";
 import { maybePromptSwitchFirmware } from "./firmware";
 import { _libGamesCache, libCacheSetDownloaded, _focusedPlatform, _setFocusedPlatform, libCacheDelete, libCacheDrop, openGameById} from "./libcache";
 import { V2Focus, V2_FOCUS_STYLE} from "./focus";
 import { CoverPip, GameCover, ScreenshotArt, awaitCover, peekCover, qGetImageBg } from "./media";
+import { cancelDetailPrefetch, scheduleDetailPrefetch } from "./detailcache";
 import { PlatformIcon, ProgressRing, UserMenuRow, MODAL_SCRIM_INSET, PickerModal, ToastCover} from "./kit";
-import { FaBookmark, FaBoxOpen, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip} from "react-icons/fa";
+import { FaBan, FaBookmark, FaBoxOpen, FaCheck, FaChevronLeft, FaChevronRight, FaClone, FaCloudUploadAlt, FaDownload, FaEllipsisH, FaGlobe, FaInfoCircle, FaPlay, FaSync, FaTrash, FaUnlink, FaGamepad, FaMicrochip, FaStopwatch} from "react-icons/fa";
 import { _broadcastLibRefresh } from "./events";
 import { MdFlashOn } from "react-icons/md";
 import { _forceGamepadFocus } from "./shell";
@@ -231,33 +232,43 @@ function regionToEmoji(region: string): string {
 
 function openRegionPicker(
   romId: number, gameName: string,
-  siblings: { rom_id: number; name: string; fs_name_no_ext?: string }[],
+  siblings: { rom_id: number; name: string; fs_name_no_ext?: string; fs_extension?: string }[],
   downloadedIds: Set<number>,
   lastUsedId?: number,
   onSelected?: (sibRomId: number) => void,
   mainFile?: string,
   mainDownloaded?: boolean,
+  noFileIds?: Set<number>,
 ) {
-  const mainEntry = { rom_id: romId, name: gameName, file: mainFile?.replace(/\.[^.]+$/, '') };
+  const mainEntry = { rom_id: romId, name: gameName, file: mainFile?.replace(/\.[^.]+$/, ''),
+    ext: mainFile?.match(/\.([^.]+)$/)?.[1] };
   const sorted = [...siblings].sort((a, b) => {
     const aDl = downloadedIds.has(a.rom_id) ? 0 : 1;
     const bDl = downloadedIds.has(b.rom_id) ? 0 : 1;
     if (aDl !== bDl) return aDl - bDl;
     return a.name.localeCompare(b.name);
   });
-  const all = [mainEntry, ...sorted.map((s) => ({ ...s, file: s.fs_name_no_ext }))];
+  // Versions RomM has no file for go last: they can't be downloaded.
+  const noFile = (id: number) => !!noFileIds?.has(id);
+  const listed = [mainEntry, ...sorted.map((s) => ({ ...s, file: s.fs_name_no_ext, ext: s.fs_extension }))];
+  const all = [...listed.filter((e) => !noFile(e.rom_id)), ...listed.filter((e) => noFile(e.rom_id))];
   // Versions of one game usually share its title (two Wii U formats of Terraria
   // are both "Terraria"), so the title cannot tell the rows apart. Their file
   // names can, and are only shown when the titles actually collide.
   const names = all.map((e) => e.name);
   const clash = names.some((n, i) => names.indexOf(n) !== i);
+  // The same file in two formats: only the extension tells them apart.
+  const base = (e: typeof all[number]) => (clash && e.file ? e.file : e.name);
+  const bases = all.map(base);
+  const baseClash = (e: typeof all[number]) => !!e.ext && bases.indexOf(base(e)) !== bases.lastIndexOf(base(e));
 
   showModal(
     <PickerModal title="Select region" items={all.map((entry) => ({
       key: entry.rom_id,
-      label: (clash && entry.file ? entry.file : entry.name)
-        + (!(entry.rom_id === romId ? mainDownloaded : downloadedIds.has(entry.rom_id)) ? ' (not downloaded)' : ''),
-      active: entry.rom_id === lastUsedId,
+      label: base(entry) + (baseClash(entry) ? ` (.${entry.ext})` : '')
+        + (noFile(entry.rom_id) ? ' (no file)'
+          : !(entry.rom_id === romId ? mainDownloaded : downloadedIds.has(entry.rom_id)) ? ' (not downloaded)' : ''),
+      active: entry.rom_id === lastUsedId && !noFile(entry.rom_id),
       onSelect: () => onSelected?.(entry.rom_id),
     }))} />
   );
@@ -298,8 +309,8 @@ const REGION_EMOJI: Record<string, string> = {
   w: '🌎', global: '🌎', world: '🌎',
 };
 
-export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef, index, onFocusIdx, focusable, resume, stateThumb }:
-  { game: LibGame; onOpen: (g: LibGame) => void; onActiveCover: (uri: string | null) => void; focusRef?: React.Ref<any>; index?: number; onFocusIdx?: (i: number) => void; focusable?: boolean; resume?: boolean; stateThumb?: string | null }) {
+export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, focusRef, index, onFocusIdx, focusable, resume, stateThumb, playMs }:
+  { game: LibGame; onOpen: (g: LibGame) => void; onActiveCover: (uri: string | null) => void; focusRef?: React.Ref<any>; index?: number; onFocusIdx?: (i: number) => void; focusable?: boolean; resume?: boolean; stateThumb?: string | null; playMs?: number }) {
   const wide = !!game.screenshot || !!stateThumb;
   // Wide cards adopt the screenshot's NATURAL aspect ratio (RomM derives the
   // card width from the cover's true shape at a fixed height); 16:9 until loaded.
@@ -311,7 +322,8 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
   const [busy, setBusy] = useState<null | 'download' | 'delete' | 'launch'>(null);
   const [activeDlRomId, setActiveDlRomId] = useState<number>(game.rom_id);
   const dlProgress = useDownloadProgress(activeDlRomId, busy === 'download');
-  const dlPct = dlProgress?.percent ?? null;
+  // The ring is a fill, so it takes the unrounded value and moves every chunk.
+  const dlPct = dlProgress?.exact ?? dlProgress?.percent ?? null;
   const globalDownloading = useIsDownloading(activeDlRomId);
   const downloading = busy === 'download' || globalDownloading;
   const ringColor = V2.brand;
@@ -362,6 +374,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
   const [activeRegionId, setActiveRegionId] = useState<number>(game.rom_id);
   const [downloadedRegionIds, setDownloadedRegionIds] = useState<Set<number>>(new Set());
   const siblingFetchTried = useRef(false);
+  const noFileRegionIds = useRef<Set<number>>(new Set());
   const ensureDiscs = async (force?: boolean) => {
     if ((discsTried.current && !force) || !dl) return;
     discsTried.current = true;
@@ -379,6 +392,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       if (r?.success) {
         const ids = new Set<number>(r.downloaded_ids || []);
         setDownloadedRegionIds(ids);
+        noFileRegionIds.current = new Set<number>(r.no_file_ids || []);
         if (r.last) setActiveRegionId(r.last);
         return ids;
       }
@@ -390,7 +404,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
   const showRegionPicker = async () => {
     const ids = (await ensureSiblings(true)) || downloadedRegionIds;
     openRegionPicker(game.rom_id, game.name, game.sibling_roms || [], ids,
-      activeRegionId, handleRegionSelected, game.file_name, dl);
+      activeRegionId, handleRegionSelected, game.file_name, dl, noFileRegionIds.current);
   };
   // Hold A to open the disc/region picker; a quick press launches. The OK
   // button's onActivate fires on the PRESS edge on Steam Deck, so we can't let
@@ -608,6 +622,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
   };
   const primary = () => {
     if (dl) doLaunch();
+    else if (game.no_server_file) toaster.toast({ title: 'No file', body: 'RomM has no file for this entry.' });
     else doDownload();
   };
 
@@ -689,9 +704,9 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
       onSecondaryActionDescription="Details"
       onOptionsButton={dl ? requestDelete : undefined}
       onOptionsActionDescription={dl ? (confirmDelete ? 'Confirm delete' : 'Delete') : undefined}
-      onOKActionDescription={dl ? (isMultiRegion ? 'Launch (hold: regions)' : isMultiDisc ? (discsAreRegion ? 'Launch (hold: regions)' : 'Launch (hold: discs)') : (resume ? 'Resume' : 'Launch')) : 'Download'}
-      onFocus={() => { setFocused(true); activate(); ensureDiscs(); ensureSiblings(); if (index !== undefined) onFocusIdx?.(index); _tileFocusScrub(selfRef.current, game.name); }}
-      onBlur={() => setFocused(false)}
+      onOKActionDescription={dl ? (isMultiRegion ? 'Launch (hold: regions)' : isMultiDisc ? (discsAreRegion ? 'Launch (hold: regions)' : 'Launch (hold: discs)') : (resume ? 'Resume' : 'Launch')) : game.no_server_file ? 'No file' : 'Download'}
+      onFocus={() => { setFocused(true); activate(); ensureDiscs(); ensureSiblings(); scheduleDetailPrefetch(game.rom_id); if (index !== undefined) onFocusIdx?.(index); _tileFocusScrub(selfRef.current, game.name); }}
+      onBlur={() => { setFocused(false); cancelDetailPrefetch(); }}
       onMouseEnter={() => { setFocused(true); activate(); ensureDiscs(); ensureSiblings(); }}
       onMouseLeave={() => setFocused(false)}
       style={{
@@ -827,9 +842,23 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             shown for downloaded multi-disc games so the hold-A picker is
             discoverable. Shows the actual count once fetched, otherwise a
             generic disc icon. */}
-        {dl && isMultiDisc && (
+        {/* Play time (Home's Most played row) — bottom-left; a disc-count
+            pill, when there is one, steps up above it. */}
+        {playMs != null && (
           <div style={{
             position: 'absolute', left: '7px', bottom: '7px', zIndex: 2,
+            display: 'inline-flex', alignItems: 'center', gap: '4px',
+            padding: '3px 7px', borderRadius: V2.radiusPill, fontSize: '11px', fontWeight: 700,
+            ...coverPill(iconDark),
+            opacity: focused ? 0 : 1,
+            transition: 'opacity 0.18s ease, background 0.2s ease, border-color 0.2s ease',
+          }}>
+            <FaStopwatch size={9} />{fmtPlayTime(playMs)}
+          </div>
+        )}
+        {dl && isMultiDisc && (
+          <div style={{
+            position: 'absolute', left: '7px', bottom: playMs != null ? '32px' : '7px', zIndex: 2,
             display: 'inline-flex', alignItems: 'center', gap: '4px',
             padding: '2px 6px', borderRadius: V2.radiusPill, fontSize: '10px', fontWeight: 600,
             ...coverPill(iconDark),
@@ -854,7 +883,8 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
             On a wide (continue-playing) card the same corner already holds the
             CoverPip box art, so the chips step to the left of it — 46px pip +
             its 6px inset + a 6px gap — instead of covering the cover. */}
-        {((game.regions?.length || 0) > 0 || (game.languages?.length || 0) > 0) && (
+        {/* Not on Most played covers: the play time pill is the point there. */}
+        {playMs == null && ((game.regions?.length || 0) > 0 || (game.languages?.length || 0) > 0) && (
           <div style={{
             position: 'absolute', bottom: '7px', zIndex: 2,
             right: wide && game.has_cover ? '58px' : '7px',
@@ -943,7 +973,7 @@ export const GameTile = memo(function GameTile({ game, onOpen, onActiveCover, fo
                  launches while it shows this — the glyph reports what is
                  happening, it does not change what A does. */
               : syncing ? <FaCloudUploadAlt size={15} />
-                : dl ? <FaPlay size={15} style={{ marginLeft: '2px' }} /> : <FaDownload size={15} />}
+                : dl ? <FaPlay size={15} style={{ marginLeft: '2px' }} /> : game.no_server_file ? <FaBan size={15} /> : <FaDownload size={15} />}
         </div>
         {/* Bottom row: Details (X) + Delete (Y, when downloaded) — glass buttons. */}
         <div className="romm-gt-actions" style={{
@@ -1096,7 +1126,7 @@ export const CollectionTile = memo(function CollectionTile({ group, onOpen, focu
       <Menu label={group.label} onCancel={() => { removeArmed.current = false; }}>
         <MenuItem onSelected={async () => {
           const res = await getLibraryGames('collection', group.key).catch(() => null);
-          const missing = res?.success ? (res.games || []).filter((g: LibGame) => !g.is_downloaded).map((g: LibGame) => ({ id: g.rom_id, name: g.name })) : [];
+          const missing = res?.success ? (res.games || []).filter((g: LibGame) => !g.is_downloaded && !g.no_server_file).map((g: LibGame) => ({ id: g.rom_id, name: g.name })) : [];
           if (!missing.length) { toaster.toast({ title: 'Nothing to sync', body: 'All games are already downloaded' }); return; }
           // Shared module-level batch: same job key as the collection page, so
           // opening the collection mid-batch shows the running header progress.
@@ -1405,12 +1435,126 @@ export function Tag({ children }: { children: any }) {
   );
 }
 
+// Row glide shared by every host. Steam's Big Picture reveals a focused tile
+// with scrollIntoView({inline:'nearest'}): the row sits still until focus hits
+// the edge, then each press runs its own ease, so a held D-pad crawls behind
+// the focus and lands in one late swoop. Desktop centres the tile with a
+// critically damped spring that keeps its velocity when retargeted. Tiles in a
+// CardRow get that same spring here; vertical reveal still goes to the host.
+type Spring = { target: number; pos: number; vel: number; last: number; raf: number };
+type Axis = 'scrollLeft' | 'scrollTop';
+const _springs: Record<Axis, WeakMap<HTMLElement, Spring>> = { scrollLeft: new WeakMap(), scrollTop: new WeakMap() };
+const _rowSprings = _springs.scrollLeft;
+const ROW_OMEGA = 22; // rad/s — settles in ~250ms, matching desktop
+
+// Critically damped spring on one scroll axis. Retargeting a running spring
+// only moves its target, so repeated presses keep the velocity instead of
+// restarting an ease. Writes the scroll position directly each frame: nothing
+// else on the page can cancel it, unlike a native smooth scroll.
+function springTo(sc: HTMLElement, axis: Axis, target: number, onDone?: () => void) {
+  const map = _springs[axis];
+  const cur = map.get(sc);
+  if (cur) { cur.target = target; return; }
+  if (Math.abs(sc[axis] - target) < 0.5) { onDone?.(); return; }
+  const a: Spring = { target, pos: sc[axis], vel: 0, last: performance.now(), raf: 0 };
+  map.set(sc, a);
+  const frame = (now: number) => {
+    if (map.get(sc) !== a) return;
+    const dt = Math.min(0.064, (now - a.last) / 1000); a.last = now;
+    const x = a.pos - a.target, k = ROW_OMEGA, e = Math.exp(-k * dt), c = a.vel + k * x;
+    a.pos = a.target + (x + c * dt) * e;
+    a.vel = (c - k * (x + c * dt)) * e;
+    if (Math.abs(a.pos - a.target) < 0.5 && Math.abs(a.vel) < 5) { sc[axis] = a.target; map.delete(sc); onDone?.(); return; }
+    sc[axis] = a.pos;
+    a.raf = requestAnimationFrame(frame);
+  };
+  a.raf = requestAnimationFrame(frame);
+}
+
+function cancelSpring(sc: HTMLElement | null, axis: Axis) {
+  const a = sc && _springs[axis].get(sc);
+  if (a) { cancelAnimationFrame(a.raf); _springs[axis].delete(sc!); }
+}
+
+// `center`: focus moved along the row. Otherwise (focus arrived from another
+// row) only bring the tile into view, as desktop does, so the row doesn't jump.
+function glideRowTo(row: HTMLElement, el: HTMLElement, center: boolean, onDone?: () => void) {
+  const rr = row.getBoundingClientRect(), r = el.getBoundingClientRect();
+  const cur = _rowSprings.get(row);
+  const base = cur ? cur.target : row.scrollLeft; // judge against where it's heading
+  const left = r.left - rr.left + row.scrollLeft;
+  const max = row.scrollWidth - row.clientWidth;
+  const pad = 28; // the track's scroll-padding-inline
+  let want: number;
+  if (center) want = left + r.width / 2 - row.clientWidth / 2;
+  else if (left - pad < base) want = left - pad;
+  else if (left + r.width + pad > base + row.clientWidth) want = left + r.width + pad - row.clientWidth;
+  else return;
+  springTo(row, 'scrollLeft', Math.max(0, Math.min(max, want)), onDone);
+}
+
+// Touch, wheel or mouse took the row: stop gliding. Listening for input
+// instead of reading scrollLeft back each frame avoids a forced layout per
+// frame while the focused tile's style is still settling.
+function cancelRowGlide(row: HTMLElement | null) { cancelSpring(row, 'scrollLeft'); }
+
+// The page scroller a row sits in.
+function pageScroller(row: HTMLElement): HTMLElement | null {
+  for (let p = row.parentElement; p; p = p.parentElement) {
+    const oy = getComputedStyle(p).overflowY;
+    if ((oy === 'auto' || oy === 'scroll') && p.scrollHeight > p.clientHeight + 1) return p;
+  }
+  return null;
+}
+
+// Vertical reveal of a row, block:'nearest' judged against where the page is
+// heading. Steam asks for this with a native smooth scroll, but the focus
+// change that comes with it cancels that scroll before its first frame, so a
+// slow Up/Down left the new row off screen (fast presses got an instant
+// scroll and looked fine). Desktop springs the page itself; so do we.
+const _pageInputHooked = new WeakSet<HTMLElement>();
+function revealRow(row: HTMLElement, el: HTMLElement) {
+  const sc = pageScroller(row);
+  if (!sc) return;
+  if (!_pageInputHooked.has(sc)) {
+    _pageInputHooked.add(sc);
+    const stop = () => cancelSpring(sc, 'scrollTop');
+    for (const ev of ['wheel', 'touchstart', 'pointerdown']) sc.addEventListener(ev, stop, { passive: true });
+  }
+  const cs = getComputedStyle(sc);
+  const padTop = parseFloat(cs.scrollPaddingTop) || 0, padBot = parseFloat(cs.scrollPaddingBottom) || 0;
+  // The focused cover plus room for its focus glow, not the whole track: the
+  // track's glow padding made Home's first row overhang a Deck's screen by a
+  // few px, so focusing it scrolled the page 4px, and every tab (they share
+  // the scroller) then sat at a different offset — the banners above jumped.
+  const GLOW = 16;
+  const sr = sc.getBoundingClientRect(), r = el.getBoundingClientRect();
+  const top = r.top - GLOW - sr.top + sc.scrollTop, bottom = top + r.height + 2 * GLOW;
+  const cur = _springs.scrollTop.get(sc);
+  const base = cur ? cur.target : sc.scrollTop;
+  let target = base;
+  if (top - padTop < base) target = top - padTop;
+  else if (bottom + padBot > base + sc.clientHeight) target = Math.min(top - padTop, bottom + padBot - sc.clientHeight);
+  target = Math.max(0, Math.min(sc.scrollHeight - sc.clientHeight, target));
+  if (target !== base || cur) springTo(sc, 'scrollTop', target);
+}
+
+// Route the host's scrollIntoView on a row tile to our own reveal: vertical
+// for the row in the page, horizontal (the onFocus glide) along the track.
+// Instance property, so nothing outside CardRow is touched.
+const _rowPatched = new WeakSet<HTMLElement>();
+function claimRowScroll(row: HTMLElement, el: HTMLElement) {
+  if (_rowPatched.has(el)) return;
+  _rowPatched.add(el);
+  el.scrollIntoView = () => revealRow(row, el);
+}
+
 // CardRow — RomM v2 Home section: header (icon + title + count) over a
 // horizontal-scroll track. Gamepad focus scrolls the track natively; the
 // gradient chevron arrows (RomM style) appear only when the track overflows
 // in that direction, signaling "more to the right".
-export function CardRow({ icon, title, count, children }:
-  { icon: any; title: string; count?: number; children: any }) {
+export function CardRow({ icon, title, count, onNearEnd, children }:
+  { icon: any; title: string; count?: number; onNearEnd?: () => void; children: any }) {
   const trackRef = useRef<HTMLDivElement | null>(null);
   const [canLeft, setCanLeft] = useState(false);
   const [canRight, setCanRight] = useState(false);
@@ -1420,6 +1564,10 @@ export function CardRow({ icon, title, count, children }:
     if (!el) return;
     setCanLeft(el.scrollLeft > 8);
     setCanRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 8);
+    // Windowed rows mount more tiles once a touch/mouse scroll nears the end.
+    // clientWidth is 0 while the panel is hidden (display:none), where 0 >= 0
+    // would read as "at the end" and grow the row to everything.
+    if (onNearEnd && el.clientWidth > 0 && el.scrollLeft + 2 * el.clientWidth >= el.scrollWidth) onNearEnd();
   };
   useEffect(() => {
     const el = trackRef.current;
@@ -1470,7 +1618,20 @@ export function CardRow({ icon, title, count, children }:
             top of hovered covers. Matches RomM's 16/20 track padding. */}
         <div
           ref={trackRef}
-          onScroll={update}
+          // Mid-glide every frame fires a scroll; re-measuring the track for the
+          // arrows then forced a layout per frame (~8ms each on a Deck). The
+          // glide refreshes them once it lands.
+          onScroll={() => { if (!trackRef.current || !_rowSprings.has(trackRef.current)) update(); }}
+          onTouchStart={() => cancelRowGlide(trackRef.current)}
+          onWheel={() => cancelRowGlide(trackRef.current)}
+          onPointerDown={() => cancelRowGlide(trackRef.current)}
+          onFocus={(e) => {
+            const row = trackRef.current, el = e.target as HTMLElement;
+            if (host.capabilities.rowScroll || !row || el === row) return;
+            claimRowScroll(row, el);
+            const from = e.relatedTarget as Node | null;
+            glideRowTo(row, el, !!from && row.contains(from), update);
+          }}
           className="romm-cardrow-track"
           // Steam scrolls a focused tile only until it touches the track's
           // edge, cropping its focus scale and glow (the first tile once the

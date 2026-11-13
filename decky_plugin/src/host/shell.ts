@@ -8,11 +8,13 @@
  * both shells against the same contract.
  */
 import { Router } from "@decky/ui";
+import { addEventListener, removeEventListener } from "@decky/api";
 import { launcher } from "./launcher";
 import { focus } from "./focus";
 import type {
   HostApp,
   HostCapabilities,
+  HostEvents,
   HostKeyboard,
   HostShell,
   LaunchSpec,
@@ -123,6 +125,15 @@ const capabilities: HostCapabilities = {
   shortcutTile: false,
   // SteamOS owns toast presentation.
   toastPlacement: false,
+  rowScroll: false,
+};
+
+// Backend nudges arrive over Decky's own event bridge (decky.emit in main.py).
+const events: HostEvents = {
+  subscribe(fn) {
+    const l = addEventListener<[string]>("ludo_changed", (topic) => fn(String(topic)));
+    return () => removeEventListener("ludo_changed", l);
+  },
 };
 
 export const host: HostShell = {
@@ -132,5 +143,6 @@ export const host: HostShell = {
   app,
   launcher,
   focus,
+  events,
   uiDocument: () => gamepadUIDocument() ?? document,
 };

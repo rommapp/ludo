@@ -8,8 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT_ZIP="${SCRIPT_DIR}/../${PLUGIN_NAME}.zip"
 
 # ── Vendored Python dependencies ─────────────────────────────────────────────
-# Decky Loader is a PyInstaller AppImage running Python 3.11 — NOT the system
-# Python — and it exposes none of these to plugins, so every one of them has to
+# Decky Loader is a PyInstaller AppImage running its own Python — 3.11 up to
+# v3.2, 3.14 from v3.3 — NOT the system Python — and it exposes none of these to plugins, so every one of them has to
 # ride along in py_modules/ (main.py puts that directory on sys.path).
 #
 # This used to refresh Pillow alone and take the rest on faith from whatever the
@@ -21,14 +21,21 @@ OUT_ZIP="${SCRIPT_DIR}/../${PLUGIN_NAME}.zip"
 # "sync_core not available" path. Vendoring them here, from a pinned list rather
 # than from the working tree, is what makes the zip reproducible.
 #
-# Binary wheels (Pillow, psutil, watchdog, charset_normalizer) must match
-# cp311/manylinux or they silently fail to import; --only-binary :all: with an
-# explicit --python-version is what pins that. Transitive deps are resolved
+# Binary wheels (Pillow, cffi, charset_normalizer) must match the interpreter or
+# they silently fail to import; --only-binary :all: with an explicit
+# --python-version is what pins that. Their extension filenames carry the Python
+# version, so both sets unpack side by side and each Decky loads its own. The
+# versions are resolved once and pinned for the second set, so one package
+# never mixes files from two releases. Transitive deps are resolved
 # rather than listed by hand — qrcode's typing_extensions is the kind of thing
 # --no-deps drops and nobody notices until a QR code fails to draw.
-DEPS=(requests watchdog psutil qrcode Pillow cryptography "python-socketio[client]")
+# typing_extensions is named because pip judges a dependency's Python-version
+# marker by the Python running pip, not by --python-version: qrcode needs it on
+# 3.11 and a newer build machine would leave it out.
+DEPS=(requests watchdog psutil qrcode Pillow cryptography typing_extensions "python-socketio[client]")
 
-echo "==> Vendoring Python deps for Decky's Python 3.11: ${DEPS[*]}"
+PY_VERSIONS=(3.14 3.11)
+echo "==> Vendoring Python deps for Decky's Python ${PY_VERSIONS[*]}: ${DEPS[*]}"
 WHEEL_TMP=$(mktemp -d)
 trap 'rm -rf "$WHEEL_TMP"' EXIT
 # --platform matches wheel tags literally: it does not imply the older
@@ -37,14 +44,16 @@ trap 'rm -rf "$WHEEL_TMP"' EXIT
 # carrying manylinux2014 — so all three spellings have to be offered or the
 # resolver reports the package as simply not existing. Pure-Python wheels
 # (py3-none-any) match regardless.
-pip download "${DEPS[@]}" \
-    --python-version 3.11 \
-    --platform manylinux_2_28_x86_64 \
-    --platform manylinux_2_17_x86_64 \
-    --platform manylinux2014_x86_64 \
-    --only-binary :all: \
-    -d "$WHEEL_TMP" \
-    --quiet
+WHEEL_TAGS=(--platform manylinux_2_28_x86_64 --platform manylinux_2_17_x86_64
+            --platform manylinux2014_x86_64 --only-binary :all:)
+# Newest Python first: it has the shortest list of releases with wheels, so the
+# older Python can always match the versions it picks.
+pip download "${DEPS[@]}" --python-version 3.14 "${WHEEL_TAGS[@]}" -d "$WHEEL_TMP" --quiet
+PINS=()
+for whl in "$WHEEL_TMP"/*.whl; do
+    base=$(basename "$whl"); PINS+=("${base%%-*}==$(echo "$base" | cut -d- -f2)")
+done
+pip download "${PINS[@]}" --python-version 3.11 "${WHEEL_TAGS[@]}" -d "$WHEEL_TMP" --quiet
 
 shopt -s nullglob
 WHEELS=("$WHEEL_TMP"/*.whl)
@@ -56,6 +65,15 @@ for whl in "${WHEELS[@]}"; do
     echo "    $(basename "$whl")"
 done
 shopt -u nullglob
+
+# A Decky whose Python has no matching extension runs without covers and stores
+# credentials in plain text, and nothing fails loudly. So fail here.
+for py in 311 314; do
+    for pattern in "PIL/_imaging.cpython-$py-*" "_cffi_backend.cpython-$py-*"; do
+        compgen -G "${SCRIPT_DIR}/py_modules/$pattern" >/dev/null || {
+            echo "ERROR: py_modules has no $pattern" >&2; exit 1; }
+    done
+done
 
 # Prove the vendored tree is complete before it is packaged. The pure-Python
 # packages are imported for real, which is what catches a missing transitive
@@ -70,7 +88,7 @@ PYTHONPATH="${SCRIPT_DIR}/py_modules" python3 - <<'PYCHECK'
 import sys
 missing = []
 mods = ["requests", "watchdog.observers", "qrcode", "socketio", "websocket"]
-if sys.version_info[:2] == (3, 11):
+if sys.version_info[:2] in ((3, 11), (3, 14)):
     mods += ["PIL.Image", "psutil", "cryptography.fernet"]
 for mod in mods:
     try:

@@ -6,6 +6,7 @@ Handles BIOS detection, verification, and synchronization
 
 from pathlib import Path
 import hashlib
+import os
 import logging
 import threading
 import time
@@ -121,6 +122,11 @@ class BiosManager:
                 self.log(f"⚠️ Ignoring BIOS path from an uninstalled emulator: "
                          f"{custom_bios_path}")
                 custom_bios_path = ''
+            # Setup saves the folder it suggested, so this often just records
+            # the default rather than a choice, and mustn't outrank a folder set
+            # in RetroArch afterwards.
+            if custom_bios_path and self._is_stale_default(Path(custom_bios_path)):
+                custom_bios_path = ''
             if custom_bios_path:  # Only use if not empty
                 custom_dir = Path(custom_bios_path)
                 if custom_dir.exists():
@@ -135,6 +141,18 @@ class BiosManager:
                     except Exception as e:
                         self.log(f"❌ Failed to create custom BIOS directory: {e}")
                         self.log("⚠️ Falling back to auto-detection")
+
+        # RetroArch's own setting, which is the folder it will really read. EmuDeck
+        # sets it to ~/Emulation/bios.
+        configured = getattr(self.retroarch, '_retroarch_cfg_value', lambda k: '')(
+            'system_directory')
+        if configured and not dead(Path(configured)):
+            try:
+                Path(configured).mkdir(parents=True, exist_ok=True)
+                self.log(f"📁 Using RetroArch's system directory: {configured}")
+                return Path(configured)
+            except OSError as e:
+                self.log(f"⚠️ Could not use RetroArch's system directory {configured}: {e}")
 
         possible_dirs = [
             # RetroDECK
@@ -170,7 +188,9 @@ class BiosManager:
         
         # Skip BIOS dirs belonging to an uninstalled emulator — ~/retrodeck/bios
         # and ~/.var/app/<id>/... both outlive the app they came with.
-        for system_dir in (d for d in possible_dirs if not dead(d)):
+        prefer = getattr(self.retroarch, '_prefer_selected_install', None)
+        live_dirs = prefer(possible_dirs) if prefer else [d for d in possible_dirs if not dead(d)]
+        for system_dir in live_dirs:
             if system_dir.exists():
                 self.log(f"📁 Found system/BIOS directory: {system_dir}")
                 return system_dir
@@ -192,8 +212,40 @@ class BiosManager:
             except Exception as e:
                 self.log(f"Failed to create RetroDECK BIOS directory: {e}")
         
+        # An emulator that has never run has no system/ yet. RetroArch makes the
+        # same folder itself on first run, so a BIOS can go there now. Not on
+        # Windows, where _install_tree's path means nothing.
+        expected = ''
+        if os.name != 'nt' and hasattr(self.retroarch, 'expected_bios_dir'):
+            expected = self.retroarch.expected_bios_dir()
+        if expected and not dead(Path(expected)):
+            try:
+                Path(expected).mkdir(parents=True, exist_ok=True)
+                self.log(f"📁 Created system/BIOS directory: {expected}")
+                return Path(expected)
+            except OSError as e:
+                self.log(f"⚠️ Could not create {expected}: {e}")
+
         self.log("⚠️ No RetroArch system/BIOS directory found")
         return None
+
+    def _is_stale_default(self, path):
+        """True for the emulator's default BIOS folder when RetroArch uses another."""
+        tree = getattr(self.retroarch, '_install_tree', lambda: None)()
+        configured = getattr(self.retroarch, '_retroarch_cfg_value', lambda k: '')(
+            'system_directory')
+        return bool(tree and configured
+                    and path == tree / 'system' and path != Path(configured))
+
+    def ensure_system_directory(self):
+        """The BIOS folder, looking again if there was none at startup.
+
+        This manager can outlive the moment it was built: Ludo may have installed
+        RetroArch since, and nothing else re-checks before a download.
+        """
+        if not self.system_dir:
+            self.refresh_system_directory()
+        return self.system_dir
     
     def calculate_md5(self, file_path):
         """Calculate MD5 hash of a file"""
@@ -493,7 +545,7 @@ class BiosManager:
             self.log("❌ Not connected to RomM")
             return False
 
-        if not self.system_dir:
+        if not self.ensure_system_directory():
             self.log("❌ No system directory found")
             return False
 
