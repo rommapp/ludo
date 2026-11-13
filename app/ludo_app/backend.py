@@ -731,7 +731,7 @@ class LudoBackend:
     _romm_client = None
     _auto_sync = None
     _collection_sync = None
-    _available_games: list = None
+    _available_games_data: list = None
 
     # Live state of an in-progress emulator install (see install_emulator).
     # Class-level default so emulator_install_state() answers before one starts.
@@ -924,6 +924,8 @@ class LudoBackend:
     # -----------------------------------------------------------------------
 
     def __init__(self, host: HostProfile = None):
+        self._games_lock = threading.RLock()
+        self._games_index_cache = None
         # Decky constructs Plugin() with no arguments, so the subclass in
         # decky_plugin/main.py supplies its host here rather than at the call
         # site. The desktop backend passes one directly.
@@ -1661,7 +1663,7 @@ class LudoBackend:
             if configured_url and data.get('server_url') and data['server_url'] != configured_url:
                 logging.info("Library snapshot is for a different server; ignoring")
                 return None
-            self._available_games = data.get('games') or []
+            games = data.get('games') or []
             # The snapshot's is_downloaded/local_path are only as fresh as the
             # last fetch that wrote it, and downloads land between fetches. A
             # stale 'false' made every game grabbed since the last fetch come
@@ -1673,8 +1675,9 @@ class LudoBackend:
             # regional/disc variants as entries of their own, which is what put
             # the same game on screen twice. Fold them into their parent first so
             # the reconcile below runs over a clean library.
-            self._absorb_variant_entries(self._available_games)
-            self._reconcile_downloads(self._available_games)
+            self._absorb_variant_entries(games)
+            self._reconcile_downloads(games)
+            self._available_games = games
             self._romm_collections = data.get('collections') or None
             self._romm_smart_collections = data.get('smart_collections') or None
             self._romm_virtual_collections = data.get('virtual_collections') or None
@@ -4109,7 +4112,9 @@ class LudoBackend:
             if not SYNC_CORE_AVAILABLE:
                 return {'success': False, 'error': 'sync_core not available'}
             settings = SettingsManager()
-            settings.set('RomM', 'url',      url.strip().rstrip('/'))
+            url = url.strip().rstrip('/')
+            server_changed = url != (settings.get('RomM', 'url', '') or '').strip().rstrip('/')
+            settings.set('RomM', 'url',      url)
             settings.set('RomM', 'username', username.strip())
             if password:
                 settings.set('RomM', 'password', password)
@@ -4129,11 +4134,13 @@ class LudoBackend:
 
             self._stop_sync()
             time.sleep(0.5)
+            if server_changed:
+                self._clear_library_cache()
             # Fresh credentials may be a different account: drop the cached
             # /api/users/me answer so the next read reflects whoever connects.
             self._invalidate_account_user_cache()
             self._start_sync()
-            _record_activity('account', 'Signed in', url.strip().rstrip('/'))
+            _record_activity('account', 'Signed in', url)
             return {'success': True}
         except Exception as e:
             logging.error(f"save_config error: {e}", exc_info=True)
@@ -6749,9 +6756,34 @@ class LudoBackend:
     # per-game cover/detail/download/delete). Styled in RomM v2 on the frontend.
     # -----------------------------------------------------------------------
 
+    @property
+    def _available_games(self):
+        """Live library; replace it or use _append_available_game to change membership."""
+        return self._available_games_data
+
+    @_available_games.setter
+    def _available_games(self, games):
+        with self._games_lock:
+            self._available_games_data = games
+            self._games_index_cache = None
+
+    def _append_available_game(self, game):
+        with self._games_lock:
+            self._available_games_data.append(game)
+            self._games_index_cache = None
+
     def _games_index(self):
-        """rom_id -> game dict, from the in-memory library."""
-        return {g.get('rom_id'): g for g in (self._available_games or []) if g.get('rom_id')}
+        """rom_id map with live game dicts; callers must not change its keys.
+
+        Publication and construction share a lock so a concurrent replacement
+        cannot leave a stale cache. Previously returned maps keep their keys.
+        """
+        with self._games_lock:
+            if self._games_index_cache is None:
+                self._games_index_cache = {
+                    g.get('rom_id'): g for g in (self._available_games or [])
+                    if g.get('rom_id')}
+            return self._games_index_cache
 
     def _variant_parent_index(self, games=None):
         """variant rom_id -> parent rom_id, from the grouped in-memory library.
@@ -10544,10 +10576,9 @@ class LudoBackend:
                         self._persist_snapshot_throttled()
                     elif ok:
                         # Genuinely not in the library and not a known variant —
-                        # add it so launch_game can find it. Safe under CPython's
-                        # GIL (same assumption as the mutations above).
+                        # add it so launch_game can find it.
                         is_md, dc = _detect_multi_disc(str(final), True)
-                        self._available_games.append({
+                        self._append_available_game({
                             'name': name or 'Unknown',
                             'rom_id': rom_id,
                             'platform': platform_slug,
@@ -11175,7 +11206,7 @@ class LudoBackend:
                                 g = found
                             else:
                                 g = found
-                                self._available_games.append(g)
+                                self._append_available_game(g)
                 except Exception:
                     pass
             if not g or not g.get('is_downloaded') or not g.get('local_path'):
