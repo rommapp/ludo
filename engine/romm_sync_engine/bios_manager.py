@@ -625,29 +625,26 @@ class BiosManager:
         if size:
             return size <= emulator_saves.KEYS_MAX_BYTES
         name = (entry.get('file_name') or '').lower()
-        if name.endswith('.keys'):
+        if name.endswith('.keys') or name.startswith(('prod.keys.', 'title.keys.')):
             return True
         return 'keys' in name and name.endswith(('.zip', '.7z', '.rar'))
 
-    def find_keys_entry(self, platform_slug):
-        """The server's prod.keys record for a platform, or None.
-
-        Separate from find_firmware_entry because the two files are uploaded
-        separately in practice. Newest wins when several exist: keys are
-        cumulative, so the most recent one opens everything the older ones did.
-        """
+    def find_keys_entries(self, platform_slug):
+        """Latest bare prod, bare title and bundle, oldest first."""
         platforms = self._fetch_platforms()
         if platforms is None:
-            return None
+            return []
         for platform in platforms:
             if (platform.get('slug') or '').lower() != platform_slug.lower():
                 continue
             keys = [f for f in (platform.get('firmware') or [])
                     if self._is_keys_entry(f)]
-            if not keys:
-                return None
-            return max(keys, key=lambda f: f.get('updated_at') or '')
-        return None
+            latest = {}
+            for entry in sorted(keys, key=lambda f: f.get('updated_at') or ''):
+                kind = emulator_saves.key_file_name(entry.get('file_name'))
+                latest[kind or 'bundle'] = entry
+            return sorted(latest.values(), key=lambda f: f.get('updated_at') or '')
+        return []
 
     def find_firmware_entry(self, platform_slug, file_name=None):
         """The server's firmware record for a platform, or None.

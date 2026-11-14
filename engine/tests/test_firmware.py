@@ -15,6 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from romm_sync_engine import emulator_saves as E  # noqa: E402
 
 FAILURES = []
+KEY_TEXT = b''.join(name + b' = ' + b'01' * 16 + b'\n' for name in
+                    (b'aes_kek_generation_source', b'aes_key_generation_source',
+                     b'bis_kek_source', b'master_key_00'))
 
 
 def check(name, got, want):
@@ -42,7 +45,7 @@ def main():
             # now -- but by basename into the keys directory we choose, so the
             # "../../" must buy the archive nothing: same destination as a
             # member named plainly "prod.keys".
-            z.writestr('../../keys/prod.keys', b'SECRET')
+            z.writestr('../../keys/prod.keys', KEY_TEXT)
             z.writestr('nested/dir/ffffffffffffffffffffffffffffffff.nca', b'F' * 20)
 
         result = E.install_firmware_zip(archive, extra_data_dir=data)
@@ -64,7 +67,7 @@ def main():
               [p.relative_to(data).as_posix() for p in data.rglob('prod.keys')],
               ['keys/prod.keys'])
         check('prod.keys content installed',
-              (data / 'keys/prod.keys').read_bytes(), b'SECRET')
+              (data / 'keys/prod.keys').read_bytes(), KEY_TEXT)
         check('key files not counted as firmware', result['keys'], 1)
         check('find_prod_keys sees it',
               E.find_prod_keys(extra_data_dir=data), data / 'keys/prod.keys')
