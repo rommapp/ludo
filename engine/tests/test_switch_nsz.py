@@ -14,6 +14,7 @@ import struct
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -28,6 +29,24 @@ def check(name, got, want):
     if not ok:
         FAILURES.append(name)
     print(f"{'ok  ' if ok else 'FAIL'} {name}: got={got!r} want={want!r}")
+
+
+def test_load():
+    lib = object()
+    cases = [
+        ('skip missing names', [None, '', 'first', 'second'], None, lib, ['first']),
+        ('candidate precedence', ['first', 'second'], None, lib, ['first']),
+        ('OSError fallback', ['first', 'second'], [OSError('missing'), lib],
+         lib, ['first', 'second']),
+        ('exhausted candidates', ['first', 'second'], OSError('missing'),
+         None, ['first', 'second']),
+        ('all empty candidates', [None, ''], None, None, []),
+    ]
+    for name, candidates, errors, expected, calls in cases:
+        with patch.object(Z.ctypes, 'CDLL', return_value=lib, side_effect=errors) as load:
+            check(f'{name}: result', Z._load(candidates) is expected, True)
+            check(f'{name}: CDLL calls', load.call_args_list,
+                  [call(candidate) for candidate in calls])
 
 
 def zstd_compress(data):
@@ -163,6 +182,9 @@ def test_xcz(tmp):
 
 
 def main():
+    test_load()
+    if FAILURES:
+        return 1
     if not Z.available():
         print('libzstd or libcrypto missing; cannot test')
         return 1
