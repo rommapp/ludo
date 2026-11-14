@@ -11220,10 +11220,11 @@ class RetroArchInterface:
                                if m.filename.endswith(f'_libretro{ext}')), None)
                 if member is None:
                     raise ValueError('archive contains no libretro core')
-                # The buildbot index CRC is the extracted core's, so this
-                # verifies the whole chain (download + unzip) in one check.
+                # Nightly builds can change while the cached index is still fresh.
                 if f'{member.CRC:08x}' != entry['crc']:
-                    raise ValueError('checksum mismatch — download corrupted')
+                    entry = self.list_downloadable_cores(force_refresh=True).get(core_name)
+                    if not entry or f'{member.CRC:08x}' != entry['crc']:
+                        raise ValueError('checksum mismatch — download corrupted')
                 payload = z.read(member)
 
             # Write beside the target and rename, so a half-written core is
