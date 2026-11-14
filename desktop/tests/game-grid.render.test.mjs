@@ -1,7 +1,7 @@
 import test, { before, after, describe } from "node:test";
 import assert from "node:assert/strict";
 import { distIsBuilt, launchBrowser, PAD } from "./support/render-harness.mjs";
-import { GAMES, bounded, direction, focused, gridServer, longScroll, openGrid, scrollState } from "./support/game-grid.mjs";
+import { GAMES, bounded, direction, focused, gridServer, longScroll, openGrid, scrollState, settleGridScroll } from "./support/game-grid.mjs";
 
 let playwright;
 try { playwright = await import("playwright"); } catch {}
@@ -26,6 +26,7 @@ describe("bounded built game grids", { skip: !playwright ? "playwright unavailab
       assert.ok(next && next[0] > beforeJump[0], `${beforeJump} -> ${next}`);
       await r.pressPad(7);
       assert.ok((await focused(r.page))[0] < next[0]);
+      await settleGridScroll(r.page);
       const name = await focused(r.page);
       const saved = await scrollState(r.page);
       await r.pressPad(PAD.SECONDARY);
@@ -96,6 +97,7 @@ describe("bounded built game grids", { skip: !playwright ? "playwright unavailab
       const original = await focused(r.page);
       for (let i = 0; i < 20; i++) await direction(r.page, "down");
       assert.notEqual(await focused(r.page), original, "Search crosses virtual rows using controller");
+      await settleGridScroll(r.page);
       const savedName = await focused(r.page);
       const savedScroll = (await scrollState(r.page)).scroll;
       await r.pressPad(PAD.SECONDARY, { settleMs: 1000 });
@@ -117,5 +119,25 @@ describe("bounded built game grids", { skip: !playwright ? "playwright unavailab
       assert.equal(await r.page.locator(".romm-gt-wrap:visible").count(), 0);
       assert.deepEqual(r.errors, []);
     } finally { await r.close(); }
+  });
+
+  test("scroll settlement waits for frame-driven motion, not a fixed delay", async () => {
+    const page = await browser.newPage();
+    try {
+      await page.setContent('<div class="romm-ui" style="height:100px;overflow:auto"><div class="romm-gt-wrap" style="height:2000px">Tile</div></div>');
+      const inFlight = await page.evaluate(() => {
+        const scroller = document.querySelector(".romm-ui");
+        let frame = 0;
+        function move() {
+          scroller.scrollTop = ++frame * 10;
+          if (frame < 12) requestAnimationFrame(move);
+        }
+        requestAnimationFrame(move);
+        return scroller.scrollTop;
+      });
+      assert.equal(inFlight, 0, "control captures an in-flight scroll");
+      await settleGridScroll(page);
+      assert.equal((await scrollState(page)).scroll, 120);
+    } finally { await page.close(); }
   });
 });

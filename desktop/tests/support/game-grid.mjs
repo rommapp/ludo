@@ -54,6 +54,26 @@ export function focused(page) {
   return page.evaluate(() => document.activeElement?.closest(".romm-gt-wrap")?.textContent.match(/[A-Z] Grid Game \d{5}/)?.[0] ?? null);
 }
 
+// Releasing the pad stops repeats, not its scroll spring; snapshot only at rest.
+export async function settleGridScroll(page) {
+  await page.evaluate(() => new Promise((resolve, reject) => {
+    const tile = [...document.querySelectorAll(".romm-gt-wrap")].find((el) => el.getBoundingClientRect().width);
+    const scroller = tile.closest(".romm-ui");
+    const deadline = performance.now() + 3000;
+    let previous = scroller.scrollTop;
+    let stable = 0;
+    function frame(now) {
+      const current = scroller.scrollTop;
+      stable = current === previous ? stable + 1 : 0;
+      previous = current;
+      if (stable >= 4) resolve();
+      else if (now >= deadline) reject(new Error("game grid scroll did not settle"));
+      else requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }));
+}
+
 export async function scrollState(page) {
   return page.evaluate(() => {
     const tile = [...document.querySelectorAll(".romm-gt-wrap")].find((el) => el.getBoundingClientRect().width);
