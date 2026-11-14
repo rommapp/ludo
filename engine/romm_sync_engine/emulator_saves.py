@@ -352,7 +352,7 @@ def _keys_marker_path():
 
 
 def read_keys_marker():
-    """The last key file we installed: {'file_name', 'md5'}, or {}."""
+    """Persistent entry/member receipts, or the legacy single-entry receipt."""
     try:
         with open(_keys_marker_path()) as fh:
             return json.load(fh) or {}
@@ -360,13 +360,38 @@ def read_keys_marker():
         return {}
 
 
-def write_keys_marker(file_name, md5):
+def key_file_name(file_name):
+    name = Path(file_name or '').name.lower()
+    if name.endswith(('.zip', '.7z', '.rar')):
+        return None
+    return next((k for k in _KEY_FILES
+                 if name == k or name.startswith(k + '.')), None)
+
+
+def write_keys_marker(file_name, md5, files=None):
+    """Merge an entry receipt, retaining legacy metadata and other entries."""
     path = _keys_marker_path()
+    marker = read_keys_marker()
+    receipts = marker.setdefault('entries', {})
+    owners = marker.setdefault('files', {})
+    # Old receipts only prove prod was installed, not that a bundle had title.
+    if marker.get('file_name') and not receipts:
+        legacy_name = marker['file_name']
+        legacy_files = [key_file_name(legacy_name) or 'prod.keys']
+        legacy = {'md5': marker.get('md5', ''), 'files': legacy_files}
+        receipts[legacy_name] = legacy
+        for name in legacy_files:
+            owners.setdefault(name, legacy)
+    files = list(files if files is not None else [key_file_name(file_name) or 'prod.keys'])
+    receipt = {'md5': (md5 or '').lower(), 'files': files}
+    receipts[file_name] = receipt
+    for name in files:
+        owners[name] = receipt
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix('.part')
         with open(tmp, 'w') as fh:
-            json.dump({'file_name': file_name, 'md5': (md5 or '').lower()}, fh)
+            json.dump(marker, fh)
         tmp.replace(path)
     except OSError as e:
         log.debug("could not write keys marker: %s", e)
@@ -379,20 +404,30 @@ def keys_are_current(entry, extra_data_dir=None):
     console update lands on the server on its own -- so this is tracked
     separately rather than folded into the firmware marker.
     """
-    if find_prod_keys(extra_data_dir) is None:
-        return False
     marker = read_keys_marker()
+    receipt = marker.get('entries', {}).get(entry.get('file_name'))
+    if receipt is None and marker.get('file_name') == entry.get('file_name'):
+        receipt = {**marker, 'files': [key_file_name(marker['file_name']) or 'prod.keys']}
+    names = (receipt or {}).get('files') or [key_file_name(entry.get('file_name')) or 'prod.keys']
+    dirs = eden_data_dirs(extra_data_dir)
+    if not all(any((d / 'keys' / name).is_file() for d in dirs) for name in names):
+        return False
     expected = (entry.get('md5_hash') or '').lower()
     if not expected:
         # Nothing to compare against: a key file already on disk is good
         # enough, since re-installing an 11 KB file has no cost worth a guess.
         return True
-    if not marker:
+    if not receipt:
         # Keys on disk that Ludo never installed: the user put them there,
         # through Eden or by hand (rommapp/ludo#22). They are the user's to
         # manage, so they count as installed and are not overwritten.
-        return True
-    return marker.get('md5') == expected
+        owners = marker.get('files', {})
+        # A receipt for another entry of this kind still detects changed hashes.
+        if not owners and marker.get('file_name'):
+            owners = {key_file_name(marker['file_name']) or 'prod.keys': marker}
+        return all(name not in owners or owners[name].get('md5') == expected
+                   for name in names)
+    return receipt.get('md5') == expected
 
 
 def firmware_is_current(entry, extra_data_dir=None):
@@ -471,6 +506,11 @@ def install_firmware_zip(zip_path, extra_data_dir=None, dry_run=False):
                 continue
 
             if is_key:
+                with archive.open(member) as probe:
+                    if (member.file_size > KEYS_MAX_BYTES
+                            or not looks_like_keys(probe.read(64 * 1024), lowered)):
+                        log.warning("%s is not key data; not installing", name)
+                        continue
                 # Resolved lazily: an archive with no keys must not create an
                 # empty keys/ directory as a side effect.
                 if keys_target is None:
@@ -518,7 +558,7 @@ def install_firmware_zip(zip_path, extra_data_dir=None, dry_run=False):
             'keys': keys_installed, 'keys_target': keys_target}
 
 
-def looks_like_keys(data):
+def looks_like_keys(data, file_name=None):
     """True when `data` is the text of a Switch key file.
 
     Content, not name. A file called prod.keys that is actually a stray
@@ -527,6 +567,9 @@ def looks_like_keys(data):
     """
     if not data:
         return False
+    if key_file_name(file_name) == 'title.keys':
+        return any(re.fullmatch(rb'[0-9a-fA-F]{32}\s*=\s*[0-9a-fA-F]{32}', line.strip())
+                   for line in data[:64 * 1024].splitlines())
     matched = 0
     for line in data[:64 * 1024].splitlines():
         if _KEY_LINE_RE.match(line.strip()):
@@ -670,18 +713,19 @@ def identify_upload(path):
                     if Path(member.filename).name.lower() not in _KEY_FILES:
                         continue
                     with archive.open(member) as fh:
-                        if looks_like_keys(fh.read(64 * 1024)):
+                        if looks_like_keys(fh.read(64 * 1024), member.filename):
                             return 'keys'
                 return None
         with open(path, 'rb') as fh:
-            if looks_like_keys(fh.read(64 * 1024)):
+            if looks_like_keys(fh.read(64 * 1024), path.name):
                 return 'keys'
     except (OSError, zipfile.BadZipFile) as e:
         log.debug("could not identify %s: %s", path, e)
     return None
 
 
-def install_keys_file(path, extra_data_dir=None, dry_run=False):
+def install_keys_file(path, extra_data_dir=None, dry_run=False,
+                      installed_files=None, preserve_manual=False):
     """Install a key file into Eden's keys/ directory. Returns the count.
 
     Accepts either a bare prod.keys or an archive containing one, because a
@@ -703,8 +747,14 @@ def install_keys_file(path, extra_data_dir=None, dry_run=False):
 
     def _write(name, read):
         destination = target / name.lower()
+        marker = read_keys_marker()
+        owned = name.lower() in marker.get('files', {})
+        if marker.get('file_name') and not marker.get('files'):
+            owned = name.lower() == (key_file_name(marker['file_name']) or 'prod.keys')
+        if preserve_manual and destination.is_file() and not owned:
+            return False
         if dry_run:
-            return
+            return True
         staging = destination.with_name(destination.name + '.part')
         try:
             with open(staging, 'wb') as sink:
@@ -713,6 +763,9 @@ def install_keys_file(path, extra_data_dir=None, dry_run=False):
         except BaseException:
             staging.unlink(missing_ok=True)
             raise
+        if installed_files is not None:
+            installed_files.append(name.lower())
+        return True
 
     if zipfile.is_zipfile(path):
         written = 0
@@ -728,13 +781,13 @@ def install_keys_file(path, extra_data_dir=None, dry_run=False):
                 # the same dialog as no keys at all -- the least diagnosable
                 # outcome available, so it is worth one read to prevent.
                 with archive.open(member) as probe:
-                    if not looks_like_keys(probe.read(64 * 1024)):
+                    if (member.file_size > KEYS_MAX_BYTES
+                            or not looks_like_keys(probe.read(64 * 1024), name)):
                         log.warning("%s in %s is not key data; not installing",
                                     name, path.name)
                         continue
                 with archive.open(member) as source:
-                    _write(name, source)
-                written += 1
+                    written += int(_write(name, source))
         return written
 
     # A bare upload: trust the destination name we choose, not the one it
@@ -742,7 +795,8 @@ def install_keys_file(path, extra_data_dir=None, dry_run=False):
     # keys, and a file named anything else is not something we rename into
     # place blindly.
     with open(path, 'rb') as probe:
-        if not looks_like_keys(probe.read(64 * 1024)):
+        if (path.stat().st_size > KEYS_MAX_BYTES
+                or not looks_like_keys(probe.read(64 * 1024), path.name)):
             log.debug("%s is not key data", path)
             return 0
 
@@ -752,8 +806,7 @@ def install_keys_file(path, extra_data_dir=None, dry_run=False):
     name = path.name.lower()
     known = next((k for k in _KEY_FILES if name.startswith(k)), 'prod.keys')
     with open(path, 'rb') as source:
-        _write(known, source)
-    return 1
+        return int(_write(known, source))
 
 
 def eden_pids():

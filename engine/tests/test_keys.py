@@ -26,6 +26,7 @@ header_key = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
 master_key_00 = c2caaff089b9aed55694876055271c7d
 """
 OTHER_KEY_TEXT = KEY_TEXT.replace(b'master_key_00', b'master_key_0a')
+TITLE_KEY_TEXT = b'00112233445566778899AABBCCDDEEFF = FFEEDDCCBBAA99887766554433221100\n'
 
 FAILURES = []
 
@@ -90,14 +91,14 @@ def main():
         # --- a zipped keys upload, shaped like the real one ------------
         archive = d / 'ProdKeys.NET-v22.5.0.zip'
         with zipfile.ZipFile(archive, 'w') as z:
-            z.writestr('title.keys', OTHER_KEY_TEXT)
+            z.writestr('title.keys', TITLE_KEY_TEXT)
             z.writestr('prod.keys', KEY_TEXT)
         check('installs both key files',
               E.install_keys_file(archive, extra_data_dir=data), 2)
         check('prod.keys content', (data / 'keys/prod.keys').read_bytes(),
               KEY_TEXT)
         check('title.keys content', (data / 'keys/title.keys').read_bytes(),
-              OTHER_KEY_TEXT)
+              TITLE_KEY_TEXT)
         check('find_prod_keys sees it',
               E.find_prod_keys(extra_data_dir=data), data / 'keys/prod.keys')
 

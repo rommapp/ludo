@@ -15231,43 +15231,60 @@ class AutoSyncManager:
     )
 
     def _sync_switch_keys(self, bios, progress=None):
-        """Fetch a separately uploaded prod.keys. Returns {'installed', ...}.
+        """Fetch independent prod/title keys uploads. Returns {'installed', ...}.
 
         Best-effort by design: a missing or failed key fetch must not abort a
         firmware install that would otherwise succeed. The caller reports the
         combined state, and 'no-keys' is what tells the user the set cannot
         boot -- not an exception from here.
         """
+        installed = 0
+        errors = []
+        changed_files = set()
         try:
-            entry = bios.find_keys_entry('switch')
-            if not entry:
-                return {'installed': 0, 'status': 'no-keys-on-server'}
-            if emulator_saves.keys_are_current(entry):
-                return {'installed': 0, 'status': 'up-to-date'}
-
-            path = bios.download_firmware_entry(
-                entry, cache_dir() / 'firmware' / entry['file_name'],
-                progress=progress)
-            if not path:
-                return {'installed': 0, 'status': 'failed'}
-
-            # Last word on what this file is: the entry looked like keys by
-            # size, now the bytes have to agree. install_keys_file re-checks
-            # per member, but failing here gives the caller a reason.
-            if emulator_saves.identify_upload(path) != 'keys':
-                self.log(f"⚠️ {entry.get('file_name')} is not a key file")
-                return {'installed': 0, 'status': 'not-keys'}
-
-            written = emulator_saves.install_keys_file(path)
-            if written:
-                emulator_saves.write_keys_marker(
-                    entry.get('file_name'), entry.get('md5_hash'))
-                self.forget_title_ids()
-                self.log(f"🔑 Installed {entry.get('file_name')}")
-            return {'installed': written, 'status': 'installed'}
-        except Exception as e:
-            self.log(f"⚠️ Could not sync Switch keys: {e}")
-            return {'installed': 0, 'status': 'failed'}
+            entries = bios.find_keys_entries('switch')
+        except Exception:
+            return {'installed': 0, 'status': 'failed',
+                    'message': 'Could not list Switch keys on RomM; retry the install'}
+        if not entries:
+            return {'installed': 0, 'status': 'no-keys-on-server'}
+        for entry in entries:
+            try:
+                receipt = emulator_saves.read_keys_marker().get('entries', {}).get(
+                    entry.get('file_name'), {})
+                names = receipt.get('files') or [
+                    emulator_saves.key_file_name(entry.get('file_name')) or 'prod.keys']
+                # Reapply a newer selected entry if an older one just changed its files.
+                if (not changed_files.intersection(names)
+                        and emulator_saves.keys_are_current(entry)):
+                    continue
+                path = bios.download_firmware_entry(
+                    entry, cache_dir() / 'firmware' / entry['file_name'],
+                    progress=progress)
+                if not path:
+                    raise ValueError('download failed')
+                if emulator_saves.identify_upload(path) != 'keys':
+                    raise ValueError('upload contains no valid key data')
+                files = []
+                written = emulator_saves.install_keys_file(
+                    path, installed_files=files, preserve_manual=True)
+                if written:
+                    emulator_saves.write_keys_marker(
+                        entry.get('file_name'), entry.get('md5_hash'), files)
+                    installed += written
+                    changed_files.update(files)
+                    self.forget_title_ids()
+                    self.log(f"🔑 Installed {entry.get('file_name')}")
+                elif not emulator_saves.keys_are_current(entry):
+                    raise ValueError('no key files installed')
+            except Exception:
+                # Do not expose downloaded content (or arbitrary exception text).
+                self.log(f"⚠️ Could not install Switch keys: {entry.get('file_name')}")
+                errors.append(f"Could not install {entry.get('file_name')}; "
+                              'check the RomM upload and connection, then retry')
+        return {'installed': installed,
+                'status': 'failed' if errors else ('installed' if installed else 'up-to-date'),
+                'message': '; '.join(errors)}
 
     def ensure_switch_keys(self, progress=None):
         """Install prod.keys from RomM when it is missing or out of date.
@@ -15308,11 +15325,13 @@ class AutoSyncManager:
         # the server, which sync_switch_firmware installs first.
         keys = emulator_saves.keys_status()
         keys_ok = keys is not None
-        if not keys_ok:
-            try:
-                keys_ok = bios.find_keys_entry('switch') is not None
-            except Exception:
-                keys_ok = False
+        try:
+            key_entries = bios.find_keys_entries('switch')
+            keys_ok = keys_ok or any(
+                emulator_saves.key_file_name(e.get('file_name')) != 'title.keys'
+                for e in key_entries)
+        except Exception:
+            pass
         # Version labels, parsed from filenames. The installed one comes from
         # the marker -- the name of the archive we actually unpacked -- so
         # "17.0.1 installed" is a statement about this machine's history, not
@@ -15379,13 +15398,19 @@ class AutoSyncManager:
         # circulate, and firmware that is already correct on disk must not be
         # re-downloaded merely because the keys beside it are missing.
         keys_result = self._sync_switch_keys(bios, progress=progress)
+        key_count = keys_result.get('installed', 0)
+        keys_failed = keys_result.get('status') == 'failed'
 
         entry = bios.find_firmware_entry('switch')
         if not entry:
+            if keys_failed:
+                return {'status': 'failed', 'installed': 0, 'skipped': 0,
+                        'keys': key_count, 'message': keys_result['message']}
             if keys_result.get('installed'):
-                return {'status': 'installed', 'installed': 0, 'skipped': 0,
-                        'keys': 1,
-                        'message': 'Installed prod.keys; no firmware on the server'}
+                return {'status': ('installed' if emulator_saves.find_prod_keys()
+                                   else 'no-firmware'), 'installed': 0, 'skipped': 0,
+                        'keys': key_count,
+                        'message': f'Installed {key_count} Switch key file(s); no firmware on the server'}
             return {'status': 'no-firmware',
                     'message': 'No Switch firmware on the server'}
 
@@ -15397,16 +15422,20 @@ class AutoSyncManager:
             skipped = (emulator_saves.firmware_status() or {}).get('count', 0)
             if emulator_saves.find_prod_keys() is None:
                 return {'status': 'no-keys', 'installed': 0, 'skipped': skipped,
-                        'keys': 0, 'message': self._NO_KEYS_MESSAGE}
-            return {'status': 'up-to-date', 'installed': 0,
+                        'keys': key_count, 'message': self._NO_KEYS_MESSAGE}
+            if keys_failed:
+                return {'status': 'failed', 'installed': 0, 'skipped': skipped,
+                        'keys': key_count, 'message': keys_result['message']}
+            return {'status': 'installed' if key_count else 'up-to-date', 'installed': 0,
                     'skipped': skipped,
                     'keys': keys_result.get('installed', 0),
-                    'message': f"{entry.get('file_name')} is already installed"}
+                    'message': (f'Installed {key_count} Switch key file(s); firmware already installed'
+                                if key_count else f"{entry.get('file_name')} is already installed")}
 
         archive = bios.download_firmware_entry(
             entry, cache_dir() / 'firmware' / entry['file_name'], progress=progress)
         if not archive:
-            return {'status': 'failed',
+            return {'status': 'failed', 'keys': key_count,
                     'message': f"Could not download {entry.get('file_name')}"}
 
         # An archive holding no NCAs is not firmware, whatever it is called.
@@ -15415,21 +15444,24 @@ class AutoSyncManager:
         kind = emulator_saves.identify_upload(archive)
         if kind != 'firmware':
             if kind == 'keys':
-                written = emulator_saves.install_keys_file(archive)
-                emulator_saves.write_keys_marker(
-                    entry.get('file_name'), entry.get('md5_hash'))
-                return {'status': 'installed', 'installed': 0, 'skipped': 0,
-                        'keys': written,
-                        'message': f"{entry.get('file_name')} is a key file, "
-                                   'not firmware; installed it as keys'}
-            return {'status': 'failed',
+                files = []
+                written = emulator_saves.install_keys_file(
+                    archive, installed_files=files, preserve_manual=True)
+                if written:
+                    emulator_saves.write_keys_marker(
+                        entry.get('file_name'), entry.get('md5_hash'), files)
+                return {'status': 'failed' if keys_failed else 'installed',
+                        'installed': 0, 'skipped': 0, 'keys': written + key_count,
+                        'message': keys_result['message'] if keys_failed else
+                                   f"{entry.get('file_name')} is a key file, not firmware; installed it as keys"}
+            return {'status': 'failed', 'keys': key_count,
                     'message': f"{entry.get('file_name')} contains no firmware"}
 
         try:
             result = emulator_saves.install_firmware_zip(archive)
         except Exception as e:
             self.log(f"❌ Firmware install failed: {e}")
-            return {'status': 'failed', 'message': str(e)}
+            return {'status': 'failed', 'keys': key_count, 'message': str(e)}
 
         # Record the set that is now on disk either way: 'installed nothing'
         # still means this archive's contents are present, and without the
@@ -15437,6 +15469,7 @@ class AutoSyncManager:
         status = emulator_saves.firmware_status() or {}
         emulator_saves.write_firmware_marker(
             entry.get('file_name'), entry.get('md5_hash'), status.get('count', 0))
+        result['keys'] += key_count
 
         # Keys are not optional bookkeeping: every NCA here is encrypted, so an
         # install without prod.keys boots nothing. Report that rather than
@@ -15451,10 +15484,15 @@ class AutoSyncManager:
             self.forget_title_ids()
             self.log(f"🔑 Installed {result['keys']} key file(s)")
 
+        if keys_failed:
+            return {'status': 'failed', **result, 'message': keys_result['message']}
+
         if not result['installed']:
-            return {'status': 'up-to-date', 'installed': 0,
+            return {'status': 'installed' if result['keys'] else 'up-to-date', 'installed': 0,
                     'skipped': result['skipped'],
-                    'message': 'Firmware already installed'}
+                    'keys': result['keys'],
+                    'message': (f"Installed {result['keys']} Switch key file(s); firmware already installed"
+                                if result['keys'] else 'Firmware already installed')}
 
         self.log(f"✅ Installed {result['installed']} firmware files "
                  f"({result['skipped']} already present)")
