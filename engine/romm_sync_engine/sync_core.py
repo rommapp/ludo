@@ -9666,6 +9666,9 @@ class RetroArchInterface:
                      '# over its own configuration for this session only.',
                      'network_cmd_enable = "true"',
                      f'network_cmd_port = "{self.port}"']
+            system_dir = getattr(getattr(self, 'bios_manager', None), 'system_dir', None)
+            if system_dir:
+                lines.append(f'system_directory = "{system_dir}"')
             core_dir = self._core_dir_override(core_path)
             if core_dir:
                 lines.append(f'libretro_directory = "{core_dir}"')
