@@ -33,6 +33,7 @@ import { CollectionActionsModal, NAV_ORDER, UserMenuModal, V2NavBar, useNavChrom
 import { v2Page, V2Focus } from "../focus";
 import { _dlActive, onProgress, progressOf, runCollectionBatch, useBatchJob, watchProgress } from "../downloads";
 import { EmuStalePath, InstallProgressBar, installSize, loadEmulatorStatus, publishEmulatorStatus, startEmulatorInstall, useEmulatorInstall, useEmulatorStatus } from "../emulator";
+import { useVirtualGrid } from "../virtual-grid";
 // The library: home, platforms, collections, search, and the grid underneath.
 //
 // The root page keeps all four panels mounted and hides the inactive ones
@@ -283,41 +284,17 @@ export function SearchPanel({ onOpen, onBg, visible }: { onOpen: (g: LibGame) =>
     // "Searching…" on every keystroke. The full-screen loading state is only
     // shown when there's nothing to display yet (see render below).
     setLoading(true);
+    let alive = true;
     const t = setTimeout(async () => {
-      try { const r = await searchGames(q); setResults(r?.success ? (r.games || []) : []); }
-      catch { setResults([]); }
-      finally { setLoading(false); }
+      try { const r = await searchGames(q); if (alive) setResults(r?.success ? (r.games || []) : []); }
+      catch { if (alive) setResults([]); }
+      finally { if (alive) setLoading(false); }
     }, 250);
-    return () => clearTimeout(t);
+    return () => { alive = false; clearTimeout(t); };
   }, [q]);
 
-  // On-demand windowed mount — same scheme as the platform/collection games
-  // page (visN + focus-driven growth + IO sentinel). A broad query (e.g. "ma")
-  // can match hundreds of ROMs; mounting every Focusable tree at once stutters,
-  // so render the first screenful and grow as the user scrolls toward the end.
-  const GRID_FIRST = 30, GRID_CHUNK = 30;
-  const [visN, setVisN] = useState(GRID_FIRST);
-  useEffect(() => { setVisN(Math.min(results.length, GRID_FIRST)); }, [results]);
-  const visNRef = useRef(visN); visNRef.current = visN;
-  const resultsLenRef = useRef(results.length); resultsLenRef.current = results.length;
-  const onTileFocus = useRef((i: number) => {
-    if (i >= visNRef.current - 12)
-      setVisN((n) => Math.min(resultsLenRef.current, Math.max(n, i + 1 + GRID_CHUNK)));
-  }).current;
-  const sentinelRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (visN >= results.length) return;
-    const el = sentinelRef.current;
-    const bump = () => setVisN((n) => Math.min(results.length, n + GRID_CHUNK));
-    if (!el || typeof IntersectionObserver === 'undefined') { bump(); return; }
-    let io: IntersectionObserver | null = null;
-    try {
-      io = new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) bump(); },
-        { rootMargin: '400px' });
-      io.observe(el);
-    } catch { bump(); }
-    return () => { try { io?.disconnect(); } catch { } };
-  }, [visN, results.length]);
+  const backId = returnFocusRomId();
+  const grid = useVirtualGrid(results.length, visible, backId == null ? -1 : results.findIndex((g) => g.rom_id === backId));
 
   // Stable callback identity so memo(GameTile) isn't invalidated each render.
   const onOpenRef = useRef(onOpen); onOpenRef.current = onOpen;
@@ -325,10 +302,14 @@ export function SearchPanel({ onOpen, onBg, visible }: { onOpen: (g: LibGame) =>
   const onBgRef = useRef(onBg); onBgRef.current = onBg;
   const setBg = useRef((uri: string | null) => onBgRef.current(uri)).current;
 
-  const gridTiles = useMemo(() => results.slice(0, visN).map((g, i) => (
-    <GameTile key={g.rom_id} game={g} onOpen={openGame} onActiveCover={setBg}
-      index={i} onFocusIdx={onTileFocus} focusable={visible} />
-  )), [results, visN, visible]);
+  const gridKey = JSON.stringify(grid.segments);
+  const gridTiles = useMemo(() => grid.segments.flatMap((segment) => [
+    ...(segment.before > 0 ? [<div key={`gap-${segment.start}`} aria-hidden style={{ gridColumn: '1 / -1', height: segment.before }} />] : []),
+    ...results.slice(segment.start, segment.end).map((g, i) => (
+      <GameTile key={g.rom_id} game={g} onOpen={openGame} onActiveCover={setBg}
+        index={segment.start + i} onFocusIdx={grid.onFocus} focusable={visible} />
+    )),
+  ]), [results, gridKey, visible]);
 
   // Land gamepad focus on the search field when the tab opens (same retry
   // cadence as the group grids) — entering Search with nothing highlighted
@@ -346,7 +327,11 @@ export function SearchPanel({ onOpen, onBg, visible }: { onOpen: (g: LibGame) =>
     // _forceGamepadFocus, not focus(): silent while the window is OS-unfocused
     // after an emulator session (same as useAutoFocus).
     const timers = [0, 60, 160, 320].map((d) =>
-      setTimeout(() => { try { if (searchFieldRef.current) _forceGamepadFocus(searchFieldRef.current); } catch { } }, d));
+      setTimeout(() => { try {
+        const id = returnFocusRomId();
+        const target = id == null ? searchFieldRef.current : tileElFor(id);
+        if (target) _forceGamepadFocus(target);
+      } catch { } }, d));
     return () => timers.forEach(clearTimeout);
   }, [visible]);
 
@@ -375,15 +360,13 @@ export function SearchPanel({ onOpen, onBg, visible }: { onOpen: (g: LibGame) =>
       ) : (
         // Results present: keep the grid mounted even while a refined query is
         // in flight, so typing another letter doesn't flash "Searching…".
-        <Focusable noFocusRing {...NAV_MAINTAIN_X} style={{
+        <div ref={grid.ref}><Focusable noFocusRing {...NAV_MAINTAIN_X} onButtonDown={(e: any) => grid.navigate(e, results)} style={{
           display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(132px, 1fr))',
           gap: '18px 16px', padding: '6px 0',
         }}>
           {gridTiles}
-          {visN < results.length && (
-            <div ref={sentinelRef} style={{ gridColumn: '1 / -1', height: '1px' }} />
-          )}
-        </Focusable>
+          {grid.after > 0 && <div aria-hidden style={{ gridColumn: '1 / -1', height: grid.after }} />}
+        </Focusable></div>
       )}
     </div>
   );
@@ -1539,6 +1522,7 @@ const rowText = (el: Element) => ((el as HTMLElement).innerText || '').replace(/
 export function LibraryRootPage() {
   const [stack, setStack] = useState<LibView[]>([]);
   const viewRef = useRef<HTMLDivElement | null>(null);
+  const tabsRef = useRef<HTMLDivElement | null>(null);
   // The game whose detail page is on top, so backing out lands on its tile.
   const returnRomId = useRef<number | null>(null);
   // Which row had focus in the view a push covered, so backing out lands on it
@@ -1566,7 +1550,7 @@ export function LibraryRootPage() {
   // The page's scroll position goes with it. Rebuilt at the top and then
   // scrolled to the focused row a moment later, the page visibly jumps.
   const restoreScroll = useRef<number | null>(null);
-  const scroller = () => viewRef.current?.querySelector('.romm-ui') as HTMLElement | null;
+  const scroller = () => (viewRef.current ?? tabsRef.current)?.querySelector('.romm-ui') as HTMLElement | null;
   useEffect(() => {
     setLibViewHooks(
       (v) => {
@@ -1590,7 +1574,7 @@ export function LibraryRootPage() {
           restoreScroll.current = scroll;
           // Pages that autofocus on mount aim at this instead of their first item.
           setReturnFocusTarget(() => findSig(saved), null, 1000);
-        } else { restoreSig.current = null; restoreScroll.current = null; }
+        } else { restoreSig.current = null; restoreScroll.current = st[st.length - 1] === 'game' ? scroll : null; }
         setStack((s) => {
         // Backing out of a game page: the view underneath re-runs its
         // first-item autofocus (a grid remounts outright). Point that at the
@@ -1691,7 +1675,7 @@ export function LibraryRootPage() {
           NOTE display:none does NOT remove hidden Focusables from gamepad nav
           (verified on-device — they linger as 0×0 "phantom" focus targets);
           the tiles opt out themselves via focusable={visible}. */}
-      <div style={{ display: top ? 'none' : undefined }}>
+      <div ref={tabsRef} style={{ display: top ? 'none' : undefined }}>
         <LibraryGroupsPage covered={!!top} />
       </div>
       {top && (
@@ -2082,54 +2066,9 @@ export function LibraryGamesPage() {
   // press to leave the header carousel.
   const firstTileRef = useAutoFocus(!loading && games.length > 0, group?.key);
 
-  // Progressive mount: a big platform (e.g. GBA = 480 games) mounted all tiles
-  // in one commit → ~360ms layout before anything showed. Render the first
-  // screenful immediately, then grow the count in chunks across frames so first
-  // paint is fast and the rest fill in without blocking. Covers are viewport-
-  // gated already, so off-screen appended tiles cost almost nothing.
-  // On-demand mount (infinite scroll): rather than eagerly mounting all 480
-  // tiles for a big platform (480 Focusable trees is inherently heavy, even
-  // spread across frames), keep only what's reached. A sentinel below the last
-  // rendered tile grows the count by a chunk whenever it nears the viewport, so
-  // typically ~2-3 screens of tiles are mounted and the grid stays fluid.
-  const GRID_FIRST = 30, GRID_CHUNK = 30;
-  // Coming back from a game further down than the first chunk: mount through
-  // its tile, so focus can go straight back to it.
-  const firstVisN = (list: LibGame[]) => {
-    const back = returnFocusRomId();
-    const i = back == null ? -1 : list.findIndex((g) => g.rom_id === back);
-    return Math.min(list.length, Math.max(GRID_FIRST, i + 1 + GRID_CHUNK));
-  };
-  const [visN, setVisN] = useState(() => firstVisN(games));
-  useEffect(() => { setVisN(firstVisN(games)); }, [group?.key]);
-  // Focus-driven growth — the reliable trigger under gamescope. When the
-  // focused tile nears the end of the mounted set, mount another chunk. (The IO
-  // sentinel below stays as a touch-scroll fallback.) Stable identity via refs
-  // so it doesn't invalidate memo(GameTile).
-  const visNRef = useRef(visN); visNRef.current = visN;
-  const gamesLenRef = useRef(games.length); gamesLenRef.current = games.length;
+  const backId = returnFocusRomId();
+  const grid = useVirtualGrid(games.length, `${group?.key}:${loading}`, backId == null ? -1 : games.findIndex((g) => g.rom_id === backId));
   const gamesRef = useRef(games); gamesRef.current = games;
-  const onTileFocus = useRef((i: number) => {
-    if (i >= visNRef.current - 12)
-      setVisN((n) => Math.min(gamesLenRef.current, Math.max(n, i + 1 + GRID_CHUNK)));
-  }).current;
-
-  const sentinelRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (visN >= games.length) return;
-    const el = sentinelRef.current;
-    const bump = () => setVisN((n) => Math.min(games.length, n + GRID_CHUNK));
-    // ~one screen of lookahead — enough that tiles are ready just before you
-    // reach them, without over-mounting rows you may never scroll to.
-    if (!el || typeof IntersectionObserver === 'undefined') { bump(); return; }
-    let io: IntersectionObserver | null = null;
-    try {
-      io = new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) bump(); },
-        { rootMargin: '400px' });
-      io.observe(el);
-    } catch { bump(); }
-    return () => { try { io?.disconnect(); } catch { } };
-  }, [visN, games.length]);
 
   // Stable identity across renders so memo(GameTile) isn't invalidated every
   // time the page re-renders (e.g. on background-art / progress updates). The
@@ -2144,15 +2083,8 @@ export function LibraryGamesPage() {
   openGameImplRef.current = openGameImpl;
   const openGame = useRef((g: LibGame) => openGameImplRef.current(g)).current;
 
-  // Memoize the tile elements so a background-art re-render (setBgUri fires on
-  // EVERY focus move) reuses the same element references instead of rebuilding
-  // and re-diffing all `visN` tiles — that O(mounted) reconciliation per dpad
-  // press is what made scrolling degrade as more tiles mounted. Recomputed only
-  // when the game list or mounted count actually changes.
   // ---- L2/R2 letter scrubbing (same UX as the index grids) ---------------
-  // Every mounted tile registers its DOM node; the jump grows visN first (the
-  // target tile may not be mounted yet — the grid is virtualized) and then
-  // retries focusing until the tile appears.
+  // Scroll to the target row, then retry focus while its tiles mount.
   const gameTileEls = useRef(new Map<number, any>());
   const gameTileRef = (romId: number, first: boolean) => (el: any) => {
     if (el) gameTileEls.current.set(romId, el); else gameTileEls.current.delete(romId);
@@ -2188,7 +2120,7 @@ export function LibraryGamesPage() {
     const target = _scrubTargetIdx(list.map((g) => g.name), cur, dir);
     const g = list[target];
     if (target !== cur) {
-      setVisN((n) => Math.min(gamesLenRef.current, Math.max(n, target + 1 + GRID_CHUNK)));
+      grid.scrollToIndex(target);
       const tryFocus = (attempt: number) => {
         const el = gameTileEls.current.get(g.rom_id);
         if (el) {
@@ -2204,10 +2136,14 @@ export function LibraryGamesPage() {
   };
   // -----------------------------------------------------------------------
 
-  const gridTiles = useMemo(() => games.slice(0, visN).map((g, i) => (
-    <GameTile key={g.rom_id} game={g} onOpen={openGame} onActiveCover={setBgUri}
-      focusRef={gameTileRef(g.rom_id, i === 0)} index={i} onFocusIdx={onTileFocus} />
-  )), [games, visN]);
+  const gridKey = JSON.stringify(grid.segments);
+  const gridTiles = useMemo(() => grid.segments.flatMap((segment) => [
+    ...(segment.before > 0 ? [<div key={`gap-${segment.start}`} aria-hidden style={{ gridColumn: '1 / -1', height: segment.before }} />] : []),
+    ...games.slice(segment.start, segment.end).map((g, i) => (
+      <GameTile key={g.rom_id} game={g} onOpen={openGame} onActiveCover={setBgUri}
+        focusRef={gameTileRef(g.rom_id, segment.start + i === 0)} index={segment.start + i} onFocusIdx={grid.onFocus} />
+    )),
+  ]), [games, gridKey]);
 
   // L1 / R1 page through sibling groups (same mode) without backing out.
   // (`siblings` is declared above for the prefetch logic.)
@@ -2242,6 +2178,8 @@ export function LibraryGamesPage() {
     setSlideDir(dir);
     setLibGroupHolder({ mode, group: next });
     setGroup(next);
+    const scroller = grid.ref.current?.closest('.romm-ui');
+    if (scroller) scroller.scrollTop = 0;
     requestAnimationFrame(() => { try { if (headerRef.current) _forceGamepadFocus(headerRef.current); } catch { } });
   };
   // Collection auto-sync toggle (Y). Keyed by the group key — the name for
@@ -2636,7 +2574,7 @@ export function LibraryGamesPage() {
       ) : games.length === 0 ? (
         <div style={{ padding: '16px', color: V2.fgMuted, fontSize: '13px' }}>No games in this group.</div>
       ) : (
-        <Focusable noFocusRing {...NAV_MAINTAIN_X}
+        <div ref={grid.ref}><Focusable noFocusRing {...NAV_MAINTAIN_X} onButtonDown={(e: any) => grid.navigate(e, games)}
           key={`${group.key}:${reloadTick}`}
           className={`romm-games-grid ${slideDir === 1 ? 'lib-slide-r' : 'lib-slide-l'}`}
           style={{
@@ -2645,10 +2583,8 @@ export function LibraryGamesPage() {
           }}
         >
           {gridTiles}
-          {visN < games.length && (
-            <div ref={sentinelRef} style={{ gridColumn: '1 / -1', height: '1px' }} />
-          )}
-        </Focusable>
+          {grid.after > 0 && <div aria-hidden style={{ gridColumn: '1 / -1', height: grid.after }} />}
+        </Focusable></div>
       )}
       <ScrubOverlay letter={scrubLetter} />
       <style>{`
