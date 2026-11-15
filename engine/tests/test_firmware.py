@@ -15,6 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from romm_sync_engine import emulator_saves as E  # noqa: E402
 
 FAILURES = []
+KEY_TEXT = b''.join(name + b' = ' + b'01' * 16 + b'\n' for name in
+                    (b'aes_kek_generation_source', b'aes_key_generation_source',
+                     b'bis_kek_source', b'master_key_00'))
 
 
 def check(name, got, want):
@@ -42,7 +45,7 @@ def main():
             # now -- but by basename into the keys directory we choose, so the
             # "../../" must buy the archive nothing: same destination as a
             # member named plainly "prod.keys".
-            z.writestr('../../keys/prod.keys', b'SECRET')
+            z.writestr('../../keys/prod.keys', KEY_TEXT)
             z.writestr('nested/dir/ffffffffffffffffffffffffffffffff.nca', b'F' * 20)
 
         result = E.install_firmware_zip(archive, extra_data_dir=data)
@@ -64,7 +67,7 @@ def main():
               [p.relative_to(data).as_posix() for p in data.rglob('prod.keys')],
               ['keys/prod.keys'])
         check('prod.keys content installed',
-              (data / 'keys/prod.keys').read_bytes(), b'SECRET')
+              (data / 'keys/prod.keys').read_bytes(), KEY_TEXT)
         check('key files not counted as firmware', result['keys'], 1)
         check('find_prod_keys sees it',
               E.find_prod_keys(extra_data_dir=data), data / 'keys/prod.keys')
@@ -127,6 +130,23 @@ def main():
 
         check('not current before anything is recorded',
               E.firmware_is_current(entry, extra_data_dir=data), False)
+
+        # Firmware Ludo never installed (Eden's own installer, or by hand):
+        # no receipt, but Eden's log names the version it loaded. A match with
+        # the server archive's version is current -- not a 340 MB re-download.
+        (data / 'log').mkdir(exist_ok=True)
+        eden_log = data / 'log/eden_log.txt'
+        eden_log.write_text('[ 0.1] Core <Info> Installed firmware: 17.0.1\n')
+        check('user-installed firmware of the same version is current',
+              E.firmware_is_current(entry, extra_data_dir=data), True)
+        eden_log.write_text('[ 0.1] Core <Info> Installed firmware: 16.0.3\n')
+        check('user-installed firmware of another version is not current',
+              E.firmware_is_current(entry, extra_data_dir=data), False)
+        eden_log.write_text('[ 0.1] Core <Info> Installed firmware: 17.0.1\n')
+        check('an unversioned server archive is not current without a receipt',
+              E.firmware_is_current({**entry, 'file_name': 'firmware.zip'},
+                                    extra_data_dir=data), False)
+        eden_log.unlink()
 
         E.write_firmware_marker(entry['file_name'], entry['md5_hash'], installed)
         check('current once recorded',

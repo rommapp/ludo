@@ -89,6 +89,8 @@ class _OutBuf(ctypes.Structure):
 
 def _load(names):
     for name in names:
+        if not name:
+            continue
         try:
             return ctypes.CDLL(name)
         except OSError:

@@ -59,7 +59,8 @@ def backend(monkeypatch, tmp_path):
 
 def _handle(b):
     active = {'req-1'}
-    b._handle_install({'id': 'req-1', 'rom_id': ROM}, 'dev-1', active)
+    b._handle_install({'id': 'req-1', 'rom_id': ROM}, 'dev-1', active,
+                      b._stop_event, b._romm_client)
     assert not active, "the request must leave the active set"
     return b._romm_client.reports
 
@@ -180,7 +181,8 @@ def test_a_switched_off_platform_is_declined_with_the_reason(c64_off):
 def test_declines_arriving_together_are_one_row_and_one_toast(c64_off):
     b, rows, toasts = c64_off
     for i in range(3):
-        b._handle_install({'id': f'req-{i}', 'rom_id': ROM}, 'dev-1', {f'req-{i}'})
+        b._handle_install({'id': f'req-{i}', 'rom_id': ROM}, 'dev-1', {f'req-{i}'},
+                          b._stop_event, b._romm_client)
     assert _settled(lambda: rows and toasts)
     import time; time.sleep(0.2)
     assert len(rows) == 1 and len(toasts) == 1

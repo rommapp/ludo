@@ -26,6 +26,7 @@ def b(monkeypatch, tmp_path):
     resp.json.return_value = dict(ROW, files=[])
     c.session.get.return_value = resp
     b._romm_client = c
+    b._romm_collections = [{'id': 1, 'name': 'C'}]
     return b
 
 
@@ -34,14 +35,14 @@ def test_trim_keeps_the_field():
 
 
 async def test_collection_row(b):
-    b._fetch_collection_roms_by_name = lambda k: [ROW]
+    b._romm_client.get_collection_roms.return_value = [ROW]
     r = await b.get_library_games('collection', 'C')
     assert r['games'][0]['no_server_file'] is True
 
 
 async def test_older_server_row_is_not_flagged(b):
     row = {k: v for k, v in ROW.items() if k != 'has_file_on_disk'}
-    b._fetch_collection_roms_by_name = lambda k: [row]
+    b._romm_client.get_collection_roms.return_value = [row]
     r = await b.get_library_games('collection', 'C')
     assert 'no_server_file' not in r['games'][0]
 
@@ -75,7 +76,7 @@ GOOD = {'rom_id': 9, 'name': 'Game', 'platform': 'DS', 'platform_slug': 'nds',
 
 async def test_collection_shows_the_playable_version_once(b):
     b._available_games = [GOOD]
-    b._fetch_collection_roms_by_name = lambda k: [ROW, dict(ROW, id=8)]
+    b._romm_client.get_collection_roms.return_value = [ROW, dict(ROW, id=8)]
     b._variant_parent_index = lambda games=None: {7: 9, 8: 9}
     b._games_index = lambda: {9: GOOD}
     games = (await b.get_library_games('collection', 'C'))['games']

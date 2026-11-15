@@ -85,8 +85,12 @@ def configured_folder_wins():
     custom.mkdir(parents=True)
     write_cfg(f'system_directory = "~/Emulation/bios"\n')
     bios = make_bios(make_ra())
+    bios.system_dir = bios.find_system_directory()
     check('system_directory wins over the default folder',
-          bios.find_system_directory(), custom)
+          bios.system_dir, custom)
+    overlay = Path(bios.retroarch._launch_overlay_config(None)).read_text()
+    check('overlay uses RetroArch\'s chosen BIOS folder',
+          f'system_directory = "{custom}"' in overlay.splitlines(), True)
 
 
 def placeholder_keeps_default():
@@ -98,11 +102,19 @@ def placeholder_keeps_default():
 
 
 def ludo_setting_still_first():
-    mine = Path.home() / 'mine'
+    mine = Path.home() / 'my BIOS folder'
     write_cfg('system_directory = "~/Emulation/bios"\n')
     ra = make_ra()
     ra.settings.set('BIOS', 'custom_path', str(mine))
-    check('a folder chosen in Ludo wins', make_bios(ra).find_system_directory(), mine)
+    bios = make_bios(ra)
+    bios.system_dir = bios.find_system_directory()
+    check('a folder chosen in Ludo wins', bios.system_dir, mine)
+    overlay = Path(ra._launch_overlay_config(None)).read_text()
+    check('overlay passes Ludo\'s BIOS folder with spaces',
+          f'system_directory = "{mine}"' in overlay.splitlines(), True)
+    check('RetroArch\'s own BIOS setting is unchanged',
+          (tree() / 'retroarch.cfg').read_text(),
+          'system_directory = "~/Emulation/bios"\n')
 
 
 def saved_default_yields():
@@ -110,8 +122,13 @@ def saved_default_yields():
     write_cfg('system_directory = "~/Emulation/bios"\n')
     ra = make_ra()
     ra.settings.set('BIOS', 'custom_path', str(tree() / 'system'))
+    bios = make_bios(ra)
+    bios.system_dir = bios.find_system_directory()
     check('the default saved by setup yields to RetroArch',
-          make_bios(ra).find_system_directory(), custom)
+          bios.system_dir, custom)
+    overlay = Path(ra._launch_overlay_config(None)).read_text()
+    check('overlay uses resolved folder, not the stale saved default',
+          f'system_directory = "{custom}"' in overlay.splitlines(), True)
 
 
 def fresh_install_gets_system():
@@ -144,12 +161,16 @@ def late_download_finds_folder():
 def first_launch_prepared():
     (tree() / 'saves').mkdir(parents=True)
     ra = make_ra()
+    bios = make_bios(ra)
+    bios.system_dir = bios.find_system_directory()
     check('still no config dir', ra.find_retroarch_config_dir(), None)
     check('per-game options go in the install tree',
           ra._ps2_option_files('/roms/Game.chd'),
           [tree() / 'config' / n / 'Game.opt' for n in PS2_CORE_NAMES])
     check('saves are filed for content sorting', ra.get_save_subdir_mode('saves'), 'content')
     overlay = Path(ra._launch_overlay_config(None)).read_text()
+    check('first launch passes the resolved default BIOS folder',
+          f'system_directory = "{tree() / "system"}"' in overlay.splitlines(), True)
     check('overlay turns core sorting off', 'sort_savefiles_enable = "false"' in overlay, True)
     check('overlay turns content sorting on',
           'sort_savefiles_by_content_enable = "true"' in overlay, True)
@@ -164,11 +185,30 @@ def later_launches_use_config():
     check('a real config is still read', ra.get_save_subdir_mode('saves'), 'core')
 
 
+def unresolved_bios_leaves_config_alone():
+    write_cfg('system_directory = "~/Emulation/bios"\n')
+    ra = make_ra()
+    ra.settings.set('BIOS', 'custom_path', str(Path.home() / 'unresolved BIOS'))
+    for state in ('no manager', 'no directory attribute', None, ''):
+        if state == 'no directory attribute':
+            bios = make_bios(ra)
+        elif state != 'no manager':
+            bios.system_dir = state
+        overlay = Path(ra._launch_overlay_config(None)).read_text()
+        check(f'{state!r}: overlay is still written',
+              'network_cmd_enable = "true"' in overlay, True)
+        check(f'{state!r}: no unresolved BIOS override', 'system_directory' in overlay, False)
+    check('unresolved BIOS leaves retroarch.cfg unchanged',
+          (tree() / 'retroarch.cfg').read_text(),
+          'system_directory = "~/Emulation/bios"\n')
+
+
 def main():
     for fn in (configured_folder_wins, placeholder_keeps_default, ludo_setting_still_first,
                saved_default_yields,
                fresh_install_gets_system, selected_install_first, late_download_finds_folder,
-               first_launch_prepared, later_launches_use_config):
+               first_launch_prepared, later_launches_use_config,
+               unresolved_bios_leaves_config_alone):
         try:
             in_fresh_home(fn)
         except Exception as e:

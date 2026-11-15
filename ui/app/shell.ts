@@ -19,7 +19,14 @@ import { host } from "@ludo/host";
 // and each adapter's focus.ts). These four wrappers keep the call sites reading
 // as intent, and all four no-op where the shell has no such facility — which is
 // why no caller checks first.
-export function _forceGamepadFocus(el: any): void { host.focus.force(el); }
+export function _forceGamepadFocus(el: any): void {
+  // Returning to a game restores the exact viewport independently of focus.
+  const scroller = _returnFocusRomId != null && _returnFocusTarget?.() === el
+    ? el?.closest?.('.romm-ui') as HTMLElement | null : null;
+  const y = scroller?.scrollTop;
+  host.focus.force(el);
+  if (scroller && y != null) scroller.scrollTop = y;
+}
 
 export function _gpFocusEl(): Element | null { return host.focus.current(); }
 
@@ -64,7 +71,7 @@ export function useAutoFocus(ready: boolean, dep?: any) {
     const timers = [0, 60, 160, 320].map((d) =>
       setTimeout(() => {
         try {
-          const el = _returnFocusTarget?.() || ref.current;
+          const el = _returnFocusTarget?.() || (_returnFocusRomId == null ? ref.current : null);
           if (el) _forceGamepadFocus(el);
         } catch { }
       }, d));
