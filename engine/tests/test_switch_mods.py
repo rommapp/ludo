@@ -79,6 +79,63 @@ class ModPackages(unittest.TestCase):
                 self.install({MOD: b'one', other: b'two'})
             self.assertFalse((self.root / MOD).exists())
 
+    def install_named(self, entries, name):
+        path = self.root / name
+        with zipfile.ZipFile(path, 'w') as z:
+            for member, data in entries.items():
+                z.writestr(member, data)
+        return self.installer.install(path, TITLE, name, name)
+
+    def test_layouts_eden_imports_are_installed_like_eden(self):
+        # Eden's "Import Mod from ZIP" takes the parent of any mod folder.
+        cases = {
+            'romfs/a.bin': f'load/{TITLE}/Bare Mod/romfs/a.bin',
+            'Sixty FPS/RomFS/a.bin': f'load/{TITLE}/Sixty FPS/romfs/a.bin',
+            f'{TITLE}/Named/exefs/main.npdm': f'load/{TITLE}/Named/exefs/main.npdm',
+            f'atmosphere/contents/{TITLE.lower()}/romfs/a.bin': f'load/{TITLE}/Bare Mod/romfs/a.bin',
+            'Ext/romfs_ext/a.bin': f'load/{TITLE}/Ext/romfs_ext/a.bin',
+            'Lite/romfslite/a.bin': f'load/{TITLE}/Lite/romfslite/a.bin',
+            'Cheat/cheats/0123456789ABCDEF.txt': f'load/{TITLE}/Cheat/cheats/0123456789ABCDEF.txt',
+        }
+        for member, target in cases.items():
+            with self.subTest(member=member):
+                self.install_named({member: b'x', 'README.md': b'notes'}, 'Bare Mod.zip')
+                self.assertEqual((self.root / target).read_bytes(), b'x')
+                self.installer.remove('Bare Mod.zip', TITLE)
+                self.assertFalse((self.root / target).exists())
+
+    def test_canonical_paths_accept_every_eden_folder_in_any_case(self):
+        target = f'load/{TITLE}/Example/RomFS_Ext/a.bin'
+        self.install({target: b'x'})
+        self.assertTrue((self.root / f'load/{TITLE}/Example/romfs_ext/a.bin').exists())
+
+    def test_several_mods_in_one_archive_are_all_installed(self):
+        self.install_named({'A/romfs/a.bin': b'a', 'B/exefs/b.ips': b'b'}, 'pack.zip')
+        self.assertTrue((self.root / f'load/{TITLE}/A/romfs/a.bin').exists())
+        self.assertTrue((self.root / f'load/{TITLE}/B/exefs/b.ips').exists())
+
+    def test_eden_layout_for_another_game_is_rejected(self):
+        with self.assertRaises(M.ModError):
+            self.install_named({'01007EF00011E000/Mod/romfs/a.bin': b'x'}, 'other.zip')
+        with self.assertRaises(M.ModError):
+            self.install_named({'docs/readme.txt': b'x'}, 'nomod.zip')
+        self.assertFalse((self.root / 'load').exists())
+
+    def test_forced_removal_deletes_edited_owned_files_only(self):
+        borrowed = f'load/{TITLE}/Example/romfs/borrowed.bin'
+        (self.root / borrowed).parent.mkdir(parents=True)
+        (self.root / borrowed).write_bytes(b'same')
+        self.install({MOD: b'code', CONFIG: b'config', borrowed: b'same'})
+        (self.root / CONFIG).write_bytes(b'user tweaked')
+        with self.assertRaises(M.ChangedError):
+            self.installer.remove('one', TITLE)
+        self.assertTrue((self.root / MOD).exists())
+        self.installer.remove('one', TITLE, force=True)
+        self.assertFalse((self.root / MOD).exists())
+        self.assertFalse((self.root / CONFIG).exists())
+        self.assertEqual((self.root / borrowed).read_bytes(), b'same')
+        self.assertEqual(self.installer.installed(TITLE), [])
+
     def test_rejects_zip_symlink(self):
         path = self.archive({MOD: b'code'})
         link = zipfile.ZipInfo(f'load/{TITLE}/Example/romfs/link')
@@ -232,34 +289,6 @@ class ModPackages(unittest.TestCase):
         self.installer.recover()
         self.assertFalse((self.root / MOD).exists())
         self.assertEqual((self.root / CONFIG).read_bytes(), b'[Resolution]\nHeight=720')
-
-    def test_handheld_profile_patches_only_known_keys(self):
-        lines = ['; keep comment\r\n']
-        section = ''
-        for group, key in M.HANDHELD720:
-            if group != section:
-                lines.append(f'[{group}]\r\n')
-                section = group
-            lines.append(f'{key} = 999\r\n')
-        lines.extend(['[Gameplay]\r\n', 'Fov = 50\r\n'])
-        original = ''.join(lines).encode()
-        self.installer.install(self.archive({MOD: b'code', CONFIG: original}), TITLE,
-                               'one', 'Example', 'handheld720')
-        after = (self.root / CONFIG).read_bytes()
-        self.assertIn(b'Width = 1280\r\n', after)
-        self.assertIn(b'MaxFPS = 60\r\n', after)
-        self.assertIn(b'; keep comment\r\n', after)
-        self.assertIn(b'Fov = 50\r\n', after)
-        self.assertEqual(self.installer.installed(TITLE)[0]['profile'], 'handheld720')
-        # Switching back uses the source bytes, not a previously patched file.
-        self.installer.install(self.archive({MOD: b'code', CONFIG: original}), TITLE,
-                               'one', 'Example', 'original')
-        self.assertEqual((self.root / CONFIG).read_bytes(), original)
-
-    def test_unrecognized_handheld_ini_is_rejected_before_target_write(self):
-        with self.assertRaises(M.ModError):
-            self.installer.install(self.archive(), TITLE, 'one', 'Example', 'handheld720')
-        self.assertFalse((self.root / MOD).exists())
 
 
 if __name__ == '__main__':

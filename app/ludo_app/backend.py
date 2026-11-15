@@ -10454,7 +10454,7 @@ class LudoBackend:
         except Exception as e:
             return {'status': 'failed', 'message': str(e)}
 
-    async def install_switch_mod_package(self, rom_id: int, file_id: int, profile: str = 'original'):
+    async def install_switch_mod_package(self, rom_id: int, file_id: int):
         if rom_id in self._switch_fetch_state:
             return {'status': 'busy'}
         progress = {'file_name': 'Mod package', 'percent': 0, 'state': 'preparing', 'kind': 'mod'}
@@ -10464,14 +10464,14 @@ class LudoBackend:
             if not title:
                 return {'status': 'not-switch'}
             return await asyncio.get_event_loop().run_in_executor(
-                None, mod_packages.install, self._romm_client, rom_id, title, file_id, progress, profile)
+                None, mod_packages.install, self._romm_client, rom_id, title, file_id, progress)
         except Exception as e:
             logging.error('install_switch_mod_package failed: %s', e)
             return {'status': 'failed', 'message': str(e)}
         finally:
             self._switch_fetch_state.pop(rom_id, None)
 
-    async def remove_switch_mod_package(self, rom_id: int, package_id: str):
+    async def remove_switch_mod_package(self, rom_id: int, package_id: str, force: bool = False):
         if rom_id in self._switch_fetch_state:
             return {'status': 'busy'}
         self._switch_fetch_state[rom_id] = {'file_name': 'Mod package', 'state': 'removing', 'kind': 'mod'}
@@ -10480,7 +10480,7 @@ class LudoBackend:
             if not title:
                 return {'status': 'not-switch'}
             return await asyncio.get_event_loop().run_in_executor(
-                None, mod_packages.remove, title, package_id)
+                None, mod_packages.remove, title, package_id, bool(force))
         except Exception as e:
             logging.error('remove_switch_mod_package failed: %s', e)
             return {'status': 'failed', 'message': str(e)}

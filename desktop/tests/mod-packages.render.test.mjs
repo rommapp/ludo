@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as playwright from 'playwright';
-import { PAD, openRoute, launchBrowser, startServer } from './support/render-harness.mjs';
+import { DIST, PAD, distIsBuilt, openRoute, launchBrowser, startServer } from './support/render-harness.mjs';
 import { POPULATED_FIXTURES } from './support/fixtures.mjs';
 
+const SKIP = distIsBuilt() ? false : `no build at ${DIST} — run \`npm run build\``;
+
 for (const modality of ['controller', 'pointer']) {
-  test(`mod packages: install preset and remove through ${modality}`, async () => {
+  test(`mod packages: install and remove through ${modality}`, { skip: SKIP }, async () => {
     const game = { ...POPULATED_FIXTURES.get_library_games.games[0], platform_slug: 'switch' };
     const fixtures = {
       ...POPULATED_FIXTURES,
@@ -23,7 +25,7 @@ for (const modality of ['controller', 'pointer']) {
       await r.page.route('**/api/switch_mod_packages', route => route.fulfill({
         contentType: 'application/json', body: JSON.stringify({ result: {
           title_id: '0100F2C0115B6000', server: [entry],
-          installed: installed ? [{ package_id: entry.package_id, name: entry.file_name, profile: 'handheld720' }] : [],
+          installed: installed ? [{ package_id: entry.package_id, name: entry.file_name }] : [],
         } }),
       }));
       await r.page.route('**/api/install_switch_mod_package', route => {
@@ -62,9 +64,9 @@ for (const modality of ['controller', 'pointer']) {
         }
       };
       await activate('Example-mods.zip');
-      await activate('Install · UltraCam 720p, 16:9, up to 60 FPS');
-      assert.deepEqual(installs, [[42, 7, 'handheld720']]);
-      await activate('Installed · UltraCam handheld preset · select to remove');
+      await activate('Install');
+      assert.deepEqual(installs, [[42, 7]]);
+      await activate('Installed · select to remove');
       await activate('Remove package');
       assert.deepEqual(removals, [[42, '42:7']]);
       assert.equal(installed, false);

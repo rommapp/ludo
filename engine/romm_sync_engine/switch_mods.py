@@ -22,40 +22,19 @@ MAX_FILES = 10_000
 MAX_FILE_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 _LOCK = threading.Lock()
+# The folders Eden loads inside a mod, matched without regard to case
+# (core/file_sys/patch_manager.cpp, FindSubdirectoryCaseless).
+MOD_DIRS = ('exefs', 'romfs', 'romfs_ext', 'romfslite', 'cheats')
+_TITLE_RE = re.compile(r'[0-9A-Fa-f]{16}')
 ULTRACAM_GAMES = {'0100F2C0115B6000': 'TOTK', '01007EF00011E000': 'BOTW'}
-HANDHELD720 = {
-    ('AspectRatio', 'Width'): '16', ('AspectRatio', 'Height'): '9',
-    ('Resolution', 'Width'): '1280', ('Resolution', 'Height'): '720',
-    ('Resolution', 'ShadowResolution'): '1024', ('Resolution', 'QualityImprovements'): 'False',
-    ('Handheld', 'Width'): '1280', ('Handheld', 'Height'): '720',
-    ('Handheld', 'OverrideHandheld_Resolution'): 'True',
-    ('UltraCamFPS', 'DynamicFPS'): 'True', ('UltraCamFPS', 'MaxFPS'): '60',
-}
 
 
 class ModError(ValueError):
     pass
 
 
-def handheld_config(data):
-    """Patch known UltraCam keys; never reserialize or guess a new INI schema."""
-    section, seen, output = '', set(), []
-    for line in data.decode('utf-8-sig').splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped.startswith('[') and stripped.endswith(']'):
-            section = stripped[1:-1]
-        key, sep, _ = line.partition('=')
-        field = (section, key.strip())
-        if sep and field in HANDHELD720:
-            if field in seen:
-                raise ModError('Ambiguous UltraCam configuration')
-            seen.add(field)
-            newline = '\r\n' if line.endswith('\r\n') else '\n' if line.endswith('\n') else ''
-            line = key + '= ' + HANDHELD720[field] + newline
-        output.append(line)
-    if seen != HANDHELD720.keys():
-        raise ModError('This UltraCam configuration does not support the handheld preset')
-    return ''.join(output).encode('utf-8')
+class ChangedError(ModError):
+    """An installed file was edited outside Ludo since it was installed."""
 
 
 def _parts(name):
@@ -79,7 +58,7 @@ def _target(name, title_id, directory=False):
         if parts[0] == 'load':
             if len(parts) > 1 and parts[1].upper() != title_id:
                 raise ModError('Package belongs to another game')
-            if len(parts) <= 3 or parts[3] in ('exefs', 'romfs', 'cheats'):
+            if len(parts) <= 3 or parts[3].lower() in MOD_DIRS:
                 return None
         if parts in (['config'], ['config', 'custom']):
             return None
@@ -89,8 +68,9 @@ def _target(name, title_id, directory=False):
         raise ModError('Unsupported archive directory')
     if (len(parts) >= 5 and parts[0] == 'load'
             and parts[1].upper() == title_id
-            and parts[3] in ('exefs', 'romfs', 'cheats')):
+            and parts[3].lower() in MOD_DIRS):
         parts[1] = title_id
+        parts[3] = parts[3].lower()
         return '/'.join(parts)
     if (len(parts) == 5 and parts[:2] == ['sdmc', 'UltraCam']
             and parts[2] == ULTRACAM_GAMES.get(title_id)
@@ -102,7 +82,48 @@ def _target(name, title_id, directory=False):
     raise ModError('Unsupported path or package belongs to another game: ' + name)
 
 
-def inspect(archive, title_id):
+def _mod_name(package_name):
+    name = Path(str(package_name or 'Mod')).name
+    stem = name[:-len(Path(name).suffix)] if Path(name).suffix else name
+    stem = re.sub(r'[\\/:<>|?*"\x00-\x1f]', '_', stem).strip(' .') or 'Mod'
+    return stem[:120]
+
+
+def _eden_layout(names, title_id, package_name):
+    """Map the layouts Eden's own "Import Mod from ZIP" accepts onto load/.
+
+    Eden takes the parent of any exefs/romfs/romfs_ext/romfslite/cheats folder
+    as a mod (frontend_common/mod_manager.cpp, GetModFolder): `romfs/` at the
+    top, `Mod/romfs/`, `<TITLE>/Mod/romfs/` and `atmosphere/contents/<TITLE>/`
+    all work there, so they work here. Returns {member: logical path or None}
+    for an archive in that shape, or None when it already uses load/ and sdmc/
+    paths (which _target validates as before). Files outside any mod folder
+    are skipped, as Eden ignores them.
+    """
+    split = {n: _parts(n) for n in names}
+    if any(p[0] in ('load', 'sdmc', 'config') for p in split.values()):
+        return None
+    mapping = {}
+    for name, parts in split.items():
+        index = next((i for i, p in enumerate(parts[:-1]) if p.lower() in MOD_DIRS), None)
+        if index is None:
+            mapping[name] = None
+            continue
+        root = parts[:index]
+        ids = [p.upper() for p in root if _TITLE_RE.fullmatch(p)]
+        if any(i != title_id for i in ids):
+            raise ModError('Package belongs to another game: ' + name)
+        if not root or _TITLE_RE.fullmatch(root[-1]):
+            mod = _mod_name(package_name)
+        else:
+            mod = root[-1]
+        mapping[name] = '/'.join(['load', title_id, mod, parts[index].lower(), *parts[index + 1:]])
+    if not any(mapping.values()):
+        raise ModError('Package contains no mod folder (exefs, romfs, romfs_ext, romfslite or cheats)')
+    return mapping
+
+
+def inspect(archive, title_id, package_name=None):
     """Validate every member before any target mutation; return logical entries."""
     title_id = str(title_id).upper()
     if not re.fullmatch(r'[0-9A-F]{16}', title_id):
@@ -111,6 +132,8 @@ def inspect(archive, title_id):
     with zipfile.ZipFile(archive) as z:
         if len(z.infolist()) > MAX_FILES:
             raise ModError('Too many archive entries')
+        layout = _eden_layout([m.filename for m in z.infolist() if not m.is_dir()],
+                              title_id, package_name or Path(archive).name)
         for member in z.infolist():
             _parts(member.orig_filename)
             mode = member.external_attr >> 16
@@ -118,14 +141,20 @@ def inspect(archive, title_id):
             if kind not in (0, stat.S_IFREG, stat.S_IFDIR) or member.flag_bits & 1:
                 raise ModError('Links, special files and encrypted files are unsupported')
             if member.is_dir():
-                _target(member.filename, title_id, directory=True)
+                if layout is None:
+                    _target(member.filename, title_id, directory=True)
                 continue
             if member.file_size > MAX_FILE_BYTES:
                 raise ModError('Archive member exceeds the size limit')
             total += member.file_size
             if total > MAX_TOTAL_BYTES:
                 raise ModError('Archive exceeds the size limit')
-            target = _target(member.filename, title_id)
+            if layout is not None:
+                target = layout[member.filename]
+                if target is not None and _target(target, title_id) != target:
+                    raise ModError('Unsupported path: ' + member.filename)
+            else:
+                target = _target(member.filename, title_id)
             if target is None:
                 skipped.append(member.filename)
                 continue
@@ -223,8 +252,7 @@ class Installer:
             r = self._read(path)
             if r and r.get('title_id') == title_id:
                 out.append({'package_id': r['package_id'], 'name': r['name'],
-                            'sha256': r['sha256'], 'skipped': r['skipped'],
-                            'profile': r.get('profile', 'original')})
+                            'sha256': r['sha256'], 'skipped': r['skipped']})
         return out
 
     def _check_roots(self, receipt):
@@ -267,7 +295,7 @@ class Installer:
         else:
             _write(path, json.dumps(receipt).encode())
 
-    def _apply(self, package_id, title_id, old, new, staged):
+    def _apply(self, package_id, title_id, old, new, staged, force=False):
         old_files = {e['target']: e for e in (old or {}).get('files', [])}
         new_files = {e['target']: e for e in (new or {}).get('files', [])}
         for receipt_path in (self.state_dir / 'packages').glob('*.json'):
@@ -282,8 +310,8 @@ class Installer:
             before = _hash(path)
             prior = old_files.get(logical)
             after = new_files.get(logical)
-            if prior and before != prior['sha256']:
-                raise ModError('Installed file changed outside Ludo: ' + logical)
+            if prior and before != prior['sha256'] and not (force and not after):
+                raise ChangedError('Installed file changed outside Ludo: ' + logical)
             if after:
                 if prior and not prior['owned'] and before != after['sha256']:
                     raise ModError('Cannot update a file that predates this installation: ' + logical)
@@ -330,18 +358,12 @@ class Installer:
             self._recover()
             raise
 
-    def install(self, archive, title_id, package_id, name, profile='original'):
-        if profile not in ('original', 'handheld720'):
-            raise ModError('Unknown mod preset')
+    def install(self, archive, title_id, package_id, name):
         with self._locked():
             if self.is_running():
                 raise ModError('Close Eden before installing or removing mods')
             self._recover()
-            plan = inspect(archive, title_id)
-            if profile == 'handheld720' and not any(
-                    e['target'] == 'sdmc/UltraCam/TOTK/Config/maxlastbreath.ini'
-                    for e in plan['files']):
-                raise ModError('This package has no supported UltraCam preset; choose original settings')
+            plan = inspect(archive, title_id, name)
             title_id = title_id.upper()
             old = self._read(self._receipt_path(package_id))
             self._check_roots(old)
@@ -355,20 +377,20 @@ class Installer:
                         path = Path(stage) / str(index)
                         with z.open(entry['source']) as source, path.open('wb') as sink:
                             shutil.copyfileobj(source, sink, 1024 * 1024)
-                        if (profile == 'handheld720'
-                                and entry['target'] == 'sdmc/UltraCam/TOTK/Config/maxlastbreath.ini'):
-                            path.write_bytes(handheld_config(path.read_bytes()))
                         staged[entry['target']] = path
                         files.append({'target': entry['target'], 'sha256': _hash(path)})
                 receipt = {'package_id': package_id, 'title_id': title_id, 'name': name,
                            'sha256': _hash(Path(archive)), 'files': files,
-                           'profile': profile,
                            'skipped': plan['skipped'],
                            'roots': {k: str(v) for k, v in self.roots.items()}}
                 self._apply(package_id, title_id, old, receipt, staged)
             return {'status': 'ok', 'skipped': plan['skipped']}
 
-    def remove(self, package_id, title_id):
+    def remove(self, package_id, title_id, force=False):
+        """Remove a package's files. ``force`` also deletes owned files that
+        were edited since (a mod's settings file is meant to be edited, and
+        without it such a package could never be removed); files that were
+        there before Ludo are still left alone."""
         with self._locked():
             if self.is_running():
                 raise ModError('Close Eden before installing or removing mods')
@@ -377,7 +399,7 @@ class Installer:
             if not old or old['title_id'] != title_id.upper():
                 raise ModError('Package is not installed for this game')
             self._check_roots(old)
-            self._apply(package_id, title_id.upper(), old, None, {})
+            self._apply(package_id, title_id.upper(), old, None, {}, force=force)
             # Only empty directories are removed; mods not owned by Ludo stay.
             for entry in old['files']:
                 path = self._path(entry['target'], title_id.upper()).parent

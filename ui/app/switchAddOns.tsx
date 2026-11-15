@@ -53,7 +53,7 @@ export async function runEdenChange(apply: () => Promise<any>, failureTitle = 'C
   }
   if (status === 'no-config') {
     toaster.toast({ title: 'Open Eden once first', body: 'Eden has not created its settings yet.' });
-  } else if (status !== 'ok' && status !== 'running') {
+  } else if (status !== 'ok' && status !== 'running' && status !== 'changed') {
     toaster.toast({ title: failureTitle, body: String(result?.message || status) });
   }
   return status;

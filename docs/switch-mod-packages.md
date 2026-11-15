@@ -6,12 +6,25 @@ packages**. The base game must identify a Switch title ID. Use a package made
 for the installed game update: a matching title ID alone does not establish
 patch/build compatibility.
 
-The package layout uses logical paths rather than device paths:
+Any archive Eden's own **Import Mod from ZIP** accepts works. Like Eden, Ludo
+treats the folder holding an `exefs`, `romfs`, `romfs_ext`, `romfslite` or
+`cheats` folder (any letter case) as one mod, so all of these install:
 
 ```text
-load/<BASE_TITLE_ID>/<mod name>/exefs/...
-load/<BASE_TITLE_ID>/<mod name>/romfs/...
-load/<BASE_TITLE_ID>/<mod name>/cheats/...
+romfs/...                                   mod named after the ZIP
+<mod name>/romfs/...
+<BASE_TITLE_ID>/<mod name>/exefs/...
+atmosphere/contents/<BASE_TITLE_ID>/romfs/... mod named after the ZIP
+```
+
+An archive holding several mod folders installs each one; turn them on or off
+under **Updates & DLC**. Files outside a mod folder are skipped, and a title ID
+in the path must be the selected game's.
+
+Archives can instead use logical paths, which also allow UltraCam settings files:
+
+```text
+load/<BASE_TITLE_ID>/<mod name>/{exefs,romfs,romfs_ext,romfslite,cheats}/...
 sdmc/UltraCam/TOTK/Config/maxlastbreath.ini
 sdmc/UltraCam/TOTK/Config/PaletteCFG.json
 ```
@@ -29,13 +42,8 @@ duplicate case-insensitive destinations, traversal, and oversized archives
 reject the entire package before target writes. Limits are 10,000 entries,
 256 MiB per file, and 1 GiB uncompressed/downloaded.
 
-The original preset preserves payload bytes. The optional TOTK UltraCam
-handheld preset changes existing keys in `maxlastbreath.ini` to 720p, 16:9,
-dynamic FPS with a 60 FPS ceiling, and 1024 shadow resolution. It preserves
-other settings and rejects an unrecognized INI schema. The ceiling is not a
-performance guarantee. Game patches outside this INI keep their original
-behavior. A package without this exact UltraCam configuration requires the
-original preset. Configure required emulator options in Eden itself.
+Packages are installed exactly as they are; configure emulator options in Eden
+itself.
 
 Ludo uses Eden's configured load and SD directories, or its normal data
 directory. Multiple detected Eden installs are rejected as ambiguous. Native
@@ -44,8 +52,10 @@ and custom data-folder layouts are not yet supported. Eden must be closed for
 installation, updates, removal, or recovery.
 
 Receipts and a persistent transaction journal live below Ludo's configuration
-directory in `switch-mod-packages`. Updates and removal refuse externally
-changed files. Differing unowned files and overlaps with another managed
+directory in `switch-mod-packages`. Updates refuse externally changed files.
+Removal asks first when a file changed since it was installed, then deletes
+Ludo's files including the edits; files that were there before are kept.
+Differing unowned files and overlaps with another managed
 package are never overwritten. Identical pre-existing files can be borrowed,
 but are not modified by updates or deleted by removal. A failed or interrupted
 transaction restores previous files and receipts on the next mutation;

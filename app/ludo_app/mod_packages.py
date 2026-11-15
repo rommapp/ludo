@@ -81,7 +81,7 @@ def state(client, rom_id, title_id):
     return result
 
 
-def install(client, rom_id, title_id, file_id, progress, profile='original'):
+def install(client, rom_id, title_id, file_id, progress):
     target = installer()
     if emulator_saves.eden_is_running():
         return {'status': 'running'}
@@ -114,10 +114,14 @@ def install(client, rom_id, title_id, file_id, progress, profile='original'):
         progress['state'] = 'installing'
         if emulator_saves.eden_is_running():
             return {'status': 'running'}
-        return target.install(archive, title_id, entry['package_id'], entry['file_name'], profile)
+        return target.install(archive, title_id, entry['package_id'], entry['file_name'])
 
 
-def remove(title_id, package_id):
+def remove(title_id, package_id, force=False):
     if emulator_saves.eden_is_running():
         return {'status': 'running'}
-    return installer().remove(package_id, title_id)
+    try:
+        return installer().remove(package_id, title_id, force=force)
+    except switch_mods.ChangedError as e:
+        # Not a failure to report: the UI offers to remove it anyway.
+        return {'status': 'changed', 'message': str(e)}
