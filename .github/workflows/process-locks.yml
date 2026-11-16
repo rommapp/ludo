@@ -1,0 +1,38 @@
+name: Process locks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  process-locks:
+    name: Process locks (${{ matrix.os }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Record native runtime
+        run: python -c "import platform, sys; print(platform.platform()); print(sys.version)"
+      - name: Install the shared engine and backend tests
+        run: |
+          python -m pip install -e engine
+          python -m pip install -e "app[test]"
+      # Each entry point isolates all home/app-data roots before imports.
+      # This matrix covers locks and worker ownership, not desktop acceptance.
+      - name: Native process locks and autosync ownership
+        run: python engine/tests/test_process_lock.py
+      - name: Mod helper import and unavailable POSIX lock
+        run: python engine/tests/test_switch_mods_import.py
+      - name: Backend install ownership and actual download shutdown
+        run: python -m pytest -q app/tests/test_device_installs.py

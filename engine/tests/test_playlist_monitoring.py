@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from romm_sync_engine import sync_core
+from romm_sync_engine.owned_tasks import OwnedTasks
 
 FAILURES = []
 
@@ -51,6 +52,9 @@ class ObservedStop(threading.Event):
 def manager(find_config, stop):
     m = sync_core.AutoSyncManager.__new__(sync_core.AutoSyncManager)
     m.should_stop = stop
+    # This polling fixture bypasses __init__; the real manager admits monitor
+    # threads through its acquired ownership group before they start.
+    m._sync_ownership = OwnedTasks(Mock())
     m.retroarch = SimpleNamespace(find_retroarch_config_dir=find_config)
     m.log = Mock()
     m.get_recent_from_playlist = Mock(return_value='/roms/game.zip')

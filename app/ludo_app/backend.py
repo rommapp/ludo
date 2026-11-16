@@ -27,9 +27,13 @@ import shutil
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urljoin
+
+from romm_sync_engine.process_lock import ProcessLock
+from romm_sync_engine.owned_tasks import OwnedTasks
 
 from .host import HostProfile
 from .install_socket import InstallSocket, ScanSocket
@@ -56,6 +60,9 @@ def _default_roms_dir() -> str:
 
 
 CONFIG_DIR = _paths.config_dir()
+# Internal remote-install ownership follows asyncio.run into download_game,
+# but does not affect frontend RPC downloads or change their public signature.
+_install_owner = ContextVar('ludo_install_owner', default=None)
 
 # Import PIL early to ensure C extensions are loaded correctly
 # This must be done before sync_core imports it at module level
@@ -5900,86 +5907,96 @@ class LudoBackend:
         active = set()        # request ids being handled now
         warned = set()        # reasons already logged, so a denial logs once
         lock = None           # held while this copy is the one handling installs
+        owner = None
         ready = False         # until connected, look again soon rather than in a minute
-        while not stop_event.is_set():
-            woken = wake.wait(self._INSTALL_POLL if ready else 5)
-            if stop_event.is_set():
-                break
-            if woken:
-                # Bursts (connect + queued) arrive together: claim once.
-                if stop_event.wait(0.5):
-                    break
-                wake.clear()
-            try:
-                client = self._romm_client
-                # Every copy listens for scans, paired or not, lock or no lock.
-                if client and client.authenticated and self._online is not False:
-                    scan_socket.ensure(client.base_url, client.client_token or '-',
-                                             client.session.verify)
-                else:
-                    scan_socket.close()
-                if not (client and client.authenticated and self._online is not False
-                        and client.server_features.get('device_install')):
-                    ready = False
-                    install_socket.close()
-                    continue
-                ready = True
-                # The desktop app and the Decky plugin share one config, so on a
-                # machine with both, two copies would claim the same requests
-                # and download the same ROM into the same file. One handles
-                # installs; the other stays out until it closes.
-                if lock is None:
-                    lock = self._take_install_lock()
-                    if lock is None:
-                        if 'locked' not in warned:
-                            warned.add('locked')
-                            logging.info("[INSTALL] another Ludo is handling installs")
-                        install_socket.close()
-                        continue
-                device_id = self._settings.get('Device', 'device_id', '')
-                if not device_id:
-                    continue
-                requests_, reason = client.claim_installs(device_id)
+        try:
+            while not stop_event.is_set():
+                woken = wake.wait(self._INSTALL_POLL if ready else 5)
                 if stop_event.is_set():
                     break
-                # The one denial the user can fix: offer to re-pair.
-                self._install_not_bound = (reason == 'not_bound')
-                # Only a token RomM will take for this device gets a socket.
-                if requests_ is None or not client.client_token:
-                    install_socket.close()
-                else:
-                    install_socket.ensure(client.base_url, client.client_token,
-                                                client.session.verify)
-                if requests_ is None:
-                    if reason not in warned:
-                        warned.add(reason)
-                        logging.info(f"[INSTALL] not claiming installs: {reason}"
-                                     + (" (this device's token is bound to another "
-                                        "device; pair again with the QR code to "
-                                        "receive installs)" if reason == 'not_bound' else ""))
-                    continue
-                for req in requests_:
-                    rid = req.get('id')
-                    if rid and rid not in active:
-                        active.add(rid)
-                        threading.Thread(
-                            target=self._handle_install, args=(req, device_id, active, stop_event, client),
-                            daemon=True, name=f"romm-install-{rid[:8]}").start()
-            except Exception as e:
-                logging.debug(f"install loop error: {e}")
+                if woken:
+                    # Bursts (connect + queued) arrive together: claim once.
+                    if stop_event.wait(0.5):
+                        break
+                    wake.clear()
+                try:
+                    client = self._romm_client
+                    # Every copy listens for scans, paired or not, lock or no lock.
+                    if client and client.authenticated and self._online is not False:
+                        scan_socket.ensure(client.base_url, client.client_token or '-',
+                                                 client.session.verify)
+                    else:
+                        scan_socket.close()
+                    if not (client and client.authenticated and self._online is not False
+                            and client.server_features.get('device_install')):
+                        ready = False
+                        install_socket.close()
+                        continue
+                    ready = True
+                    # The desktop app and the Decky plugin share one config, so on a
+                    # machine with both, two copies would claim the same requests
+                    # and download the same ROM into the same file. One handles
+                    # installs; the other stays out until it closes.
+                    if lock is None:
+                        lock = self._take_install_lock()
+                        if lock is None:
+                            if 'locked' not in warned:
+                                warned.add('locked')
+                                logging.info("[INSTALL] another Ludo is handling installs")
+                            install_socket.close()
+                            continue
+                        owner = OwnedTasks(lock)
+                    device_id = self._settings.get('Device', 'device_id', '')
+                    if not device_id:
+                        continue
+                    requests_, reason = client.claim_installs(device_id)
+                    if stop_event.is_set():
+                        break
+                    # The one denial the user can fix: offer to re-pair.
+                    self._install_not_bound = (reason == 'not_bound')
+                    # Only a token RomM will take for this device gets a socket.
+                    if requests_ is None or not client.client_token:
+                        install_socket.close()
+                    else:
+                        install_socket.ensure(client.base_url, client.client_token,
+                                                    client.session.verify)
+                    if requests_ is None:
+                        if reason not in warned:
+                            warned.add(reason)
+                            logging.info(f"[INSTALL] not claiming installs: {reason}"
+                                         + (" (this device's token is bound to another "
+                                            "device; pair again with the QR code to "
+                                            "receive installs)" if reason == 'not_bound' else ""))
+                        continue
+                    for req in requests_:
+                        rid = req.get('id')
+                        if rid and rid not in active:
+                            active.add(rid)
+                            owner.start(
+                                self._handle_owned_install,
+                                (owner, req, device_id, active, stop_event, client),
+                                name=f"romm-install-{rid[:8]}")
+                except Exception as e:
+                    logging.error(f"install loop error: {e}", exc_info=True)
+
+        finally:
+            if owner:
+                owner.close()
+            elif lock:
+                lock.release()
+
+    def _handle_owned_install(self, owner, *args):
+        token = _install_owner.set(owner)
+        try:
+            self._handle_install(*args)
+        finally:
+            _install_owner.reset(token)
 
     @staticmethod
     def _take_install_lock():
-        """An exclusive lock on installs.lock, or None if another process has it.
-        The open file is the lock: it is released when the process exits."""
-        import fcntl
-        f = open(CONFIG_DIR / 'installs.lock', 'w')
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return f
-        except OSError:
-            f.close()
-            return None
+        """Return an owned lock, None for contention; propagate real I/O errors."""
+        lock = ProcessLock(CONFIG_DIR / 'installs.lock')
+        return lock if lock.acquire() else None
 
     def _handle_install(self, req, device_id, active, stop_event, client):
         """Download one requested ROM and report how it went."""
@@ -10948,7 +10965,12 @@ class LudoBackend:
                         'speed': 0, 'eta': 0, 'state': 'error', 'message': str(e),
                     }
 
-            threading.Thread(target=_worker, daemon=True, name=f"romm-dl-{rom_id}").start()
+            owner = _install_owner.get()
+            if owner is not None:
+                if owner.start(_worker, name=f"romm-dl-{rom_id}") is None:
+                    raise RuntimeError('Install ownership is stopping')
+            else:
+                threading.Thread(target=_worker, daemon=True, name=f"romm-dl-{rom_id}").start()
             return {'success': True, 'started': True, 'message': 'Download started'}
         except Exception as e:
             self._download_progress[rom_id] = {

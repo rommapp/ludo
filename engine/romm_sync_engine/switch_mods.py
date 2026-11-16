@@ -6,7 +6,6 @@ the emulator's actual load and SD roots. No archive path is an absolute path.
 """
 
 import hashlib
-import fcntl
 import json
 import os
 import re
@@ -218,6 +217,11 @@ class Installer:
 
     @contextmanager
     def _locked(self):
+        # Loading the shared backend must not require this POSIX-only feature.
+        # Mod transactions still require flock; fail before touching state if
+        # it is unavailable, without weakening the existing blocking lock.
+        import fcntl
+
         with _LOCK:
             self.state_dir.mkdir(parents=True, exist_ok=True)
             with (self.state_dir / 'lock').open('a') as lock:

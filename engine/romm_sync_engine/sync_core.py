@@ -16,6 +16,8 @@ from functools import wraps
 from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
+from .process_lock import ProcessLock
+from .owned_tasks import OwnedTasks
 from .save_channels import snapshots_supported
 from . import events as _events
 from . import (eden_config, emulator_saves, folder_saves, gamecube_saves,
@@ -12467,6 +12469,8 @@ class AutoSyncManager:
 
         # Add lock mechanism
         self.lock = AutoSyncLock()
+        self._sync_lifecycle = threading.RLock()
+        self._sync_ownership = None
         # True when another Ludo (the desktop AppImage, or a second plugin
         # instance) holds the auto-sync lock. Read by build_sync_status.
         self.blocked_by_other_instance = False
@@ -12920,106 +12924,99 @@ class AutoSyncManager:
 
     def start_auto_sync(self):
         """Start all auto-sync components"""
-        if self.enabled:
-            self.log("Auto-sync already running")
-            return
+        with self._sync_lifecycle:
+            if self.enabled:
+                self.log("Auto-sync already running")
+                return
         
-        # Try to acquire lock
-        if not self.lock.acquire(self.instance_id):
-            # Both shells set app_id "ludo", so the Decky plugin and the desktop
-            # AppImage share ~/.config/ludo and this lock: on a Deck with both
-            # installed, whichever starts second gets no auto-sync. Correct --
-            # two processes watching the same save files would race each other's
-            # uploads -- but it used to be SILENT, one log line deep, and the UI
-            # went on looking like sync was running. The flag is what lets the
-            # library say so.
-            self.log("⚠️ Auto-sync blocked - another instance is already running")
-            self.blocked_by_other_instance = True
-            return
+            # A previous stop can return while network I/O drains. Never clear its
+            # stop event or reuse its lock until the last admitted task has exited.
+            if self._sync_ownership and not self._sync_ownership.done.is_set():
+                self.log("Auto-sync is still stopping; retry after its workers finish")
+                return
 
-        self.blocked_by_other_instance = False
-        self.enabled = True
-        self.should_stop.clear()
+            self.blocked_by_other_instance = False
+            # Permission/disk errors propagate to the caller as real failures.
+            # Only a native lock conflict becomes blocked_by_other_instance.
+            # Try to acquire lock
+            if not self.lock.acquire(self.instance_id):
+                # Both shells set app_id "ludo", so the Decky plugin and the desktop
+                # AppImage share ~/.config/ludo and this lock: on a Deck with both
+                # installed, whichever starts second gets no auto-sync. Correct --
+                # two processes watching the same save files would race each other's
+                # uploads -- but it used to be SILENT, one log line deep, and the UI
+                # went on looking like sync was running. The flag is what lets the
+                # library say so.
+                self.log("⚠️ Auto-sync blocked - another instance is already running")
+                self.blocked_by_other_instance = True
+                return
 
-        try:
-            # Start upload worker
-            self.start_upload_worker()
+            self.blocked_by_other_instance = False
+            self._sync_ownership = OwnedTasks(self.lock)
+            self.enabled = True
+            self.should_stop.clear()
 
-            # Start startup save sync
-            if self.settings.get('AutoSync', 'startup_sync_enabled', 'true') == 'true':
-                self.start_startup_save_sync()
+            try:
+                # Start upload worker
+                self.start_upload_worker()
 
-            # Start file system monitoring
-            self.start_file_monitoring()
+                # Start startup save sync
+                if self.settings.get('AutoSync', 'startup_sync_enabled', 'true') == 'true':
+                    self.start_startup_save_sync()
 
-            self.start_retroarch_monitoring()
-            self.start_playlist_monitoring()
+                # Start file system monitoring
+                self.start_file_monitoring()
 
-            # RomM session-based sync on connect: pull saves changed on other
-            # devices (and push any local changes) as a single batch negotiate.
-            self.trigger_session_save_sync("connect")
-            # Sessions that ended while offline or before the last quit go
-            # up, and the other devices' sessions come down.
-            self.play_sessions.sync_async()
+                self.start_retroarch_monitoring()
+                self.start_playlist_monitoring()
 
-            self.log("🔄 Auto-sync started (file monitoring + RetroArch + playlist monitoring)")
+                # RomM session-based sync on connect: pull saves changed on other
+                # devices (and push any local changes) as a single batch negotiate.
+                self.trigger_session_save_sync("connect")
+                # Sessions that ended while offline or before the last quit go
+                # up, and the other devices' sessions come down.
+                self.play_sessions.sync_async()
+
+                self.log("🔄 Auto-sync started (file monitoring + RetroArch + playlist monitoring)")
             
-        except Exception as e:
-            self.log(f"❌ Failed to start auto-sync: {e}")
-            self.stop_auto_sync()
+            except Exception as e:
+                self.log(f"❌ Failed to start auto-sync: {e}")
+                self.stop_auto_sync()
+
+    def _start_sync_thread(self, target, args=(), *, name=None):
+        owner = self._sync_ownership
+        return owner.start(target, args, name=name) if owner else None
+
+    _SYNC_DRAIN_TIMEOUT = 8
 
     def stop_auto_sync(self):
-        """Stop all auto-sync components"""
-        if not self.enabled:
-            return
-            
-        self.enabled = False
-        self.should_stop.set()
+        """Stop admission now; retain ownership through in-flight sync I/O."""
+        with self._sync_lifecycle:
+            if not self.enabled:
+                return
+            self.enabled = False
+            self.should_stop.set()
+            owner = self._sync_ownership
+            # Teardown's own persistence also runs while ownership is held.
+            with owner.hold():
+                owner.close()
+                try:
+                    self.settings.config['AutoSync']['last_shutdown_time'] = str(time.time())
+                    self.settings.save_settings()
+                except Exception as e:
+                    logging.debug(f"Could not save shutdown time: {e}")
+                self._save_upload_fingerprints()
+                if self.observer:
+                    self.observer.stop()
+                    self.observer.join(timeout=2)
+                    self.observer = None
+            # Preserve bounded shutdown. A timed-out worker still owns the
+            # lock, and its finally releases it after the actual I/O finishes.
+            if not owner.done.wait(self._SYNC_DRAIN_TIMEOUT):
+                logging.warning("Auto-sync is still draining; retaining process lock")
+            flush_pending_game_toasts()
+            self.log("⏹️ Auto-sync stopped")
 
-        # Save shutdown time for startup sync
-        try:
-            self.settings.config['AutoSync']['last_shutdown_time'] = str(time.time())
-            self.settings.save_settings()
-        except Exception as e:
-            logging.debug(f"Could not save shutdown time: {e}")
-
-        # Save upload fingerprints to persist between restarts
-        self._save_upload_fingerprints()
-
-        # Release lock
-        self.lock.release()
-        
-        # Stop file monitoring
-        if self.observer:
-            self.observer.stop()
-            self.observer.join()
-            self.observer = None
-        
-        # Stop upload worker
-        if self.upload_worker and self.upload_worker.is_alive():
-            self.upload_worker.join(timeout=2)
-        
-        # Let an in-flight session sync finish before the process goes away.
-        # The sync thread is a daemon, so a teardown mid-cycle kills it between
-        # the upload and the bookkeeping that ANNOUNCES the upload -- observed
-        # exactly: save uploaded and accepted at 14:35:46.796, auto-sync
-        # stopped at 14:35:46.832, and no activity row or toast for it. The
-        # save was safely on the server and the user had every reason to
-        # believe it had not been. Bounded so a wedged sync cannot hang
-        # shutdown; the upload itself is already durable either way.
-        try:
-            if self._session_sync_lock.acquire(timeout=8):
-                self._session_sync_lock.release()
-            else:
-                logging.debug("a session save-sync was still running at "
-                              "shutdown; its toast may be lost")
-        except Exception as e:
-            logging.debug(f"waiting for the session sync failed: {e}")
-        # Then say what happened, before there is nothing left to say it with.
-        flush_pending_game_toasts()
-
-        self.log("⏹️ Auto-sync stopped")
-    
     def start_file_monitoring(self):
         """Start monitoring RetroArch save directories for file changes"""
         if not self.retroarch.save_dirs:
@@ -13090,7 +13087,7 @@ class AutoSyncManager:
                     self.log(f"Playlist monitoring error: {e}")
                     self.should_stop.wait(10)
         
-        threading.Thread(target=monitor_playlists, daemon=True).start()
+        self._start_sync_thread(monitor_playlists, name="romm-playlist-sync")
 
     def get_recent_from_playlist(self, playlist_path):
         """Get most recently added/played item from a playlist file"""
@@ -13243,7 +13240,7 @@ class AutoSyncManager:
                     self.log(f"RetroArch monitoring error: {e}")
                     time.sleep(5)
             
-        threading.Thread(target=monitor_retroarch, daemon=True).start()
+        self._start_sync_thread(monitor_retroarch, name="romm-retroarch-sync")
         self.log("🔄 RetroArch monitoring started (network priority + history fallback)")
 
     def start_play_watch(self):
@@ -13704,8 +13701,7 @@ class AutoSyncManager:
             except Exception as e:
                 self.log(f"❌ Startup sync error: {e}")
 
-        self.startup_sync_thread = threading.Thread(target=startup_sync_worker, daemon=True)
-        self.startup_sync_thread.start()
+        self.startup_sync_thread = self._start_sync_thread(startup_sync_worker, name="romm-startup-sync")
 
     # A save at or above this size waits LARGE_SAVE_SETTLE seconds of quiet
     # instead of upload_delay before the watcher acts on it.
@@ -13761,8 +13757,7 @@ class AutoSyncManager:
                     self.log(f"Upload worker error: {e}")
                     time.sleep(5)  # Back off on error
         
-        self.upload_worker = threading.Thread(target=upload_worker, daemon=True)
-        self.upload_worker.start()
+        self.upload_worker = self._start_sync_thread(upload_worker, name="romm-upload-sync")
     
     def on_save_file_changed(self, file_path, save_type):
         """Handle save file change detected by file system monitor"""
@@ -13903,11 +13898,9 @@ class AutoSyncManager:
                     None
                 )
                 if conflict_game:
-                    threading.Thread(
-                        target=self.download_saves_for_specific_game,
-                        args=(conflict_game,),
-                        daemon=True
-                    ).start()
+                    self._start_sync_thread(
+                        self.download_saves_for_specific_game, (conflict_game,),
+                        name="romm-conflict-download")
             elif result:
                 # Record successful upload fingerprint to avoid duplicate uploads
                 self.last_uploaded[str(file_path)] = current_fingerprint
@@ -14152,6 +14145,13 @@ class AutoSyncManager:
             return list(state['pending'].values())
 
     def conflicts_before_launch(self, rom_id):
+        owner = getattr(self, '_sync_ownership', None)
+        if owner is None:
+            return self._conflicts_before_launch(rom_id)
+        with owner.hold() as admitted:
+            return self._conflicts_before_launch(rom_id) if admitted else []
+
+    def _conflicts_before_launch(self, rom_id):
         """Sync just this game's saves and return its parked conflicts, so
         a launch can ask before the emulator reads either save. Waits a few
         seconds for a sync already in flight rather than racing it."""
@@ -16132,7 +16132,7 @@ class AutoSyncManager:
                 self._session_sync_lock.release()
                 _events.publish('session')
 
-        threading.Thread(target=_run, daemon=True, name="romm-session-sync").start()
+        self._start_sync_thread(_run, name="romm-session-sync")
 
     def _upload_key(self, path):
         try:
@@ -16343,6 +16343,17 @@ class AutoSyncManager:
                                             channel=out.channel)
 
     def run_negotiated_save_sync(self, conflict_resolver=None, trigger="", only_rom_id=None):
+        # RPC-triggered conflict/re-pair syncs run outside our worker threads.
+        # Admit them before I/O too, so stop cannot release underneath them.
+        owner = getattr(self, '_sync_ownership', None)
+        if owner is None:
+            return self._run_negotiated_save_sync(conflict_resolver, trigger, only_rom_id)
+        with owner.hold() as admitted:
+            if not admitted:
+                raise RuntimeError('Auto-sync ownership is stopping')
+            return self._run_negotiated_save_sync(conflict_resolver, trigger, only_rom_id)
+
+    def _run_negotiated_save_sync(self, conflict_resolver=None, trigger="", only_rom_id=None):
         """Run one save-sync cycle via RomM 4.9.0's /negotiate engine (SAVES ONLY).
 
         Builds the local inventory, negotiates with the server, then executes the
@@ -18625,51 +18636,15 @@ class AutoSyncManager:
         except Exception as e:
             self.log(f"❌ Error downloading saves/states for {game.get('name', 'Unknown')}: {e}")
 
-class AutoSyncLock:
-    """Linux-only file locking to prevent multiple auto-sync instances"""
-    
+class AutoSyncLock(ProcessLock):
+    """Shared desktop/Decky ownership; the diagnostic file persists."""
     def __init__(self):
-        self.lock_file = config_dir() / 'autosync.lock'
-        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-        self.lock_fd = None
-    
+        super().__init__(config_dir() / 'autosync.lock')
+
     def acquire(self, instance_id):
-        """Acquire exclusive lock"""
-        import fcntl
-        
-        try:
-            # Open lock file
-            self.lock_fd = open(self.lock_file, 'w')
-            
-            # Try to acquire exclusive lock (non-blocking)
-            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            
-            # Write instance info
-            self.lock_fd.write(f"{os.getpid()}:{instance_id}:{time.time()}\n")
-            self.lock_fd.flush()
-            
-            return True
-            
-        except (IOError, OSError):
-            # Lock already held by another process
-            if self.lock_fd:
-                self.lock_fd.close()
-                self.lock_fd = None
-            return False
-    
-    def release(self):
-        """Release the lock"""
-        if self.lock_fd:
-            self.lock_fd.close()  # Automatically releases flock
-            self.lock_fd = None
-            
-        try:
-            self.lock_file.unlink()  # Clean up lock file
-        except FileNotFoundError:
-            pass
-    
-    def __del__(self):
-        self.release()
+        metadata = f"{os.getpid()}:{instance_id}:{time.time()}\n".encode('utf-8')
+        return super().acquire(metadata)
+
 
 class SaveFileHandler(FileSystemEventHandler):
     """File system event handler for save file changes"""

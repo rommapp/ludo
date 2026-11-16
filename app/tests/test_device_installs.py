@@ -99,19 +99,117 @@ def test_shutdown_mid_download_leaves_the_request_for_the_next_claim(backend, mo
 
 def test_install_lock_is_held_by_one_process(tmp_path, monkeypatch):
     """Desktop and Decky share a config: only one may claim installs."""
-    import subprocess, sys
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'engine' / 'tests'))
+    from lock_process_helper import LockProcess
+    assert Path(backend_mod.__file__).resolve() == Path(__file__).resolve().parents[1] / 'ludo_app' / 'backend.py'
     monkeypatch.setattr(backend_mod, "CONFIG_DIR", tmp_path)
     held = LudoBackend._take_install_lock()
     assert held is not None
-    other = subprocess.run(
-        [sys.executable, "-c",
-         "import fcntl,sys; f=open(sys.argv[1],'w')\n"
-         "try: fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB); print('got')\n"
-         "except OSError: print('busy')", str(tmp_path / "installs.lock")],
-        capture_output=True, text=True)
-    assert other.stdout.strip() == "busy"
-    held.close()
-    assert LudoBackend._take_install_lock() is not None
+    try:
+        other = LockProcess(tmp_path / "installs.lock", 'install')
+        try:
+            assert not other.acquired
+        finally:
+            other.close()
+    finally:
+        held.close()
+    again = LudoBackend._take_install_lock()
+    assert again is not None
+    again.close()
+
+
+@pytest.mark.parametrize('stage', ['download', 'extraction'])
+def test_install_stop_retains_lock_until_actual_io_finishes(backend, tmp_path, monkeypatch, stage):
+    import sys
+    from types import SimpleNamespace
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'engine' / 'tests'))
+    from lock_process_helper import LockProcess, TIMEOUT
+    from romm_sync_engine.owned_tasks import OwnedTasks
+    monkeypatch.setattr(backend_mod, 'CONFIG_DIR', tmp_path)
+    owners = []
+    def owned(lock):
+        owner = OwnedTasks(lock)
+        owners.append(owner)
+        return owner
+    monkeypatch.setattr(backend_mod, 'OwnedTasks', owned)
+    entered, finish, request_done = threading.Event(), threading.Event(), threading.Event()
+    outputs = []
+    def block():
+        entered.set()
+        assert finish.wait(TIMEOUT), 'test I/O was not released'
+    def download(rom_id, name, dest, *args, **kwargs):
+        if stage == 'download':
+            block()
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        Path(dest).write_bytes(b'fixture rom')
+        outputs.append(Path(dest))
+        return True, 'done'
+    def extract(dest, rom_id):
+        if stage == 'extraction':
+            block()
+        return dest
+    client = SimpleNamespace(authenticated=True, base_url='https://fixture.invalid',
+                             client_token='test-only', session=SimpleNamespace(verify=True),
+                             server_features={'device_install': True}, download_rom=download,
+                             claim_installs=lambda device: ([{'id': 'req-1', 'rom_id': ROM}], None),
+                             report_install=lambda *args: None)
+    backend._romm_client = client
+    backend._install_platform_off = lambda rom_id, game: []
+    backend._maybe_unzip_download = extract
+    backend._maybe_decompress_switch = lambda dest, rom_id: dest
+    backend._handle_switch_add_ons = lambda *args: None
+    backend._persist_snapshot_throttled = lambda: None
+    original = backend._handle_install
+    def handle(*args):
+        try:
+            original(*args)
+        finally:
+            request_done.set()
+    monkeypatch.setattr(backend, '_handle_install', handle)
+    socket = SimpleNamespace(ensure=lambda *args: None, close=lambda: None)
+    wake = threading.Event()
+    wake.set()
+    loop = threading.Thread(target=backend._install_loop,
+                            args=(backend._stop_event, wake, socket, socket))
+    loop.start()
+    try:
+        assert entered.wait(TIMEOUT)
+        backend._stop_event.set()
+        wake.set()
+        loop.join(TIMEOUT)
+        assert not loop.is_alive()
+        assert request_done.wait(TIMEOUT)  # The request watcher has exited.
+        assert not owners[0].done.is_set()  # Actual file I/O has not.
+        contender = LockProcess(tmp_path / 'installs.lock', 'install')
+        try:
+            assert not contender.acquired
+        finally:
+            contender.close()
+        finish.set()
+        assert owners[0].done.wait(TIMEOUT)
+        assert backend._download_progress[ROM]['state'] == 'done'
+        assert outputs[0].read_bytes() == b'fixture rom'
+        contender = LockProcess(tmp_path / 'installs.lock', 'install')
+        try:
+            assert contender.acquired
+        finally:
+            contender.close()
+    finally:
+        finish.set()
+        backend._stop_event.set()
+        wake.set()
+        loop.join(TIMEOUT)
+        for owner in owners:
+            owner.close()
+            assert owner.done.wait(TIMEOUT)
+
+
+def test_install_lock_real_io_failure_propagates(tmp_path, monkeypatch):
+    monkeypatch.setattr(backend_mod, 'CONFIG_DIR', tmp_path)
+    (tmp_path / 'installs.lock').mkdir()
+    with pytest.raises(OSError):
+        LudoBackend._take_install_lock()
 
 
 class Resp:
