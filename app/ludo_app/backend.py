@@ -1671,7 +1671,7 @@ class LudoBackend:
     # the save-matching code in sync_core (which attributes a save to a rom by
     # matching disc/member filenames, and falls back destructively when it finds
     # nothing), so they must stay present and complete for every game.
-    _SNAPSHOT_FILE_KEYS = ('file_name', 'fs_name', 'file_size_bytes', 'size_bytes')
+    _SNAPSHOT_FILE_KEYS = ('file_name', 'fs_name', 'file_size_bytes', 'size_bytes', 'category')
     _SNAPSHOT_SIBLING_KEYS = ('id', 'name', 'fs_name', 'fs_name_no_ext', 'fs_extension',
                               'has_file_on_disk')
 

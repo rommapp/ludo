@@ -17102,6 +17102,9 @@ class AutoSyncManager:
                     rf_name = rf.get('file_name', '')
                     if not rf_name:
                         continue
+                    category = rf.get("category", '')
+                    if not category or category != "game":
+                        continue
                     rf_stem = Path(rf_name).stem
                     if rf_stem in (save_basename, clean_basename):
                         return game['rom_id']
