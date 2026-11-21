@@ -300,6 +300,10 @@ function isVisible(el: HTMLElement) {
   if (el.offsetParent === null && getComputedStyle(el).position !== "fixed") {
     return false;
   }
+  // Inside an inert subtree the browser refuses focus(), so a move that picked
+  // it went nowhere: the account menu's faded panel, kept mounted under the
+  // profile picker, dead-ended Left/Right between the profile cards.
+  if (el.closest("[inert]")) return false;
   const r = el.getBoundingClientRect();
   return r.width > 0 && r.height > 0;
 }

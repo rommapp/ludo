@@ -7,7 +7,7 @@ from romm_sync_engine import eden_config, emulator_saves, paths, switch_mods
 
 
 def pending():
-    return (paths.config_dir() / 'switch-mod-packages/pending.json').exists()
+    return (paths.machine_dir() / 'switch-mod-packages/pending.json').exists()
 
 
 def recover():
@@ -47,7 +47,7 @@ def installer():
             raise switch_mods.ModError('Relative Eden folders are unsupported')
         if eden_config._setting('[Data%20Storage]', key, config) and not path.is_dir():
             raise switch_mods.ModError('Configured Eden folder is unavailable: ' + str(path))
-    return switch_mods.Installer(paths.config_dir() / 'switch-mod-packages', load, sdmc,
+    return switch_mods.Installer(paths.machine_dir() / 'switch-mod-packages', load, sdmc,
                                  emulator_saves.eden_is_running)
 
 

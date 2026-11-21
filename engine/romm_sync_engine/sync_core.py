@@ -15,7 +15,7 @@ import copy
 from functools import wraps
 from pathlib import Path
 
-from .paths import app_id, cache_dir, client_name, config_dir, library_dir
+from .paths import app_id, cache_dir, client_name, config_dir, library_dir, machine_cache_dir, profile_id
 from .save_channels import snapshots_supported
 from . import events as _events
 from . import (eden_config, emulator_saves, folder_saves, gamecube_saves,
@@ -8291,6 +8291,18 @@ class RetroArchInterface:
             })
         return stale
 
+    @staticmethod
+    def _profile_save_dirs():
+        """This profile's own save/state folders, or None for the default profile.
+
+        RetroArch has one retroarch.cfg for everyone on the machine, so a
+        second profile's folders are never written there: the launch overlay
+        hands them to RetroArch for each session, and everything that asks
+        where RetroArch keeps saves gets the same answer from here.
+        """
+        from . import profiles
+        return profiles.save_dirs(profile_id())
+
     def _retroarch_cfg_value(self, key):
         """One key out of the detected install's retroarch.cfg, or ''.
 
@@ -8300,6 +8312,9 @@ class RetroArchInterface:
         value starting with ':' is relative to the content directory, neither of
         which is a path we can hand to a folder picker.
         """
+        own = self._profile_save_dirs()
+        if own and key in ('savefile_directory', 'savestate_directory'):
+            return str(own['saves' if key == 'savefile_directory' else 'states'])
         try:
             cfg_dir = self.find_retroarch_config_dir()
             if not cfg_dir:
@@ -8495,6 +8510,11 @@ class RetroArchInterface:
         Returns {'changed': bool, 'saves': str, 'states': str, 'reason': str}.
         """
         out = {'changed': False, 'saves': '', 'states': '', 'reason': ''}
+        own = self._profile_save_dirs()
+        if own:
+            out.update(saves=str(own['saves']), states=str(own['states']),
+                       reason='This profile passes its own folders at launch')
+            return out
         exe = (self.retroarch_executable or '').lower()
         if not exe:
             out['reason'] = 'no emulator detected'
@@ -9287,12 +9307,29 @@ class RetroArchInterface:
                         'platforms': list(spec['platforms'])})
         return out
 
+    @staticmethod
+    def _eden_user_args(executable):
+        """-u <n> so Eden plays as the current profile's own Switch user, whose
+        saves are the ones this profile syncs. Empty without profiles."""
+        from . import profiles
+        try:
+            if not profiles.profiles_in_use():
+                return []
+            data_dir = emulator_saves.eden_data_dir_for(executable)
+            index = profiles.eden_launch_index(data_dir)
+            return ['-u', str(index)] if index is not None else []
+        except Exception as e:
+            logging.warning(f"Eden user for this profile unavailable: {e}")
+            return []
+
     def build_standalone_launch_command(self, rom_path, key, spec, executable):
         """argv for a standalone emulator, from its args template."""
         grant_root = Path(rom_path).parent
         if spec.get('resolve_rom') == 'wiiu':
             rom_path, grant_root = resolve_wiiu_rom(rom_path)
         args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
+        if key == 'eden':
+            args = self._eden_user_args(executable) + args
         if spec.get('prelaunch') == 'cemu_audio_repair':
             repair_cemu_audio_device(executable)
         if executable.startswith('flatpak:'):
@@ -9840,16 +9877,116 @@ class RetroArchInterface:
             combo = self._menu_toggle_combo()
             if combo:
                 lines.append(f'input_menu_toggle_gamepad_combo = "{combo}"')
+            own = self._profile_save_dirs()
+            if own:
+                for path in own.values():
+                    path.mkdir(parents=True, exist_ok=True)
+                lines += [f'savefile_directory = "{own["saves"]}"',
+                          f'savestate_directory = "{own["states"]}"']
             # ensure_content_save_sorting can't run without a retroarch.cfg, so
             # the first session gets the same two values here.
             if self._unconfigured_tree():
                 lines += ['sort_savefiles_enable = "false"',
                           'sort_savefiles_by_content_enable = "true"']
             overlay.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+            self._remember_overlaid_settings(cfg_dir, lines)
             return str(overlay)
         except Exception as e:
             print(f"⚠️  Could not write the launch config overlay: {e}")
             return ''
+
+    # Overlay keys that must not outlive the session. RetroArch saves its whole
+    # running config on exit (config_save_on_exit, on by default), appended
+    # values included, so without this a second profile's save folders became
+    # retroarch.cfg's — every profile's — and a sandbox's system folder stuck.
+    # Network commands and save sorting are left: Ludo wants those permanent.
+    OVERLAY_RESTORE_KEYS = ('system_directory', 'libretro_directory',
+                            'input_menu_toggle_gamepad_combo',
+                            'savefile_directory', 'savestate_directory')
+    OVERLAY_RESTORE_FILE = 'ludo-launch.restore.json'
+
+    @staticmethod
+    def _cfg_raw_lines(cfg, keys):
+        """{key: the line as written in cfg} for each key present."""
+        found = {}
+        if not cfg.exists():
+            return found
+        for line in cfg.read_text(encoding='utf-8', errors='replace').splitlines():
+            key = line.split('=', 1)[0].strip()
+            if key in keys and '=' in line and key not in found:
+                found[key] = line
+        return found
+
+    @staticmethod
+    def _cfg_line_value(line):
+        return line.split('=', 1)[1].strip().strip('"').strip() if line else None
+
+    def _remember_overlaid_settings(self, cfg_dir, lines):
+        """Note what retroarch.cfg held for each overlaid key, to put it back."""
+        try:
+            overlaid = {}
+            for line in lines:
+                key = line.split('=', 1)[0].strip()
+                if key in self.OVERLAY_RESTORE_KEYS:
+                    overlaid[key] = self._cfg_line_value(line)
+            record = Path(cfg_dir) / self.OVERLAY_RESTORE_FILE
+            # A record left by a session we never saw end still holds the true
+            # originals; the cfg may already carry that session's values.
+            if record.exists():
+                self.restore_overlaid_settings()
+            originals = self._cfg_raw_lines(Path(cfg_dir) / 'retroarch.cfg', overlaid)
+            entries = {k: {'overlay': v, 'original': originals.get(k)}
+                       for k, v in overlaid.items()
+                       if self._cfg_line_value(originals.get(k)) != v}
+            if entries:
+                record.write_text(json.dumps(entries), encoding='utf-8')
+            elif record.exists():
+                record.unlink()
+        except Exception as e:
+            print(f"⚠️  Could not note settings to restore after the session: {e}")
+
+    @staticmethod
+    def _same_path_value(written, overlay):
+        """Whether RetroArch's saved value is the overlay's, '~' abbreviation and all."""
+        if written == overlay:
+            return True
+        if written and overlay and written.startswith('~/'):
+            return overlay.endswith(written[1:])
+        return False
+
+    def restore_overlaid_settings(self):
+        """Undo what RetroArch saved from the last overlay into retroarch.cfg.
+
+        A key is only put back while it still holds the overlay's value: one
+        the user changed in RetroArch's menu during the session is theirs.
+        """
+        try:
+            cfg_dir = self.find_retroarch_config_dir() or self._install_tree()
+            if not cfg_dir:
+                return
+            record = Path(cfg_dir) / self.OVERLAY_RESTORE_FILE
+            if not record.exists():
+                return
+            entries = json.loads(record.read_text(encoding='utf-8'))
+            cfg = Path(cfg_dir) / 'retroarch.cfg'
+            if cfg.exists():
+                text = cfg.read_text(encoding='utf-8', errors='replace')
+                out, changed = [], False
+                for line in text.splitlines():
+                    key = line.split('=', 1)[0].strip()
+                    entry = entries.get(key) if '=' in line else None
+                    if entry and self._same_path_value(
+                            self._cfg_line_value(line), entry['overlay']):
+                        changed = True
+                        if entry['original'] is not None:
+                            out.append(entry['original'])
+                        continue
+                    out.append(line)
+                if changed:
+                    cfg.write_text('\n'.join(out) + '\n', encoding='utf-8')
+            record.unlink()
+        except Exception as e:
+            print(f"⚠️  Could not restore settings after the session: {e}")
 
     def _core_dir_override(self, core_path):
         """The core's folder when it is not RetroArch's libretro_directory, else ''."""
@@ -10302,6 +10439,11 @@ class RetroArchInterface:
         Returns:
             dict: Dictionary with 'saves' and/or 'states' keys pointing to configured paths
         """
+        own = self._profile_save_dirs()
+        if own:
+            for path in own.values():
+                path.mkdir(parents=True, exist_ok=True)
+            return dict(own)
         save_dirs = {}
         config_file = config_dir / 'retroarch.cfg'
 
@@ -10346,6 +10488,11 @@ class RetroArchInterface:
 
     def find_retroarch_dirs(self):
         """Find RetroArch save directories with comprehensive installation support"""
+        own = self._profile_save_dirs()
+        if own:
+            for path in own.values():
+                path.mkdir(parents=True, exist_ok=True)
+            return dict(own)
         save_dirs = {}
 
         # First, try to get the config directory and read configured paths
@@ -10852,7 +10999,7 @@ class RetroArchInterface:
             self._buildbot_index_cache = {}
             return {}
 
-        cache_file = cache_dir() / 'libretro_core_index.json'
+        cache_file = machine_cache_dir() / 'libretro_core_index.json'
         if not force_refresh:
             try:
                 blob = json.loads(cache_file.read_text(encoding='utf-8'))
@@ -10897,7 +11044,7 @@ class RetroArchInterface:
         """The last core list saved to disk, however old, or {}."""
         base, _ext = self._buildbot_base()
         try:
-            blob = json.loads((cache_dir() / 'libretro_core_index.json')
+            blob = json.loads((machine_cache_dir() / 'libretro_core_index.json')
                               .read_text(encoding='utf-8'))
             return blob['cores'] if blob.get('base') == base else {}
         except Exception:
@@ -11456,7 +11603,7 @@ class RetroArchInterface:
             if not info_dir.is_dir() or not os.access(info_dir, os.W_OK):
                 return
 
-            bundle = cache_dir() / 'libretro_info.zip'
+            bundle = machine_cache_dir() / 'libretro_info.zip'
             if (not bundle.exists()
                     or time.time() - bundle.stat().st_mtime > 86400):
                 r = requests.get('https://buildbot.libretro.com/assets/frontend/info.zip',
@@ -13149,6 +13296,7 @@ class AutoSyncManager:
                             # Clear per-file debounce; the session boundary (close)
                             # is where we push this play session's saves as a batch.
                             self.upload_debounce.clear()
+                            self.retroarch.restore_overlaid_settings()
                             # RomM session-based sync: reconcile all saves now that
                             # RetroArch has flushed them on exit.
                             self.trigger_session_save_sync("RetroArch closed")
@@ -15445,7 +15593,7 @@ class AutoSyncManager:
                         and emulator_saves.keys_are_current(entry)):
                     continue
                 path = bios.download_firmware_entry(
-                    entry, cache_dir() / 'firmware' / entry['file_name'],
+                    entry, machine_cache_dir() / 'firmware' / entry['file_name'],
                     progress=progress)
                 if not path:
                     raise ValueError('download failed')
@@ -15627,7 +15775,7 @@ class AutoSyncManager:
                                 if key_count else f"{entry.get('file_name')} is already installed")}
 
         archive = bios.download_firmware_entry(
-            entry, cache_dir() / 'firmware' / entry['file_name'], progress=progress)
+            entry, machine_cache_dir() / 'firmware' / entry['file_name'], progress=progress)
         if not archive:
             return {'status': 'failed', 'keys': key_count,
                     'message': f"Could not download {entry.get('file_name')}"}
@@ -20275,6 +20423,13 @@ class SteamShortcutManager:
                 self._userdata_path_cache = p
                 return p
 
+        # With profiles, the Steam account using this profile, not a guess.
+        from . import profiles
+        linked = profiles.steam_config_dir()
+        if linked:
+            self._userdata_path_cache = linked
+            return linked
+
         # Auto-detect Steam userdata
         steam_roots = [
             Path.home() / '.steam' / 'steam' / 'userdata',
@@ -21264,7 +21419,13 @@ def find_steam_config_dir():
     Scans the usual install roots and picks the user with the most recently
     touched shortcuts.vdf, falling back to any user whose config dir exists but
     who has no shortcuts yet. Returns a Path or None.
+
+    With profiles, the Steam account using the current profile comes first.
     """
+    from . import profiles
+    linked = profiles.steam_config_dir()
+    if linked:
+        return linked
     steam_roots = [
         Path.home() / '.steam' / 'steam' / 'userdata',
         Path.home() / '.local' / 'share' / 'Steam' / 'userdata',

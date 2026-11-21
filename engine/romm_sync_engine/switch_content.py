@@ -55,7 +55,7 @@ from pathlib import Path
 
 from . import title_ids
 from .emulator_saves import eden_data_dirs, eden_keys_dir
-from .paths import cache_dir
+from .paths import machine_cache_dir
 
 log = logging.getLogger(__name__)
 
@@ -427,7 +427,7 @@ def container_members(path):
 # the same reasoning as _firmware_marker_path.
 
 def _manifest_path():
-    return cache_dir() / 'switch_content' / 'installed.json'
+    return machine_cache_dir() / 'switch_content' / 'installed.json'
 
 
 def read_manifest():
@@ -748,7 +748,7 @@ _DISABLED_FIELDS = ('title_id', 'base_id', 'kind', 'version', 'file_name', 'mode
 
 
 def _disabled_path():
-    return cache_dir() / 'switch_content' / 'disabled.json'
+    return machine_cache_dir() / 'switch_content' / 'disabled.json'
 
 
 def read_disabled():

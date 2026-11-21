@@ -96,6 +96,13 @@ export const getConfig = callable<[], any>("get_config");
 export const logout = callable<[boolean], any>("logout");
 export const getAccountUsername = callable<[], any>("get_account_username");
 export const getAvatar = callable<[], any>("get_avatar");
+export const getProfiles = callable<[], any>("get_profiles");
+export const switchProfile = callable<[string], any>("switch_profile");
+export const createProfile = callable<[string], any>("create_profile");
+export const renameProfile = callable<[string, string], any>("rename_profile");
+export const removeProfile = callable<[string], any>("remove_profile");
+export const linkProfileSteam = callable<[string, string], any>("link_profile_steam");
+export const unlinkProfileSteam = callable<[string], any>("unlink_profile_steam");
 export const getPluginStats = callable<[], any>("get_plugin_stats");
 // Play time (engine play_sessions + play_stats).
 export const getPlayTime = callable<[], any>("get_play_time");

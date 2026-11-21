@@ -75,7 +75,7 @@ def run_case(label, initial_crc, refreshed_crc, success, corrupt=False):
             response.iter_content.return_value = [data]
             return response
 
-        with mock.patch.object(sync_core, 'cache_dir', return_value=root), \
+        with mock.patch.object(sync_core, 'machine_cache_dir', return_value=root), \
                 mock.patch.object(sync_core.requests, 'get', side_effect=get) as http, \
                 mock.patch.object(ra, 'list_downloadable_cores',
                                   wraps=ra.list_downloadable_cores) as index:

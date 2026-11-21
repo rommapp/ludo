@@ -30,6 +30,7 @@ import type {
 type DesktopBridge = {
   quit?: () => void;
   restart?: () => void;
+  reloadBackend?: () => void;
   launchSpec?: () => LaunchSpec | null;
 };
 
@@ -66,6 +67,13 @@ const app: HostApp = {
   restart() {
     try {
       bridge()?.restart?.();
+    } catch {
+      /* no-op */
+    }
+  },
+  reloadBackend() {
+    try {
+      bridge()?.reloadBackend?.();
     } catch {
       /* no-op */
     }

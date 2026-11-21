@@ -98,6 +98,9 @@ export type HostApp = {
   quit(): void;
   /** Relaunch, after the executable has been swapped by a self-update. */
   restart(): void;
+  /** Restart the backend and reload the UI, so it opens the profile just
+   *  chosen. No-op where the shell has a single profile. */
+  reloadBackend(): void;
   /** How to start this shell again, or null if it cannot be determined. */
   launchSpec(): LaunchSpec | null;
 };

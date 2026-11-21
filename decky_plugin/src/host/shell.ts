@@ -110,6 +110,7 @@ const keyboard: HostKeyboard = {
 const app: HostApp = {
   quit() {},
   restart() {},
+  reloadBackend() {},
   launchSpec(): LaunchSpec | null {
     return null;
   },

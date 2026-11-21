@@ -34,7 +34,7 @@ def interface():
 def main():
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
-        sync_core.cache_dir = lambda: tmp
+        sync_core.machine_cache_dir = lambda: tmp
         boom = mock.Mock(side_effect=OSError('unreachable'))
         ra = interface()
         with mock.patch.object(sync_core.requests, 'get', boom):

@@ -22,6 +22,13 @@ const { listNativePads } = require("./native-pads.cjs");
 const { startNativeInput } = require("./native-input.cjs");
 const { backendEnv } = require("./backend-env.cjs");
 
+// --profile=<name or id> opens that profile whatever Steam account launched us
+// (romm_sync_engine.profiles). The backend reads it as LUDO_PROFILE.
+{
+  const arg = process.argv.find((a) => a.startsWith("--profile="));
+  if (arg) process.env.LUDO_PROFILE = arg.slice("--profile=".length);
+}
+
 // The name Electron reports for itself — window titles it derives, the shell's
 // window list, notifications. It comes from the packaged package.json, and
 // electron-builder writes only `name` there ("ludo-desktop"); `productName`,
@@ -246,6 +253,9 @@ function startBackend(host, port) {
 
     child.on("error", reject);
     child.on("exit", (code) => {
+      // A backend stopped on purpose (stopBackend clears `backend` first) is
+      // not a crash: a profile switch replaces it while the window stays up.
+      if (ready && backend !== child) return;
       backend = null;
       if (!ready) {
         reject(new Error(`backend exited before ready (code ${code})`));
@@ -262,15 +272,28 @@ function startBackend(host, port) {
 // normal exit, so on POSIX we send SIGINT to trigger that path; Windows has no
 // usable SIGINT-to-child, so we terminate and let the daemon threads die.
 function stopBackend() {
-  if (!backend) return;
+  if (!backend) return Promise.resolve();
   const child = backend;
   backend = null;
+  const exited = new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve();
+    else child.once("exit", () => resolve());
+  });
   try {
     child.kill(process.platform === "win32" ? undefined : "SIGINT");
   } catch { /* already gone */ }
   // Hard-stop if it doesn't exit promptly.
   setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 3000).unref();
+  return exited;
 }
+
+// Where the backend listens, kept so a profile switch can start a new one on
+// the same address (the ludo:// proxy and the page both point at it).
+let backendAddr = null;
+// The page the window first opened, which a profile switch returns to: the
+// new profile starts from the front of the app, not from wherever the last
+// one was (a signed-out profile's setup wizard, a game page it may not have).
+let appUrl = null;
 
 // ── Window ───────────────────────────────────────────────────────────────────
 
@@ -484,6 +507,7 @@ async function boot() {
     ? parseInt(process.env.ROMM_PORT, 10)
     : await freePort(host);
 
+  backendAddr = { host, port };
   await startBackend(host, port);
 
   // Fullscreen by default (matches the Deck feel); ROMM_FULLSCREEN=0 for a normal
@@ -501,6 +525,7 @@ async function boot() {
     registerAppScheme(host, port);
     url = `${APP_ORIGIN}/`;
   }
+  appUrl = url;
   createWindow(url, fullscreen);
 }
 
@@ -511,6 +536,26 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   // Renderer's Exit row (desktop-only UserMenu item) asks the shell to quit.
   ipcMain.on("romm:quit", () => app.quit());
+
+  // Profile switch: the backend chose its profile at startup (it reads that
+  // profile's state at import), so switching means a new backend on the same
+  // port, then a reload so the page starts clean against it.
+  let reloading = false;
+  ipcMain.on("romm:reload-backend", async () => {
+    if (reloading || !backendAddr) return;
+    reloading = true;
+    try {
+      await stopBackend();
+      await startBackend(backendAddr.host, backendAddr.port);
+      if (appUrl) win?.loadURL(appUrl);
+      else win?.webContents.reload();
+    } catch (err) {
+      console.error("[profiles] backend restart failed:", err);
+      app.quit();
+    } finally {
+      reloading = false;
+    }
+  });
 
   // Restart after a self-update. The AppImage on disk has already been
   // swapped, so relaunching picks up the new build. app.relaunch() re-execs

@@ -57,6 +57,8 @@ window.__rommDesktop = {
   quit() { ipcRenderer.send("romm:quit"); },
   // Relaunch after the AppImage has been swapped by a self-update.
   restart() { ipcRenderer.send("romm:restart"); },
+  // Start a fresh backend (it picks the profile chosen in the app) and reload.
+  reloadBackend() { ipcRenderer.send("romm:reload-backend"); },
   // {exe, startDir, args} describing how to relaunch this shell — handed to the
   // backend so it can write a Steam shortcut pointing back at us. null when the
   // main process can't work it out.

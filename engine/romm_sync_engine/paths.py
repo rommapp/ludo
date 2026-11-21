@@ -88,8 +88,39 @@ def library_dir() -> Path:
     return Path.home() / _library_dir_name
 
 
-def config_dir() -> Path:
-    """The app's state directory. Created on first use."""
+DEFAULT_PROFILE = "default"
+_profile = DEFAULT_PROFILE
+_profile_locked = False
+
+
+def set_profile(profile_id: str) -> None:
+    """Point per-person state at a profile (see profiles.py).
+
+    The default profile is the app's own state directory, unchanged from
+    before profiles existed, so an install that never adds a second profile
+    reads and writes exactly the files it always did. Like set_app_id, this
+    must happen before the first config_dir() call.
+    """
+    global _profile
+    if not profile_id or "/" in profile_id or profile_id.startswith("."):
+        raise ValueError(f"invalid profile id: {profile_id!r}")
+    if _profile_locked and profile_id != _profile:
+        raise RuntimeError(
+            f"set_profile({profile_id!r}) called after paths were already resolved "
+            f"as {_profile!r}; move the call earlier in startup"
+        )
+    _profile = profile_id
+
+
+def profile_id() -> str:
+    return _profile
+
+
+def machine_dir() -> Path:
+    """State shared by every profile on this machine: the profile list, and
+    records of what is installed into emulators (firmware, keys, Switch
+    content), which belong to the machine rather than to whoever installed
+    them. Created on first use."""
     global _locked
     _locked = True
     d = Path.home() / ".config" / _app_id
@@ -97,5 +128,27 @@ def config_dir() -> Path:
     return d
 
 
+def profile_dir(profile: str) -> Path:
+    """Where a profile's own state lives (not created here)."""
+    if profile == DEFAULT_PROFILE:
+        return machine_dir()
+    return machine_dir() / "profiles" / profile
+
+
+def config_dir() -> Path:
+    """The current profile's state directory. Created on first use."""
+    global _profile_locked
+    _profile_locked = True
+    d = profile_dir(_profile)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def cache_dir() -> Path:
+    """The current profile's cache: save staging, backups, sync records."""
     return config_dir() / "cache"
+
+
+def machine_cache_dir() -> Path:
+    """Cache shared by every profile: downloads of firmware and core data."""
+    return machine_dir() / "cache"

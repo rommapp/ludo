@@ -39,6 +39,7 @@ from .release_token import release_token
 # keeps ~/.config/ludo; it shares nothing with the GTK app.
 from romm_sync_engine import paths as _paths  # noqa: E402
 from romm_sync_engine import events as _events  # noqa: E402
+from romm_sync_engine import profiles as _profiles  # noqa: E402
 _paths.set_app_id("ludo")
 _paths.set_client_name("Ludo")
 # Downloads, covers and generated icons go under ~/Ludo rather than the GTK
@@ -155,6 +156,37 @@ snapshot_file = CONFIG_DIR / 'library_snapshot.json'
 # migration: the grouping cannot be redone from the persisted rows, because the
 # siblings it would need were folded away when the snapshot was written.
 SNAPSHOT_SCHEMA = 4  # 4: rows and versions carry has_file_on_disk
+
+
+def _seed_snapshot(server_url):
+    """Another profile's snapshot of the same server, newest first, for a
+    profile that has none of its own yet.
+
+    The game rows, platform names and per-platform baselines describe the
+    server, not the RomM user, so a new profile can start from them and let
+    the connect reconcile fetch only what changed. Without this every new
+    profile paid a full library walk (minutes on a large server) for rows it
+    already had on disk. Returns the parsed snapshot or None."""
+    if not server_url:
+        return None
+    candidates = [_paths.profile_dir(p['id']) / snapshot_file.name
+                  for p in _profiles.load()['profiles']]
+    best = None
+    for path in candidates:
+        if path == snapshot_file or not path.exists():
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if data.get('schema') != SNAPSHOT_SCHEMA or data.get('server_url') != server_url:
+            continue
+        if best is None or (data.get('fetched_at') or '') > (best.get('fetched_at') or ''):
+            best = data
+    if best is not None:
+        logging.info("No library snapshot for this profile; seeding from another profile's")
+    return best
 
 # How long the last library fetch took, so a user can report it without having
 # to reproduce it while someone watches. Diagnosing the RomM fetch has meant
@@ -1786,17 +1818,27 @@ class LudoBackend:
         snapshot from a different server or an incompatible schema. Returns the
         ISO fetched_at timestamp on success, else None."""
         try:
-            if not snapshot_file.exists():
-                return None
-            with open(snapshot_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            configured_url = self._settings.get('RomM', 'url') if self._settings else ''
+            seeded = False
+            if snapshot_file.exists():
+                with open(snapshot_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:
+                data = _seed_snapshot(configured_url)
+                if data is None:
+                    return None
+                seeded = True
             if data.get('schema') != SNAPSHOT_SCHEMA:
                 logging.info("Library snapshot schema mismatch; ignoring")
                 return None
-            configured_url = self._settings.get('RomM', 'url') if self._settings else ''
             if configured_url and data.get('server_url') and data['server_url'] != configured_url:
                 logging.info("Library snapshot is for a different server; ignoring")
                 return None
+            if seeded:
+                # Collections are per RomM user, so another profile's are not
+                # ours: leave them for this connect's own fetch to fill.
+                for key in ('collections', 'smart_collections', 'virtual_collections'):
+                    data.pop(key, None)
             games = data.get('games') or []
             # The snapshot's is_downloaded/local_path are only as fresh as the
             # last fetch that wrote it, and downloads land between fetches. A
@@ -4434,6 +4476,11 @@ class LudoBackend:
         payload = self._account_user_payload(user)
         if payload:
             self._account_user_cache = {'user': payload, 'at': time.time()}
+            if _profiles.launch is not None and payload['username'] != self._ANON_USERNAME:
+                try:
+                    _profiles.set_identity(_paths.profile_id(), payload['username'], payload['role'])
+                except Exception as e:
+                    logging.warning(f"profiles: could not cache identity: {e}")
         return payload
 
     async def _refresh_account_user_cache(self):
@@ -4532,11 +4579,16 @@ class LudoBackend:
             # RomM returns the default avatar when avatar_path is empty; skip the
             # round-trip and let the frontend draw its own initial fallback.
             if not uid or not ap:
+                # An account without an avatar: the picker must not keep the
+                # face of whichever account this profile used before.
+                if uid:
+                    self._remember_profile_avatar(None)
                 return {'data_uri': None}
             ts = user.get('updated_at') or ''
             ck = ('avatar', uid, ap, ts)
             hit = self._cover_cache_get(ck)
             if hit is not None:
+                self._remember_profile_avatar(hit)
                 return {'data_uri': hit}
             url = urljoin(client.base_url, f"/api/users/{uid}/avatar")
             params = {'ts': ts} if ts else None
@@ -4549,10 +4601,155 @@ class LudoBackend:
                 mimetypes.guess_type(ap)[0] or 'image/png'
             uri = f"data:{mime};base64,{base64.b64encode(resp.content).decode('ascii')}"
             self._cover_cache_put(ck, uri)
+            self._remember_profile_avatar(uri)
             return {'data_uri': uri}
         except Exception as e:
             logging.error(f"get_avatar error: {e}", exc_info=True)
             return {'data_uri': None}
+
+    # -----------------------------------------------------------------------
+    # Profiles (desktop only; see romm_sync_engine.profiles)
+    # -----------------------------------------------------------------------
+
+    _PROFILE_AVATAR = 'avatar.uri'
+
+    def _remember_profile_avatar(self, uri):
+        """Keep the signed-in account's avatar beside the profile, so the
+        picker can show everyone's face without signing anyone in. None
+        removes it: the account has no avatar."""
+        if _profiles.launch is None:
+            return
+        try:
+            target = _paths.config_dir() / self._PROFILE_AVATAR
+            if uri is None:
+                target.unlink(missing_ok=True)
+                return
+            if not target.exists() or target.read_text(encoding='ascii') != uri:
+                target.write_text(uri, encoding='ascii')
+        except Exception as e:
+            logging.warning(f"profiles: could not keep avatar: {e}")
+
+    def _profile_view(self, entry, data, accounts):
+        pid = entry['id']
+        avatar = None
+        try:
+            avatar = (_paths.profile_dir(pid) / self._PROFILE_AVATAR).read_text(encoding='ascii') or None
+        except OSError:
+            pass
+        steam = []
+        for account, owner in data['steam'].items():
+            if owner == pid:
+                info = accounts.get(account) or {}
+                steam.append(info.get('account_name') or info.get('persona') or account)
+        signed_in = (_paths.profile_dir(pid) / 'settings.ini').exists() and bool(entry.get('username'))
+        return {
+            'id': pid,
+            'name': entry.get('name') or entry.get('username') or 'New profile',
+            'custom_name': bool(entry.get('name')),
+            'username': entry.get('username') or '',
+            'role': entry.get('role') or '',
+            'avatar': avatar,
+            'steam': steam,
+            'signed_in': signed_in,
+            'current': pid == _paths.profile_id(),
+            'removable': pid != _profiles.DEFAULT and pid != _paths.profile_id(),
+        }
+
+    async def get_profiles(self):
+        """The profile list for the switcher, or {'supported': False} where the
+        shell has a single profile (the Deck plugin)."""
+        launch = _profiles.launch
+        if launch is None:
+            return {'supported': False}
+        data = _profiles.load()
+        accounts = _profiles.steam_accounts()
+        steam = None
+        if launch.get('steam'):
+            info = accounts.get(launch['steam']) or {}
+            steam = {'id': launch['steam'],
+                     'name': info.get('account_name') or info.get('persona') or launch['steam']}
+        return {
+            'supported': True,
+            'current': _paths.profile_id(),
+            'ask': bool(launch.get('ask')),
+            'steam': steam,
+            # Every Steam account signed in on this machine, so a profile can
+            # be linked from Manage even when Ludo wasn't started by Steam.
+            'steam_accounts': [
+                {'id': a, 'name': i.get('account_name') or i.get('persona') or a,
+                 'linked_to': data['steam'].get(a)}
+                for a, i in sorted(accounts.items(), key=lambda kv: -kv[1].get('timestamp', 0))],
+            'profiles': [self._profile_view(p, data, accounts) for p in data['profiles']],
+        }
+
+    async def switch_profile(self, profile_id):
+        """Choose a profile. Returns {'status': 'reload'} when the shell must
+        restart the backend to open it, 'ok' when it is already open (the
+        choice still links the Steam account that launched the app)."""
+        launch = _profiles.launch
+        if launch is None:
+            return {'status': 'unsupported'}
+        try:
+            _profiles.choose(profile_id, steam=launch.get('steam'))
+        except ValueError as e:
+            return {'status': 'error', 'message': str(e)}
+        launch['ask'] = False
+        if profile_id == _paths.profile_id():
+            # Already open: the one-shot would only matter on the next launch,
+            # where the Steam link or 'last' already lands here.
+            data = _profiles.load()
+            data.pop('next', None)
+            _profiles.save(data)
+            return {'status': 'ok'}
+        return {'status': 'reload'}
+
+    async def create_profile(self, name=''):
+        """Add a signed-out profile and open it; sign-in happens in setup."""
+        if _profiles.launch is None:
+            return {'status': 'unsupported'}
+        try:
+            pid = _profiles.create(name)
+        except Exception as e:
+            logging.error(f"create_profile failed: {e}", exc_info=True)
+            return {'status': 'error', 'message': str(e)}
+        result = await self.switch_profile(pid)
+        result['id'] = pid
+        return result
+
+    async def rename_profile(self, profile_id, name):
+        if _profiles.launch is None:
+            return {'status': 'unsupported'}
+        try:
+            _profiles.rename(profile_id, name)
+        except ValueError as e:
+            return {'status': 'error', 'message': str(e)}
+        return {'status': 'ok'}
+
+    async def remove_profile(self, profile_id):
+        if _profiles.launch is None:
+            return {'status': 'unsupported'}
+        try:
+            _profiles.remove(profile_id)
+        except ValueError as e:
+            return {'status': 'error', 'message': str(e)}
+        return {'status': 'ok'}
+
+    async def link_profile_steam(self, profile_id, account):
+        if _profiles.launch is None:
+            return {'status': 'unsupported'}
+        if str(account) not in _profiles.steam_accounts():
+            return {'status': 'error', 'message': 'That Steam account is not on this machine'}
+        try:
+            _profiles.link_steam(profile_id, account)
+        except ValueError as e:
+            return {'status': 'error', 'message': str(e)}
+        return {'status': 'ok'}
+
+    async def unlink_profile_steam(self, profile_id):
+        if _profiles.launch is None:
+            return {'status': 'unsupported'}
+        _profiles.unlink_steam(profile_id)
+        return {'status': 'ok'}
 
     # -----------------------------------------------------------------------
     # Play time
@@ -11729,7 +11926,7 @@ class LudoBackend:
             if f:
                 text = f.read_text(encoding='utf-8', errors='replace')
             else:
-                bundle = _paths.cache_dir() / 'libretro_info.zip'
+                bundle = _paths.machine_cache_dir() / 'libretro_info.zip'
                 if bundle.exists():
                     import zipfile
                     with zipfile.ZipFile(bundle) as z:
@@ -11771,7 +11968,7 @@ class LudoBackend:
                 result = self._parse_required_firmware(
                     f.read_text(encoding='utf-8', errors='replace'))
             else:
-                bundle = _paths.cache_dir() / 'libretro_info.zip'
+                bundle = _paths.machine_cache_dir() / 'libretro_info.zip'
                 if bundle.exists():
                     import zipfile
                     with zipfile.ZipFile(bundle) as z:

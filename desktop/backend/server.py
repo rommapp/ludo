@@ -33,6 +33,17 @@ from urllib.parse import parse_qs, unquote, urlparse
 # `ludo_app` is a package both shells install; nothing here reaches into
 # decky_plugin/. The three facts that differ between the shells are passed in
 # as a HostProfile rather than patched onto module globals.
+# Which profile this launch opens, decided before the backend is imported: it
+# reads the profile's state directory at import time. An explicit choice comes
+# in as LUDO_PROFILE (the shell's --profile); otherwise the Steam account that
+# launched the app picks its own profile (see romm_sync_engine.profiles).
+from romm_sync_engine import paths as _paths, profiles as _profiles  # noqa: E402
+_paths.set_app_id("ludo")
+_paths.set_library_dir_name("Ludo")
+_profiles.launch = _profiles.resolve(os.environ.get("LUDO_PROFILE") or None)
+_paths.set_profile(_profiles.launch["id"])
+_profiles.mark_used(_profiles.launch["id"])
+
 import ludo_app.backend  # noqa: E402
 from ludo_app.backend import LudoBackend  # noqa: E402
 from ludo_app.host import HostProfile, read_package_version  # noqa: E402

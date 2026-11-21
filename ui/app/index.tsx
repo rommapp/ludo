@@ -34,6 +34,7 @@ import { stopBackgroundMonitoring, startBackgroundMonitoring } from "./notificat
 import { setPreDownloadHook, watchBackgroundInstalls } from "./downloads";
 import { maybePromptSwitchFirmware } from "./firmware";
 import { watchSaveConflicts } from "./saveConflict";
+import { initProfiles } from "./profiles";
 
 /**
  * Re-exported so the app's public surface stays two names.
@@ -202,6 +203,10 @@ export function startApp(): { stop: () => void } {
       }
     } catch (e) { console.error('[RomM] startup update check', e); }
   })();
+
+  // A Steam account with no profile yet, on a machine with several, is asked
+  // who is playing before anything else (desktop only; see profiles.tsx).
+  void initProfiles();
 
   // Re-bind the launch intercept if the Ludo tile was added in a prior session,
   // and auto-open the setup wizard once when no connection is configured.

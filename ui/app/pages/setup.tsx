@@ -1,14 +1,15 @@
 import { cloneElement, useEffect, useRef, useState } from "react";
-import { finishOnboarding, getConfig, getRommLogo, getSteamTileStatus, pairDevice, repairEmulatorPaths, saveConfig, setDeviceNameRpc, setLibraryPaths, setSteamTile, testRommConnection } from "../rpc";
+import { finishOnboarding, getConfig, getProfiles, getRommLogo, getSteamTileStatus, pairDevice, repairEmulatorPaths, saveConfig, setDeviceNameRpc, setLibraryPaths, setSteamTile, testRommConnection } from "../rpc";
 import { FileSelectionType, Focusable, Navigation, host, openFilePicker, showModal, ModalRoot, GamepadButton } from "@ludo/host";
 import { toaster } from "../toast";
 import { V2 } from "../theme";
-import { FaBoxOpen, FaCheck, FaCheckCircle, FaChevronLeft, FaChevronRight, FaDownload, FaExternalLinkAlt, FaGamepad, FaPlay, FaPuzzlePiece, FaSave, FaSync, FaTimes, FaUndo} from "react-icons/fa";
+import { FaBoxOpen, FaCheck, FaCheckCircle, FaChevronLeft, FaChevronRight, FaDownload, FaExternalLinkAlt, FaGamepad, FaPlay, FaPuzzlePiece, FaSave, FaSync, FaTimes, FaUndo, FaUsers} from "react-icons/fa";
 import { libNavigate } from "../nav";
 import { Bumper, GameActionButton, PairCodeField, V2Segment, V2SettingsRow, V2SettingsSection, V2Switch, V2TextField, UserMenuRow, MODAL_SCRIM_INSET, ScrollFade, V2CardRow} from "../kit";
 import { _forceGamepadFocus, playSteamSound, useAutoFocus } from "../shell";
 import { V2Bg } from "../media";
 import { V2_FOCUS_STYLE } from "../focus";
+import { ProfilePickerModal } from "../profiles";
 import { QrCode, pickerStart, useQrPairing } from "../pairing";
 import { EmuStalePath, InstallProgressBar, PlatformSyncList, installSize, loadEmulatorStatus, publishEmulatorStatus, startEmulatorInstall, useEmulatorInstall, useEmulatorStatus, usePlatformSync, setWizardOpen} from "../emulator";
 // First run: welcome, connect, folders, done.
@@ -312,6 +313,12 @@ const WIZ_MODES: WizMode[] = ['qr', 'pair', 'login'];
 
 export function SetupWizard() {
   const [step, setStep] = useState(0);
+  // Other profiles on this machine (desktop only): the welcome step offers a
+  // way back to them.
+  const [otherProfiles, setOtherProfiles] = useState(false);
+  useEffect(() => {
+    getProfiles().then((l: any) => setOtherProfiles(!!l?.supported && (l.profiles?.length ?? 0) > 1)).catch(() => {});
+  }, []);
   // 'qr' leads because it is the only route that asks for nothing but the URL —
   // the other two still cost a trip through the on-screen keyboard, and both
   // stay available for servers too old for device auth (or users without a
@@ -813,8 +820,14 @@ export function SetupWizard() {
               <div style={{ fontSize: '14px', color: V2.fg2, lineHeight: 1.6, maxWidth: '420px' }}>
                 Connect to your RomM server to browse, download, and sync saves.
               </div>
-              <div style={{ marginTop: '8px' }}>
+              <div style={{ marginTop: '8px', display: 'flex', gap: '10px' }}>
                 <GameActionButton variant="emphasized" label="Get started" focusRef={startFocusRef} icon={<FaPlay size={13} style={{ marginLeft: '2px' }} />} onClick={next} />
+                {/* A new profile starts here, signed out: without this there is
+                    no way back to the others short of signing it in. */}
+                {otherProfiles && (
+                  <GameActionButton label="Switch profile" icon={<FaUsers size={13} />}
+                    onClick={() => showModal(<ProfilePickerModal />)} />
+                )}
               </div>
             </div>
           )}

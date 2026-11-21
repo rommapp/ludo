@@ -32,6 +32,13 @@ function restoreOpener(el: HTMLElement | null) {
   if (!el || inMouseMode()) return;
   requestAnimationFrame(() => {
     if (!el.isConnected || (el.offsetWidth === 0 && el.offsetHeight === 0)) return;
+    // Another modal opened in the meantime (one menu entry opening the next
+    // dialog): focus belongs to it, not to whatever sits behind it. The frame
+    // can arrive late while the page is still loading, which is how a closing
+    // menu used to pull focus out of the dialog it had just opened.
+    const scrims = document.querySelectorAll(".desk-modal-scrim");
+    const top = scrims[scrims.length - 1];
+    if (top && !top.contains(el)) return;
     try { el.focus({ preventScroll: false } as any); } catch { /* gone */ }
   });
 }
