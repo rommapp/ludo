@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import time
 import zipfile
 from pathlib import Path
@@ -97,8 +98,53 @@ EDEN_DATA_DIRS = (
 )
 
 
-def eden_data_dirs(extra=None):
+# Eglantine, the Switch 2 emulator forked from Eden, keeps Eden's tree under its
+# own name (src/common/fs/fs_paths.h: EDEN_DIR "eglantine"), so its saves sit at
+# the same nand/user/save/<...>/<title id> depth, named by "04…" program IDs.
+EGLANTINE_DATA_DIRS = (
+    '~/.local/share/eglantine',
+)
+
+# The Eden-family emulators whose save trees Ludo syncs. ``generation`` is the
+# console their titles belong to (title_ids.switch_generation): each tree only
+# ever yields its own console's saves, so a Switch 2 save restored by mistake
+# into Eden (or the reverse) is impossible by construction. ``process`` is the
+# /proc comm prefix; Eglantine's Qt binary is "eglantine" (src/yuzu
+# CMakeLists OUTPUT_NAME).
+SWITCH_SAVE_EMULATORS = {
+    'eden': {'name': 'Eden', 'env': 'EDEN_DATA_DIR', 'process': 'eden',
+             'generation': 1},
+    'eglantine': {'name': 'Eglantine', 'env': 'EGLANTINE_DATA_DIR',
+                  'process': 'eglantine', 'generation': 2},
+}
+
+
+def _flavour_spec(flavour):
+    spec = SWITCH_SAVE_EMULATORS.get(flavour or 'eden')
+    if spec is None:
+        raise ValueError(f"unknown Switch emulator {flavour!r}")
+    return spec
+
+
+def _flavour_default_dirs(flavour):
+    # Looked up at call time so a test patching the module tuple is honoured.
+    return EGLANTINE_DATA_DIRS if flavour == 'eglantine' else EDEN_DATA_DIRS
+
+
+def switch_emulator_name(flavour):
+    """"Eden" or "Eglantine", for logs and the server's emulator label."""
+    return _flavour_spec(flavour)['name']
+
+
+def flavour_for_title_id(title_id):
+    """'eglantine' for a Switch 2 title ID, 'eden' for anything else."""
+    return 'eglantine' if title_ids.switch_generation(title_id) == 2 else 'eden'
+
+
+def eden_data_dirs(extra=None, flavour='eden'):
     """Existing Eden data directories, most specific first.
+
+    ``flavour`` 'eglantine' answers the same question for Eglantine.
 
     Both install kinds are checked because Ludo launches both: a flatpak Eden
     and an AppImage in ~/AppImages are equally supported by
@@ -116,10 +162,10 @@ def eden_data_dirs(extra=None):
         return [path] if path.is_dir() else []
 
     candidates = []
-    env = os.environ.get('EDEN_DATA_DIR')
+    env = os.environ.get(_flavour_spec(flavour)['env'])
     if env:
         candidates.append(env)
-    candidates.extend(EDEN_DATA_DIRS)
+    candidates.extend(_flavour_default_dirs(flavour))
 
     found = []
     for candidate in candidates:
@@ -227,20 +273,55 @@ def _newest_mtime(directory):
     return newest
 
 
-def find_eden_saves(extra_data_dir=None):
+# Written by Eden and Eglantine the moment a title boots, before the game saves
+# anything (16 bytes: the save's journal and data sizes). Alone in a directory
+# it is not a save: packing it would upload "nothing" over the player's save.
+_SAVE_SIZE_MARKER = '.yuzu_save_size'
+
+
+def _has_save_data(directory):
+    """True when a save directory holds anything besides the size marker."""
+    try:
+        for entry in Path(directory).rglob('*'):
+            if entry.is_file() and entry.name != _SAVE_SIZE_MARKER:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _data_dirs(extra, flavour):
+    # Eden keeps the one-argument call, which is what existing callers (and
+    # tests standing in for eden_data_dirs) expect.
+    if flavour == 'eden':
+        return eden_data_dirs(extra)
+    return eden_data_dirs(extra, flavour=flavour)
+
+
+def find_eden_saves(extra_data_dir=None, flavour='eden'):
     """Every Eden save on disk, as dicts of {title_id, path, modified}.
+
+    ``flavour`` 'eglantine' reads Eglantine's tree instead. Either way only
+    titles of that emulator's console are returned (see SWITCH_SAVE_EMULATORS).
 
     Empty save directories are skipped — Eden creates one for a game the moment
     it boots, whether or not the game ever writes anything, and an empty save
     is not worth a sync round trip.
     """
     best = {}
-    for data_dir in eden_data_dirs(extra_data_dir):
+    generation = _flavour_spec(flavour)['generation']
+    for data_dir in _data_dirs(extra_data_dir, flavour):
         root = data_dir.joinpath(*_EDEN_SAVE_ROOT)
         if not root.is_dir():
-            log.debug("no Eden save tree at %s (not booted a game yet)", root)
+            log.debug("no %s save tree at %s (not booted a game yet)",
+                      switch_emulator_name(flavour), root)
             continue
         for title_id, directory in _walk_for_titles(root):
+            if title_ids.switch_generation(title_id) != generation:
+                continue
+            if not _has_save_data(directory):
+                # Booted but never saved (only .yuzu_save_size): not a save.
+                continue
             modified = _newest_mtime(directory)
             if modified is None:
                 # Empty. Eden creates a save directory when a game boots,
@@ -870,6 +951,22 @@ def eden_pids():
     return _pids_named('eden')
 
 
+def eglantine_pids():
+    """PIDs of running Eglantine processes (zombies excluded)."""
+    return _pids_named('eglantine')
+
+
+def eglantine_is_running():
+    """True when Eglantine, the Switch 2 emulator, appears to be running."""
+    return bool(eglantine_pids())
+
+
+def switch_emulator_is_running(flavour='eden'):
+    """eden_is_running or eglantine_is_running, by flavour."""
+    _flavour_spec(flavour)
+    return eglantine_is_running() if flavour == 'eglantine' else eden_is_running()
+
+
 def cemu_is_running():
     """True when a Cemu process appears to be running. The play-session
     tracker's only way to see a Wii U game end: nothing else watches Cemu."""
@@ -944,7 +1041,7 @@ def close_eden(timeout=10.0):
     return not eden_pids()
 
 
-def eden_restore_dir(title_id, extra_data_dir=None):
+def eden_restore_dir(title_id, extra_data_dir=None, flavour='eden'):
     """Where a save for ``title_id`` belongs on this device, or None if unknown.
 
     A title that has a save uses that directory. One that has never booted can
@@ -952,24 +1049,98 @@ def eden_restore_dir(title_id, extra_data_dir=None):
     then a fact, not a guess. No profile or several means Eden has to boot it
     first, because a save under the wrong user is invisible to the player.
     """
-    for save in find_eden_saves(extra_data_dir):
+    for save in (find_eden_saves(extra_data_dir) if flavour == 'eden'
+                 else find_eden_saves(extra_data_dir, flavour=flavour)):
         if save['title_id'].lower() == title_id.lower():
             return save['path']
-    users, first = set(), None
-    for data_dir in eden_data_dirs(extra_data_dir):
+    users = {}
+    for data_dir in _data_dirs(extra_data_dir, flavour):
         root = data_dir.joinpath(*_EDEN_SAVE_ROOT, '0' * 16)
         try:
             found = [d for d in root.iterdir() if d.is_dir() and d.name.strip('0')]
         except OSError:
             continue
-        users.update(d.name.lower() for d in found)
-        first = first or (found[0] if found else None)
+        for d in found:
+            users.setdefault(d.name.lower(), d)
     if len(users) == 1:
-        return first / title_id.upper()
+        return next(iter(users.values())) / title_id.upper()
+    # Several user folders, or none yet. Folder names are per machine (each
+    # profile is a random UUID), so none can be assumed: ask the emulator.
+    # Its profile list says which users exist -- a stray folder (seen in
+    # Eglantine: "D328A98D…0000", the real ID shifted) is in none -- and its
+    # current_user setting says which one plays, as profile_manager.cpp
+    # resolves it: that index if it exists, else the first profile.
+    for data_dir in _data_dirs(extra_data_dir, flavour):
+        registered = registered_users(data_dir)
+        if not registered:
+            continue
+        index = current_user_index(data_dir)
+        user = registered[index] if 0 <= index < len(registered) else registered[0]
+        root = data_dir.joinpath(*_EDEN_SAVE_ROOT, '0' * 16)
+        return users.get(user.lower(), root / user) / title_id.upper()
     return None
 
 
-def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None):
+# The account service's profile list, as Eden/Eglantine store it
+# (profile_manager.cpp ProfileDataRaw): a 0x10 header, then 8 entries of 0xC8
+# bytes, each opening with the user's UUID as a little-endian u128. A save
+# folder is named "{high:016X}{low:016X}" of that same value.
+_PROFILES_DAT = ('nand', 'system', 'save', '8000000000000010', 'su', 'avators',
+                 'profiles.dat')
+_PROFILE_ENTRY = 0xC8
+_PROFILE_SLOTS = 8
+
+
+def registered_users(data_dir):
+    """User folder names the emulator's profile list declares, in its order.
+
+    The order is the profile index current_user refers to: ParseUserSaveFile
+    adds every valid entry in turn.
+    """
+    try:
+        raw = Path(data_dir).joinpath(*_PROFILES_DAT).read_bytes()
+    except OSError:
+        return []
+    users = []
+    for i in range(_PROFILE_SLOTS):
+        entry = raw[0x10 + i * _PROFILE_ENTRY:0x10 + (i + 1) * _PROFILE_ENTRY]
+        if len(entry) < 16:
+            break
+        low, high = struct.unpack_from('<QQ', entry, 0)
+        name = f'{high:016X}{low:016X}'
+        if (low or high) and name not in users:
+            users.append(name)
+    return users
+
+
+_CURRENT_USER_RE = re.compile(r'^current_user\s*=\s*(-?\d+)\s*$', re.MULTILINE)
+
+
+def _config_dir_for(data_dir):
+    """The config directory paired with a data directory.
+
+    Flatpak: ~/.var/app/<id>/data/<name> -> ~/.var/app/<id>/config/<name>.
+    Otherwise XDG: ~/.local/share/<name> -> $XDG_CONFIG_HOME/<name>.
+    """
+    data_dir = Path(data_dir)
+    if data_dir.parent.name == 'data' and data_dir.parent.parent.parent.name == 'app':
+        return data_dir.parent.parent / 'config' / data_dir.name
+    base = os.environ.get('XDG_CONFIG_HOME') or (Path.home() / '.config')
+    return Path(base) / data_dir.name
+
+
+def current_user_index(data_dir):
+    """The emulator's current_user setting (a profile index), 0 when unset."""
+    try:
+        text = (_config_dir_for(data_dir) / 'qt-config.ini').read_text(errors='replace')
+    except OSError:
+        return 0
+    match = _CURRENT_USER_RE.search(text)
+    return int(match.group(1)) if match else 0
+
+
+def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None,
+                flavour='eden'):
     """Restore a packed save into Eden's tree for `title_id`.
 
     The mirror of pack_save, but the write direction cannot be a mirror of the
@@ -994,13 +1165,15 @@ def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None):
     running.
     """
     zip_path = Path(zip_path)
-    if eden_is_running():
-        raise RuntimeError("Eden is running; close it before restoring a save")
+    name = switch_emulator_name(flavour)
+    if switch_emulator_is_running(flavour):
+        raise RuntimeError(f"{name} is running; close it before restoring a save")
 
-    existing = eden_restore_dir(title_id, extra_data_dir)
+    existing = (eden_restore_dir(title_id, extra_data_dir) if flavour == 'eden'
+                else eden_restore_dir(title_id, extra_data_dir, flavour=flavour))
     if existing is None:
         raise FileNotFoundError(
-            f"no Eden save directory for {title_id}; boot the game once first")
+            f"no {name} save directory for {title_id}; boot the game once first")
     existing.mkdir(parents=True, exist_ok=True)
 
     backup = None

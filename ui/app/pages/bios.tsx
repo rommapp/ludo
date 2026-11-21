@@ -187,7 +187,8 @@ export function BiosDetailModal({ slug, platformName, seed, onChanged, closeModa
   // belongs in Eden's NAND tree, and download_bios would drop it in RetroArch's
   // system directory where Eden never looks — so this platform routes to its
   // own installer. Everything else keeps the original path unchanged.
-  const isSwitch = slug === 'switch' || /nintendo\s*switch/i.test(
+  // "Nintendo Switch 2" is not Eden's: its firmware must never land in Eden.
+  const isSwitch = slug === 'switch' || /nintendo\s*switch(?!\s*[-_]?\s*(2|ii)\b)/i.test(
     row?.platform_name || row?.name || platformName || '');
 
   const fetchAll = async () => {

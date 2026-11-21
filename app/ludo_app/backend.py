@@ -78,6 +78,7 @@ try:
         flatpak_app_installed,
         STANDALONE_EMULATORS, find_standalone_builds,
         _extract_archive, _archive_member_names, arcade_romset_stays_zipped, WIIU_SLUGS, resolve_wiiu_rom,
+        is_switch2_platform, resolve_switch2_rom, is_switch2_folder_game,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
         push_notification as _push_notification,
@@ -473,6 +474,10 @@ def _detect_multi_disc(local_path, is_downloaded):
     if not p.exists():
         return False, 0
     if p.is_dir():
+        # A Switch 2 folder is one game: a loose ExeFS dump's files (main,
+        # rtld, sdk, romfs/…) are not variants, nor is a .nup beside its DLC.
+        if is_switch2_folder_game(p):
+            return False, 0
         launchable = [f for f in p.rglob('*')
                       if f.is_file() and f.suffix.lower() in _LAUNCHABLE_DISC_EXTS]
         # One disc and RomM's one-line playlist is still one disc.
@@ -8151,6 +8156,11 @@ class LudoBackend:
         if p.is_dir() and str(platform_slug or '').lower() in WIIU_SLUGS:
             target, _root = resolve_wiiu_rom(p)
             return str(target) if target.is_file() else None
+        # Switch 2: Eglantine is handed the .nup, or a loose dump's exefs/main
+        # (it reads the sibling romfs/ itself); there is nothing to pick.
+        if p.is_dir() and is_switch2_platform(None, platform_slug):
+            target, _root = resolve_switch2_rom(p)
+            return str(target) if target.is_file() else None
         discs = self._list_local_discs(local_path)
         if not discs:
             return None
@@ -8237,8 +8247,9 @@ class LudoBackend:
             g = self._games_index().get(rom_id)
             if not g or not g.get('is_downloaded') or not g.get('local_path'):
                 return {'success': True, 'discs': [], 'last': ''}
-            if str(g.get('platform_slug') or '').lower() in WIIU_SLUGS:
-                # One launch file per Wii U title; there is nothing to pick.
+            if (str(g.get('platform_slug') or '').lower() in WIIU_SLUGS
+                    or is_switch2_platform(g.get('platform_name'), g.get('platform_slug'))):
+                # One launch file per Wii U or Switch 2 title; nothing to pick.
                 return {'success': True, 'discs': [], 'last': ''}
             discs = self._list_local_discs(g['local_path'])
             last = self._get_last_disc(rom_id)
@@ -9852,6 +9863,16 @@ class LudoBackend:
                 return
             sync.forget_title_ids()
 
+            # Everything below installs into EDEN. A Switch 2 game can be an
+            # .nsp/.xci too (Eglantine reads both), and its update is not a
+            # Switch 1 add-on: Eden must never receive it. A .nup carries its
+            # own updates and DLC, so Eglantine needs nothing installed.
+            g = self._games_index().get(rom_id) or {}
+            if (is_switch2_platform(g.get('platform_name'), self._platform_slug_for(g))
+                    or any(is_switch2_platform(None, part.name.lower())
+                           for part in path.parents)):
+                return
+
             # A folder ROM. RomM folds a base game and its patch into ONE entry
             # whose download is a directory, so the add-ons arrive inside it and
             # were previously never seen by any of this -- the directory has no
@@ -10822,6 +10843,20 @@ class LudoBackend:
                         is_md, dc = _detect_multi_disc(str(final), True)
                         live['is_multi_disc'] = is_md
                         live['disc_count'] = dc
+                        # A Switch/Switch 2 game's save lives in Eden's or
+                        # Eglantine's tree: bring the server's latest down now,
+                        # so a fresh install does not first boot with no save
+                        # (and then upload that empty save over the real one).
+                        # Only when nothing local exists; see
+                        # _restore_latest_switch_save_if_missing.
+                        slug = str(live.get('platform_slug') or '').lower()
+                        if self._auto_sync is not None and (
+                                slug == 'switch' or is_switch2_platform(
+                                    live.get('platform_name'), slug)):
+                            try:
+                                self._auto_sync.sync_before_launch(live)
+                            except Exception as e:
+                                logging.warning(f"post-download save restore failed: {e}")
                     elif ok and parent is not None:
                         # A regional/disc variant the user picked from the region
                         # picker. It has no tile of its own — the library folded
