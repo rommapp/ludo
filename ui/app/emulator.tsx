@@ -55,6 +55,9 @@ export type EmuStandalone = {
   key: string; name: string; installed: boolean; executable: string;
   // Lowercase tokens matched against a game's platform name and slug.
   platforms: string[];
+  // Tokens that rule the emulator out even when one of `platforms` matches:
+  // Eden's "switch" is inside "Nintendo Switch 2", which only Eglantine runs.
+  excludes?: string[];
 };
 
 // ── Emulator status ─────────────────────────────────────────────────────────
@@ -225,15 +228,19 @@ export function installSize(s: EmuInstall): string {
 }
 
 // The standalone emulator that owns a game's platform, installed or not — Eden
-// for a Switch ROM. Matched on the same tokens the backend uses, against both
-// the platform name and its slug, so "Nintendo Switch" and "switch" both hit.
+// for a Switch ROM, Eglantine for a Switch 2 one. Matched on the same tokens
+// and the same folding as the backend (standalone_emulator_for_platform),
+// against both the platform name and its slug: "-" and "_" read as spaces, so
+// "switch-2" and "Nintendo Switch 2" both hit Eglantine and never Eden.
 export function standaloneFor(status: EmuStatus | null,
                        platform?: string | null,
                        slug?: string | null): EmuStandalone | null {
   if (!status?.standalone?.length) return null;
-  const hay = `${platform || ''} ${slug || ''}`.toLowerCase();
-  if (!hay.trim()) return null;
-  return status.standalone.find((s) => s.platforms.some((p) => hay.includes(p))) || null;
+  const hay = `${platform || ''} ${slug || ''}`.toLowerCase().replace(/[\s_-]+/g, ' ').trim();
+  if (!hay) return null;
+  return status.standalone.find((s) =>
+    !(s.excludes || []).some((x) => hay.includes(x))
+    && s.platforms.some((p) => hay.includes(p))) || null;
 }
 
 // ─── Per-platform sync ───────────────────────────────────────────────────────

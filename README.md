@@ -23,8 +23,8 @@ and launches the game — without leaving the couch or touching a keyboard.
 - **Downloads** — queue and resume ROM downloads, extracting archives as needed.
 - **Saves and states** — sync both ways with RomM, on a watchdog rather than a
   button. When two machines run Ludo, only one does the syncing.
-- **Launch** — start a game in RetroArch, or in Eden for
-  Switch titles, with core selection handled for you.
+- **Launch** — start a game in RetroArch, in Eden for Switch titles, or in
+  Eglantine for Switch 2 titles, with core selection handled for you.
 - **BIOS, cores and firmware** — fetch what a platform needs and report what is
   missing before it becomes a failed launch.
 - **Gamepad-first** — the entire interface is built to be driven by a controller.

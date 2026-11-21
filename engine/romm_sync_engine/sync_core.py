@@ -830,6 +830,7 @@ class GameDataCache:
             'wii': 'Nintendo Wii',
             'wiiu': 'Nintendo Wii U',
             'switch': 'Nintendo Switch',
+            'switch-2': 'Nintendo Switch 2',
             'gb': 'Game Boy',
             'gbc': 'Game Boy Color',
             'gba': 'Game Boy Advance',
@@ -1265,15 +1266,62 @@ PS2_CORE_NAMES = ('LRPS2', 'ParaLLEl PS2')
 # How long a failed core list fetch stands before anything asks again.
 BUILDBOT_RETRY_SECONDS = 300
 
+# Platform tokens naming the Switch 2, compared against the platform name and
+# slug after _platform_haystack folds "-" and "_" to spaces ("switch-2",
+# "Nintendo Switch 2", "nintendo_switch_2", "switch2").
+SWITCH2_PLATFORM_TOKENS = ('switch 2', 'switch2', 'switch ii')
+SWITCH2_SLUGS = ('switch-2', 'switch2', 'switch_2', 'nintendo-switch-2')
+
+
+def _platform_haystack(*parts):
+    text = ' '.join(str(x or '').lower() for x in parts)
+    return re.sub(r'[\s_-]+', ' ', text).strip()
+
+
+def is_switch2_platform(platform_name=None, platform_slug=None):
+    """True when a platform name or slug is the Nintendo Switch 2."""
+    if str(platform_slug or '').strip().lower() in SWITCH2_SLUGS:
+        return True
+    hay = _platform_haystack(platform_name, platform_slug)
+    return any(t in hay for t in SWITCH2_PLATFORM_TOKENS)
+
+
+def _spec_matches_platform(spec, haystack):
+    if any(t in haystack for t in spec.get('excludes', ())):
+        return False
+    return any(t in haystack for t in spec['platforms'])
+
+
 STANDALONE_EMULATORS = {
     'eden': {
         'name': 'Eden',
         'platforms': ('nintendo switch', 'switch'),
+        # "switch" is a substring of "Nintendo Switch 2" and "switch-2": a
+        # Switch 2 game must never be handed to Eden, which cannot boot it.
+        'excludes': SWITCH2_PLATFORM_TOKENS,
         'flatpak_id': 'dev.eden_emu.eden',
         # Gear Lever installs land in ~/AppImages as a lowercase 'eden.appimage',
         # so the match is on the stem rather than the official casing.
         'binaries': ('eden',),
         'args': ('-f', '-g', '{rom}'),
+    },
+    'eglantine': {
+        # The Switch 2 emulator (github.com/Eglantine-Community/Eglantine),
+        # an Eden fork: same command line, same data layout under its own name.
+        'name': 'Eglantine',
+        'platforms': SWITCH2_PLATFORM_TOKENS,
+        'flatpak_id': None,
+        'binaries': ('eglantine',),
+        # Releases ship as "eglantine-linux-x86_64.AppImage" and
+        # "eglantine-linux-x86_64-pgo.AppImage", browsers add "(1)" to a
+        # second download, and users rename it ("eglantine.AppImage"). Any
+        # stem that is "eglantine" followed by nothing or a non-letter.
+        'appimage_re': r'^eglantine(?:[^a-z].*)?$',
+        # A fresh download is not executable yet.
+        'make_executable': True,
+        'args': ('-f', '-g', '{rom}'),
+        # A .nup file, or the exefs/main of a loose dump inside a folder.
+        'resolve_rom': 'switch2',
     },
     'cemu': {
         'name': 'Cemu',
@@ -1364,6 +1412,67 @@ def resolve_wiiu_rom(rom_path):
     return path, path.parent
 
 
+_SWITCH2_CONTAINER_SUFFIXES = ('.nup', '.nsp', '.xci')
+
+
+def resolve_switch2_rom(rom_path):
+    """(launch_file, grant_root) for a Switch 2 game, file or folder.
+
+    Eglantine boots a .nup container (base, update and DLC in one file), an
+    .nsp/.xci, or a loose ExeFS dump by its exefs/main (the loader then reads
+    the sibling romfs/). A folder is searched in that order: the largest .nup,
+    then the base exefs/main -- never one under updates/, which is not a
+    bootable game on its own -- then the largest .nsp/.xci.
+    """
+    path = Path(rom_path)
+    if not path.is_dir():
+        return path, path.parent
+    try:
+        files = [f for f in path.rglob('*') if f.is_file()]
+    except OSError:
+        return path, path
+    nups = sorted((f for f in files if f.suffix.lower() == '.nup'),
+                  key=lambda f: f.stat().st_size, reverse=True)
+    if nups:
+        return nups[0], path
+    mains = [f for f in files
+             if f.name == 'main' and f.parent.name.lower() == 'exefs']
+    if mains:
+        def depth(f):
+            rel = f.relative_to(path).parts
+            return (any(part.lower() == 'updates' for part in rel), len(rel))
+        return sorted(mains, key=depth)[0], path
+    found = sorted((f for f in files if f.suffix.lower() in _SWITCH2_CONTAINER_SUFFIXES),
+                   key=lambda f: f.stat().st_size, reverse=True)
+    if found:
+        return found[0], path
+    return path, path
+
+
+def is_switch2_folder_game(folder):
+    """True when a folder holds a Switch 2 game (a .nup or a loose exefs/main).
+
+    Such a folder is ONE game: the files of a loose dump are not regional
+    variants, and a .nup beside another .nup is the same title's content.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        return False
+    # Only where a download puts them: the folder itself or one level down
+    # (an archive unpacked into a folder of its own). Never a full walk: this
+    # runs for every folder game in the library, PC games with thousands of
+    # files included.
+    try:
+        for level in (folder, *(d for d in folder.iterdir() if d.is_dir())):
+            if (level / 'exefs' / 'main').is_file():
+                return True
+            if any(f.suffix.lower() == '.nup' and f.is_file() for f in level.iterdir()):
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def _standalone_appimage_dirs():
     """Directories to scan for a standalone emulator's AppImage, best first.
 
@@ -1380,6 +1489,39 @@ def _standalone_appimage_dirs():
 # and they share an app id -- so they share saves, NAND, firmware, keys and
 # qt-config.ini, and switching between them loses nothing.
 _STANDALONE_DEV_MARKERS = ('nightly', 'canary', 'dev', 'early-access', 'ea')
+
+
+def _appimage_stem_matches(spec, stem):
+    """Whether an AppImage stem (lowercase, no extension) is this emulator.
+
+    Startswith, not contains: an AppImage merely mentioning the emulator (a
+    launcher, a sibling tool) is not the emulator. A spec may give a stricter
+    ``appimage_re`` instead.
+    """
+    pattern = spec.get('appimage_re')
+    if pattern:
+        return re.match(pattern, stem, re.IGNORECASE) is not None
+    names = tuple(n.lower() for n in spec.get('binaries', ()))
+    return any(stem.startswith(n) for n in names)
+
+
+def _appimage_usable(spec, entry):
+    if not entry.is_file():
+        return False
+    return os.access(entry, os.X_OK) or bool(spec.get('make_executable'))
+
+
+def ensure_executable(path):
+    """Add the execute bit to a downloaded AppImage. True when it is runnable."""
+    try:
+        p = Path(path)
+        if os.access(p, os.X_OK):
+            return True
+        p.chmod(p.stat().st_mode | 0o111)
+        return os.access(p, os.X_OK)
+    except OSError as e:
+        logging.warning(f"could not make {path} executable: {e}")
+        return False
 
 
 def _standalone_build_label(spec, stem):
@@ -1422,7 +1564,6 @@ def find_standalone_builds(key, spec, settings=None):
         add(f'flatpak:{app_id_}', f"{spec.get('name') or key} (Flatpak)",
             'flatpak')
 
-    names = tuple(n.lower() for n in spec.get('binaries', ()))
     for location in _standalone_appimage_dirs():
         try:
             if not location.is_dir():
@@ -1432,9 +1573,9 @@ def find_standalone_builds(key, spec, settings=None):
                 if not low.endswith('.appimage') or _is_own_appimage(entry.name):
                     continue
                 stem = low[:-len('.appimage')]
-                if not any(stem.startswith(n) for n in names):
+                if not _appimage_stem_matches(spec, stem):
                     continue
-                if entry.is_file() and os.access(entry, os.X_OK):
+                if _appimage_usable(spec, entry):
                     add(str(entry), _standalone_build_label(spec, stem),
                         'appimage')
         except Exception:
@@ -1444,6 +1585,13 @@ def find_standalone_builds(key, spec, settings=None):
         found = shutil.which(name)
         if found:
             add(found, f"{spec.get('name') or key} ({name} on PATH)", 'path')
+
+    # Several downloads of one release ("…x86_64.AppImage", "…-pgo.AppImage",
+    # "…(1).AppImage") all read "Eglantine": name the file so they differ.
+    labels = [b['label'] for b in builds]
+    for build in builds:
+        if build['kind'] == 'appimage' and labels.count(build['label']) > 1:
+            build['label'] = f"{build['label']} · {Path(build['path']).name}"
 
     # Mark what an unconfigured Ludo would pick, so the UI can label the
     # automatic choice with the build it actually resolves to rather than
@@ -1489,23 +1637,23 @@ def find_standalone_executable(key, spec, settings=None):
     if app_id_ and flatpak_app_installed(app_id_):
         return f'flatpak:{app_id_}'
 
-    names = tuple(n.lower() for n in spec.get('binaries', ()))
     for location in _standalone_appimage_dirs():
         try:
             if not location.is_dir():
                 continue
-            for entry in sorted(location.iterdir()):
+            # Executable copies first: one the user already set up beats a
+            # fresh download in the same folder.
+            entries = sorted(location.iterdir(),
+                             key=lambda e: (not os.access(e, os.X_OK), e.name))
+            for entry in entries:
                 low = entry.name.lower()
                 if not low.endswith('.appimage'):
                     continue
                 if _is_own_appimage(entry.name):
                     continue
                 stem = low[:-len('.appimage')]
-                # Startswith, not contains: an AppImage merely mentioning the
-                # emulator (a launcher, a sibling tool) is not the emulator.
-                if any(stem.startswith(n) for n in names):
-                    if entry.is_file() and os.access(entry, os.X_OK):
-                        return str(entry)
+                if _appimage_stem_matches(spec, stem) and _appimage_usable(spec, entry):
+                    return str(entry)
         except Exception:
             continue
 
@@ -1668,13 +1816,12 @@ def standalone_emulator_for_platform(platform_name, platform_slug=None):
     and the two are worth keeping apart: "Switch is not a core platform" stays
     true whether or not Eden is on disk.
     """
-    haystack = ' '.join(str(x or '').lower() for x in (platform_name, platform_slug))
-    if not haystack.strip():
+    haystack = _platform_haystack(platform_name, platform_slug)
+    if not haystack:
         return None
     for key, spec in STANDALONE_EMULATORS.items():
-        for token in spec['platforms']:
-            if token in haystack:
-                return key, spec
+        if _spec_matches_platform(spec, haystack):
+            return key, spec
     return None
 
 
@@ -2567,7 +2714,7 @@ _ARCHIVE_COMPANION_SUFFIXES = ('.m3u', '.nfo', '.sfv', '.md5', '.sha1',
                                '.diz', '.url', '.jpg', '.jpeg')
 
 
-def _extract_wiiu_archive(archive_path, on_progress=None):
+def _extract_wiiu_archive(archive_path, on_progress=None, emulator='Cemu'):
     """Unpack a Wii U .zip/.7z into a folder named after it. (ok, message).
 
     The folder is <archive stem> next to the archive; the archive is removed
@@ -2578,7 +2725,7 @@ def _extract_wiiu_archive(archive_path, on_progress=None):
     dest = archive_path.parent / archive_path.stem
     if not _extract_archive(archive_path, dest, on_progress):
         return False, (f"Downloaded {archive_path.name} but could not unpack it "
-                       "(a .7z needs 7z or py7zr); Cemu cannot open an archive")
+                       f"(a .7z needs 7z or py7zr); {emulator} cannot open an archive")
     for f in dest.rglob('*'):
         if f.is_file() and f.suffix.lower() in _ARCHIVE_COMPANION_SUFFIXES:
             try:
@@ -5751,15 +5898,21 @@ class RomMClient:
                 # single-file archives: .zip or .7z). Console ROM archives are left
                 # as-is (RetroArch loads them natively); only directory-based PC games
                 # are extracted.
+                _dl_slug = str(rom_details.get('platform_slug') or '').lower()
+                # Eglantine cannot open an archive either: a zipped loose
+                # ExeFS dump or .nup has to be unpacked like a Wii U title.
+                switch2_archive = is_switch2_platform(
+                    rom_details.get('platform_name'), _dl_slug)
                 wiiu_archive = (download_path.suffix.lower() in ('.zip', '.7z')
                                 and actual_downloaded > 0
-                                and str(rom_details.get('platform_slug') or '').lower()
-                                in WIIU_SLUGS)
+                                and (_dl_slug in WIIU_SLUGS or switch2_archive))
                 if wiiu_archive:
                     def _unpack_pct(pct):
                         if progress_callback:
                             progress_callback({'extracting': pct})
-                    unpacked, why = _extract_wiiu_archive(download_path, _unpack_pct)
+                    unpacked, why = _extract_wiiu_archive(
+                        download_path, _unpack_pct,
+                        emulator='Eglantine' if switch2_archive else 'Cemu')
                     if not unpacked:
                         return False, why
                 elif download_path.suffix.lower() in ('.zip', '.7z') and actual_downloaded > 0:
@@ -9284,7 +9437,8 @@ class RetroArchInterface:
                 exe = ''
             out.append({'key': key, 'name': spec['name'],
                         'installed': bool(exe), 'executable': exe,
-                        'platforms': list(spec['platforms'])})
+                        'platforms': list(spec['platforms']),
+                        'excludes': list(spec.get('excludes', ()))})
         return out
 
     def build_standalone_launch_command(self, rom_path, key, spec, executable):
@@ -9292,6 +9446,11 @@ class RetroArchInterface:
         grant_root = Path(rom_path).parent
         if spec.get('resolve_rom') == 'wiiu':
             rom_path, grant_root = resolve_wiiu_rom(rom_path)
+        elif spec.get('resolve_rom') == 'switch2':
+            rom_path, grant_root = resolve_switch2_rom(rom_path)
+        if (spec.get('make_executable') and not executable.startswith('flatpak:')
+                and executable.lower().endswith('.appimage')):
+            ensure_executable(executable)
         args = [a.replace('{rom}', str(rom_path)) for a in spec['args']]
         if spec.get('prelaunch') == 'cemu_audio_repair':
             repair_cemu_audio_device(executable)
@@ -13125,6 +13284,7 @@ class AutoSyncManager:
             # still produces a close transition, rather than being mistaken for
             # a state we have already handled.
             eden_was_running = False
+            eglantine_was_running = False
             last_network_state = False  # Local variable, not self._last_network_state
             startup_grace_period = True
             network_retry_count = 0
@@ -13161,7 +13321,9 @@ class AutoSyncManager:
                     # on the next app start. Closing the emulator is the moment
                     # the save is both final and worth confirming to the user.
                     eden_running = emulator_saves.eden_is_running()
-                    now_running = bool(retroarch_running or eden_running)
+                    eglantine_running = emulator_saves.eglantine_is_running()
+                    now_running = bool(retroarch_running or eden_running
+                                       or eglantine_running)
                     if now_running != self.game_running:
                         self.game_running = now_running
                         _events.publish('game')
@@ -13180,6 +13342,14 @@ class AutoSyncManager:
                             self.log("🎮 Eden closed")
                             self.trigger_session_save_sync("Eden closed")
                         eden_was_running = eden_running
+                    # Eglantine (Switch 2) flushes its saves on exit too.
+                    if eglantine_running != eglantine_was_running:
+                        if eglantine_running:
+                            self.log("🎮 Eglantine launched")
+                        else:
+                            self.log("🎮 Eglantine closed")
+                            self.trigger_session_save_sync("Eglantine closed")
+                        eglantine_was_running = eglantine_running
 
                     # 3. PRIORITY: Network state detection (content loaded/unloaded)
                     if network_responding != last_network_state:
@@ -13268,6 +13438,7 @@ class AutoSyncManager:
                 try:
                     running = (self.is_retroarch_running()
                                or emulator_saves.eden_is_running()
+                               or emulator_saves.eglantine_is_running()
                                or emulator_saves.cemu_is_running())
                     self.play_sessions.observe(running)
                 except Exception as e:
@@ -14076,7 +14247,7 @@ class AutoSyncManager:
     CONFLICT_ANSWER_TTL = 600
     # Syncs whose conflicts are asked about on the spot: the game is about to
     # start or has just closed, so a prompt interrupts nothing.
-    PROMPT_TRIGGERS = ('launch', 'RetroArch closed', 'Eden closed')
+    PROMPT_TRIGGERS = ('launch', 'RetroArch closed', 'Eden closed', 'Eglantine closed')
 
     def _conflicts(self):
         state = getattr(self, '_conflict_state', None)
@@ -14765,6 +14936,7 @@ class AutoSyncManager:
             except Exception as e:
                 self.log(f"⚠️ Switch key check failed: {e}")
         inventory.extend(eden_entries)
+        inventory.extend(self._eglantine_inventory_entries())
 
         # Dedupe by (rom_id, slot), keeping the newest file. Stale duplicate
         # copies of the same save (e.g. a leftover flat saves/Game.srm next to
@@ -15300,7 +15472,22 @@ class AutoSyncManager:
                 return RomMClient.compute_content_hash(packed) if packed else None
         return None
 
+    def _switch_data_override(self, flavour):
+        """The [Emulators] <flavour>_data_dir override, or ''."""
+        try:
+            return (self.settings.get('Emulators', f'{flavour}_data_dir', '') or '').strip()
+        except Exception:
+            return ''
+
     def _eden_inventory_entries(self):
+        """Inventory rows for Eden's Switch saves; see _switch_inventory_entries."""
+        return self._switch_inventory_entries('eden')
+
+    def _eglantine_inventory_entries(self):
+        """Inventory rows for Eglantine's Switch 2 saves, labelled 'Eglantine'."""
+        return self._switch_inventory_entries('eglantine')
+
+    def _switch_inventory_entries(self, flavour='eden'):
         """Inventory rows for Eden's Switch saves, packed one zip per game.
 
         Eden keeps its saves in its own tree, as a directory per title named by
@@ -15324,6 +15511,7 @@ class AutoSyncManager:
         stays read-only — nothing in this method writes into Eden's tree.
         """
         entries = []
+        emu_name = emulator_saves.switch_emulator_name(flavour)
         # Eden flushes a Switch save when the game exits, not continuously, so
         # anything on disk mid-session is a partial picture of a save the
         # emulator still holds in memory. Packing it would upload a stale
@@ -15333,8 +15521,8 @@ class AutoSyncManager:
         # the deferral costs seconds, not a cycle. Restore already refuses on
         # the same condition (unpack_save), so both directions now agree that a
         # live Eden owns its save tree.
-        if emulator_saves.eden_is_running():
-            logging.debug("Eden is running; deferring its saves to the sync "
+        if emulator_saves.switch_emulator_is_running(flavour):
+            logging.debug(f"{emu_name} is running; deferring its saves to the sync "
                           "triggered when it closes")
             return entries
 
@@ -15342,10 +15530,7 @@ class AutoSyncManager:
         # missing SECTION — it still raises. Read it on its own so that a config
         # without the section leaves the override empty instead of being caught
         # below as "discovery failed" and disabling Eden sync outright.
-        try:
-            override = (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip()
-        except Exception:
-            override = ''
+        override = self._switch_data_override(flavour)
 
         # Timed separately from the pack loop below. The session sync a player
         # sits through on close is ~2.8s, and the phase timers narrowed almost
@@ -15354,9 +15539,13 @@ class AutoSyncManager:
         # what is worth caching, so measure them apart rather than together.
         _t0 = time.monotonic()
         try:
-            saves = emulator_saves.find_eden_saves(extra_data_dir=override or None)
+            if flavour == 'eden':
+                saves = emulator_saves.find_eden_saves(extra_data_dir=override or None)
+            else:
+                saves = emulator_saves.find_eden_saves(
+                    extra_data_dir=override or None, flavour=flavour)
         except Exception as e:
-            logging.debug(f"Eden save discovery failed: {e}")
+            logging.debug(f"{emu_name} save discovery failed: {e}")
             return entries
         _t1 = time.monotonic()
 
@@ -15376,14 +15565,14 @@ class AutoSyncManager:
                 # only legible in a ROM's filename, so an unmatched save is the
                 # expected outcome for a library named without title tags —
                 # skip it rather than attach it to a guess.
-                logging.debug(f"Eden save {title_id} matches no known ROM; skipping")
+                logging.debug(f"{emu_name} save {title_id} matches no known ROM; skipping")
                 continue
             try:
                 packed = emulator_saves.pack_save(
                     save['path'], pack_dir / f'{title_id}.zip')
                 stat = packed.stat()
             except Exception as e:
-                self.log(f"⚠️ Could not pack the Eden save for {title_id}: {e}")
+                self.log(f"⚠️ Could not pack the {emu_name} save for {title_id}: {e}")
                 continue
 
             updated_at = datetime.datetime.fromtimestamp(
@@ -15392,7 +15581,7 @@ class AutoSyncManager:
                 'rom_id': rom_id,
                 'file_name': packed.name,
                 'slot': 'autosave',
-                'emulator': 'Eden',
+                'emulator': emu_name,
                 # The name Argosy reads as the game's autosave; the title ID
                 # travels inside the pack ("<title id>/…"), which is where a
                 # restore reads it from when the name does not carry it.
@@ -15404,8 +15593,8 @@ class AutoSyncManager:
                 '_autocleanup': True,
                 '_autocleanup_limit': 10,
             })
-        logging.debug("[AUTO-SYNC] ⏱️ eden inventory: discovery %.2fs, "
-                      "pack+hash %.2fs (%d saves, %d matched)",
+        logging.debug("[AUTO-SYNC] ⏱️ %s inventory: discovery %.2fs, "
+                      "pack+hash %.2fs (%d saves, %d matched)", flavour,
                       _t1 - _t0, time.monotonic() - _t1, len(saves), len(entries))
         return entries
 
@@ -16831,45 +17020,30 @@ class AutoSyncManager:
         if self._is_folder_op(op):
             return self._restore_folder_save(op, device_id, session_id)
         file_name = op.get('file_name') or ''
-        # is_switch_title_id is the save-directory test specifically: Eden files
-        # a save under the BASE title, never an update or DLC id.
-        title_id = Path(file_name).stem
-        if not title_ids.is_switch_title_id(title_id):
-            # Not our pack's name. A save uploaded by another RomM client is
-            # named after the GAME -- "SUPER ROBOT WARS Y [010063301BD50000]
-            # [2026-08-20_21-43-34].srm" -- and refusing that meant a save made
-            # on a phone could never come back to the desktop, which is most of
-            # the reason to sync one at all. The title is in the name either
-            # way; only the spelling differs.
-            tag = title_ids.raw_switch_tag_in_name(file_name)
-            title_id = title_ids.base_switch_title_id(tag) if tag else ''
-            # Argosy names a save after its ROM file, tag or not, and Ludo
-            # uploads as "autosave.zip". The ROM's own ID, read by RomM's scan,
-            # says the same thing the name was being asked for.
-            if not title_id:
-                data = (self._game_for_rom(op.get('rom_id')) or {}).get('romm_data') or {}
-                for value in (data.get('title_id'), data.get('save_target')):
-                    title_id = title_ids.base_switch_title_id(str(value or '').strip())
-                    if title_id:
-                        break
-                title_id = title_id or ''
-            # Still nothing: the pack itself says, once downloaded -- both
-            # Ludo and Argosy nest a save under its title-ID folder.
+        title_id = self._switch_title_for_op(op)
+        # Still nothing: the pack itself says, once downloaded -- both Ludo
+        # and Argosy nest a save under its title-ID folder.
+
+        # Which tree it goes to: Eglantine's for a Switch 2 game, Eden's for
+        # everything else. The ROM's platform decides first, then the title ID
+        # itself ("04…" is a Switch 2 program), then the server's label.
+        flavour = self._switch_flavour_for_op(op, title_id)
+        emu_name = emulator_saves.switch_emulator_name(flavour)
 
         # Check before spending the transfer. unpack_save checks again and is
         # the authoritative one -- Eden can start while the download runs --
         # but without this a restore attempted with Eden open pays for the
         # whole save every sync just to be refused at the end.
-        if emulator_saves.eden_is_running():
-            self.log(f"ℹ️ Save-sync: Eden is running; {title_id or file_name} will "
+        if emulator_saves.switch_emulator_is_running(flavour):
+            self.log(f"ℹ️ Save-sync: {emu_name} is running; {title_id or file_name} will "
                      f"restore once it is closed.")
             return False
 
-        try:
-            override = (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip()
-        except Exception:
-            override = ''
-        if title_id and emulator_saves.eden_restore_dir(title_id, override or None) is None:
+        override = self._switch_data_override(flavour)
+        if title_id and (emulator_saves.eden_restore_dir(title_id, override or None)
+                         if flavour == 'eden' else
+                         emulator_saves.eden_restore_dir(
+                             title_id, override or None, flavour=flavour)) is None:
             self._set_eden_awaiting_restore(title_id, op)
             self.log(f"ℹ️ Save-sync: {title_id} hasn't booted here yet; its server "
                      f"save will restore after the first boot.")
@@ -16891,7 +17065,7 @@ class AutoSyncManager:
         import zipfile
         if not zipfile.is_zipfile(staged):
             self.log(f"⚠️ Save-sync: server save {file_name!r} for {title_id} is a "
-                     f"bare .srm, not an Eden save pack — likely a stray upload from "
+                     f"bare .srm, not an {emu_name} save pack — likely a stray upload from "
                      f"a mislabelled sync. Delete it in RomM so the real save can "
                      f"become the slot's latest.")
             staged.unlink(missing_ok=True)
@@ -16906,9 +17080,10 @@ class AutoSyncManager:
 
         pack_hash = RomMClient.compute_content_hash(staged)
         try:
+            unpack_kw = {} if flavour == 'eden' else {'flavour': flavour}
             result = emulator_saves.unpack_save(
                 staged, title_id, extra_data_dir=override or None,
-                backup_dir=cache_dir() / 'save_backups')
+                backup_dir=cache_dir() / 'save_backups', **unpack_kw)
         except RuntimeError as e:
             # Eden is open. Not a failure -- retrying after it closes is the
             # right outcome, and overwriting a save the emulator has in memory
@@ -16934,6 +17109,118 @@ class AutoSyncManager:
                      if result['backup'] else '')
         self.log(f"✅ Restored {result['files']} save file(s) for {title_id}{backed_up}")
         return True
+
+    def _switch_title_for_op(self, op):
+        """The base Switch title a server save belongs to, or '' if unknown."""
+        if title_ids.is_switch_title_id(op.get('_title_id')):
+            return op['_title_id'].upper()     # resolved by the caller
+        file_name = op.get('file_name') or ''
+        # is_switch_title_id is the save-directory test specifically: Eden files
+        # a save under the BASE title, never an update or DLC id.
+        title_id = Path(file_name).stem
+        if title_ids.is_switch_title_id(title_id):
+            return title_id.upper()
+        # Not our pack's name. A save uploaded by another RomM client is
+        # named after the GAME -- "SUPER ROBOT WARS Y [010063301BD50000]
+        # [2026-08-20_21-43-34].srm" -- and refusing that meant a save made
+        # on a phone could never come back to the desktop, which is most of
+        # the reason to sync one at all. The title is in the name either
+        # way; only the spelling differs.
+        tag = title_ids.raw_switch_tag_in_name(file_name)
+        title_id = title_ids.base_switch_title_id(tag) if tag else ''
+        # Argosy names a save after its ROM file, tag or not, and Ludo
+        # uploads as "autosave.zip". The ROM's own ID, read by RomM's scan,
+        # says the same thing the name was being asked for.
+        if not title_id:
+            data = (self._game_for_rom(op.get('rom_id')) or {}).get('romm_data') or {}
+            for value in (data.get('title_id'), data.get('save_target')):
+                title_id = title_ids.base_switch_title_id(str(value or '').strip())
+                if title_id:
+                    break
+        return title_id or ''
+
+    def _restore_latest_switch_save_if_missing(self, game, rom_id, latest_save):
+        """Restore a Switch/Switch 2 game's server save when none exists here.
+
+        True when a restore was attempted (whatever its outcome, which
+        _restore_standalone_save logs), False when it does not apply: not an
+        Eden/Eglantine game, or a local save already exists -- that one is the
+        negotiated sync's to weigh, never overwritten from here.
+        """
+        slug = str(game.get('platform_slug') or '').lower()
+        if slug != 'switch' and not is_switch2_platform(game.get('platform_name'), slug):
+            return False
+        op = {'save_id': latest_save.get('id'), 'rom_id': rom_id,
+              'file_name': latest_save.get('file_name') or '',
+              'emulator': latest_save.get('emulator'),
+              'slot': latest_save.get('slot')}
+        if not op['save_id']:
+            return False
+        # A session sync restores through the same path; two unpacks into one
+        # save directory would trample each other's staging folder.
+        lock = getattr(self, '_session_sync_lock', None)
+        if lock is not None and not lock.acquire(timeout=30):
+            logging.info("a save sync is still running; leaving the restore to it")
+            return False
+        try:
+            return self._restore_latest_switch_save_locked(game, rom_id, op)
+        finally:
+            if lock is not None:
+                lock.release()
+
+    def _restore_latest_switch_save_locked(self, game, rom_id, op):
+        # Which game is it? The save's own title first; else the one title the
+        # local index ties to this ROM (a .nup read in place, a tagged name).
+        # Unknown means unknowable here: leave it to the negotiated sync rather
+        # than guess and risk restoring over a save that is really there.
+        title_id = self._switch_title_for_op(op)
+        if not title_id:
+            self._rom_id_for_title_id('')     # builds the index on first use
+            owned = {t for t, r in (self._title_id_index or {}).items()
+                     if r == rom_id and title_ids.switch_generation(t)}
+            if len(owned) != 1:
+                return False
+            title_id = owned.pop()
+        flavour = self._switch_flavour_for_op(op, title_id)
+        override = self._switch_data_override(flavour)
+        try:
+            saves = (emulator_saves.find_eden_saves(extra_data_dir=override or None)
+                     if flavour == 'eden' else
+                     emulator_saves.find_eden_saves(extra_data_dir=override or None,
+                                                    flavour=flavour))
+        except Exception as e:
+            logging.debug(f"could not list {flavour} saves: {e}")
+            return False
+        # Existence is judged by the title's own save folder, not by matching
+        # local saves back to ROMs: a save whose ROM cannot be identified
+        # here is still a save, and must not be restored over.
+        if any(s['title_id'].upper() == title_id.upper() for s in saves):
+            return False
+        self.log(f"  📥 No local {emulator_saves.switch_emulator_name(flavour)} save "
+                 f"for {game.get('name', rom_id)}; restoring the server's latest")
+        try:
+            device_id = self.settings.get('Device', 'device_id', '') or None
+            self._restore_standalone_save(dict(op, _title_id=title_id), device_id, None)
+        except Exception as e:
+            self.log(f"  ⚠️ Could not restore the server save: {e}")
+        return True
+
+    def _switch_flavour_for_op(self, op, title_id=None):
+        """'eglantine' when a save op belongs to a Switch 2 game, else 'eden'."""
+        game = self._game_for_rom(op.get('rom_id')) or {}
+        slug = (game.get('platform_slug')
+                or (game.get('romm_data') or {}).get('platform_slug'))
+        if slug or game.get('platform_name') or game.get('platform'):
+            if is_switch2_platform(game.get('platform_name') or game.get('platform'), slug):
+                return 'eglantine'
+            if str(slug or '').lower() == 'switch':
+                return 'eden'
+        generation = title_ids.switch_generation(title_id) if title_id else None
+        if generation:
+            return 'eglantine' if generation == 2 else 'eden'
+        if str(op.get('emulator') or '').strip().lower() == 'eglantine':
+            return 'eglantine'
+        return 'eden'
 
     @staticmethod
     def _is_standalone_emulator(emulator):
@@ -18247,6 +18534,15 @@ class AutoSyncManager:
                     if (self._is_standalone_emulator(romm_emulator)
                             or standalone_emulator_for_platform(
                                 game.get('platform_name'), _platform_slug)):
+                        # With nothing on disk for this game, nothing can be
+                        # overwritten: restore the server's latest here. The
+                        # negotiated sync cannot be relied on for it -- RomM
+                        # pairs saves per device, so on the device that
+                        # uploaded this save (a reinstall, a wiped emulator)
+                        # it reports "in sync" and never offers a download.
+                        if self._restore_latest_switch_save_if_missing(
+                                game, rom_id, latest_save):
+                            continue
                         self.log(f"  ⏭️ {romm_emulator} save for a "
                                  f"{_platform_slug or 'standalone'} game is "
                                  f"handled by the standalone restore path, "

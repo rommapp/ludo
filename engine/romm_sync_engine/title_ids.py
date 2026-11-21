@@ -46,7 +46,11 @@ _GCI_NAME_RE = re.compile(r'^[A-Z0-9]{2}-([A-Z0-9]{4})-', re.IGNORECASE)
 # "0000000000000000", a user ID — which are 16 hex digits too, so length alone
 # cannot say which level names the game. Update and DLC IDs share a title's
 # prefix but end "800" and "001+", and neither owns the save.
-_SWITCH_TITLE_RE = re.compile(r'^01[0-9A-F]{11}000$', re.IGNORECASE)
+#
+# Switch 2 programs open with "04" instead ("0400C3F00006E000"), and Eglantine
+# files their saves under that ID exactly as Eden does a Switch 1 title, so the
+# same tests serve both; switch_generation tells the two apart.
+_SWITCH_TITLE_RE = re.compile(r'^0[14][0-9A-F]{11}000$', re.IGNORECASE)
 
 # "[0100152000022000]" as scene-named dumps and RomM's own filenames carry it.
 # This is the fallback when Sigil is absent: NSP/XCI store the real ID in an
@@ -58,7 +62,7 @@ _SWITCH_TAG_RE = re.compile(r'(?:^|[\[\(\s])([0-9A-F]{16})[\]\)\s]', re.IGNORECA
 
 # Any Switch title: a base game, an update, or a DLC add-on. Narrower tests
 # come from _switch_kind below.
-_SWITCH_ANY_RE = re.compile(r'^01[0-9A-F]{14}$', re.IGNORECASE)
+_SWITCH_ANY_RE = re.compile(r'^0[14][0-9A-F]{14}$', re.IGNORECASE)
 
 # How far a derived ID sits from its base. An update is the base with bit 11
 # set; a DLC add-on is numbered upward from the base's next multiple of 0x1000.
@@ -68,7 +72,10 @@ _DLC_STRIDE = 0x1000
 # What index_roms opens. Sigil reads every one of these, a game zipped whole
 # included: it opens the archive's largest member in place.
 _ROM_EXTENSIONS = {'.iso', '.gcm', '.gcz', '.rvz', '.wbfs', '.ciso', '.img', '.bin',
-                   '.nsp', '.xci', '.cso', '.chd', '.3ds', '.cci', '.cxi', '.zip'}
+                   '.nsp', '.xci', '.cso', '.chd', '.3ds', '.cci', '.cxi', '.zip',
+                   # Switch 2: a NUP container, or the main.npdm of a loose
+                   # ExeFS dump (see read_nup_title_id / read_npdm_program_id).
+                   '.nup', '.npdm'}
 
 log = logging.getLogger(__name__)
 
@@ -293,6 +300,120 @@ def is_switch_title_id(value):
     return bool(value) and bool(_SWITCH_TITLE_RE.match(str(value)))
 
 
+def switch_generation(value):
+    """1 for a Switch title ID, 2 for a Switch 2 one, None for anything else.
+
+    The first byte is the console: Switch 1 programs are "01…", Switch 2
+    programs "04…". It is what keeps a Switch 2 save out of Eden's tree and a
+    Switch 1 save out of Eglantine's, whatever the server row is labelled.
+    """
+    if not value or not _SWITCH_ANY_RE.match(str(value)):
+        return None
+    return 2 if str(value)[:2] == '04' else 1
+
+
+# NUP v1, the plaintext Switch/Switch 2 container Eglantine boots
+# (https://github.com/a55uka/nup SPEC.md; argosy-sigil src/switch_nup.c, which
+# the bundled libsigil predates). Every package record in its TOC carries the
+# title ID in the clear, so no key is needed.
+_NUP_MAGIC = b'NUP\x01'
+_NUP_TOC_MAGIC = b'TOC\x01'
+_NUP_SUPERBLOCK = 0x80
+_NUP_TOC_HEADER = 0x30
+_NUP_RECORD = 0x40
+_NUP_MAX_PACKAGES = 1024
+_NUP_KINDS = {0: 'base', 1: 'update', 2: 'dlc'}
+
+
+def read_nup_packages(path):
+    """[{'title_id', 'kind', 'version'}] for a NUP container, or None.
+
+    Only the superblock and TOC are read, a few hundred bytes, however large
+    the container is.
+    """
+    try:
+        with open(path, 'rb') as fh:
+            sb = fh.read(_NUP_SUPERBLOCK)
+            if len(sb) < _NUP_SUPERBLOCK or sb[:4] != _NUP_MAGIC:
+                return None
+            header_size = struct.unpack_from('<H', sb, 0x04)[0]
+            toc_offset, toc_size = struct.unpack_from('<QQ', sb, 0x08)
+            count = struct.unpack_from('<I', sb, 0x48)[0]
+            if (header_size < _NUP_SUPERBLOCK or toc_offset != header_size
+                    or not 0 < count <= _NUP_MAX_PACKAGES
+                    or toc_size < _NUP_TOC_HEADER + count * _NUP_RECORD):
+                return None
+            fh.seek(toc_offset)
+            toc = fh.read(_NUP_TOC_HEADER + count * _NUP_RECORD)
+    except OSError:
+        return None
+    if (len(toc) < _NUP_TOC_HEADER + count * _NUP_RECORD
+            or toc[:4] != _NUP_TOC_MAGIC
+            or struct.unpack_from('<I', toc, 4)[0] != count):
+        return None
+    packages = []
+    for i in range(count):
+        rec = toc[_NUP_TOC_HEADER + i * _NUP_RECORD:][:_NUP_RECORD]
+        title = struct.unpack_from('<Q', rec, 0)[0]
+        kind = _NUP_KINDS.get(rec[0x18])
+        if not title or not kind:
+            # A zero ID is a placeholder record (seen in real dumps beside the
+            # update that actually carries the game's ID).
+            continue
+        packages.append({'title_id': f'{title:016X}', 'kind': kind,
+                         'version': struct.unpack_from('<I', rec, 0x14)[0]})
+    return packages
+
+
+def read_nup_title_id(path):
+    """The base application a NUP container boots, or None."""
+    for package in sorted(read_nup_packages(path) or [],
+                          key=lambda p: p['kind'] != 'base'):
+        base = base_switch_title_id(package['title_id'])
+        if base:
+            return base
+    return None
+
+
+def read_npdm_program_id(path):
+    """The program ID in an ExeFS main.npdm, as a base title ID, or None.
+
+    A Switch 2 game dumped loose (exefs/main, exefs/main.npdm, romfs/) has no
+    container to read; the NPDM's ACI0 block names the program instead. META
+    header: ACI0 offset at 0x70; ACI0: magic, then the program ID at +0x10.
+    """
+    try:
+        with open(path, 'rb') as fh:
+            meta = fh.read(0x80)
+            if len(meta) < 0x80 or meta[:4] != b'META':
+                return None
+            aci_offset = struct.unpack_from('<I', meta, 0x70)[0]
+            fh.seek(aci_offset)
+            aci = fh.read(0x18)
+    except OSError:
+        return None
+    if len(aci) < 0x18 or aci[:4] != b'ACI0':
+        return None
+    program = struct.unpack_from('<Q', aci, 0x10)[0]
+    return base_switch_title_id(f'{program:016X}') if program else None
+
+
+def exefs_game_root(npdm_path):
+    """The game folder a loose ExeFS belongs to: the parent of exefs/.
+
+    An update dumped beside the base ("<game>/updates/exefs/main.npdm" or
+    "<game>/updates/65536/exefs/…") still belongs to <game>.
+    """
+    exefs = Path(npdm_path).parent
+    root = exefs.parent
+    # Two levels only, the two layouts above: a folder called "updates"
+    # further up is the user's own and says nothing about this game.
+    for parent in (root, root.parent):
+        if parent.name.lower() == 'updates':
+            return parent.parent
+    return root
+
+
 def switch_kind(value):
     """'base', 'update', 'dlc', or None for a Switch title ID.
 
@@ -363,7 +484,7 @@ def _switch_title_id(path):
     be an update's or an add-on's; normalising it to the base is what lets a
     library that holds only the update NSP still own its game's save.
     """
-    if path.suffix.lower() not in {'.nsp', '.xci', '.nsz', '.xcz'}:
+    if path.suffix.lower() not in {'.nsp', '.xci', '.nsz', '.xcz', '.nup'}:
         return None
     for candidate in _SWITCH_TAG_RE.findall(path.name):
         base = base_switch_title_id(candidate)
@@ -406,6 +527,15 @@ def identify(path, platform=None, prod_keys=None):
     path = Path(path)
     if not path.is_file():
         return None
+    suffix = path.suffix.lower()
+    if suffix in ('.nup', '.npdm'):
+        # The bundled libsigil predates NUP, and an NPDM is not a ROM to it.
+        title_id = (read_nup_title_id(path) if suffix == '.nup'
+                    else read_npdm_program_id(path))
+        if not title_id:
+            return None
+        return {'title_id': title_id, 'save_id': title_id, 'usage': 'folder-exact',
+                'raw_serial': '', 'from_binary': True, 'features': 0}
     result = _Sigil.get().extract(path, prod_keys=prod_keys,
                                   platform=platform or _platform_hint(path))
     if not result:
@@ -490,6 +620,11 @@ def index_roms(directories, extensions=None, prod_keys=None):
         for path in directory.rglob('*'):
             if not path.is_file() or path.suffix.lower() not in extensions:
                 continue
+            if path.suffix.lower() == '.npdm':
+                # Only a loose ExeFS's own NPDM names a game, and the game is
+                # the folder holding exefs/, which is what the library lists.
+                if path.name.lower() != 'main.npdm' or path.parent.name.lower() != 'exefs':
+                    continue
             try:
                 title_id = title_id_from_rom(path, prod_keys=prod_keys)
             except Exception as e:
@@ -502,6 +637,10 @@ def index_roms(directories, extensions=None, prod_keys=None):
             # the title the save belongs to, and attributing a save to a DLC
             # entry would sync it against the wrong ROM. Ties keep the first.
             rank = _content_rank(path, prod_keys=prod_keys)
+            if path.suffix.lower() == '.npdm':
+                # A base ExeFS outranks an update's ExeFS of the same game.
+                rank = 1 if exefs_game_root(path) != path.parent.parent else 0
+                path = exefs_game_root(path)
             if title_id not in index or rank < ranks[title_id]:
                 index[title_id] = path
                 ranks[title_id] = rank
