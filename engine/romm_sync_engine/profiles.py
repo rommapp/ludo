@@ -307,6 +307,69 @@ def eden_launch_index(data_dir):
     return found['index'] if found else None
 
 
+# ── Cemu (Wii U) accounts ──────────────────────────────────────────────────
+#
+# Cemu keeps saves per Wii U account, so profiles work as with Eden: the
+# first profile keeps the account Cemu has active, every other profile gets
+# one Ludo adds. The id is stored in profiles.json and the same id is used in
+# every Cemu install; launches pass it with -a.
+
+def cemu_account(inst, create=False):
+    """The Cemu account id (int) the current profile plays as in ``inst``.
+
+    None when profiles are not in use: Cemu's active account is used, as
+    before. {'error': reason} when it can't be settled yet (twelve accounts
+    taken, or Cemu running when one would have to be added); Wii U saves
+    are then left alone.
+    """
+    if not profiles_in_use():
+        return None
+    from . import cemu_saves, emulator_saves
+    current = paths.profile_id()
+    data = load()
+    entry = get(data, current)
+    if entry is None:
+        return {'error': 'Unknown profile'}
+    try:
+        pid = int(entry.get('cemu_account') or '', 16)
+    except ValueError:
+        pid = None
+    listed = cemu_saves.accounts(inst.mlc)
+    if pid is None and current == DEFAULT and listed:
+        # The first profile keeps whoever Cemu plays as: their saves are
+        # already under that account.
+        pid = cemu_saves.active_account(inst)
+        entry['cemu_account'] = f'{pid:08x}'
+        save(data)
+    if pid is not None and pid in listed:
+        return pid
+    if not create:
+        return {'error': 'This profile has no Cemu account yet'}
+    if emulator_saves.cemu_is_running():
+        return {'error': 'Close Cemu so Ludo can add this profile as a Cemu account'}
+    try:
+        if current == DEFAULT and pid is None:
+            # Cemu never ran: make the account it would make itself.
+            cemu_saves.ensure_default_account(inst.mlc)
+            pid = cemu_saves.MIN_ACCOUNT
+        else:
+            name = entry.get('name') or entry.get('username') or 'Player'
+            pid = cemu_saves.add_account(inst.mlc, name, pid)
+    except (OSError, cemu_saves.CemuAccountsError) as e:
+        return {'error': str(e)}
+    entry['cemu_account'] = f'{pid:08x}'
+    save(data)
+    return pid
+
+
+def cemu_launch_args(executable):
+    """['-a', '<hex id>'] so Cemu plays as the current profile's account, or
+    [] to launch as before."""
+    from . import cemu_saves
+    pid = cemu_account(cemu_saves.install_for(executable), create=True)
+    return ['-a', f'{pid:08x}'] if isinstance(pid, int) else []
+
+
 # ── Choosing and changing profiles ─────────────────────────────────────────
 
 def resolve(requested=None, env=None):

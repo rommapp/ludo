@@ -109,6 +109,7 @@ def manager(tmp, saves, games, mode='core'):
     m.rom_id_for_save = lambda p: {'GALE': 1, 'GZLE': 2}.get(G.game_code(p))
     m.refresh_save_dirs = lambda: None
     m._eden_inventory_entries = lambda: []
+    m._cemu_inventory_entries = lambda: []
     return m
 
 

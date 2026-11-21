@@ -59,4 +59,14 @@ user and syncs only that user's save folder
 (`nand/user/save/0000000000000000/<user>/<title>`). When Eden has never started, Ludo first
 writes the user list Eden would make itself (one user named "Eden", which
 stays the first profile's). Eden allows eight users; once they are all taken,
-Ludo leaves Switch saves alone for any new profile. Cemu saves are not synced by Ludo.
+Ludo leaves Switch saves alone for any new profile.
+
+Wii U saves work the same way through Cemu's accounts. The first profile
+keeps the account Cemu has active; every other profile gets a Cemu account
+of its own (named after the profile), added while Cemu is closed. When Cemu
+has never started, Ludo first creates the "default" account Cemu would make
+itself, so that account stays the first profile's. Ludo starts Cemu with
+`-a <account>` and syncs only that account's folder
+(`mlc01/usr/save/<title>/user/<account>`), plus the game's shared `common`
+folder and its `meta` folder. Cemu allows twelve accounts; once they are
+all taken, Ludo leaves Wii U saves alone for any new profile.
