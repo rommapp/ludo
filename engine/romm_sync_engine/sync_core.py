@@ -12,6 +12,7 @@ import pickle
 import time
 import logging
 import copy
+from dataclasses import replace as _dc_replace
 from functools import wraps
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from .save_channels import snapshots_supported
 from . import events as _events
 from . import (cemu_saves, eden_config, emulator_saves, folder_saves, gamecube_saves,
                play_sessions, ps2_memcard, save_channels, save_convert, switch_content,
-               switch_nsz, title_ids)
+               sigil_saves, switch_nsz, title_ids)
 from urllib.parse import urljoin, quote, urlparse
 import socket
 import configparser
@@ -15652,6 +15653,91 @@ class AutoSyncManager:
                     units.append(('3ds', rom_id, tid,
                                   lambda d, u=unit: folder_saves.n3ds_pack(u, d),
                                   [unit['data'], unit['extdata']]))
+        units.extend(self._wii_units())
+        return units
+
+    # ── Wii saves: Dolphin's title folders, through Sigil ────────────────────
+
+    # The folder the libretro core keeps its User tree in under per-core sorting.
+    _DOLPHIN_CORE_DIR = 'dolphin-emu'
+
+    def _wii_game(self, rom_id):
+        """(Sigil game, disc path) for a downloaded Wii game, or None.
+
+        Read once per disc: the identity is in the disc header and the
+        partition's ticket, which carries the title's category (a disc that
+        installs a channel files its save under 00010004, not 00010000).
+        """
+        game = self._game_for_rom(rom_id) or {}
+        local = Path(game.get('local_path') or '')
+        if local.is_dir():
+            discs = sorted((f for f in local.rglob('*') if f.is_file()),
+                           key=lambda f: f.stat().st_size, reverse=True)[:1]
+        else:
+            discs = [local] if local.is_file() else []
+        if not discs:
+            return None
+        disc = discs[0]
+        cache = self.__dict__.setdefault('_wii_games', {})
+        key = (str(disc), disc.stat().st_mtime)
+        if key not in cache:
+            result = title_ids._Sigil.get().extract(disc, platform='wii')
+            found = sigil_saves.Game.from_result('wii', result)
+            if not found.title_id:
+                cache[key] = None
+            else:
+                # A result without the category places the save under 00010000,
+                # where a game that installs no channel keeps it.
+                cache[key] = (found if found.save_id else
+                              _dc_replace(found, save_id=found.title_id), disc)
+        return cache[key]
+
+    def _wii_save_base(self, rom_id):
+        """The folder holding the Dolphin core's "User" tree for this game."""
+        return self._folder_save_base(rom_id, self._DOLPHIN_CORE_DIR)
+
+    def _wii_collect(self, rom_id):
+        """Sigil's unit for this Wii game's save (None when it has none)."""
+        found = self._wii_game(rom_id)
+        base = self._wii_save_base(rom_id)
+        if not found or not base or not Path(base).is_dir():
+            return None
+        game, disc = found
+        result = sigil_saves.collect(game, 'dolphin', str(disc), str(base),
+                                     game_ids=[game.title_id])
+        return (game, result) if result.data else None
+
+    def _wii_units(self):
+        """Folder-save units for every downloaded Wii game with a save here.
+
+        The save is the title's data/ folder, zipped by Sigil as
+        "<title>/data/…" -- byte for byte what Argosy uploads, so the two
+        restore each other's saves.
+        """
+        units = []
+        if not sigil_saves.available():
+            return units
+        for g in (self.get_games() or []):
+            if not g.get('is_downloaded') or _platform_of(g) != 'wii':
+                continue
+            rom_id = g.get('rom_id')
+            try:
+                got = self._wii_collect(rom_id)
+            except sigil_saves.SigilError as e:
+                logging.debug(f"[Wii] no save for rom {rom_id}: {e}")
+                continue
+            if not got:
+                continue
+            game, result = got
+            category = game.save_id.split('/')[0] if '/' in game.save_id else '00010000'
+            data_dir = (Path(self._wii_save_base(rom_id)) / 'User' / 'Wii' / 'title'
+                        / category / game.title_id.lower() / 'data')
+
+            def pack(dest, data=result.data):
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+                return dest
+            units.append(('wii', rom_id, game.title_id.lower(), pack, [data_dir]))
         return units
 
     def _folder_inventory_entries(self):
@@ -15679,7 +15765,7 @@ class AutoSyncManager:
                 'rom_id': rom_id,
                 'file_name': packed.name,
                 'slot': 'autosave',
-                'emulator': 'ppsspp' if kind == 'psp' else 'citra',
+                'emulator': {'psp': 'ppsspp', 'wii': 'dolphin'}.get(kind, 'citra'),
                 'content_hash': RomMClient.compute_content_hash(packed),
                 'updated_at': datetime.datetime.fromtimestamp(
                     folder_saves.unit_newest(folders), tz=datetime.timezone.utc).isoformat(),
@@ -15701,7 +15787,7 @@ class AutoSyncManager:
     def _is_folder_op(self, op):
         """A server save that is a PSP or 3DS game's save folders."""
         return (str(op.get('file_name') or '').lower().endswith('.zip')
-                and _platform_of(self._game_for_rom(op.get('rom_id'))) in ('psp', '3ds'))
+                and _platform_of(self._game_for_rom(op.get('rom_id'))) in ('psp', '3ds', 'wii'))
 
     def _rom_save_id(self, rom_id, platform):
         """The game's own save id: RomM's scan of it, else Sigil reading the ROM."""
@@ -15795,6 +15881,18 @@ class AutoSyncManager:
                     raise ValueError('no serial or save folder for it')
                 restored = folder_saves.psp_restore(staged, savedata, serial, backups)
                 what = f"{len(restored)} PSP save folder(s) for {serial}"
+            elif platform == 'wii':
+                found = self._wii_game(rom_id)
+                base = self._wii_save_base(rom_id)
+                if not found or not base:
+                    raise ValueError('the disc is not here to identify it')
+                game, disc = found
+                Path(base).mkdir(parents=True, exist_ok=True)
+                self._backup_wii_save(rom_id, backups)
+                sigil_saves.restore(staged.read_bytes(), game, 'dolphin', str(disc),
+                                    str(base), game_ids=[game.title_id],
+                                    overwrite_local=True)
+                what = f"the Wii save for {game.raw_serial or game.title_id}"
             else:
                 tid = self._rom_save_id(rom_id, '3ds')
                 unit = self._n3ds_unit_for(rom_id, tid) if tid else None
@@ -15802,13 +15900,27 @@ class AutoSyncManager:
                     raise ValueError('no title id for it')
                 restored = folder_saves.n3ds_restore(staged, unit, backups)
                 what = f"3DS {' + '.join(restored)} for {self._title_id_key(tid)}"
-        except (ValueError, OSError, _zipfile.BadZipFile) as e:
+        except (ValueError, OSError, _zipfile.BadZipFile, sigil_saves.SigilError) as e:
             self.log(f"⚠️ Save-sync: could not restore {file_name!r}: {e}")
             return False
         finally:
             staged.unlink(missing_ok=True)
         self.log(f"✅ Restored {what}")
         return True
+
+    def _backup_wii_save(self, rom_id, backups):
+        """Zip the Wii save a restore is about to replace into ``backups``."""
+        try:
+            got = self._wii_collect(rom_id)
+        except sigil_saves.SigilError:
+            return None
+        if not got:
+            return None
+        game, result = got
+        out = Path(backups) / 'wii' / f"{game.title_id.lower()}-{int(time.time())}.zip"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(result.data)
+        return out
 
     def _folder_unit_hash(self, rom_id):
         """The content hash of this game's PSP/3DS save as it would upload, or None."""
@@ -19248,7 +19360,7 @@ class AutoSyncManager:
                 # Same for GameCube: a game's GCIs are one save, whether a
                 # client uploaded them zipped, as one raw GCI, or (Ludo before
                 # it packed them) one row per GCI.
-                if _platform_slug == 'ps2' or _platform_of(game) in ('gamecube', 'psp', '3ds'):
+                if _platform_slug == 'ps2' or _platform_of(game) in ('gamecube', 'psp', '3ds', 'wii'):
                     saves_to_process = [get_latest_file(
                         [x for x in user_saves if isinstance(x, dict)], "save")]
                 saves_to_process = [s for s in saves_to_process if s]
@@ -19329,7 +19441,7 @@ class AutoSyncManager:
                                 downloads_successful += 1
                         continue
 
-                    if (_platform_of(game) in ('psp', '3ds')
+                    if (_platform_of(game) in ('psp', '3ds', 'wii')
                             and original_filename.lower().endswith('.zip')):
                         device_id = self.settings.get('Device', 'device_id', '') or None
                         op = {'rom_id': rom_id, 'file_name': original_filename,
