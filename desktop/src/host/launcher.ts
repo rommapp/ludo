@@ -21,11 +21,30 @@ import type { HostLauncher, LauncherHooks } from "../../../ui/host/contract";
 
 const launchRetrodeckNative = callable<[], { ok: boolean; reason?: string }>("launch_retrodeck");
 
+let _offLaunch: (() => void) | null = null;
+
 export const launcher: HostLauncher = {
   available: false,
 
-  start(_hooks: LauncherHooks) {},
-  stop() {},
+  // A game's own Steam shortcut runs this shell with --launch=<rom_id>; the
+  // main process holds it until we ask. Later ones arrive while we're running.
+  start(hooks: LauncherHooks) {
+    const b = (window as any).__rommDesktop;
+    if (!b?.takeLaunch) return;
+    const go = (id: unknown, closeAfter = false) => {
+      const romId = Number(id);
+      if (romId > 0) hooks.launchGame(romId, '', { closeAfter });
+    };
+    _offLaunch?.();
+    // Forwarded to an already-open window: that window stays open.
+    _offLaunch = b.onLaunch?.((id: unknown) => go(id)) ?? null;
+    const first = b.takeLaunch();
+    if (first) go(first.romId, !!first.closeAfter);
+  },
+  stop() {
+    _offLaunch?.();
+    _offLaunch = null;
+  },
 
   async hasTile() {
     return false;
@@ -69,5 +88,14 @@ export const launcher: HostLauncher = {
   },
   resumeSession() {
     return false;
+  },
+
+  // Per-game shortcuts go into shortcuts.vdf through the backend here, like
+  // the tile (capabilities.shortcutTile); there is no live library to touch.
+  async hasGameShortcut(_romId: number) {
+    return false;
+  },
+  async setGameShortcut(_romId: number, _enabled: boolean) {
+    return { ok: false, installed: false, message: 'Not available in this shell' };
   },
 };

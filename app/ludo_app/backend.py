@@ -105,6 +105,12 @@ try:
 except Exception:
     activity_log = None
 
+try:
+    from romm_sync_engine import steam_game_shortcuts
+except Exception as e:
+    logging.warning(f"steam_game_shortcuts not available: {e}")
+    steam_game_shortcuts = None
+
 
 def _record_activity(kind, title, detail='', rom_id=None, action=None):
     """Append to the Settings ▸ Recent Activity feed (no-op if unavailable).
@@ -2410,6 +2416,7 @@ class LudoBackend:
                     orphans = self._preserve_orphaned_downloads(games, self._available_games)
                     if orphans:
                         logging.info(f"Kept {orphans} downloaded game(s) no longer on RomM")
+                    self._sweep_game_steam_shortcuts(games)
 
                 # The swap. Everything downstream — the snapshot, BIOS
                 # tracking, the auto-sync get_games_callback — reads the
@@ -3518,6 +3525,7 @@ class LudoBackend:
                         if orphans:
                             logging.info(
                                 f"Kept {orphans} downloaded game(s) no longer on RomM")
+                        self._sweep_game_steam_shortcuts(games)
                     self._available_games = games
                     logging.info(f"Full refresh: loaded {len(self._available_games)} games")
 
@@ -4325,6 +4333,8 @@ class LudoBackend:
                     if game.get('rom_id') in deleted_rom_ids:
                         game['is_downloaded'] = False
                         game['local_path']    = None
+            if deleted_rom_ids:
+                self._forget_steam_shortcuts(deleted_rom_ids)
 
             logging.info(f"Deleted {deleted_count} ROM(s) from '{collection_name}' "
                          f"({skipped_count} skipped, shared with other collections)")
@@ -8031,6 +8041,7 @@ class LudoBackend:
         orphans = self._preserve_orphaned_downloads(games, self._available_games)
         if orphans:
             logging.info(f"Reconcile: kept {orphans} downloaded game(s) no longer on RomM")
+        self._sweep_game_steam_shortcuts(games)
 
         after_ids = {g['rom_id'] for g in games if g.get('rom_id')}
         stats['added'] = len(after_ids - before_ids)
@@ -8425,6 +8436,7 @@ class LudoBackend:
             self._available_games = [x for x in self._available_games
                                      if x.get('rom_id') != rom_id]
             self._persist_snapshot()
+            self._forget_steam_shortcuts([rom_id])
             name = g.get('display_name') or g.get('name') or str(rom_id)
             _record_activity('delete', 'Removed from RomM, deleted local data',
                              f"{name} — {len(moved)} item(s) moved to "
@@ -10047,6 +10059,211 @@ class LudoBackend:
         except Exception as e:
             logging.error(f"set_steam_tile error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
+
+    # ─── Per-game Steam shortcuts (#105) ────────────────────────────────────
+    # The shortcut launches back through Ludo so saves sync around the session;
+    # see romm_sync_engine/steam_game_shortcuts.py for how each shell does it.
+
+    @staticmethod
+    def _forget_steam_shortcuts(rom_ids):
+        """Drop the Steam shortcuts of games that just left the device. Never
+        raises: a delete must not fail over its shortcut."""
+        if steam_game_shortcuts is None:
+            return
+        try:
+            out = steam_game_shortcuts.forget_games(rom_ids)
+            # The Deck plugin removes its live shortcuts itself; nudge it now
+            # rather than at its next load.
+            if out.get('queued'):
+                _events.publish('game')
+        except Exception as e:
+            logging.warning(f"forgetting steam shortcuts failed: {e}")
+
+    def _sweep_game_steam_shortcuts(self, games):
+        """Forget shortcuts for games the complete library list no longer has.
+
+        Downloaded games that left RomM are kept in the list as orphans (still
+        playable), so their shortcuts stay until the user deletes them.
+        """
+        if steam_game_shortcuts is None:
+            return
+        try:
+            present = {g.get('rom_id') for g in games if g.get('rom_id')}
+            have = (steam_game_shortcuts.desktop_shortcut_rom_ids()
+                    | steam_game_shortcuts.registry_rom_ids())
+            gone = have - present
+            if gone:
+                self._forget_steam_shortcuts(gone)
+        except Exception as e:
+            logging.warning(f"steam shortcut sweep failed: {e}")
+
+    def _game_cover_file(self, rom_id):
+        """A full-size cover for `rom_id` as a temp file path, or None.
+
+        Fetched fresh from RomM at the large size: the disk cache only keeps
+        thumbnails, which look soft as a 1920px Steam hero.
+        """
+        client = self._romm_client
+        if not (client and client.authenticated):
+            return None
+        g = self._games_index().get(rom_id) or {}
+        path = g.get('cover_path_large') or g.get('cover_path') or self._cover_paths.get(rom_id)
+        if not path:
+            r = client.session.get(urljoin(client.base_url, f'/api/roms/{rom_id}'), timeout=10)
+            if r.status_code == 200:
+                d = r.json()
+                path = d.get('path_cover_large') or d.get('path_cover_small')
+        if not path:
+            return None
+        resp = client.session.get(urljoin(client.base_url, path), timeout=20)
+        if resp.status_code != 200 or not resp.content:
+            logging.warning(f"steam shortcut cover {rom_id}: {resp.status_code}")
+            return None
+        import tempfile
+        fd, tmp = tempfile.mkstemp(prefix=f'ludo-cover-{rom_id}-')
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(resp.content)
+        return tmp
+
+    async def get_game_steam_shortcut(self, rom_id: int):
+        """Whether this game has its own Steam shortcut.
+
+        Desktop reads shortcuts.vdf; the Deck plugin's live shortcuts are known
+        only through the registry it reports to, returned as `deck_appid`."""
+        try:
+            rom_id = int(rom_id)
+            st = await asyncio.to_thread(steam_game_shortcuts.game_shortcut_status, rom_id)
+            st['deck_appid'] = steam_game_shortcuts.registry_get(rom_id)
+            return st
+        except Exception as e:
+            logging.error(f"get_game_steam_shortcut error: {e}", exc_info=True)
+            return {'available': False, 'installed': False, 'appid': None,
+                    'steam_running': False, 'deck_appid': None, 'reason': str(e)}
+
+    async def set_game_steam_shortcut(self, rom_id: int, enabled: bool, exe: str = '',
+                                      start_dir: str = '', launch_options: str = ''):
+        """Desktop: add or remove a game's shortcut in shortcuts.vdf.
+
+        `exe`/`start_dir`/`launch_options` are the shell's own launch spec (as for
+        set_steam_tile); `--launch=<rom_id>` is appended here."""
+        try:
+            rom_id = int(rom_id)
+            if not enabled:
+                return await asyncio.to_thread(steam_game_shortcuts.remove_game_shortcuts, [rom_id])
+            if not exe:
+                return {'success': False, 'message': 'No launch command supplied'}
+            g = self._games_index().get(rom_id)
+            if not g:
+                return {'success': False, 'message': 'Game not found'}
+            name = g.get('display_name') or g.get('name') or f'Game {rom_id}'
+            args = f"{launch_options} --launch={rom_id}".strip()
+
+            def _work():
+                cover = self._game_cover_file(rom_id)
+                try:
+                    return steam_game_shortcuts.add_game_shortcut(
+                        rom_id, name, exe, start_dir=start_dir, launch_options=args,
+                        cover_path=cover, platform_name=g.get('platform_name') or '')
+                finally:
+                    if cover:
+                        try:
+                            os.unlink(cover)
+                        except OSError:
+                            pass
+            return await asyncio.to_thread(_work)
+        except Exception as e:
+            logging.error(f"set_game_steam_shortcut error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def get_game_steam_art(self, rom_id: int, appid=None):
+        """Deck: the shortcut artwork as base64 PNGs keyed portrait/landscape/
+        hero/icon, for SetCustomArtworkForApp. Empty when there's no cover.
+
+        With `appid`, the icon is also written to grid/<appid>_icon.png in every
+        Steam profile (see install_shortcut_icon for why the shortcut's icon
+        field alone isn't enough) and its path returned as `icon_path`."""
+        try:
+            rom_id = int(rom_id)
+
+            def _work():
+                cover = self._game_cover_file(rom_id)
+                if not cover:
+                    return {}
+                try:
+                    return steam_game_shortcuts.render_art_bytes(cover)
+                finally:
+                    try:
+                        os.unlink(cover)
+                    except OSError:
+                        pass
+            art = await asyncio.to_thread(_work)
+            import base64
+            g = self._games_index().get(rom_id) or {}
+            icon_path = None
+            if appid is not None and art.get('icon'):
+                icon_path = self._write_grid_icon(int(appid), art['icon'])
+            return {'success': True, 'icon_path': icon_path,
+                    'name': g.get('display_name') or g.get('name') or '',
+                    'platform_name': g.get('platform_name') or '',
+                    'art': {k: base64.b64encode(v).decode('ascii') for k, v in art.items()}}
+        except Exception as e:
+            logging.error(f"get_game_steam_art error: {e}", exc_info=True)
+            return {'success': False, 'art': {}}
+
+    @staticmethod
+    def _write_grid_icon(appid, png):
+        """Write a shortcut icon as grid/<unsigned appid>_icon.png in every
+        Steam profile; returns one written path (for SetShortcutIcon) or None."""
+        u = appid & 0xFFFFFFFF
+        first = None
+        for root in (Path.home() / '.steam' / 'steam' / 'userdata',
+                     Path.home() / '.local' / 'share' / 'Steam' / 'userdata'):
+            if not root.is_dir():
+                continue
+            for profile in root.iterdir():
+                grid = profile / 'config' / 'grid'
+                if not grid.is_dir():
+                    continue
+                dest = grid / f"{u}_icon.png"
+                try:
+                    dest.write_bytes(png)
+                    first = first or str(dest)
+                except OSError as e:
+                    logging.debug(f"could not write {dest}: {e}")
+        return first
+
+    async def record_game_steam_shortcut(self, rom_id: int, appid=None):
+        """Deck: the plugin reports the live shortcut it created (appid) or
+        removed (None), including acknowledging a queued removal."""
+        try:
+            steam_game_shortcuts.registry_set(int(rom_id), appid)
+            return {'success': True}
+        except Exception as e:
+            logging.error(f"record_game_steam_shortcut error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def get_deck_steam_shortcuts(self):
+        """Deck: the plugin's per-game shortcuts, {rom_id: appid}, and the ones
+        it should remove, {rom_id: appid}, in one call at startup."""
+        try:
+            return {'success': True,
+                    'shortcuts': {str(k): v for k, v in
+                                  steam_game_shortcuts.registry_all().items()},
+                    'removals': {str(k): v for k, v in
+                                 steam_game_shortcuts.pending_removals().items()}}
+        except Exception as e:
+            logging.error(f"get_deck_steam_shortcuts error: {e}", exc_info=True)
+            return {'success': False, 'shortcuts': {}, 'removals': {}}
+
+    async def get_pending_steam_shortcut_removals(self):
+        """Deck: {rom_id: appid} the plugin should remove, then acknowledge."""
+        try:
+            return {'success': True,
+                    'removals': {str(k): v for k, v in
+                                 steam_game_shortcuts.pending_removals().items()}}
+        except Exception as e:
+            logging.error(f"get_pending_steam_shortcut_removals error: {e}", exc_info=True)
+            return {'success': False, 'removals': {}}
 
     async def launch_retrodeck(self):
         """Launch RetroDECK directly, without Steam.
@@ -11696,6 +11913,8 @@ class LudoBackend:
             # gone can still have saves on disk, and those are exactly the
             # strays a re-download would inherit.
             removed_saves = self._delete_saves_for_rom(rom_id)
+            # Its Steam shortcut would launch a game that isn't here (#105).
+            self._forget_steam_shortcuts([rom_id])
             if not target or not target.exists():
                 if g:
                     g['is_downloaded'] = False; g['local_path'] = None
@@ -13128,7 +13347,12 @@ class LudoBackend:
         """
         try:
             auto = self._auto_sync
-            return {'epoch': int(getattr(auto, 'session_epoch', 0)) if auto else 0}
+            ex = (getattr(auto, 'exit_sync', None) if auto else None) or {}
+            return {'epoch': int(getattr(auto, 'session_epoch', 0)) if auto else 0,
+                    # The last post-emulator-exit sync: its epoch and whether
+                    # it finished clean (no error, no conflict, server reached).
+                    'exit_epoch': int(ex.get('epoch', 0)),
+                    'exit_ok': bool(ex.get('ok'))}
         except Exception as e:
             logging.error(f"get_sync_epoch error: {e}")
             return {'epoch': 0}

@@ -12,8 +12,8 @@
  * opening the library, and deciding whether a path is one of ours.
  */
 import { Router } from "@decky/ui";
-import { callable, toaster } from "@decky/api";
-import type { HostLauncher, LauncherHooks } from "./contract";
+import { addEventListener, callable, removeEventListener, toaster } from "@decky/api";
+import type { GameShortcutResult, HostLauncher, LauncherHooks } from "./contract";
 
 // Backend calls this file makes on its own behalf. Same method names the app
 // binds; `callable` just marshals to the Python side either way.
@@ -24,6 +24,9 @@ const getShortcutIconPath = callable<[], any>("get_shortcut_icon_path");
 const installShortcutIcon = callable<[number], any>("install_shortcut_icon");
 const getSteamTileStatus = callable<[], any>("get_steam_tile_status");
 const launchRetrodeckNative = callable<[], { ok: boolean; reason?: string }>("launch_retrodeck");
+const getDeckSteamShortcuts = callable<[], any>("get_deck_steam_shortcuts");
+const getGameSteamArt = callable<[number, number | null], any>("get_game_steam_art");
+const recordGameSteamShortcut = callable<[number, number | null], any>("record_game_steam_shortcut");
 
 let _hooks: LauncherHooks | null = null;
 
@@ -174,8 +177,11 @@ async function refreshDesktopTileId(): Promise<void> {
 }
 
 function _rommAppIds(): number[] {
+  // A game's own shortcut runs the same session-host, so until it is renamed
+  // Steam calls it "romm-session-host" too; it is never a duplicate tile.
   return _shortcutAppIds().filter((aid) =>
-    (aid >>> 0) !== _desktopTileId && _isRommName(_appName(aid)));
+    (aid >>> 0) !== _desktopTileId && _romForApp(aid >>> 0) == null
+    && _isRommName(_appName(aid)));
 }
 
 // Stamp "played just now" onto the Ludo tile's overview so it surfaces in the
@@ -428,6 +434,7 @@ function registerRommLaunchIntercept() {
       // high dword. Try both the raw value and the extracted appid.
       const hi = Math.floor(raw / 4294967296);
       const aid = hi > 0 ? hi : raw;
+      if (_interceptGameShortcut(aid >>> 0, String(strAppId))) return;
       // Identify by name/overview, not numeric id: GameActionStart's appid
       // representation (signed/unsigned/gameid) doesn't reliably equal the
       // collectionStore key, and stamping renumbers the cached id. Name match
@@ -557,6 +564,211 @@ function registerRommWindowGoneWatch() {
   } catch (e) { console.error('[RomM] registerRommWindowGoneWatch', e); }
 }
 
+// ─── Per-game shortcuts (#105) ───────────────────────────────────────────────
+// A game the user added to Steam gets its own shortcut. Its exe is the same
+// session-host as the Ludo tile, and its launch options carry GAME_SENTINEL
+// plus the rom id. Steam launching it directly would run the host with no
+// launch-spec, so the intercept cancels that launch and asks the app to run
+// its normal launch of the game (save sync, conflict prompt, core picker).
+// That ends in launchTile(romId), which RunGames this shortcut rather than
+// the Ludo tile, so the session and its play time belong to the game.
+// When the game exits the user stays in Steam, where they started.
+//
+// The backend keeps the rom id → appid registry, because it is the side that
+// learns a game left the device; it queues those removals and nudges us.
+const GAME_SENTINEL = "ludo-rom:";
+// rom id → unsigned appid of the live shortcut.
+const _gameShortcuts = new Map<number, number>();
+let _gameShortcutsLoad: Promise<void> | null = null;
+let _gameShortcutEventsOff: (() => void) | null = null;
+let _gameShortcutRetry: any = null;
+// Which shortcut the launch the intercept started should run. Keyed by rom so
+// a different game's Play in Ludo never picks it up, and expiring because a
+// save-conflict prompt the user dismisses ends that launch without a word.
+let _gameLaunchTarget: { romId: number; appid: number; at: number } | null = null;
+const GAME_LAUNCH_TARGET_TTL_MS = 10 * 60 * 1000;
+// The shortcut we are RunGame'ing ourselves, which the intercept lets through.
+let _gameLaunchPending: number | null = null;
+
+function _gid(appid: number): string {
+  return ((BigInt(appid >>> 0) << 32n) | 0x2000000n).toString();
+}
+
+function _shortcutExists(appid: number): boolean {
+  try { return !!(window as any).appStore?.GetAppOverviewByAppID?.(appid >>> 0); } catch { return false; }
+}
+
+function _romForApp(appid: number): number | null {
+  for (const [romId, aid] of _gameShortcuts) if (aid === appid) return romId;
+  return null;
+}
+
+// Pull the registry, apply queued removals, and forget shortcuts the user
+// deleted in Steam themselves. Safe to call repeatedly.
+async function syncGameShortcuts(): Promise<void> {
+  const r = await getDeckSteamShortcuts();
+  if (!r?.success) return;
+  const apps = _sc()?.Apps;
+  for (const [rom, appid] of Object.entries<any>(r.removals || {})) {
+    const aid = Number(appid) >>> 0;
+    try { if (_shortcutExists(aid)) await apps?.RemoveShortcut?.(aid); }
+    catch (e) { console.error('[RomM] remove game shortcut', e); continue; }
+    _gameShortcuts.delete(Number(rom));
+    try { await recordGameSteamShortcut(Number(rom), null); } catch { /* retried next sync */ }
+  }
+  _gameShortcuts.clear();
+  const ready = _shortcutStoreReady();
+  for (const [rom, appid] of Object.entries<any>(r.shortcuts || {})) {
+    const aid = Number(appid) >>> 0;
+    if (ready && !_shortcutExists(aid)) {
+      // Removed from Steam's side (the user deleted the shortcut there).
+      try { await recordGameSteamShortcut(Number(rom), null); } catch { /* ignore */ }
+      continue;
+    }
+    _gameShortcuts.set(Number(rom), aid);
+  }
+}
+
+function _gameShortcutsLoaded(): Promise<void> {
+  if (!_gameShortcutsLoad) {
+    _gameShortcutsLoad = syncGameShortcuts().catch((e) => {
+      console.error('[RomM] syncGameShortcuts', e);
+      _gameShortcutsLoad = null;
+    });
+  }
+  return _gameShortcutsLoad;
+}
+
+function startGameShortcutSync() {
+  void _gameShortcutsLoaded();
+  // At plugin load Steam's shortcut store can still be empty, which stops the
+  // prune above from telling "deleted in Steam" from "not loaded yet". Look
+  // again once it has had time to fill.
+  _gameShortcutRetry = setTimeout(() => {
+    _gameShortcutRetry = null;
+    void syncGameShortcuts().catch(() => { });
+  }, 15000);
+  if (!_gameShortcutEventsOff) {
+    // 'game' is published when a deleted game queues its shortcut's removal;
+    // '*' means nudges may have been missed.
+    const l = addEventListener<[string]>("ludo_changed", (topic) => {
+      const t = String(topic);
+      if (t === 'game' || t === '*') void syncGameShortcuts().catch(() => { });
+    });
+    _gameShortcutEventsOff = () => removeEventListener("ludo_changed", l);
+  }
+}
+
+function stopGameShortcutSync() {
+  try { _gameShortcutEventsOff?.(); } catch { /* ignore */ }
+  _gameShortcutEventsOff = null;
+  if (_gameShortcutRetry != null) { try { clearTimeout(_gameShortcutRetry); } catch { /* ignore */ } }
+  _gameShortcutRetry = null;
+}
+
+// Steam asset types: 0 portrait capsule, 1 hero, 4 landscape capsule (see
+// ensureRommArtwork for why the landscape goes through type 4).
+const GAME_ART_TYPES: [number, string][] = [[0, 'portrait'], [1, 'hero'], [4, 'landscape']];
+
+async function addGameShortcut(romId: number): Promise<GameShortcutResult> {
+  const apps = _sc()?.Apps;
+  if (!apps?.AddShortcut) {
+    return { ok: false, installed: false, message: 'Steam shortcuts are not available on this Steam build.' };
+  }
+  try {
+    await _gameShortcutsLoaded();
+    const exe = await rommShortcutExe();
+    if (exe === ROMM_SHORTCUT_EXE) {
+      return { ok: false, installed: false, message: "Ludo's launcher could not be found." };
+    }
+    let appid = _gameShortcuts.get(romId);
+    if (appid == null || (_shortcutStoreReady() && !_shortcutExists(appid))) {
+      appid = Number(await apps.AddShortcut(`Game ${romId}`, exe, "", "")) >>> 0;
+      _gameShortcuts.set(romId, appid);
+      // Named now, not after the cover fetch: AddShortcut's name does not
+      // stick, and a shortcut still called "romm-session-host" when the plugin
+      // reloads would look like a duplicate Ludo tile to cleanupRommShortcuts.
+      try { await apps.SetShortcutName?.(appid, `Game ${romId}`); } catch { /* ignore */ }
+      await recordGameSteamShortcut(romId, appid);
+    }
+    try { await apps.SetShortcutLaunchOptions?.(appid, `${GAME_SENTINEL}${romId}`); } catch { /* ignore */ }
+    // The art call also names the game and writes its grid icon file.
+    const info = await getGameSteamArt(romId, appid);
+    if (info?.name) {
+      try { await apps.SetShortcutName?.(appid, info.name); } catch { /* ignore */ }
+    }
+    const art = (info?.art || {}) as Record<string, string>;
+    if (apps.SetCustomArtworkForApp) {
+      for (const [type, key] of GAME_ART_TYPES) {
+        if (!art[key]) continue;
+        try { await apps.ClearCustomArtworkForApp?.(appid, type); } catch { /* ignore */ }
+        try { await apps.SetCustomArtworkForApp(appid, art[key], 'png', type); } catch { /* ignore */ }
+      }
+    }
+    if (info?.icon_path) {
+      try { await apps.SetShortcutIcon?.(appid, info.icon_path); } catch { /* ignore */ }
+    }
+    return { ok: true, installed: true };
+  } catch (e) {
+    console.error('[RomM] addGameShortcut', e);
+    return { ok: false, installed: _gameShortcuts.has(romId), message: String(e) };
+  }
+}
+
+async function removeGameShortcut(romId: number): Promise<GameShortcutResult> {
+  try {
+    await _gameShortcutsLoaded();
+    const appid = _gameShortcuts.get(romId);
+    if (appid != null && _shortcutExists(appid)) await _sc()?.Apps?.RemoveShortcut?.(appid);
+    _gameShortcuts.delete(romId);
+    await recordGameSteamShortcut(romId, null);
+    return { ok: true, installed: false };
+  } catch (e) {
+    console.error('[RomM] removeGameShortcut', e);
+    return { ok: false, installed: _gameShortcuts.has(romId), message: String(e) };
+  }
+}
+
+// GameActionStart for one of our game shortcuts. True when handled.
+function _interceptGameShortcut(appid: number, strAppId: string): boolean {
+  const romId = _romForApp(appid);
+  if (romId == null) return false;
+  if (_gameLaunchPending === appid) {
+    // Our own RunGame after the prep: let the host exec the emulator.
+    _gameLaunchPending = null;
+    return true;
+  }
+  // Started from Steam's library: no launch-spec yet. Cancel it and run Ludo's
+  // launch, which comes back through launchTile(romId).
+  try { _sc()?.Apps?.TerminateApp?.(strAppId, false); } catch { /* ignore */ }
+  _gameLaunchTarget = { romId, appid, at: Date.now() };
+  const name = _appName(appid) || 'Game';
+  setTimeout(() => {
+    try { _hooks?.launchGame(romId, name); } catch (e) { console.error('[RomM] launchGame', e); }
+  }, 0);
+  return true;
+}
+
+function _takeGameLaunchTarget(romId?: number): number | null {
+  const t = _gameLaunchTarget;
+  if (!t || romId == null || t.romId !== romId) return null;
+  _gameLaunchTarget = null;
+  if (Date.now() - t.at > GAME_LAUNCH_TARGET_TTL_MS) return null;
+  return t.appid;
+}
+
+async function _runGameShortcut(appid: number): Promise<boolean> {
+  _gameLaunchPending = appid;
+  try {
+    await _sc()?.Apps?.RunGame?.(_gid(appid), "", -1, 100);
+    return true;
+  } catch (e) {
+    _gameLaunchPending = null;
+    console.error('[RomM] RunGame game shortcut', e);
+    return false;
+  }
+}
+
 // ── The contract ────────────────────────────────────────────────────────────
 
 export const launcher: HostLauncher = {
@@ -572,6 +784,7 @@ export const launcher: HostLauncher = {
     registerRommLaunchIntercept();
     registerRommSessionEndWatch();
     registerRommWindowGoneWatch();
+    startGameShortcutSync();
   },
 
   stop() {
@@ -583,6 +796,7 @@ export const launcher: HostLauncher = {
     _rommFocusReg = null;
     if (_rommNavTimer != null) { try { clearTimeout(_rommNavTimer); } catch { /* ignore */ } }
     _rommNavTimer = null;
+    stopGameShortcutSync();
     _hooks = null;
   },
 
@@ -600,7 +814,9 @@ export const launcher: HostLauncher = {
 
   ensureTile: (force = false) => addRommShortcut(force),
 
-  async launchTile(): Promise<boolean> {
+  async launchTile(romId?: number): Promise<boolean> {
+    const target = _takeGameLaunchTarget(romId);
+    if (target != null) return _runGameShortcut(target);
     if (_rommAppId == null) return false;
     _rommLaunchPending = true;
     _rommWindowGone = false;
@@ -656,6 +872,15 @@ export const launcher: HostLauncher = {
       return false;
     }
   },
+
+  async hasGameShortcut(romId: number): Promise<boolean> {
+    await _gameShortcutsLoaded();
+    const aid = _gameShortcuts.get(romId);
+    return aid != null && (!_shortcutStoreReady() || _shortcutExists(aid));
+  },
+
+  setGameShortcut: (romId: number, enabled: boolean) =>
+    (enabled ? addGameShortcut(romId) : removeGameShortcut(romId)),
 };
 
 // Our session flag alone can outlive the game (a lifetime notification Steam

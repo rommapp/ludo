@@ -12907,6 +12907,7 @@ class AutoSyncManager:
         # knows (last_played, new states): the emulator runs outside it, so
         # rows built from that data stayed stale until the app restarted.
         self.session_epoch = 0
+        self.exit_sync = None
 
         # Time played, reported to RomM per launch (see play_sessions).
         self.play_sessions = play_sessions.PlaySessions(
@@ -16756,6 +16757,7 @@ class AutoSyncManager:
             return
 
         def _run():
+            ok = False
             if not self._session_sync_lock.acquire(blocking=False):
                 logging.debug("Session save-sync already running; coalescing trigger")
                 return
@@ -16780,19 +16782,27 @@ class AutoSyncManager:
                 # server instead of being marked synced in place.
                 self.flush_pending_states()
                 _t2 = time.monotonic()
-                self.run_negotiated_save_sync(trigger=reason)
+                summary = self.run_negotiated_save_sync(trigger=reason)
                 _t3 = time.monotonic()
+                ok = bool(summary) and summary.get('session_id') is not None \
+                    and not summary.get('errors') and not summary.get('conflicts')
                 logging.info(
                     "[AUTO-SYNC] ⏱️ session sync %.2fs "
                     "(dirs %.2fs, states %.2fs, negotiate+ops %.2fs)",
                     _t3 - _t0, _t1 - _t0, _t2 - _t1, _t3 - _t2)
             except Exception as e:
+                ok = False
                 self.log(f"❌ Session save-sync failed: {e}")
             finally:
                 # After the sync, not before: whoever is watching this epoch
                 # wants the state the server holds once this session's uploads
                 # have landed.
                 self.session_epoch += 1
+                # The sync after an emulator exit, kept apart: a Ludo started
+                # by a game's own Steam shortcut closes once this lands clean
+                # (#105), and must not mistake a mid-game sync for it.
+                if reason.endswith(' closed'):
+                    self.exit_sync = {'epoch': self.session_epoch, 'ok': ok}
                 self._session_sync_lock.release()
                 _events.publish('session')
 

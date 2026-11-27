@@ -71,6 +71,16 @@ window.__rommDesktop = {
   pickFolder(opts) {
     return ipcRenderer.invoke("romm:pick-folder", opts || {});
   },
+  // --launch=<rom_id> (a game's own Steam shortcut): the one we were started
+  // with, taken once, and those forwarded from later launches while running.
+  takeLaunch() {
+    try { return ipcRenderer.sendSync("romm:take-launch"); } catch { return null; }
+  },
+  onLaunch(cb) {
+    const h = (_e, id) => cb(id);
+    ipcRenderer.on("romm:launch", h);
+    return () => ipcRenderer.removeListener("romm:launch", h);
+  },
 };
 
 const OK = 1, CANCEL = 2, SECONDARY = 3, OPTIONS = 4;

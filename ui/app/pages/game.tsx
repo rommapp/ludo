@@ -1,7 +1,7 @@
 import { Focusable, GamepadButton, ModalRoot, showModal, Navigation } from "@ludo/host";
 import { toaster } from "../toast";
 import { V2, DEVICE_COLORS, fmtBytes, fmtPlayTime, fmtReleaseDate, formatEta, formatSpeed } from "../theme";
-import { FaBan, FaWrench, FaChevronDown, FaChevronRight, FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages} from "react-icons/fa";
+import { FaBan, FaWrench, FaChevronDown, FaChevronRight, FaBookmark, FaBoxOpen, FaCheckCircle, FaClock, FaClone, FaCloudUploadAlt, FaCopy, FaDownload, FaFolder, FaLayerGroup, FaPlay, FaPuzzlePiece, FaRedo, FaSync, FaTimes, FaTrash, FaUndo, FaUnlink, FaExclamationTriangle, FaExternalLinkAlt, FaLink, FaMicrochip, FaUsers, FaBook, FaImages, FaSteam} from "react-icons/fa";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { V2Focus, V2_FOCUS_STYLE, v2Page } from "../focus";
 import { peekDetail, storeDetail } from "../detailcache";
@@ -25,6 +25,7 @@ import { LocalDisc, discDisplayLabel, openDiscPicker, openRegionPicker } from ".
 import { useSaveActivityFor } from "../status";
 import { SwitchDlcModal, addOnLabel, fetchLabel, openUpdatePicker, runEdenChange, useFetchProgress } from "../switchAddOns";
 import { SwitchModPackagesSection } from "../switchModPackages";
+import { useGameSteamShortcut } from "../steamShortcut";
 // One game, in full: the hero art, the actions, and the four metadata tabs.
 //
 // The tabs are where most of this lives — overview, files, save data,
@@ -1635,6 +1636,10 @@ export function GameDetailPage() {
   const orphan = !!game?.is_orphan;
   const noEmulator = cannotLaunch(emu, game?.platform, game?.platform_slug);
   const [ctaFocused, setCtaFocused] = useState(false);
+  // The game's own Steam shortcut (#105), for downloaded games only: a
+  // shortcut to a game that isn't here would launch into "not downloaded".
+  const steamShortcut = useGameSteamShortcut(game?.rom_id,
+    game?.name || 'game', isDownloaded);
   // Land gamepad focus on the primary CTA (Play / Download) when the page
   // opens. As an internal view (LibraryRootPage) there is no route change, so
   // Steam gives us no focus pass — without this the generic view focus-pull
@@ -2136,6 +2141,14 @@ export function GameDetailPage() {
                       ? `${gameStandalone.name} is not installed — ${game?.platform || 'this platform'} needs it to play.`
                       : 'No emulator installed — install RetroArch from Home to play.'}
                   </span>
+                )}
+                {steamShortcut.supported && (
+                  <GameActionButton variant="surface" disabled={steamShortcut.busy}
+                    onClick={steamShortcut.toggle}
+                    okHint={steamShortcut.installed ? 'Remove from Steam' : 'Add to Steam'}
+                    icon={steamShortcut.busy
+                      ? <FaSync size={15} style={{ animation: 'spin 1s linear infinite' }} />
+                      : <FaSteam size={16} style={{ color: steamShortcut.installed ? V2.brandHover : undefined }} />} />
                 )}
                 <GameActionButton variant="surface" accent="danger" onClick={() => setConfirmDelete(true)} okHint="Delete"
                   icon={<FaTrash size={15} />} />
