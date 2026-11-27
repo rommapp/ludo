@@ -123,7 +123,8 @@ def restart_backend(monkeypatch, tmp_path, request):
     b._defer_library_fetch = False
     for name in ('_apply_platform_sync_to_client', '_fetch_disabled_counts',
                  '_ensure_device_registered', '_read_server_features', '_init_bios_tracking',
-                 '_init_collection_sync', '_note_reachable', '_reachability_loop', '_install_loop'):
+                 '_init_collection_sync', '_note_reachable', '_reachability_loop', '_install_loop',
+                 '_steam_shortcut_loop'):
         monkeypatch.setattr(b, name, lambda *a, **kw: None)
     monkeypatch.setattr(b, '_library_auto_update', lambda: False)
 

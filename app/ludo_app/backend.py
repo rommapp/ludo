@@ -1335,6 +1335,10 @@ class LudoBackend:
             daemon=True, name="romm-installs")
         self._install_thread.start()
 
+        # Desktop: re-apply Steam shortcut changes a running Steam overwrote.
+        threading.Thread(target=self._steam_shortcut_loop, args=(self._stop_event,),
+                         daemon=True, name="steam-shortcuts").start()
+
         logging.info("Sync started (retry + reachability threads; managers start on connect)")
 
     def _stop_sync(self):
@@ -10079,6 +10083,18 @@ class LudoBackend:
         except Exception as e:
             logging.warning(f"forgetting steam shortcuts failed: {e}")
 
+    def _steam_shortcut_loop(self, stop):
+        """Steam saves its in-memory shortcut list over shortcuts.vdf, undoing
+        a game shortcut added or removed while it ran. Check every 20s (a local
+        file read, and nothing at all with no pending changes) and put them back."""
+        while not stop.is_set():
+            if steam_game_shortcuts is not None:
+                try:
+                    steam_game_shortcuts.reconcile_desktop_shortcuts()
+                except Exception as e:
+                    logging.warning(f"steam shortcut reconcile failed: {e}")
+            stop.wait(20)
+
     def _sweep_game_steam_shortcuts(self, games):
         """Forget shortcuts for games the complete library list no longer has.
 
@@ -10236,7 +10252,9 @@ class LudoBackend:
         """Deck: the plugin reports the live shortcut it created (appid) or
         removed (None), including acknowledging a queued removal."""
         try:
-            steam_game_shortcuts.registry_set(int(rom_id), appid)
+            dropped = steam_game_shortcuts.registry_set(int(rom_id), appid)
+            # Steam keeps a removed shortcut's grid images; clear them too.
+            steam_game_shortcuts.delete_grid_art(dropped)
             return {'success': True}
         except Exception as e:
             logging.error(f"record_game_steam_shortcut error: {e}", exc_info=True)

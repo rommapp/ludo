@@ -9,7 +9,11 @@ depends on the shell:
   the Ludo tile uses) plus ``--launch=<rom_id>``. It's written to shortcuts.vdf
   here. Steam rewrites that file from memory when it exits, so a shortcut added
   while Steam is running only shows up after a Steam restart (``steam_running``
-  in every result lets the UI say so).
+  in every result lets the UI say so). Worse, Steam saves that in-memory list
+  over the file whenever its own shortcuts change, which silently undoes our
+  write. So changes made under a running Steam are kept as pending in the
+  registry and re-applied by reconcile_desktop_shortcuts() until a Steam that
+  started after the write is seen, which means Steam has loaded them.
 * Deck plugin: the plugin creates the shortcut through SteamClient's live API.
   This module only supplies the artwork and keeps a registry of rom_id -> appid,
   because the backend can't remove a live shortcut itself. Removals the backend
@@ -23,6 +27,7 @@ import json
 import logging
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from .paths import library_dir
@@ -144,6 +149,31 @@ def _delete_art(config_dir, appid):
             logging.debug(f"Could not delete {p.name}: {e}")
 
 
+def delete_grid_art(appid):
+    """Delete a removed shortcut's artwork from every local Steam profile.
+
+    Steam keeps grid files after RemoveShortcut, so each removed game would
+    leave its images behind. Also clears the logo Steam writes itself."""
+    if appid is None:
+        return
+    u = _unsigned(int(appid))
+    for root in (Path.home() / '.steam' / 'steam' / 'userdata',
+                 Path.home() / '.local' / 'share' / 'Steam' / 'userdata'):
+        if not root.is_dir():
+            continue
+        for profile in root.iterdir():
+            grid = profile / 'config' / 'grid'
+            if not grid.is_dir():
+                continue
+            for suffix in (*ART_SUFFIXES.values(), '_logo.png'):
+                f = grid / f"{u}{suffix}"
+                try:
+                    if f.exists():
+                        f.unlink()
+                except OSError as e:
+                    logging.debug(f"Could not delete {f}: {e}")
+
+
 # ─── Desktop: shortcuts.vdf ─────────────────────────────────────────────────
 
 def game_shortcut_status(rom_id):
@@ -154,6 +184,11 @@ def game_shortcut_status(rom_id):
                 'steam_running': False, 'reason': 'Steam not found on this system'}
     shortcuts = SteamVDFHandler.read_shortcuts(config_dir / 'shortcuts.vdf')
     _, sc = find_game_shortcut(shortcuts, rom_id)
+    # A pending change is what the user asked for, even if Steam has
+    # overwritten it in the file for now; reconcile puts it back.
+    op = desktop_pending().get(int(rom_id))
+    if op:
+        sc = op['entry'] if op['op'] == 'add' else None
     return {'available': True, 'installed': sc is not None,
             'appid': sc.get('appid') if sc else None,
             'steam_running': is_steam_running(), 'reason': None}
@@ -220,6 +255,7 @@ def add_game_shortcut(rom_id, name, exe, start_dir='', launch_options='',
         _delete_art(config_dir, old)
 
     running = is_steam_running()
+    _set_pending(rom_id, {'op': 'add', 'entry': entry} if running else None)
     return {'success': True, 'appid': appid, 'created': created,
             'steam_running': running,
             'message': ('Restart Steam to see it in your library' if running
@@ -242,9 +278,20 @@ def remove_game_shortcuts(rom_ids):
     keep, gone = [], []
     for sc in shortcuts:
         (gone if shortcut_rom_id(sc) in wanted else keep).append(sc)
+    running = is_steam_running()
+    # Removing a game whose pending add Steam already wiped from the file is
+    # still a removal: drop the pending add, or reconcile would bring it back.
+    pending = desktop_pending()
+    cancelled = [r for r in wanted if (pending.get(r) or {}).get('op') == 'add']
+    for r in wanted:
+        if r in pending:
+            _set_pending(r, None)
     if not gone:
-        return {'success': True, 'removed': 0, 'steam_running': is_steam_running(),
-                'message': 'Nothing to remove'}
+        if running:
+            for r in cancelled:
+                _set_pending(r, {'op': 'remove'})
+        return {'success': True, 'removed': len(cancelled), 'steam_running': running,
+                'message': 'Removed from your Steam library' if cancelled else 'Nothing to remove'}
     try:
         SteamVDFHandler.write_shortcuts(shortcuts_path, keep)
     except Exception as e:
@@ -254,20 +301,113 @@ def remove_game_shortcuts(rom_ids):
     for sc in gone:
         if sc.get('appid') is not None:
             _delete_art(config_dir, sc['appid'])
-    running = is_steam_running()
+    if running:
+        for sc in gone:
+            _set_pending(shortcut_rom_id(sc), {'op': 'remove'})
     return {'success': True, 'removed': len(gone), 'steam_running': running,
             'message': ('Restart Steam to drop it from your library' if running
                         else 'Removed from your Steam library')}
 
 
 def desktop_shortcut_rom_ids():
-    """RomM ids that have a desktop shortcut."""
+    """RomM ids that have a desktop shortcut, counting pending adds."""
+    pending = desktop_pending()
+    config_dir = find_steam_config_dir()
+    ids = set()
+    if config_dir:
+        ids = {i for i in (shortcut_rom_id(sc) for sc in
+               SteamVDFHandler.read_shortcuts(config_dir / 'shortcuts.vdf'))
+               if i is not None}
+    ids |= {r for r, op in pending.items() if op['op'] == 'add'}
+    return {r for r in ids if (pending.get(r) or {}).get('op') != 'remove'}
+
+
+def steam_started_at():
+    """When the running Steam client started (epoch seconds), or None."""
+    import psutil
+    starts = []
+    try:
+        for proc in psutil.process_iter(['name', 'create_time']):
+            if (proc.info.get('name') or '').lower() in ('steam', 'steam.exe'):
+                starts.append(proc.info.get('create_time') or 0)
+    except Exception as e:
+        logging.debug(f"steam_started_at failed: {e}")
+    return min(starts) if starts else None
+
+
+def desktop_pending():
+    """{rom_id: {'op': 'add'|'remove', 'entry'?, 'at'}} changes made while
+    Steam was running that Steam hasn't loaded yet."""
+    with _registry_lock:
+        return {int(k): v for k, v in _load_registry()['desktop_pending'].items()}
+
+
+def _set_pending(rom_id, op):
+    key = str(int(rom_id))
+    with _registry_lock:
+        reg = _load_registry()
+        if op is None:
+            if reg['desktop_pending'].pop(key, None) is None:
+                return
+        else:
+            reg['desktop_pending'][key] = dict(op, at=time.time())
+        _save_registry(reg)
+
+
+def reconcile_desktop_shortcuts():
+    """Re-apply pending desktop changes Steam overwrote, and settle the ones
+    a Steam started after the write has loaded. Returns how many were re-applied.
+
+    The pending entries only exist for changes made under a running Steam. The
+    user can't undo one from Steam before Steam loads it (Steam doesn't show it
+    yet), so whatever the file says before then is Steam's stale copy, never
+    the user's choice.
+    """
+    pending = desktop_pending()
+    if not pending:
+        return 0
     config_dir = find_steam_config_dir()
     if not config_dir:
-        return set()
-    ids = (shortcut_rom_id(sc) for sc in
-           SteamVDFHandler.read_shortcuts(config_dir / 'shortcuts.vdf'))
-    return {i for i in ids if i is not None}
+        return 0
+    shortcuts_path = config_dir / 'shortcuts.vdf'
+    shortcuts = SteamVDFHandler.read_shortcuts(shortcuts_path)
+    started = steam_started_at()
+    fixed, settled, reapplied = [], [], []
+    for rom_id, op in pending.items():
+        idx, sc = find_game_shortcut(shortcuts, rom_id)
+        in_file = sc is not None if op['op'] == 'add' else sc is None
+        if in_file:
+            if started is not None and started > op.get('at', 0):
+                settled.append(rom_id)
+            continue
+        if op['op'] == 'add':
+            shortcuts.append(op['entry'])
+        else:
+            shortcuts.pop(idx)
+            reapplied.append(sc)
+        fixed.append(rom_id)
+    if fixed:
+        try:
+            SteamVDFHandler.write_shortcuts(shortcuts_path, shortcuts)
+        except Exception as e:
+            logging.warning(f"[Steam] re-applying shortcut changes failed: {e}")
+            fixed = []
+        for sc in reapplied:
+            if fixed and sc.get('appid') is not None:
+                _delete_art(config_dir, sc['appid'])
+    now = time.time()
+    with _registry_lock:
+        reg = _load_registry()
+        for r in settled:
+            reg['desktop_pending'].pop(str(r), None)
+        for r in fixed:
+            if str(r) in reg['desktop_pending']:
+                reg['desktop_pending'][str(r)]['at'] = now
+        if settled or fixed:
+            _save_registry(reg)
+    if fixed:
+        logging.info(f"[Steam] re-applied {len(fixed)} shortcut change(s) Steam overwrote")
+    return len(fixed)
 
 
 # ─── Deck: registry + queued removals ──────────────────────────────────────
@@ -285,7 +425,8 @@ def _load_registry():
         data = {}
     shortcuts = data.get('shortcuts') if isinstance(data.get('shortcuts'), dict) else {}
     pending = data.get('pending_removal') if isinstance(data.get('pending_removal'), dict) else {}
-    return {'shortcuts': shortcuts, 'pending_removal': pending}
+    desktop = data.get('desktop_pending') if isinstance(data.get('desktop_pending'), dict) else {}
+    return {'shortcuts': shortcuts, 'pending_removal': pending, 'desktop_pending': desktop}
 
 
 def _save_registry(reg):
@@ -303,16 +444,20 @@ def registry_get(rom_id):
 
 
 def registry_set(rom_id, appid):
-    """Record (appid) or forget (None) the plugin's shortcut for a game."""
+    """Record (appid) or forget (None) the plugin's shortcut for a game.
+    Forgetting returns the appid it dropped (live or queued for removal)."""
     key = str(int(rom_id))
     with _registry_lock:
         reg = _load_registry()
+        dropped = reg['pending_removal'].pop(key, None)
         if appid is None:
-            reg['shortcuts'].pop(key, None)
+            live = reg['shortcuts'].pop(key, None)
+            dropped = live if live is not None else dropped
         else:
             reg['shortcuts'][key] = int(appid)
-        reg['pending_removal'].pop(key, None)
+            dropped = None
         _save_registry(reg)
+        return dropped
 
 
 def registry_rom_ids():

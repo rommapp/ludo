@@ -179,9 +179,23 @@ async function refreshDesktopTileId(): Promise<void> {
 function _rommAppIds(): number[] {
   // A game's own shortcut runs the same session-host, so until it is renamed
   // Steam calls it "romm-session-host" too; it is never a duplicate tile.
+  // Another machine's tile (Remote Play) is never ours either.
   return _shortcutAppIds().filter((aid) =>
     (aid >>> 0) !== _desktopTileId && _romForApp(aid >>> 0) == null
-    && _isRommName(_appName(aid)));
+    && !_isRemote(aid) && _isRommName(_appName(aid)));
+}
+
+// Steam lists the apps of the user's other machines on the network for Remote
+// Play streaming, Ludo tiles and game shortcuts included. They are not
+// shortcuts on this device: never adopt, repaint, remove or intercept them, so
+// Play streams them as Steam intends. per_client_data names the machines an
+// app is on; this one is clientid "0".
+function _isRemote(aid: number): boolean {
+  try {
+    const pcd = (window as any).appStore?.GetAppOverviewByAppID?.(aid >>> 0)?.per_client_data;
+    if (!Array.isArray(pcd) || !pcd.length) return false;
+    return !pcd.some((c: any) => String(c?.clientid) === '0');
+  } catch { return false; }
 }
 
 // Stamp "played just now" onto the Ludo tile's overview so it surfaces in the
@@ -345,30 +359,27 @@ async function ensureRommArtwork(appId: number) {
     //   0 -> {appid}p.png   (portrait capsule)  : grid
     //   1 -> {appid}_hero   (hero background)    : hero
     //   2 -> {appid}_logo   (transparent logo)   : logo
-    //   4 -> {appid}.png    (landscape capsule)  : THIS is the image Big
+    //   3 or 4 -> {appid}.png (landscape capsule) : THIS is the image Big
     //        Picture's "Recent Games" featured banner uses, so it must get the
     //        background-only landscape art, not the centered-mark icon.
-    // (Type 3 is a no-op on this build, so the landscape goes through type 4.)
+    // Which type writes the landscape changed between Steam builds: older ones
+    // ignored 3 and took 4; current ones (Nov 2026, Deck and Arch) take 3 and
+    // reject 4. So it's sent as both; the unsupported one fails harmlessly.
     const res = await getRommArtwork();
     const art = res?.art as Record<string, string> | undefined;
     if (art && Object.keys(art).length) {
       const ext = res.ext || 'png';
       // type -> source art key. Type 4 (the landscape {appid}.png) is fed the
       // header (bg-only) art instead of the icon.
-      const plan: [number, string][] = [[0, '0'], [1, '1'], [2, '2'], [4, '3']];
-      for (const [n, key] of plan) {
-        if (!art[key]) continue;
-        // Clear first: Steam won't overwrite an existing custom asset, so a
-        // repaint over stale art would otherwise silently no-op.
-        try { await apps.ClearCustomArtworkForApp?.(appId, n); } catch { /* ignore */ }
-        try { await apps.SetCustomArtworkForApp(appId, art[key], ext, n); } catch { /* ignore */ }
-      }
+      const plan: [number, string][] = [[0, '0'], [1, '1'], [2, '2'], [3, '3'], [4, '3']];
+      await setArtwork(apps, appId, plan.filter(([, key]) => art[key]).map(([n, key]) => [n, art[key]]), ext);
       return;
     }
     // Fallback to the flat logo if branded artwork is unavailable.
     const logo = await getPluginLogo();
     if (!logo?.b64) return;
     try { await apps.SetCustomArtworkForApp(appId, logo.b64, logo.ext || 'png', 0); } catch { /* ignore */ }
+    try { await apps.SetCustomArtworkForApp(appId, logo.b64, logo.ext || 'png', 3); } catch { /* ignore */ }
     try { await apps.SetCustomArtworkForApp(appId, logo.b64, logo.ext || 'png', 4); } catch { /* ignore */ }
   } catch (e) { console.error('[RomM] ensureRommArtwork', e); }
 }
@@ -435,6 +446,8 @@ function registerRommLaunchIntercept() {
       const hi = Math.floor(raw / 4294967296);
       const aid = hi > 0 ? hi : raw;
       if (_interceptGameShortcut(aid >>> 0, String(strAppId))) return;
+      // Another machine's tile: let Steam stream it.
+      if (_isRemote(aid) || _isRemote(raw)) return;
       // Identify by name/overview, not numeric id: GameActionStart's appid
       // representation (signed/unsigned/gameid) doesn't reliably equal the
       // collectionStore key, and stamping renumbers the cached id. Name match
@@ -666,9 +679,27 @@ function stopGameShortcutSync() {
   _gameShortcutRetry = null;
 }
 
-// Steam asset types: 0 portrait capsule, 1 hero, 4 landscape capsule (see
-// ensureRommArtwork for why the landscape goes through type 4).
-const GAME_ART_TYPES: [number, string][] = [[0, 'portrait'], [1, 'hero'], [4, 'landscape']];
+// Steam asset types: 0 portrait capsule, 1 hero, 3/4 landscape capsule (see
+// ensureRommArtwork for why the landscape is sent as both).
+const GAME_ART_TYPES: [number, string][] = [[0, 'portrait'], [1, 'hero'], [3, 'landscape'], [4, 'landscape']];
+
+function _gameArtPlan(art: Record<string, string>): [number, string][] {
+  return GAME_ART_TYPES.filter(([, key]) => art[key]).map(([type, key]) => [type, art[key]]);
+}
+
+// Set custom artwork, as [asset type, base64] pairs. Every type is cleared
+// before any is set: Steam won't overwrite an existing custom asset, so a
+// repaint over stale art would otherwise silently no-op. Clearing all first
+// matters because on current builds clearing type 4 deletes the landscape
+// that setting type 3 just wrote.
+async function setArtwork(apps: any, appid: number, plan: [number, string][], ext: string) {
+  for (const [type] of plan) {
+    try { await apps.ClearCustomArtworkForApp?.(appid, type); } catch { /* ignore */ }
+  }
+  for (const [type, b64] of plan) {
+    try { await apps.SetCustomArtworkForApp(appid, b64, ext, type); } catch { /* ignore */ }
+  }
+}
 
 async function addGameShortcut(romId: number): Promise<GameShortcutResult> {
   const apps = _sc()?.Apps;
@@ -698,13 +729,7 @@ async function addGameShortcut(romId: number): Promise<GameShortcutResult> {
       try { await apps.SetShortcutName?.(appid, info.name); } catch { /* ignore */ }
     }
     const art = (info?.art || {}) as Record<string, string>;
-    if (apps.SetCustomArtworkForApp) {
-      for (const [type, key] of GAME_ART_TYPES) {
-        if (!art[key]) continue;
-        try { await apps.ClearCustomArtworkForApp?.(appid, type); } catch { /* ignore */ }
-        try { await apps.SetCustomArtworkForApp(appid, art[key], 'png', type); } catch { /* ignore */ }
-      }
-    }
+    if (apps.SetCustomArtworkForApp) await setArtwork(apps, appid, _gameArtPlan(art), 'png');
     if (info?.icon_path) {
       try { await apps.SetShortcutIcon?.(appid, info.icon_path); } catch { /* ignore */ }
     }
