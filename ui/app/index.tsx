@@ -6,11 +6,16 @@
 // thing either of them needs to know about the UI.
 
 import { Navigation, routerHook, host } from "@ludo/host";
+import { watchTopic } from "./push";
 import { toaster, loadNotificationPrefs } from "./toast";
 import {
   checkForUpdate,
   getCheckOnStartup,
   getConfig,
+  gameRunning,
+  getGameDetail,
+  getSaveConflicts,
+  getSyncEpoch,
   getServiceStatus,
   getUpdateChannel,
   notifyNetworkState,
@@ -35,6 +40,7 @@ import { setPreDownloadHook, watchBackgroundInstalls } from "./downloads";
 import { maybePromptSwitchFirmware } from "./firmware";
 import { watchSaveConflicts } from "./saveConflict";
 import { initProfiles } from "./profiles";
+import { runLaunch } from "./launch";
 
 /**
  * Re-exported so the app's public surface stays two names.
@@ -116,6 +122,21 @@ export function startApp(): { stop: () => void } {
   host.launcher.start({
     openLibrary: () => { Navigation.Navigate("/romm-sync-library"); Navigation.CloseSideMenus(); },
     isOwnRoute: (path) => path.startsWith("/romm-sync"),
+    // A game's own Steam shortcut, started from Steam's library.
+    // The desktop's --launch=<rom_id> passes no name; the detail fills it in,
+    // and the game's page is what's left on screen when the game exits.
+    launchGame: (romId, name, opts) => {
+      void (async () => {
+        if (!name) {
+          try { name = (await getGameDetail(romId))?.name || ''; } catch { /* toasts fall back */ }
+          Navigation.Navigate(`/romm-sync-game/${romId}`);
+        }
+        // Baseline before launching, so the exit sync can't land unseen.
+        const base = opts?.closeAfter ? await exitSyncEpoch() : null;
+        await runLaunch(romId, name || 'game', null);
+        if (base !== null) closeAfterExitSync(base);
+      })();
+    },
   });
 
   // The user's notification switches, pulled once so every toast raised from
@@ -271,4 +292,35 @@ export function startApp(): { stop: () => void } {
       routerHook.removeRoute("/romm-sync-game/:romId");
     },
   };
+}
+
+// A Ludo started by a game's own Steam shortcut (desktop --launch) closes once
+// that game has exited and its saves synced clean, so Steam returns to its
+// library and counts the game's time rather than Ludo's. Anything short of a
+// clean sync — an error, a conflict, no server — leaves the window open to say
+// so. Gives up after a day; the user can always close it themselves.
+async function exitSyncEpoch(): Promise<number | null> {
+  try {
+    const e = (await getSyncEpoch())?.exit_epoch;
+    return typeof e === 'number' ? e : null;
+  } catch { return null; }
+}
+
+function closeAfterExitSync(base: number) {
+  const started = Date.now();
+  let stop: (() => void) | null = null;
+  const check = async () => {
+    if (Date.now() - started > 24 * 3600 * 1000) { stop?.(); return; }
+    try {
+      const r = await getSyncEpoch();
+      if (typeof r?.exit_epoch !== 'number' || r.exit_epoch <= base) return;
+      stop?.();
+      if (!r.exit_ok) return;
+      if ((await gameRunning())?.running) return;
+      const conflicts = await getSaveConflicts();
+      if (Array.isArray(conflicts) && conflicts.length) return;
+      host.app.quit();
+    } catch { /* transient: keep watching */ }
+  };
+  stop = watchTopic('session', check, 5000, 30000);
 }

@@ -82,6 +82,14 @@ export const setRetrodeckButtonEnabled = callable<[boolean], boolean>("set_retro
 export const getRetrodeckLogo = callable<[], any>("get_retrodeck_logo");
 export const getSteamTileStatus = callable<[], any>("get_steam_tile_status");
 export const setSteamTile = callable<[boolean, string, string, string], any>("set_steam_tile");
+// Per-game Steam shortcuts (#105). Desktop writes shortcuts.vdf through
+// setGameSteamShortcut; the Deck plugin creates live shortcuts itself and
+// reports them with recordGameSteamShortcut.
+export const getGameSteamShortcut = callable<[number], any>("get_game_steam_shortcut");
+export const setGameSteamShortcut = callable<[number, boolean, string, string, string], any>("set_game_steam_shortcut");
+export const getGameSteamArt = callable<[number], any>("get_game_steam_art");
+export const recordGameSteamShortcut = callable<[number, (number | null)], any>("record_game_steam_shortcut");
+export const getPendingSteamShortcutRemovals = callable<[], any>("get_pending_steam_shortcut_removals");
 export const getCoreMappings = callable<[], any>("get_core_mappings");
 export const setCoreOverride = callable<[string, string], any>("set_core_override");
 export const downloadCore = callable<[string], any>("download_core");

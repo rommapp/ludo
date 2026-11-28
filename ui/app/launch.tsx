@@ -444,7 +444,7 @@ export async function launchGameSmart(romId: number, disc: string | null = null,
       const prep = await prepareSteamLaunch(romId, disc, siblingRomId, resume);
       if (prep?.save_conflict) return prep;
       if (prep?.steam_host) {
-        if (await host.launcher.launchTile()) {
+        if (await host.launcher.launchTile(romId)) {
           // Carry the prep's BIOS verdict through: this path returns a synthetic
           // success, so anything prepare_steam_launch resolved (the warning, or
           // the files it fetched to avoid one) is lost unless it is forwarded.

@@ -154,7 +154,7 @@ export type HostLauncher = {
    * Resolves false if the launch could not be started, so the caller can fall
    * back to a direct launch.
    */
-  launchTile(): Promise<boolean>;
+  launchTile(romId?: number): Promise<boolean>;
 
   /** Launch RetroDECK through the platform, rather than as a bare process. */
   launchRetroDeck(): Promise<{ ok: boolean; reason?: string }>;
@@ -190,6 +190,27 @@ export type HostLauncher = {
 
   /** Bring that running game back to the front. False if there is none. */
   resumeSession(): boolean;
+
+  /**
+   * Whether `romId` has its own shortcut in the platform's library (#105).
+   * Only meaningful where `available` is true; a shell that writes
+   * shortcuts.vdf instead (`capabilities.shortcutTile`) goes through the
+   * backend, and answers false here.
+   */
+  hasGameShortcut(romId: number): Promise<boolean>;
+
+  /**
+   * Add or remove `romId`'s own library shortcut. Launching it runs the game
+   * through Ludo (save sync included) and returns to the platform, not to Ludo.
+   */
+  setGameShortcut(romId: number, enabled: boolean): Promise<GameShortcutResult>;
+};
+
+export type GameShortcutResult = {
+  ok: boolean;
+  /** Whether the shortcut exists after the call. */
+  installed: boolean;
+  message?: string;
 };
 
 /**
@@ -251,6 +272,14 @@ export type LauncherHooks = {
   openLibrary(): void;
   /** Whether a path belongs to Ludo, as opposed to the platform's own UI. */
   isOwnRoute(path: string): boolean;
+  /**
+   * Run Ludo's normal launch of `romId` (save sync, conflict prompt, core
+   * picker) for a game's own shortcut started from the platform's library.
+   * `name` is the shortcut's title, for toasts.
+   */
+  // closeAfter: this shell was started only to run this game (a desktop
+  // shortcut's --launch), so it may close once the game's saves are synced.
+  launchGame(romId: number, name: string, opts?: { closeAfter?: boolean }): void;
 };
 
 /**

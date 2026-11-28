@@ -29,6 +29,20 @@ const { backendEnv } = require("./backend-env.cjs");
   if (arg) process.env.LUDO_PROFILE = arg.slice("--profile=".length);
 }
 
+// --launch=<rom_id> starts that game as soon as the UI is up: what a single
+// game's own Steam shortcut runs (#105). Held here until the renderer asks for
+// it, so a slow first load can't miss it; a second launch while we're already
+// running is forwarded to the window instead (see second-instance).
+function launchArg(argv) {
+  const a = (argv || []).find((x) => typeof x === "string" && x.startsWith("--launch="));
+  const id = a ? parseInt(a.slice("--launch=".length), 10) : NaN;
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+let pendingLaunch = launchArg(process.argv);
+// Started by a game's shortcut, rather than opened by the user: the window may
+// close after that game's session syncs. A forwarded --launch never sets it.
+const startedForLaunch = pendingLaunch !== null;
+
 // The name Electron reports for itself — window titles it derives, the shell's
 // window list, notifications. It comes from the packaged package.json, and
 // electron-builder writes only `name` there ("ludo-desktop"); `productName`,
@@ -653,8 +667,20 @@ if (!app.requestSingleInstanceLock()) {
     } catch { e.returnValue = null; }
   });
 
-  app.on("second-instance", () => {
+  // The renderer collects a --launch it was started with, once.
+  ipcMain.on("romm:take-launch", (e) => {
+    e.returnValue = pendingLaunch === null ? null
+      : { romId: pendingLaunch, closeAfter: startedForLaunch };
+    pendingLaunch = null;
+  });
+
+  app.on("second-instance", (_e, argv) => {
     if (win) { if (win.isMinimized()) win.restore(); win.focus(); }
+    const id = launchArg(argv);
+    if (id) {
+      if (win) win.webContents.send("romm:launch", id);
+      else pendingLaunch = id;
+    }
   });
 
   app.whenReady().then(boot).catch((err) => {
