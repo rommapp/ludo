@@ -139,6 +139,20 @@ def test_homebrew_kit_boots_the_platforms_rom(backend, tmp_path):
     assert _detect_multi_disc(game, True) == (False, 1)
 
 
+@pytest.mark.parametrize('platform_slug', ['switch', None], ids=['explicit', 'inferred'])
+def test_switch_folder_boots_nested_base_beside_top_level_update(backend, tmp_path,
+                                                              platform_slug, monkeypatch):
+    monkeypatch.setattr(backend, '_prod_keys', lambda: None)
+    folder = tmp_path / 'roms' / 'switch' / 'Game'
+    touch(folder / 'Update [0100152000022800][v65536].nsp')
+    base = touch(folder / 'Base' / 'Game [0100152000022000].nsp')
+    if platform_slug:
+        got = backend._resolve_launch_path(str(folder), platform_slug=platform_slug)
+    else:
+        got = backend._resolve_launch_path(str(folder))
+    assert got == str(base)
+
+
 def test_regional_variants_still_offer_a_pick(backend, tmp_path):
     folder = tmp_path / 'roms' / 'gba' / 'Pokemon'
     touch(folder / 'Pokemon (USA).gba')

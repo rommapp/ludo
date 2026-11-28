@@ -424,9 +424,10 @@ def _prefer_platform_games(games, folder, platform_slug):
     and .wav samples -- and every one of those is a "standalone game" to the
     generic filter, so the first by name (tools/ape.aarch64) was booted. Keep
     the files whose extension the platform's cores take, then the ones at the
-    top of the folder, as Argosy picks (findPrimaryRomInFolder). Unknown
-    platform, or nothing matching: the list is returned unchanged. Without a
-    slug the platform is read off the folder a download lands in
+    top of the folder, as Argosy picks (findPrimaryRomInFolder), except for
+    Switch containers. Unknown platform, or nothing matching: the list is
+    returned unchanged. Without a slug the platform is read off the folder a
+    download lands in
     ("<roms>/gba/<game>/"), which is a RomM slug or an ES-DE folder name.
     """
     exts = extensions_for(platform_slug or folder.parent.name)
@@ -435,6 +436,9 @@ def _prefer_platform_games(games, folder, platform_slug):
     own = [f for f in games if f.suffix.lower() in exts]
     if not own:
         return games
+    # The Switch base selector needs nested containers as well as top-level ones.
+    if any(f.suffix.lower() in switch_content.CONTAINER_EXTS for f in own):
+        return own
     top = [f for f in own if f.parent == folder]
     return top or own
 
