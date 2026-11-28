@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urljoin
 
+from romm_sync_engine.settings_file import SETTINGS_ENCODING, read_settings
 from romm_sync_engine.process_lock import ProcessLock
 from romm_sync_engine.owned_tasks import OwnedTasks
 
@@ -4138,7 +4139,7 @@ class LudoBackend:
                 return False
 
             config = configparser.ConfigParser()
-            config.read(ini_path)
+            read_settings(config, ini_path)
             if not config.has_section('Collections'):
                 config.add_section('Collections')
 
@@ -4171,7 +4172,7 @@ class LudoBackend:
             config.set('Collections', 'selected_for_sync', '|'.join(sorted(sync_set)))
             config.set('Collections', 'auto_sync_enabled', 'true' if sync_set else 'false')
 
-            with open(ini_path, 'w') as f:
+            with open(ini_path, 'w', encoding=SETTINGS_ENCODING) as f:
                 config.write(f)
 
             # Update in-memory settings so the heartbeat sees the change immediately
@@ -6049,7 +6050,7 @@ class LudoBackend:
             logging.info("Reset: sync stopped")
 
             config = configparser.ConfigParser()
-            config.read(ini_path)
+            read_settings(config, ini_path)
 
             download_dir = Path(config.get('Download', 'rom_directory',
                                            fallback=_default_roms_dir())).expanduser()
@@ -6174,7 +6175,7 @@ class LudoBackend:
                 config.set('Collections', 'actively_syncing',  '')
                 config.set('Collections', 'selected_for_sync', '')
                 config.set('Collections', 'auto_sync_enabled', 'false')
-                with open(ini_path, 'w') as f:
+                with open(ini_path, 'w', encoding=SETTINGS_ENCODING) as f:
                     config.write(f)
 
             self._romm_collections = None
@@ -13278,7 +13279,7 @@ class LudoBackend:
                 return {'success': False, 'message': 'Settings file not found'}
 
             config = configparser.ConfigParser()
-            config.read(ini_path)
+            read_settings(config, ini_path)
             if not config.has_section('Steam'):
                 config.add_section('Steam')
 
@@ -13331,7 +13332,7 @@ class LudoBackend:
                         # Clear the Steam sync collections list
                         self._steam_manager.set_steam_sync_collections(set())
 
-            with open(ini_path, 'w') as f:
+            with open(ini_path, 'w', encoding=SETTINGS_ENCODING) as f:
                 config.write(f)
 
             # Update in-memory settings

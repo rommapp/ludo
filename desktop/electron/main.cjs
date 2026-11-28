@@ -1,5 +1,4 @@
-// Ludo — Electron desktop shell. Linux is what ships; the code below keeps
-// Windows paths working, but no Windows build is produced or tested.
+// Ludo — Electron desktop shell. The release workflow builds a Linux AppImage.
 //
 // Replaces an earlier GTK3/WebKit2GTK shell. Same lifecycle: spawn the
 // existing Python backend (backend/server.py) on a free localhost port at launch,
@@ -167,6 +166,8 @@ const DESIGN_HEIGHT = 800;
 const MIN_ZOOM = 0.5;
 
 let backend = null; // the Python child process
+let stopping = null; // shared by profile switch and quit
+let quitting = false;
 let win = null;
 let stopNativeInput = null; // teardown for the kernel pad reader (native-input.cjs)
 
@@ -191,21 +192,25 @@ function freePort(host = "127.0.0.1") {
 // user's system Python: it would be missing the engine and the backend deps,
 // and would fail confusingly at import time rather than here.
 function pythonExe() {
-  if (process.env.ROMM_PYTHON) return process.env.ROMM_PYTHON;
-
-  if (PACKAGED) {
-    const bundled = path.join(RES, "python", "bin", "python3");
-    if (fs.existsSync(bundled)) return bundled;
-    throw new Error(
-      `Bundled Python runtime missing at ${bundled}. The build is incomplete; ` +
-      `run desktop/tools/prepare-runtime.sh before packaging.`);
+  const windows = process.platform === "win32";
+  if (process.env.ROMM_PYTHON && (!PACKAGED || !windows)) {
+    return process.env.ROMM_PYTHON;
   }
 
-  const venv = process.platform === "win32"
+  if (PACKAGED) {
+    const bundled = windows
+      ? path.join(RES, "python", "python.exe")
+      : path.join(RES, "python", "bin", "python3");
+    if (fs.existsSync(bundled)) return bundled;
+    throw new Error(
+      `Bundled Python runtime missing at ${bundled}. The build is incomplete.`);
+  }
+
+  const venv = windows
     ? path.join(DESKTOP_DIR, ".venv", "Scripts", "python.exe")
     : path.join(DESKTOP_DIR, ".venv", "bin", "python");
   if (fs.existsSync(venv)) return venv;
-  return process.platform === "win32" ? "python" : "python3";
+  return windows ? "python" : "python3";
 }
 
 // Mirroring the backend's output is a convenience for terminal launches. When
@@ -214,7 +219,7 @@ function pythonExe() {
 // in the main process takes the whole app down. Logging is never worth
 // crashing over, so failures here are swallowed.
 function mirror(stream, text) {
-  try { stream.write(text); } catch { /* no reader; drop it */ }
+  try { if (!stream.writableNeedDrain) stream.write(text); } catch { /* no reader; drop it */ }
 }
 
 // write() can also surface EPIPE asynchronously, which bypasses the try/catch
@@ -226,65 +231,86 @@ for (const stream of [process.stdout, process.stderr]) {
   });
 }
 
-// Start backend/server.py on `host:port` and resolve once it announces it's
-// listening. server.serve() binds the socket only after the engine is ready, so
-// the "[server] listening" line means the URL is loadable.
+// Resolve only after the backend has bound the port and initialized the engine.
 function startBackend(host, port) {
-  return new Promise((resolve, reject) => {
-    const env = backendEnv(process.env, host, port, PACKAGED);
-    const child = spawn(pythonExe(), [SERVER_PY], {
-      env,
-      // Line-buffered pipes so we can watch for the readiness banner.
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    backend = child;
+  const windows = process.platform === "win32";
+  const env = backendEnv(process.env, host, port, PACKAGED, process.platform);
+  const child = spawn(pythonExe(), [SERVER_PY], {
+    env, windowsHide: windows,
+    stdio: [windows ? "pipe" : "ignore", "pipe", "pipe"],
+  });
+  backend = child;
+  child.stdin?.on("error", err => {
+    if (err.code !== "EPIPE" && err.code !== "ECONNRESET") console.error("[backend] stdin:", err);
+  });
 
+  return new Promise((resolve, reject) => {
     let ready = false;
-    const onData = (buf) => {
-      const text = buf.toString();
-      mirror(process.stdout, text); // engine logs, when anyone is listening
-      if (!ready && text.includes("[server] listening")) {
+    let tail = "";
+    let line = "";
+    const banner = `[server] listening on http://${host}:${port}`;
+    const timeout = setTimeout(() => reject(new Error(`Backend startup timed out at ${host}:${port}.\n${tail}`)), 75000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", text => {
+      mirror(process.stdout, text);
+      if (ready) return;
+      const lines = (line + text).split("\n");
+      line = lines.pop().slice(-banner.length - 1);
+      if (lines.some(s => s.trimEnd() === banner)) {
+        clearTimeout(timeout);
         ready = true;
         resolve();
       }
-    };
-    child.stdout.on("data", onData);
-    child.stderr.on("data", (b) => mirror(process.stderr, b.toString()));
-
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      // A backend stopped on purpose (stopBackend clears `backend` first) is
-      // not a crash: a profile switch replaces it while the window stays up.
-      if (ready && backend !== child) return;
+    });
+    child.stderr.on("data", text => {
+      mirror(process.stderr, text);
+      if (!ready) tail = (tail + text).slice(-4096);
+    });
+    child.once("error", err => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.once("exit", () => {
+      if (backend !== child) return;
       backend = null;
-      if (!ready) {
-        reject(new Error(`backend exited before ready (code ${code})`));
-      } else if (win) {
-        // Engine died while the window is up — nothing to show; quit.
-        app.quit();
-      }
+      if (ready && win) app.quit();
+    });
+    // close follows the last stderr bytes, including Python's bind/import error.
+    child.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      if (backend === child) backend = null;
+      if (!ready) reject(new Error(`Backend exited before listening on ${host}:${port} (${signal ?? code}).\n${tail.trim()}`));
     });
   });
 }
 
-// Stop the backend cleanly on window close, so the engine's
-// _unload() runs. server.py's main() calls engine.stop() on KeyboardInterrupt /
-// normal exit, so on POSIX we send SIGINT to trigger that path; Windows has no
-// usable SIGINT-to-child, so we terminate and let the daemon threads die.
 function stopBackend() {
+  if (stopping) return stopping;
   if (!backend) return Promise.resolve();
   const child = backend;
   backend = null;
-  const exited = new Promise((resolve) => {
-    if (child.exitCode !== null || child.signalCode !== null) resolve();
-    else child.once("exit", () => resolve());
-  });
-  try {
-    child.kill(process.platform === "win32" ? undefined : "SIGINT");
-  } catch { /* already gone */ }
-  // Hard-stop if it doesn't exit promptly.
-  setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 3000).unref();
-  return exited;
+  const windows = process.platform === "win32";
+  stopping = new Promise((resolve, reject) => {
+    if (!child.pid || child.exitCode !== null || child.signalCode !== null) return resolve();
+    const grace = windows ? 11000 : 3000;
+    const force = setTimeout(() => child.kill("SIGKILL"), grace);
+    const deadline = setTimeout(() => reject(new Error("Backend did not exit after forced stop")), grace + 2000);
+    child.once("exit", () => {
+      clearTimeout(force);
+      clearTimeout(deadline);
+      resolve();
+    });
+    if (windows) child.stdin.end("Q");
+    else child.kill("SIGINT");
+  }).finally(() => { stopping = null; });
+  return stopping;
+}
+
+function backendFailure(error) {
+  console.error("[electron] backend failed:", error);
+  if (!quitting) dialog.showErrorBox("Ludo backend", error.message || String(error));
+  app.quit();
 }
 
 // Where the backend listens, kept so a profile switch can start a new one on
@@ -507,8 +533,11 @@ async function boot() {
     ? parseInt(process.env.ROMM_PORT, 10)
     : await freePort(host);
 
+  if (quitting) return;
   backendAddr = { host, port };
   await startBackend(host, port);
+
+  if (quitting) return;
 
   // Fullscreen by default (matches the Deck feel); ROMM_FULLSCREEN=0 for a normal
   // window. F11 toggles fullscreen at runtime.
@@ -542,16 +571,17 @@ if (!app.requestSingleInstanceLock()) {
   // port, then a reload so the page starts clean against it.
   let reloading = false;
   ipcMain.on("romm:reload-backend", async () => {
-    if (reloading || !backendAddr) return;
+    if (quitting || reloading || !backendAddr) return;
     reloading = true;
     try {
       await stopBackend();
+      if (quitting) return;
       await startBackend(backendAddr.host, backendAddr.port);
+      if (quitting) return;
       if (appUrl) win?.loadURL(appUrl);
       else win?.webContents.reload();
     } catch (err) {
-      console.error("[profiles] backend restart failed:", err);
-      app.quit();
+      backendFailure(err);
     } finally {
       reloading = false;
     }
@@ -561,7 +591,7 @@ if (!app.requestSingleInstanceLock()) {
   // swapped, so relaunching picks up the new build. app.relaunch() re-execs
   // $APPIMAGE rather than the mounted binary, whose mountpoint disappears the
   // moment we exit.
-  ipcMain.on("romm:restart", () => {
+  ipcMain.on("romm:restart", async () => {
     const appImage = process.env.APPIMAGE;
     console.log(`[restart] APPIMAGE=${appImage || "(unset)"}`);
 
@@ -572,7 +602,8 @@ if (!app.requestSingleInstanceLock()) {
       // away. Spawning a fully detached child first, and only then exiting,
       // keeps the two lifetimes independent. The child mounts its own copy.
       try {
-        stopBackend();
+        quitting = true;
+        await stopBackend();
         const child = spawn(appImage, [], {
           detached: true,
           stdio: "ignore",
@@ -657,22 +688,21 @@ if (!app.requestSingleInstanceLock()) {
     if (win) { if (win.isMinimized()) win.restore(); win.focus(); }
   });
 
-  app.whenReady().then(boot).catch((err) => {
-    console.error("[electron] failed to start:", err);
-    app.quit();
-  });
+  app.whenReady().then(boot).catch(backendFailure);
 
-  app.on("window-all-closed", () => {
-    stopBackend();
-    app.quit();
+  app.on("window-all-closed", () => app.quit());
+  app.on("before-quit", event => {
+    const alreadyQuitting = quitting;
+    quitting = true;
+    if (!backend && !stopping) return;
+    event.preventDefault();
+    if (alreadyQuitting && stopping) return;
+    stopBackend().catch(err => console.error("[backend] quit:", err)).finally(() => app.quit());
   });
-
-  // Ensure the backend is reaped even on unusual exit paths.
-  app.on("before-quit", stopBackend);
-  process.on("exit", stopBackend);
-  // A plain `kill` (or the session ending) exits Node without the "exit"
-  // event, so stopBackend would never run. Turn those into a normal quit.
-  for (const sig of ["SIGTERM", "SIGHUP"]) {
-    process.on(sig, () => { stopBackend(); app.quit(); });
-  }
+  // process.exit() bypasses Electron's asynchronous quit event. Windows
+  // observes the closed owner pipe; POSIX still gets its synchronous SIGINT.
+  process.once("exit", () => {
+    if (backend && process.platform !== "win32") backend.kill("SIGINT");
+  });
+  for (const sig of ["SIGTERM", "SIGHUP"]) process.on(sig, () => app.quit());
 }

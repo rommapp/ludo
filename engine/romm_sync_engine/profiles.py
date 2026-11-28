@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 from . import paths
+from .settings_file import read_settings
 
 DEFAULT = paths.DEFAULT_PROFILE
 # How the running app chose its profile ({'id', 'steam', 'ask'}), set by a
@@ -484,7 +485,7 @@ def create(name='', copy_from=None):
     source = paths.profile_dir(copy_from or paths.profile_id()) / 'settings.ini'
     if source.exists():
         src = configparser.ConfigParser()
-        src.read(source)
+        read_settings(src, source)
         out = configparser.ConfigParser()
         for section in _MACHINE_SECTIONS:
             if src.has_section(section):

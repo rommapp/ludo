@@ -1,0 +1,44 @@
+name: Desktop backend lifecycle
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: Native backend lifecycle (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Install the engine and backend from this checkout
+        id: install
+        run: python -m pip install ./engine ./app
+      - name: Verify settings migration, profile copy and failed atomic replacement
+        run: python engine/tests/test_settings_file.py
+      - name: Exercise the real backend in each layout and on an occupied port
+        shell: bash
+        run: |
+          set -eo pipefail
+          node --test --test-reporter=tap desktop/tests/backend.native.mjs | tr -d '\r' | tee native.tap
+          for scenario in "development" "packaged layout" "occupied port"; do
+            grep -Eq "^ok [0-9]+ - ${scenario} with the real (win32|linux) backend$" native.tap
+          done
+          grep -qx '# skipped 0' native.tap
+      - name: Exercise normal exit, owner loss and forced process-tree cleanup
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.install.outcome == 'success' }}
+        run: python desktop/tests/windows_process_tree.py

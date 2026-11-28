@@ -21,3 +21,14 @@ test("packaged builds cannot inherit backend debug mode", () => {
   assert.equal(env.ROMM_PORT, "9000");
   assert.equal(original.LUDO_DEBUG, "1", "the parent environment is not mutated");
 });
+
+test("Windows isolates Python and preserves profile selection", () => {
+  const env = backendEnv({
+    PythonHome: "old interpreter", PYTHONPATH: "old modules", Ludo_Debug: "1", LUDO_PROFILE: "İzmir",
+    romm_port: "7", Path: "C:\\Windows",
+  }, "127.0.0.1", 8888, true, "win32");
+  assert.deepEqual(env, {
+    LUDO_PROFILE: "İzmir", Path: "C:\\Windows", ROMM_HOST: "127.0.0.1", ROMM_PORT: "8888",
+    LUDO_OWNER_PIPE: "1", PYTHONNOUSERSITE: "1", PYTHONIOENCODING: "utf-8",
+  });
+});

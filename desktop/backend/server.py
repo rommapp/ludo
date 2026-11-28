@@ -23,11 +23,23 @@ import logging
 import mimetypes
 import os
 import platform
+import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+
+_owner_stop = None
+if __name__ == "__main__" and os.name == "nt" and os.environ.pop("LUDO_OWNER_PIPE", None) == "1":
+    # Embedded distributions can ignore PYTHONIOENCODING via their ._pth.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    # An embedded Python's ._pth may omit even the entry script's directory.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from windows_lifetime import watch_owner
+    _owner_stop = watch_owner()
+
 
 # ── The backend ─────────────────────────────────────────────────────────────
 #
@@ -169,6 +181,7 @@ class Engine:
         self.loop = asyncio.new_event_loop()
         self.plugin = LudoBackend(host=DESKTOP_HOST)
         self._ready = threading.Event()
+        self._startup_error = None
         self._state_lock = threading.Lock()
         self._stopping = False
         self._thread = threading.Thread(target=self._run, name="engine-loop",
@@ -179,8 +192,13 @@ class Engine:
         # _main() constructs the sync managers and starts the watchdog threads,
         # exactly as Decky's load path does.
         try:
-            self.loop.run_until_complete(self.plugin._main())
-            self._ready.set()
+            try:
+                self.loop.run_until_complete(self.plugin._main())
+            except Exception as e:
+                self._startup_error = e
+                return
+            finally:
+                self._ready.set()
             self.loop.run_forever()
         finally:
             pending = asyncio.all_tasks(self.loop)
@@ -196,6 +214,8 @@ class Engine:
         self._thread.start()
         if not self._ready.wait(timeout):
             raise RuntimeError("engine _main() did not complete in time")
+        if self._startup_error is not None:
+            raise RuntimeError("engine startup failed") from self._startup_error
 
     def call(self, method: str, args: list):
         fn = getattr(self.plugin, method, None)
@@ -490,6 +510,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class DesktopHTTPServer(ThreadingHTTPServer):
+    # Windows SO_REUSEADDR can steal an occupied listener.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def serve(host="127.0.0.1", port=8723):
     """Start the engine + HTTP server and return (httpd, engine).
 
@@ -499,14 +529,18 @@ def serve(host="127.0.0.1", port=8723):
     backend in-process and know exactly when the UI can be loaded.
     """
     global ENGINE
-    ENGINE = Engine()
-    from romm_sync_engine import events as _engine_events
-    _engine_events.add_sink(EVENTS.push)
-    print("[server] starting engine…", flush=True)
-    ENGINE.start()
-    print("[server] engine ready", flush=True)
+    httpd = DesktopHTTPServer((host, port), Handler)
+    try:
+        ENGINE = Engine()
+        from romm_sync_engine import events as _engine_events
+        _engine_events.add_sink(EVENTS.push)
+        print("[server] starting engine…", flush=True)
+        ENGINE.start()
+        print("[server] engine ready", flush=True)
+    except BaseException:
+        httpd.server_close()
+        raise
 
-    httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"[server] listening on http://{host}:{port}", flush=True)
     return httpd, ENGINE
 
@@ -538,10 +572,16 @@ def main():
     port = int(os.environ.get("ROMM_PORT", "8723"))
     httpd, engine = serve(host, port)
     try:
-        httpd.serve_forever()
+        if _owner_stop is None:
+            httpd.serve_forever()
+        else:
+            httpd.timeout = .2
+            while not _owner_stop.is_set():
+                httpd.handle_request()
     except KeyboardInterrupt:
         pass
     finally:
+        httpd.server_close()
         engine.stop()
 
 

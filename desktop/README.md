@@ -71,8 +71,21 @@ npm run electron       # build the UI, then launch the window
 npm run electron:dev   # launch against the Vite dev server (hot reload)
 ```
 
-The interpreter is `desktop/.venv/bin/python` (or `.venv/Scripts/python.exe` on
+From source the interpreter is `desktop/.venv/bin/python` (or `.venv/Scripts/python.exe` on
 Windows) if present, else `python3`/`python`; override with `ROMM_PYTHON`.
+
+A packaged Windows shell expects `resources/python/python.exe` and
+`resources/app-src/desktop/backend/{server,windows_lifetime}.py`. The shell
+starts the interpreter hidden and reports launch or bind errors in a dialog.
+Closing the last window or choosing Exit waits for the backend. Switching
+profiles waits for the old backend to exit before reopening the port.
+
+On Windows the shell requests shutdown through the child's stdin. Losing the
+shell also closes that pipe. The backend gives the existing RPC drain time to
+finish, with a ten-second watchdog. A private Windows job contains the backend
+and its descendants. Independent emulator processes stay outside that job.
+The shell escalates after eleven seconds and waits up to two more for exit.
+POSIX shutdown uses SIGINT and retains the three-second escalation.
 
 ### Launch from the host, not from a container (NVIDIA)
 
